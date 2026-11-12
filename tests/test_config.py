@@ -56,3 +56,8 @@ def test_dashboard_bind_parse():
 def test_bad_dashboard_bind_raises():
     with pytest.raises(ConfigError, match="DASHBOARD_BIND"):
         load_config({**BASE_ENV, "DASHBOARD_BIND": "nope"})
+
+
+def test_dashboard_bind_out_of_range_port_raises_config_error():
+    with pytest.raises(ConfigError, match="DASHBOARD_BIND"):
+        load_config({**BASE_ENV, "DASHBOARD_BIND": "127.0.0.1:99999"})

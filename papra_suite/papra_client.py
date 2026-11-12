@@ -5,7 +5,6 @@ import httpx
 MAX_ATTEMPTS = 3
 
 
-
 class PapraError(Exception):
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
@@ -44,8 +43,9 @@ class PapraClient:
                     break
                 await asyncio.sleep(self._backoff_base_s * 4**attempt)
                 continue
-            if (response.status_code == 429 or response.status_code >= 500) \
-                    and attempt < MAX_ATTEMPTS - 1:
+            if (
+                response.status_code == 429 or response.status_code >= 500
+            ) and attempt < MAX_ATTEMPTS - 1:
                 await asyncio.sleep(self._backoff_base_s * 4**attempt)
                 continue
             if response.is_success:

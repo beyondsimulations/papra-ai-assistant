@@ -28,16 +28,6 @@ class AppConfig:
     sweep_interval_s: int
 
 
-REQUIRED = (
-    "PAPRA_BASE_URL",
-    "PAPRA_API_KEY",
-    "LLM_BASE_URL",
-    "LLM_API_KEY",
-    "TITLE_MODEL",
-    "OCR_MODEL",
-    "ADMIN_PASSWORD",
-)
-
 DEFAULT_BIND = "127.0.0.1:8080"
 
 
@@ -60,9 +50,15 @@ def _int_env(env: Mapping[str, str], name: str, default: int) -> int:
 
 def _parse_bind(raw: str) -> tuple[str, int]:
     parsed = urlparse(f"//{raw}")
-    if not parsed.hostname or parsed.port is None:
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ConfigError(
+            f"DASHBOARD_BIND port must be between 0 and 65535, got: {raw!r}"
+        ) from None
+    if not parsed.hostname or port is None:
         raise ConfigError(f"DASHBOARD_BIND must be 'host:port', got: {raw!r}")
-    return parsed.hostname, parsed.port
+    return parsed.hostname, port
 
 
 def load_config(env: Mapping[str, str] | None = None) -> AppConfig:

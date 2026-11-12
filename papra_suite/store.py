@@ -19,14 +19,17 @@ LOG_RING_BUFFER_SIZE = 1000
 
 
 def _migration_001_initial(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    conn.execute(
         """
         CREATE TABLE orgs (
             id TEXT PRIMARY KEY,
             papra_org_id TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE mailboxes (
             id TEXT PRIMARY KEY,
             org_id TEXT NOT NULL REFERENCES orgs(id),
@@ -44,8 +47,11 @@ def _migration_001_initial(conn: sqlite3.Connection) -> None:
             last_poll_at TEXT,
             last_error TEXT,
             consecutive_failures INTEGER NOT NULL DEFAULT 0
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE jobs (
             id TEXT PRIMARY KEY,
             kind TEXT NOT NULL,
@@ -59,11 +65,22 @@ def _migration_001_initial(conn: sqlite3.Connection) -> None:
             error TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        );
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE UNIQUE INDEX idx_jobs_idempotency
-            ON jobs(kind, papra_org_id, document_id, content_hash);
-        CREATE INDEX idx_jobs_claim ON jobs(kind, status, next_attempt_at);
-
+            ON jobs(kind, papra_org_id, document_id, content_hash)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX idx_jobs_claim ON jobs(kind, status, next_attempt_at)
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE documents (
             papra_org_id TEXT NOT NULL,
             papra_document_id TEXT NOT NULL,
@@ -72,24 +89,33 @@ def _migration_001_initial(conn: sqlite3.Connection) -> None:
             ingested_via TEXT NOT NULL,
             first_seen_at TEXT NOT NULL,
             PRIMARY KEY (papra_org_id, papra_document_id)
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE dedup_hashes (
             hash TEXT PRIMARY KEY,
             created_at TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE log_lines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
             level TEXT NOT NULL,
             line TEXT NOT NULL
-        );
+        )
         """
     )
 

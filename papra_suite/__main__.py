@@ -1,11 +1,8 @@
 import argparse
-import logging
 import sys
 
 from papra_suite import __version__
 from papra_suite.config import ConfigError, load_config
-
-logger = logging.getLogger(__name__)
 
 
 def main() -> int:
