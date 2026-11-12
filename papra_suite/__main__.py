@@ -23,8 +23,15 @@ def main() -> int:
         return 2
 
     if args.command == "check":
+        from papra_suite.store import Store
+
         config.data_dir.mkdir(parents=True, exist_ok=True)
-        print(f"config ok; data dir: {config.data_dir}")
+        store = Store(config.data_dir / "state.db")
+        try:
+            store.migrate()
+        finally:
+            store.close()
+        print(f"config ok; store migrated; data dir: {config.data_dir}")
         return 0
 
     return 1

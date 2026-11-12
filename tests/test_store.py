@@ -1,0 +1,107 @@
+import pytest
+
+from papra_suite.store import Store
+
+
+@pytest.fixture
+def store(tmp_path):
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    yield store
+    store.close()
+
+
+def test_migrate_is_idempotent(tmp_path):
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.migrate()
+    store.close()
+
+
+def test_settings_roundtrip(store):
+    assert store.get_setting("missing") is None
+    store.set_setting("key", "value")
+    assert store.get_setting("key") == "value"
+
+
+def test_enqueue_job_is_idempotent(store):
+    first = store.enqueue_job(
+        kind="ocr", papra_org_id="org_1", document_id="doc_1",
+        content_hash="abc", payload={"page_count": 2},
+    )
+    second = store.enqueue_job(
+        kind="ocr", papra_org_id="org_1", document_id="doc_1",
+        content_hash="abc", payload={"page_count": 2},
+    )
+    assert first == second
+    assert len(store.list_jobs()) == 1
+
+
+def test_different_content_hash_creates_new_job(store):
+    a = store.enqueue_job(kind="title", papra_org_id="org_1", document_id="doc_1",
+                           content_hash="h1", payload={})
+    b = store.enqueue_job(kind="title", papra_org_id="org_1", document_id="doc_1",
+                           content_hash="h2", payload={})
+    assert a != b
+    assert len(store.list_jobs()) == 2
+
+
+def test_claim_next_job_transitions_to_running(store):
+    store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                      content_hash="abc", payload={})
+    job = store.claim_next_job("ocr")
+    assert job is not None and job.status == "running"
+    # claimed job is not claimable again
+    assert store.claim_next_job("ocr") is None
+
+
+def test_mark_job_failed_requeues_with_backoff_then_fails(store):
+    job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                               content_hash="abc", payload={})
+    job = store.claim_next_job("ocr")
+
+    store.mark_job_failed(job.id, "boom", backoff_base_s=0)
+    assert store.get_job(job_id).status == "pending"
+    assert store.get_job(job_id).attempts == 1
+
+    store.claim_next_job("ocr")
+    store.mark_job_failed(job_id, "boom", backoff_base_s=0)
+    store.claim_next_job("ocr")
+    store.mark_job_failed(job_id, "boom", backoff_base_s=0)
+    assert store.get_job(job_id).status == "failed"
+    assert store.get_job(job_id).attempts == 3
+    assert "boom" in store.get_job(job_id).error
+
+
+def test_reset_job_revives_failed_job(store):
+    job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                               content_hash="abc", payload={})
+    for _ in range(3):
+        job = store.claim_next_job("ocr")
+        store.mark_job_failed(job.id, "boom", backoff_base_s=0)
+    assert store.get_job(job_id).status == "failed"
+
+    store.reset_job(job_id)
+    revived = store.get_job(job_id)
+    assert revived.status == "pending" and revived.attempts == 0 and revived.error is None
+
+
+def test_document_seen_roundtrip(store):
+    assert not store.document_seen("org_1", "doc_1")
+    store.record_document_seen(papra_org_id="org_1", papra_document_id="doc_1",
+                               name="bill.pdf", mime="application/pdf", ingested_via="mail")
+    assert store.document_seen("org_1", "doc_1")
+
+
+def test_dedup_roundtrip(store):
+    assert not store.dedup_exists("hash-1")
+    store.add_dedup("hash-1")
+    assert store.dedup_exists("hash-1")
+
+
+def test_log_ring_buffer_capped(store):
+    for i in range(1200):
+        store.append_log_line(ts=f"2026-11-12T00:00:{i % 60:02d}Z", level="INFO", line=f"line {i}")
+    lines = store.recent_log_lines(limit=500)
+    assert len(lines) == 500
+    assert lines[-1][2] == "line 1199"
