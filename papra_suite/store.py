@@ -175,6 +175,14 @@ class Store:
             for index in range(current, len(MIGRATIONS)):
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
+                    # Re-read inside the transaction: another process may have
+                    # migrated (and bumped user_version) between our pre-lock
+                    # read and the BEGIN IMMEDIATE lock. Skip anything already
+                    # applied so concurrent migrators cannot double-apply.
+                    applied = self._conn.execute("PRAGMA user_version").fetchone()[0]
+                    if applied > index:
+                        self._conn.rollback()
+                        continue
                     MIGRATIONS[index](self._conn)
                     self._conn.execute(f"PRAGMA user_version = {index + 1}")
                     self._conn.commit()

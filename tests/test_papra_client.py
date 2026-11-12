@@ -182,3 +182,32 @@ async def test_add_tag_posts_tag_id():
     import json
 
     assert json.loads(bodies[0]) == {"tagId": "tag_9"}
+
+
+async def test_create_document_sends_multipart_file():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["content_type"] = request.headers.get("Content-Type", "")
+        seen["body"] = request.read()
+        return httpx.Response(200, json={"document": DOC})
+
+    async with make_client(handler) as client:
+        document = await client.create_document(ORG, "bill.pdf", b"%PDF-1.4 fake")
+
+    assert document == DOC
+    assert seen["content_type"].startswith("multipart/form-data")
+    body = seen["body"]
+    assert b'name="file"' in body  # part must be named "file"
+    assert b'filename="bill.pdf"' in body
+    assert b"%PDF-1.4 fake" in body
+
+
+async def test_whoami_returns_api_key():
+    api_key = {"id": "ak_1", "permissions": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"apiKey": api_key})
+
+    async with make_client(handler) as client:
+        assert await client.whoami() == api_key

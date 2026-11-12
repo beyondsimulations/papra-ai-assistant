@@ -15,20 +15,29 @@ API_KEY_PERMISSIONS = [
 ]
 
 
-def _papra_is_up(*, readiness_timeout_s: float = 0.0) -> bool:
+def _probe_readiness(url: str, *, readiness_timeout_s: float,
+                     poll_interval_s: float = 0.5) -> bool:
     # `docker compose up -d --wait` reports the container healthy as soon as it is
     # *running* — the papra image defines no healthcheck, so the app may still be
-    # booting and refuse connections for a few seconds. Retry within a bounded
-    # window so `make test` does not race the app startup.
+    # booting and refuse connections (or answer with a non-200/401 status, e.g.
+    # 503 while booting) for a few seconds. Retry on ANY outcome — connection
+    # error or HTTP status — within a bounded window; only after the full window
+    # passes without a 200/401 do we report the stack as down.
     deadline = time.monotonic() + readiness_timeout_s
     while True:
         try:
-            response = httpx.get(f"{PAPRA_TEST_URL}/api/api-keys/current", timeout=2.0)
-            return response.status_code in (200, 401)
+            response = httpx.get(f"{url}/api/api-keys/current", timeout=2.0)
+            if response.status_code in (200, 401):
+                return True
         except httpx.TransportError:
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(0.5)
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval_s)
+
+
+def _papra_is_up(*, readiness_timeout_s: float = 0.0) -> bool:
+    return _probe_readiness(PAPRA_TEST_URL, readiness_timeout_s=readiness_timeout_s)
 
 
 @pytest.fixture(scope="session")

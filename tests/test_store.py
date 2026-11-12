@@ -56,6 +56,74 @@ def test_claim_next_job_transitions_to_running(store):
     assert store.claim_next_job("ocr") is None
 
 
+def test_concurrent_migrate_no_double_apply(tmp_path):
+    """Two migrators race on one file: B's pre-lock user_version read is stale
+    after A commits; the in-transaction re-read must skip already-applied
+    migrations instead of crashing with 'table orgs already exists'."""
+    db_path = tmp_path / "state.db"
+    store_a = Store(db_path)
+    store_b = Store(db_path)
+
+    class _StaleVersionConn:
+        """Proxy forcing the first (pre-lock) user_version read to return the
+        stale value 0, simulating B reading before A commits."""
+
+        def __init__(self, conn):
+            self._conn = conn
+            self._reads = 0
+
+        def execute(self, sql, *args):
+            if sql == "PRAGMA user_version":
+                self._reads += 1
+                if self._reads == 1:
+                    return self._conn.execute("SELECT 0")
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    store_a.migrate()
+
+    real_conn = store_b._conn
+    store_b._conn = _StaleVersionConn(real_conn)
+    try:
+        store_b.migrate()  # must no-op, not raise
+    finally:
+        store_b._conn = real_conn
+
+    expected = len(store_module.MIGRATIONS)
+    assert store_a._conn.execute("PRAGMA user_version").fetchone()[0] == expected
+    assert store_b._conn.execute("PRAGMA user_version").fetchone()[0] == expected
+
+    store_a.close()
+    store_b.close()
+
+
+def test_mark_job_done(store):
+    job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                               content_hash="abc", payload={})
+    job = store.claim_next_job("ocr")
+    store.mark_job_done(job.id)
+    done = store.get_job(job_id)
+    assert done.status == "done"
+    assert done.error is None
+
+
+def test_list_jobs_filters_by_status(store):
+    first_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                                 content_hash="h1", payload={})
+    second_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_2",
+                                  content_hash="h2", payload={})
+    claimed = store.claim_next_job("ocr")
+    running_id = claimed.id
+    pending_id = second_id if running_id == first_id else first_id
+
+    pending_jobs = store.list_jobs(status="pending")
+    assert [job.id for job in pending_jobs] == [pending_id]
+    running_jobs = store.list_jobs(status="running")
+    assert [job.id for job in running_jobs] == [running_id]
+
+
 def test_mark_job_failed_requeues_with_backoff_then_fails(store):
     job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
                                content_hash="abc", payload={})
