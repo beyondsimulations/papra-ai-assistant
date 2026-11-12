@@ -40,6 +40,34 @@ async def test_retries_5xx_then_succeeds():
     assert document["id"] == "doc_1" and calls["n"] == 3
 
 
+async def test_501_is_retried_then_succeeds():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(501)
+        return httpx.Response(200, json={"document": DOC})
+
+    async with make_client(handler) as client:
+        document = await client.get_document(ORG, "doc_1")
+    assert document["id"] == "doc_1" and calls["n"] == 2
+
+
+async def test_persistent_5xx_raises_with_status():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503)
+
+    async with make_client(handler) as client:
+        with pytest.raises(PapraError) as excinfo:
+            await client.get_document(ORG, "doc_1")
+    assert excinfo.value.status == 503
+    assert calls["n"] == 3
+
+
 async def test_4xx_raises_immediately_without_retry():
     calls = {"n": 0}
 
