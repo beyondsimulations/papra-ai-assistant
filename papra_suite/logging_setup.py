@@ -13,7 +13,7 @@ class SecretRegistry:
         self._secrets: set[str] = set()
 
     def add(self, value: str | None) -> None:
-        if value and len(value) >= 4:
+        if value:
             self._secrets.add(value)
 
     def redact(self, text: str) -> str:

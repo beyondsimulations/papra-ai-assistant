@@ -35,6 +35,16 @@ def test_secrets_are_redacted_everywhere(store, capsys):
     assert "[REDACTED]" in json.loads(line)["message"]
 
 
+def test_short_secrets_are_redacted(store, capsys):
+    SECRET_REGISTRY.add("abc")
+    setup_logging(store)
+    logging.getLogger("test").info("login with password=abc failed")
+    raw = capsys.readouterr().out
+    line = raw.strip().splitlines()[-1]
+    assert "abc" not in raw
+    assert "[REDACTED]" in json.loads(line)["message"]
+
+
 def test_ring_buffer_receives_lines(store):
     setup_logging(store)
     logging.getLogger("test").warning("watch out")

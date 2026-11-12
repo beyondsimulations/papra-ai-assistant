@@ -1,3 +1,5 @@
+import time
+
 import httpx
 import pytest
 
@@ -38,6 +40,27 @@ async def test_retries_5xx_then_succeeds():
     async with make_client(handler) as client:
         document = await client.get_document(ORG, "doc_1")
     assert document["id"] == "doc_1" and calls["n"] == 3
+
+
+async def test_backoff_sleeps_between_attempts():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(500)
+        return httpx.Response(200, json={"document": DOC})
+
+    client = PapraClient(
+        "http://papra.test", "ppapi_test", backoff_base_s=0.05,
+        transport=httpx.MockTransport(handler),
+    )
+    start = time.monotonic()
+    async with client:
+        await client.get_document(ORG, "doc_1")
+    elapsed = time.monotonic() - start
+    assert calls["n"] == 3
+    assert elapsed >= 0.24  # two sleeps: 0.05 + 0.20 = 0.25s total
 
 
 async def test_501_is_retried_then_succeeds():

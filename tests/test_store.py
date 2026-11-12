@@ -1,5 +1,6 @@
 import pytest
 
+import papra_suite.store as store_module
 from papra_suite.store import Store
 
 
@@ -105,3 +106,37 @@ def test_log_ring_buffer_capped(store):
     lines = store.recent_log_lines(limit=500)
     assert len(lines) == 500
     assert lines[-1][2] == "line 1199"
+    retained = store.recent_log_lines(limit=2000)
+    assert len(retained) == 1000
+    assert retained[0][2] == "line 200"
+    assert retained[-1][2] == "line 1199"
+
+
+def test_failed_migration_is_rolled_back_atomically(tmp_path, monkeypatch):
+    def failing_migration(conn):
+        conn.execute("CREATE TABLE scratch (id INTEGER PRIMARY KEY)")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", [failing_migration])
+    store = Store(tmp_path / "state.db")
+    with pytest.raises(RuntimeError, match="boom"):
+        store.migrate()
+    store.close()
+
+    monkeypatch.undo()
+    fresh = Store(tmp_path / "state.db")
+    fresh.migrate()
+    assert fresh._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert fresh._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scratch'"
+    ).fetchone() is None
+    fresh.close()
+
+
+def test_failed_job_is_not_claimable_during_backoff(store):
+    job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                               content_hash="abc", payload={})
+    job = store.claim_next_job("ocr")
+    store.mark_job_failed(job.id, "boom")  # default backoff_base_s=30
+    assert store.get_job(job_id).status == "pending"
+    assert store.claim_next_job("ocr") is None

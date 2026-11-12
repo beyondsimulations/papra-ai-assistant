@@ -173,9 +173,14 @@ class Store:
         with self._lock:
             current = self._conn.execute("PRAGMA user_version").fetchone()[0]
             for index in range(current, len(MIGRATIONS)):
-                with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
                     MIGRATIONS[index](self._conn)
                     self._conn.execute(f"PRAGMA user_version = {index + 1}")
+                    self._conn.commit()
+                except BaseException:
+                    self._conn.rollback()
+                    raise
 
     # -- settings ---------------------------------------------------------
 
