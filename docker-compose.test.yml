@@ -1,0 +1,9 @@
+services:
+  papra:
+    image: ghcr.io/papra-hq/papra:latest
+    environment:
+      AUTH_SECRET: "papra-suite-test-secret-not-for-prod-0123456789"
+      AUTH_IS_EMAIL_VERIFICATION_REQUIRED: "false"
+      AUTH_IS_REGISTRATION_ENABLED: "true"
+    ports:
+      - "127.0.0.1:12210:1221"
