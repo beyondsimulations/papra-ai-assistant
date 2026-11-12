@@ -48,3 +48,24 @@ def test_ring_buffer_lines_are_redacted(store):
     logging.getLogger("test").error("auth error, password=hunter2-hunter2")
     lines = store.recent_log_lines(limit=10)
     assert all("hunter2-hunter2" not in line for _, _, line in lines)
+
+
+def test_exception_text_is_redacted_in_both_sinks(store, capsys):
+    SECRET_REGISTRY.add("sup3r-secret-token")
+    setup_logging(store)
+    try:
+        raise ValueError("connection failed with sup3r-secret-token")
+    except ValueError:
+        logging.getLogger("test").error("boom", exc_info=True)
+
+    stdout_line = capsys.readouterr().out.strip().splitlines()[-1]
+    assert "sup3r-secret-token" not in stdout_line
+    payload = json.loads(stdout_line)
+    assert "sup3r-secret-token" not in payload["exc_info"]
+    assert "[REDACTED]" in payload["exc_info"]
+
+    ring_lines = store.recent_log_lines(limit=10)
+    matching = [line for _, _, line in ring_lines if "boom" in line]
+    assert matching, "expected the error line in the ring buffer"
+    assert all("sup3r-secret-token" not in line for line in matching)
+    assert any("[REDACTED]" in line for line in matching)

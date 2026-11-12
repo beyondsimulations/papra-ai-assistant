@@ -31,6 +31,10 @@ class RedactingFilter(logging.Filter):
         message = record.getMessage()
         record.msg = SECRET_REGISTRY.redact(message)
         record.args = None
+        if record.exc_info:
+            record.exc_text = SECRET_REGISTRY.redact(
+                logging.Formatter().formatException(record.exc_info)
+            )
         return True
 
 
@@ -43,7 +47,7 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
         if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
+            payload["exc_info"] = record.exc_text or self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
 
 
