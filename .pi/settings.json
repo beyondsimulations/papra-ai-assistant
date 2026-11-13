@@ -1,0 +1,5 @@
+{
+  "defaultProvider": "omlx",
+  "defaultModel": "Qwen3.8-Flash-Next-UD-Q4_K_XL",
+  "defaultThinkingLevel": "medium"
+}

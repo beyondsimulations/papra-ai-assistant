@@ -1,11 +1,13 @@
 import hashlib
 import json
+import logging
 
 import httpx
 import pytest
 
 from papra_suite.config import load_config
 from papra_suite.pipeline import (
+    MAX_SWEEP_PAGES,
     SWEEP_PAGE_SIZE,
     SweepResult,
     on_job_done,
@@ -413,6 +415,38 @@ async def test_sweep_once_stops_at_page_boundary(store):
     assert result.jobs_enqueued == SWEEP_PAGE_SIZE
     # page 0 is full -> one confirming fetch of page 1 (empty) -> stop
     assert papra.pages_requested == [0, 1]
+
+
+class NeverShortPagePapra(StubPapra):
+    """A listing endpoint that ignores page_index: every page comes back full."""
+
+    def __init__(self):
+        super().__init__()
+        self.pages_requested = 0
+        self.documents = {"org_1": {
+            f"doc_{i}": {"id": f"doc_{i}", "name": f"doc_{i}.txt",
+                         "mimeType": "text/plain"}
+            for i in range(SWEEP_PAGE_SIZE)
+        }}
+
+    async def list_documents(self, org_id, *, page_index=0, page_size=100,
+                             search_query=None, sort_field="createdAt",
+                             sort_order="desc"):
+        self.pages_requested += 1  # page_index deliberately ignored
+        return list(self.documents[org_id].values()), len(self.documents[org_id])
+
+
+async def test_sweep_once_terminates_on_never_short_listing(store, caplog):
+    papra = NeverShortPagePapra()
+
+    with caplog.at_level(logging.WARNING):
+        result = await sweep_once(store, papra)
+
+    # the hard cap ends pagination instead of looping forever
+    assert papra.pages_requested == MAX_SWEEP_PAGES
+    assert result.documents_checked == MAX_SWEEP_PAGES * SWEEP_PAGE_SIZE
+    assert any(record.levelno == logging.WARNING and "org_1" in record.getMessage()
+               for record in caplog.records)
 
 
 async def test_sweep_once_is_idempotent(store):

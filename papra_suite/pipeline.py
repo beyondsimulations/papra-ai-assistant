@@ -18,6 +18,7 @@ from papra_suite.titles import generate_title
 logger = logging.getLogger(__name__)
 
 SWEEP_PAGE_SIZE = 50
+MAX_SWEEP_PAGES = 100  # hard cap: a listing endpoint that ignores pageIndex must not loop forever
 DEFAULT_DOCUMENT_NAME = "document.pdf"
 
 
@@ -117,19 +118,20 @@ async def serve(config, *, stop: asyncio.Event | None = None,
 
     tasks = []
     for mailbox in store.list_mailboxes(enabled_only=True):
-        tasks.append(asyncio.create_task(_poll_loop(store, papra, mailbox)))
+        tasks.append(asyncio.create_task(
+            _poll_loop(store, papra, mailbox), name=f"poll:{mailbox.id}"))
     for _ in range(config.ocr_concurrency):
         tasks.append(asyncio.create_task(worker_loop(
             store, kind="ocr",
             handler=lambda job: run_ocr_job(papra, ocr_llm, job, config=config),
-        )))
+        ), name="ocr-worker"))
     tasks.append(asyncio.create_task(worker_loop(
         store, kind="title",
         handler=lambda job: run_title_job(papra, title_llm, job),
-    )))
+    ), name="title-worker"))
     if config.sweep_interval_s > 0:
         tasks.append(asyncio.create_task(
-            _sweep_loop(store, papra, config.sweep_interval_s)))
+            _sweep_loop(store, papra, config.sweep_interval_s), name="sweep"))
 
     def _supervise(task: asyncio.Task, name: str) -> None:
         """Log loudly if a long-lived task exits without cancellation."""
@@ -290,6 +292,11 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
             if len(documents) < SWEEP_PAGE_SIZE:
                 break
             page_index += 1
+            if page_index >= MAX_SWEEP_PAGES:
+                logger.warning(
+                    "sweep: stopping after %d pages for org %s (listing may ignore pagination)",
+                    MAX_SWEEP_PAGES, org.papra_org_id)
+                break
     return result
 
 
