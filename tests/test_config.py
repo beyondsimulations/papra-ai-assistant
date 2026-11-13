@@ -220,3 +220,44 @@ def test_data_dir_default():
     # The documented default data dir when DATA_DIR is unset.
     config = load_config(BASE_ENV)
     assert config.data_dir == Path("/app/data")
+
+
+def test_path_bearing_base_url_rejected():
+    # "http://papra:1221/api" parses fine, but httpx concatenates the base
+    # path with every request path ("/api/api-keys/current" ->
+    # "/api/api-keys/current" under the base path -> 404 on every call). No
+    # input makes a path-bearing base work with this client — reject it.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221/api"})
+
+
+def test_path_bearing_base_url_with_trailing_slash_rejected():
+    # The rstrip removes the trailing "/", leaving a real path — same
+    # concatenation failure as above.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221/api/"})
+
+
+def test_pathless_base_urls_still_pass():
+    # Both the bare and the trailing-slash form (stripped) must keep working.
+    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221"})
+    assert config.papra_base_url == "http://papra:1221"
+    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221/"})
+    assert config.papra_base_url == "http://papra:1221"
+
+
+def test_control_chars_in_host_rejected():
+    # NUL/ESC/DEL in a host: Python's urlparse happily accepts them, but
+    # httpx raises InvalidURL on every request — the check command must not
+    # bless such a config. This also pins _has_nondisplay_chars against an
+    # isspace()-only regression (control characters are not whitespace).
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": f"http://ho{chr(0)}st:1221"})
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": f"http://ho{chr(0x1b)}st:1221"})
+
+
+def test_control_chars_in_bind_rejected():
+    # Same for DASHBOARD_BIND: a DEL byte in the host must not pass.
+    with pytest.raises(ConfigError, match="DASHBOARD_BIND"):
+        load_config({**BASE_ENV, "DASHBOARD_BIND": f"127.0.0.1{chr(0x7f)}:8080"})

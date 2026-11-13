@@ -275,3 +275,37 @@ async def test_whoami_returns_api_key():
         assert await client.whoami() == api_key
     # Pin the whoami endpoint path against a mutated URL.
     assert seen["path"] == "/api/api-keys/current"
+
+
+async def test_transport_error_backoff_sleeps():
+    # Pins the asyncio.sleep in the TransportError branch: deleting it (only
+    # the 5xx sleep is pinned elsewhere) would turn transport failures into
+    # a busy retry loop.
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, json={"document": DOC})
+
+    client = PapraClient(
+        "http://papra.test", "ppapi_test", backoff_base_s=0.05,
+        transport=httpx.MockTransport(handler),
+    )
+    start = time.monotonic()
+    async with client:
+        await client.get_document(ORG, "doc_1")
+    elapsed = time.monotonic() - start
+    assert calls["n"] == 3
+    assert elapsed >= 0.24  # two sleeps: 0.05 + 0.20 = 0.25s total
+
+
+async def test_aclose_closes_underlying_client():
+    # __aexit__ must actually close the wrapped httpx.AsyncClient — a no-op
+    # aclose would leak connections while every test keeps passing.
+    async with make_client(
+        lambda request: httpx.Response(200, json={"document": DOC})
+    ) as client:
+        pass
+    assert client._client.is_closed is True

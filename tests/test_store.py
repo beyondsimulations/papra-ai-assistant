@@ -379,3 +379,31 @@ def test_failed_job_is_not_claimable_during_backoff(store):
     store.mark_job_failed(job.id, "boom")  # default backoff_base_s=30
     assert store.get_job(job_id).status == "pending"
     assert store.claim_next_job("ocr") is None
+
+
+def test_migrate_holds_write_lock_from_begin(tmp_path, monkeypatch):
+    """Pins BEGIN IMMEDIATE (vs a deferred BEGIN): the write lock must already
+    be held when the migration function runs, otherwise a concurrent migrator
+    can slip in between the BEGIN and the first DDL statement."""
+    db_path = tmp_path / "state.db"
+
+    def migration(conn: sqlite3.Connection) -> None:
+        other = sqlite3.connect(db_path, timeout=0.1)
+        try:
+            other.execute("PRAGMA busy_timeout=100")
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                other.execute("CREATE TABLE sneaky (id TEXT)")
+                other.commit()
+            except sqlite3.OperationalError:
+                pass  # locked/busy: the write lock IS held from the start
+            else:
+                raise AssertionError("write lock was not held from the start")
+        finally:
+            other.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", [migration])
+
+    store = Store(db_path)
+    store.migrate()
+    store.close()

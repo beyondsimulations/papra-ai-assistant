@@ -68,6 +68,15 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
         # request time — the check command must reject it up front instead.
         if not parsed.hostname:
             raise ConfigError(f"{name} must include a host, got: {value!r}")
+        # httpx concatenates a base URL's path with every request path
+        # ("http://papra:1221/api" + "/api/api-keys/current" ->
+        # "/api/api-keys/current" 404s on every call), so no input can make a
+        # path-bearing base work with this client. After the rstrip a trailing
+        # "/" is already gone, so any remaining path is a real path.
+        if parsed.path not in ("",):
+            raise ConfigError(
+                f"{name} must not include a path, got: {value!r}"
+            )
         # httpx merges a base URL's query string into every request path
         # (e.g. "http://papra:1221?token=abc" + "/api/..." -> garbage), so
         # every call would 404. A bare trailing "?" ("http://papra:1221?")

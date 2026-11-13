@@ -129,3 +129,29 @@ def test_exception_text_is_redacted_in_both_sinks(store, capsys):
     assert matching, "expected the error line in the ring buffer"
     assert all("sup3r-secret-token" not in line for line in matching)
     assert any("[REDACTED]" in line for line in matching)
+
+
+def test_setup_logging_is_idempotent(store, capsys):
+    """Pins root.handlers.clear(): without it a second setup_logging call
+    duplicates every handler, so each logged line is emitted (and stored)
+    once per setup call."""
+    setup_logging(store)
+    setup_logging(store)
+    logging.getLogger("test").info("idempotency sentinel line")
+    raw = capsys.readouterr().out
+    assert raw.count("idempotency sentinel line") == 1
+    lines = store.recent_log_lines(limit=10)
+    assert sum("idempotency sentinel line" in line for _, _, line in lines) == 1
+
+
+def test_prefix_secrets_redact_longest_first(store, capsys):
+    """Pins the longest-first iteration in SecretRegistry.redact: replacing a
+    secret that is a strict prefix of another first leaks the longer secret's
+    suffix ({"abc123", "abc123xyz"} on "abc123xyz" -> "[REDACTED]xyz")."""
+    SECRET_REGISTRY.add("abc123")
+    SECRET_REGISTRY.add("abc123xyz")
+    redacted = SECRET_REGISTRY.redact("failed for abc123xyz")
+    assert "[REDACTED]" in redacted
+    assert "xyz" not in redacted
+    assert "abc123" not in redacted
+    assert redacted == "failed for [REDACTED]"

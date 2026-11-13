@@ -87,3 +87,29 @@ def test_probe_returns_false_after_deadline():
     elapsed = time.monotonic() - start
     assert result is False
     assert elapsed >= 1.0
+
+
+def test_probe_poll_interval_sleeps(monkeypatch):
+    """Pins the time.sleep between probe attempts: deleting it turns the
+    probe into a busy spin against a booting stack (thousands of calls within
+    the readiness window instead of ~window/interval)."""
+    import httpx
+
+    import tests.integration.conftest as conftest
+
+    calls = {"n": 0}
+
+    def fake_get(url, **kwargs):
+        calls["n"] += 1
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(conftest.httpx, "get", fake_get)
+
+    start = time.monotonic()
+    assert not _probe_readiness(
+        "http://127.0.0.1:1", readiness_timeout_s=0.3, poll_interval_s=0.05
+    )
+    elapsed = time.monotonic() - start
+    # With the sleep: ~6-7 calls in 0.3s. Without it: thousands.
+    assert calls["n"] <= 20
+    assert elapsed >= 0.3

@@ -17,7 +17,10 @@ class SecretRegistry:
             self._secrets.add(value)
 
     def redact(self, text: str) -> str:
-        for secret in self._secrets:
+        # Longest-first: a secret that is a strict prefix of another must not
+        # be replaced first, or the longer secret's suffix leaks
+        # ({"abc123", "abc123xyz"} on "abc123xyz" -> "[REDACTED]xyz").
+        for secret in sorted(self._secrets, key=len, reverse=True):
             if secret in text:
                 text = text.replace(secret, REDACTED)
         return text
