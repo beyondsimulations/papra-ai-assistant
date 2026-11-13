@@ -171,6 +171,25 @@ def test_base_url_with_username_only_rejected():
         load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://user@papra:1221"})
 
 
+def test_credentials_error_does_not_echo_value():
+    # The credentials rejection must not echo the URL back: __main__ prints
+    # ConfigError messages to stderr, an unredacted sink, and the URL embeds
+    # the password. Same for the query rejection (?token=... carries secrets).
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL") as exc_info:
+        load_config(
+            {**BASE_ENV, "PAPRA_BASE_URL": "http://svc:secretpw@papra:1221"}
+        )
+    assert "secretpw" not in str(exc_info.value)
+    assert "credentials" in str(exc_info.value)
+
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL") as exc_info:
+        load_config(
+            {**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221?token=xyz"}
+        )
+    assert "xyz" not in str(exc_info.value)
+    assert "query string" in str(exc_info.value)
+
+
 def test_base_url_without_credentials_still_passes():
     config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221"})
     assert config.papra_base_url == "http://papra:1221"

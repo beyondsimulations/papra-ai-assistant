@@ -86,7 +86,9 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
         # it logs the credentialed URL at INFO — leaking the password to
         # stdout logs the redaction filter cannot catch. Reject up front.
         if parsed.username is not None or parsed.password is not None:
-            raise ConfigError(f"{name} must not contain credentials, got: {value!r}")
+            # Do NOT echo the value here: it embeds the password, and
+            # __main__ prints ConfigError messages to stderr unredacted.
+            raise ConfigError(f"{name} must not contain credentials")
         # httpx concatenates a base URL's path with every request path
         # ("http://papra:1221/api" + "/api/api-keys/current" ->
         # "/api/api-keys/current" 404s on every call), so no input can make a
@@ -105,9 +107,9 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
         # ("...#frag") without a query is harmless.
         before_fragment = value.split("#", 1)[0]
         if "?" in before_fragment:
-            raise ConfigError(
-                f"{name} must not contain a query string, got: {value!r}"
-            )
+            # Do NOT echo the value here: query strings carry secrets
+            # (?token=...) that stderr printing would leak.
+            raise ConfigError(f"{name} must not contain a query string")
         if _has_nondisplay_chars(parsed.hostname) or _has_nondisplay_chars(value):
             raise ConfigError(
                 f"{name} must not contain whitespace or control characters, got: {value!r}"

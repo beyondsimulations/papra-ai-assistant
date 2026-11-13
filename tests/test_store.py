@@ -32,6 +32,12 @@ def test_settings_roundtrip(store):
     assert store.get_setting("key") == "value"
 
 
+def test_get_job_unknown_returns_none(store):
+    # Pins the None guard in get_job: removing it would raise TypeError on
+    # unknown ids instead of honouring the advertised Job | None contract.
+    assert store.get_job("nonexistent") is None
+
+
 def test_set_setting_upserts(store):
     # Pins the ON CONFLICT(key) DO UPDATE branch: a plain INSERT would raise
     # an IntegrityError on the second call instead of updating.

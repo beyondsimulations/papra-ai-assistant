@@ -329,6 +329,29 @@ async def test_transport_error_backoff_sleeps():
     assert elapsed >= 0.24  # two sleeps: 0.05 + 0.20 = 0.25s total
 
 
+async def test_transport_exhaustion_does_not_sleep_after_final_attempt():
+    # Pins the `if attempt == MAX_ATTEMPTS - 1: break` in the TransportError
+    # branch: deleting it would sleep an extra backoff_base_s * 4**2 after
+    # the final attempt before raising the identical error (dead backoff).
+    # With backoff_base_s=0.5 the two between-attempt sleeps are
+    # 0.5 + 2.0 = 2.5s; the mutant would add 8s more (10.5s).
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    client = PapraClient(
+        "http://papra.test", "ppapi_test", backoff_base_s=0.5,
+        transport=httpx.MockTransport(handler),
+    )
+    start = time.monotonic()
+    with pytest.raises(PapraError):
+        async with client:
+            await client.get_document(ORG, "doc_1")
+    elapsed = time.monotonic() - start
+    # Lower bound: the two real sleeps (0.5 + 2.0) must happen.
+    # Upper bound: 1.5s of headroom vs the mutant's +8s dead sleep.
+    assert 2.0 <= elapsed < 4.0
+
+
 async def test_aclose_closes_underlying_client():
     # __aexit__ must actually close the wrapped httpx.AsyncClient — a no-op
     # aclose would leak connections while every test keeps passing.
