@@ -2,20 +2,31 @@
 
 Mirrors papra_client's retry policy: 3 attempts, exponential backoff,
 retry on 429 + all 5xx + network errors; other 4xx fail permanently.
+A 200 whose finish_reason says the generation stopped early is a failure
+too — it is raised as a permanent LLMError, never returned as content.
 """
 
 import asyncio
 import base64
+import logging
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
 
 
 class LLMError(Exception):
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(self, message: str, status: int | None = None, *,
+                 permanent: bool = False) -> None:
         super().__init__(message)
         self.status = status
+        # True when retrying cannot help — a completion that stopped early at
+        # the output cap repeats identically, so backing off only delays the
+        # same half page. Plain 4xx statuses need no flag: worker_loop tests
+        # them via .status.
+        self.permanent = permanent
 
 
 class LLMClient:
@@ -72,7 +83,9 @@ class LLMClient:
                 continue
             if response.is_success:
                 try:
-                    return response.json()["choices"][0]["message"]["content"].strip()
+                    choice = response.json()["choices"][0]
+                    content = choice["message"]["content"].strip()
+                    finish_reason = choice.get("finish_reason")
                 except Exception as error:  # noqa: BLE001
                     # A 2xx body is not guaranteed to be a well-formed chat
                     # completions payload — it may be non-UTF-8 (UnicodeDecodeError)
@@ -85,6 +98,27 @@ class LLMClient:
                         f"malformed chat completions response: {response.text[:200]}",
                         response.status_code,
                     ) from error
+                # A 200 is not a complete answer: a server that stops at its
+                # output cap (finish_reason "length") or gets cut off by safety
+                # filtering answers 200 with a truncated page. Handing that back
+                # would commit half a page as a finished OCR.
+                if finish_reason in ("length", "content_filter"):
+                    raise LLMError(
+                        f"chat completion ended early: finish_reason={finish_reason} "
+                        f"after {len(content)} characters",
+                        None,
+                        permanent=True,
+                    )
+                if finish_reason is not None and finish_reason != "stop":
+                    # Unknown reasons (servers invent their own) stay usable but
+                    # must not pass silently.
+                    logger.warning(
+                        "unexpected finish_reason %r in chat completion (%d characters)",
+                        finish_reason, len(content),
+                    )
+                # "stop", null or an absent field (plenty of servers omit it,
+                # our own fake among them) is a normal completion.
+                return content
             raise LLMError(
                 f"chat completions failed: {response.status_code} {response.text[:200]}",
                 response.status_code,

@@ -281,13 +281,20 @@ async def worker_loop(store: Store, *, kind: str, handler,
         except Exception as error:  # noqa: BLE001 - the loop must survive
             logger.error("job %s (%s) failed: %s", job.id, kind, error)
             try:
-                # 4xx (except 429) never auto-retries (decisions §6), from
-                # ANY client: a deleted document (PapraError 404) or a bad
-                # model name (LLMError 404) riding the 3-attempt backoff is
-                # ~2.5 minutes of futile retries. Fail such jobs permanently
-                # on the first attempt; 5xx/429/other errors keep the backoff.
+                # Two permanence triggers (decisions §6):
+                # 1. error.permanent — the client knows a retry cannot help, e.g.
+                #    a 200 whose finish_reason says the completion stopped early
+                #    (a truncated page retried is just the same half page).
+                # 2. a 4xx status (except 429) from ANY client: a deleted
+                #    document (PapraError 404) or a bad model name (LLMError 404)
+                #    riding the 3-attempt backoff is ~2.5 minutes of futile
+                #    retries. Fail such jobs permanently on the first attempt;
+                #    5xx/429/other errors keep the backoff.
                 status = getattr(error, "status", None)
-                if status is not None and 400 <= status < 500 and status != 429:
+                permanent = bool(getattr(error, "permanent", False)) or (
+                    status is not None and 400 <= status < 500 and status != 429
+                )
+                if permanent:
                     store.mark_job_failed(job.id, str(error), max_attempts=1)
                 else:
                     store.mark_job_failed(job.id, str(error))

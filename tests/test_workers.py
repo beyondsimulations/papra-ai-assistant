@@ -65,15 +65,20 @@ class StubPapra:
         return page, len(docs)
 
 
-def make_llm(responses: list[str]):
+def make_llm(responses: list[str], finish_reasons: list[str] | None = None):
+    """finish_reasons optionally sets choice.finish_reason per response index;
+    when omitted the fake sends no finish_reason at all (as many servers do)."""
     calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.read())
         assert body["messages"][0]["role"] == "system"
-        content = responses[min(calls["n"], len(responses) - 1)]
+        index = min(calls["n"], len(responses) - 1)
+        choice: dict = {"message": {"content": responses[index]}}
+        if finish_reasons is not None:
+            choice["finish_reason"] = finish_reasons[min(index, len(finish_reasons) - 1)]
         calls["n"] += 1
-        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+        return httpx.Response(200, json={"choices": [choice]})
 
     from papra_suite.llm_client import LLMClient
 
@@ -654,6 +659,51 @@ async def test_worker_loop_backs_off_llm_5xx(store):
 
     job = store.list_jobs()[0]
     assert job.status == "pending" and job.attempts == 1  # normal backoff
+
+
+async def test_worker_loop_fails_ocr_when_a_page_is_truncated(store, config, caplog):
+    """The real symptom of an output-capped server: page 1 comes back clean,
+    page 2 is a half page with finish_reason="length" on an HTTP 200. The job
+    must fail PERMANENTLY (attempts 1), write NO partial document back, and
+    enqueue NO title job — otherwise a truncated excerpt gets titled and the
+    job closes as done with nothing in the logs."""
+    import fitz
+
+    pdf = fitz.open()
+    pdf.new_page()
+    pdf.new_page()
+    papra = StubPapra(pdf.tobytes())
+    pdf.close()
+    llm, calls = make_llm(["# Seite eins", "# Seite zwei (abge"],
+                          finish_reasons=["stop", "length"])
+    make_job(store)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 1:
+            raise KeyboardInterrupt()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(KeyboardInterrupt):
+            await worker_loop(store, kind="ocr", idle_sleep_s=0,
+                              handler=lambda job: run_ocr_job(papra, llm, job, config=config))
+
+    jobs = store.list_jobs()
+    ocr_jobs = [entry for entry in jobs if entry.kind == "ocr"]
+    assert len(ocr_jobs) == 1
+    assert ocr_jobs[0].status == "failed" and ocr_jobs[0].attempts == 1
+    assert "length" in ocr_jobs[0].error
+    # no title job — a truncated excerpt must not become the document's title
+    assert [entry.kind for entry in jobs if entry.kind == "title"] == []
+    assert papra.content_updates == []  # never a partial document
+    assert calls["n"] == 2  # page 2 was attempted once, not retried
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1  # the failure is visible exactly once
 
 
 async def test_run_ocr_job_renders_off_the_event_loop(store, config, monkeypatch):

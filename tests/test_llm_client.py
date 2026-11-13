@@ -1,9 +1,20 @@
 import base64
+import logging
 
 import httpx
 import pytest
 
 from papra_suite.llm_client import LLMClient, LLMError
+
+# sentinel: the finish_reason KEY is absent from the response body
+OMITTED = object()
+
+
+def completion_body(content: str, finish_reason=OMITTED) -> dict:
+    choice: dict = {"message": {"content": content}}
+    if finish_reason is not OMITTED:
+        choice["finish_reason"] = finish_reason
+    return {"choices": [choice]}
 
 
 def make_client(handler, **kwargs):
@@ -262,6 +273,72 @@ async def test_malformed_message_as_string_raises_llm_error():
         with pytest.raises(LLMError, match="malformed chat completions response") as excinfo:
             await client.chat([{"role": "user", "content": "hi"}])
     assert excinfo.value.status == 200
+
+
+# --- Truncated completions: a 200 that stopped at the output cap is NOT a success ---
+
+
+async def test_finish_reason_length_is_permanent_error_without_retry():
+    """A released mlx_lm.server answers HTTP 200 with finish_reason="length"
+    when it hits its output cap. That half page must never be handed back as a
+    completion: permanent LLMError, status None, and EXACTLY ONE request (the
+    client's own retry loop must not re-fire on a deterministic truncation)."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=completion_body("half a page", "length"))
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError) as excinfo:
+            await client.chat([{"role": "user", "content": "x"}])
+    assert excinfo.value.status is None
+    assert excinfo.value.permanent is True
+    assert calls["n"] == 1
+    # the message names the finish_reason and the content length it cut off at
+    assert "length" in str(excinfo.value)
+    assert str(len("half a page")) in str(excinfo.value)
+
+
+async def test_finish_reason_content_filter_is_permanent_like_length():
+    """content_filter ends generation early too — same permanent failure."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=completion_body("blocked", "content_filter"))
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError) as excinfo:
+            await client.chat([{"role": "user", "content": "x"}])
+    assert excinfo.value.status is None and excinfo.value.permanent is True
+    assert calls["n"] == 1
+    assert "content_filter" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("finish_reason", [OMITTED, None, "stop"])
+async def test_untruncated_completion_returns_content(finish_reason):
+    """Absent (our fake, and any server that omits the field), explicit null,
+    and "stop" are all success — treating absent as truncation would break
+    every server that does not send the field."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=completion_body("  full page\n", finish_reason))
+
+    async with make_client(handler) as client:
+        assert await client.chat([{"role": "user", "content": "x"}]) == "full page"
+
+
+async def test_unknown_finish_reason_warns_but_returns_content(caplog):
+    """An unrecognised reason is not treated as truncation (content stays
+    usable) but must be visible in the logs instead of silently accepted."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=completion_body("page", "tool_calls"))
+
+    with caplog.at_level(logging.WARNING):
+        async with make_client(handler) as client:
+            assert await client.chat([{"role": "user", "content": "x"}]) == "page"
+    assert any("tool_calls" in record.getMessage() for record in caplog.records)
+    assert all(record.levelno < logging.ERROR for record in caplog.records)
 
 
 async def test_malformed_top_level_array_raises_llm_error():
