@@ -1,6 +1,10 @@
 from email.message import EmailMessage
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 from papra_suite.mail import (
+    Attachment,
     compute_file_hash,
     dedup_hash,
     parse_message,
@@ -82,6 +86,60 @@ def test_parse_message_without_message_id():
     raw = build_raw(message_id=None)
     parsed = parse_message(raw)
     assert parsed.message_id is None
+
+
+def test_parse_message_recovers_filename_less_pdf_part():
+    # a filename-less application/pdf part (some forwarders strip the name)
+    # must not be silently dropped: sniff the payload and classify it as an
+    # attachment under the fallback name. A plain text body never starts with
+    # %PDF- and still lands in neither list.
+    outer = MIMEMultipart()
+    outer["Subject"] = "Invoice"
+    outer.attach(MIMEText("please find the invoice attached", "plain"))
+    outer.attach(MIMEApplication(PDF_BYTES, _subtype="pdf"))  # deliberately unnamed
+
+    parsed = parse_message(outer.as_bytes())
+
+    assert parsed.pdf_attachments == [Attachment("document.pdf", PDF_BYTES)]
+    assert parsed.skipped_attachments == []
+
+
+def test_parse_message_skips_named_eml_but_extracts_embedded_pdf():
+    # a NAMED message/rfc822 part (.eml forward) has no decodable payload:
+    # per spec it must be logged and skipped (not silently dropped into
+    # neither list), while the walk still descends and extracts the PDF
+    # attached inside the forwarded mail
+    inner = EmailMessage()
+    inner["From"] = "inner@example.com"
+    inner["To"] = "box@example.com"
+    inner["Subject"] = "Inner invoice"
+    inner["Message-ID"] = "<inner@x>"
+    inner.add_attachment(PDF_BYTES, maintype="application", subtype="pdf",
+                         filename="inner.pdf")
+
+    raw = (
+        b"From: sender@example.com\r\n"
+        b"To: box@example.com\r\n"
+        b"Subject: Fwd: Invoice\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/mixed; boundary="OUTER-BOUNDARY"\r\n'
+        b"\r\n"
+        b"--OUTER-BOUNDARY\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\nsee the forwarded mail\r\n"
+        b"--OUTER-BOUNDARY\r\n"
+        b'Content-Type: message/rfc822; name="forward.eml"\r\n'
+        b'Content-Disposition: attachment; filename="forward.eml"\r\n'
+        b"\r\n"
+        + inner.as_bytes() + b"\r\n"
+        b"--OUTER-BOUNDARY--\r\n"
+    )
+
+    parsed = parse_message(raw)
+
+    assert parsed.skipped_attachments == ["forward.eml"]
+    assert [a.filename for a in parsed.pdf_attachments] == ["inner.pdf"]
+    assert parsed.pdf_attachments[0].content == PDF_BYTES
 
 
 def test_parse_message_plain_body_only():

@@ -1,11 +1,39 @@
 """Unit tests for the integration readiness probe (no Docker required)."""
 
+import imaplib
 import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from tests.integration.conftest import _probe_readiness
+import pytest
+
+from tests.integration.conftest import _probe_readiness, _wait_for_greenmail_delivery
+
+
+def test_wait_for_greenmail_delivery_raises_on_timeout(monkeypatch):
+    """The delivery wait must fail loudly: an IMAP server that never finds
+    the message must produce a TimeoutError within the window — never a
+    hang (each per-attempt connection carries its own bounded timeout)."""
+
+    class _NeverDelivered:
+        def login(self, user, password):
+            pass
+
+        def select(self, mailbox):
+            return ("OK", [b"1"])
+
+        def uid(self, command, *args):
+            return ("OK", [b""])   # SEARCH: the message is never found
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(imaplib, "IMAP4", lambda *args, **kwargs: _NeverDelivered())
+    start = time.monotonic()
+    with pytest.raises(TimeoutError, match="did not deliver"):
+        _wait_for_greenmail_delivery("<missing@test>", timeout_s=0.2)
+    assert time.monotonic() - start < 2.0
 
 
 def test_probe_retries_on_503_until_200():

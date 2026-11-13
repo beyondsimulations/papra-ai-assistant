@@ -103,7 +103,10 @@ def _wait_for_greenmail_delivery(message_id: str, *, timeout_s: float = 5.0) -> 
     deadline = time.monotonic() + timeout_s
     while True:
         try:
-            imap = imaplib.IMAP4(GREENMAIL_HOST, GREENMAIL_IMAP_PORT)
+            # per-attempt timeout: a stalled GreenMail must surface as an
+            # OSError (retryable) or a TimeoutError at the window — never a
+            # wedged test suite hanging on a socket read forever
+            imap = imaplib.IMAP4(GREENMAIL_HOST, GREENMAIL_IMAP_PORT, timeout=5)
             try:
                 imap.login(GREENMAIL_USER, GREENMAIL_PASSWORD)
                 imap.select("INBOX")

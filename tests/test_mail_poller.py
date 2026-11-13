@@ -1,3 +1,4 @@
+import asyncio
 import time
 from dataclasses import dataclass, field
 
@@ -300,6 +301,89 @@ async def test_rescan_failure_persists_zero_last_seen(store, monkeypatch):
     updated = store.get_mailbox(mailbox_id)
     assert updated.last_seen_uid == 0
     assert updated.uidvalidity == "222"
+
+
+async def test_poll_parses_messages_off_the_event_loop(store, monkeypatch):
+    # parse_message on a crafted 22MB multipart measured a 238ms block of the
+    # event loop: the parse must go through asyncio.to_thread like every other
+    # blocking call in the poller, never run inline on the loop
+    real_to_thread = asyncio.to_thread
+    threaded_calls = []
+
+    async def _spy_to_thread(func, *args, **kwargs):
+        threaded_calls.append(getattr(func, "__name__", str(func)))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _spy_to_thread)
+    session = FakeSession(raws=[(1, build_raw())])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+
+    assert result.error is None and result.documents_uploaded == 1
+    assert "parse_message" in threaded_calls
+
+
+async def test_empty_non_rescan_poll_carries_last_seen_forward(store, monkeypatch):
+    # an empty fetch on an established (non-rescan) mailbox must carry the
+    # persisted last_seen forward — NOT reset it to 0, which would re-fetch
+    # the whole mailbox on every empty poll
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    store.record_poll_success(mailbox_id, last_seen_uid=42, uidvalidity="111")
+
+    session = FakeSession(uidvalidity="111")   # empty fetch: no raws, no oversized
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    org = store.get_org(org_id)
+    mailbox = store.get_mailbox(mailbox_id)
+    assert mailbox.last_seen_uid == 42
+
+    result = await poll_mailbox_once(store, StubClient(), mailbox, org)
+
+    assert result.error is None and result.messages_scanned == 0
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 42
+
+
+async def test_poll_resumes_after_cap_truncated_batch(store, monkeypatch):
+    # poller-level aggregate-cap interaction: a fetch truncated at the cap
+    # (3 of 5 uids) must persist the last PROCESSED uid; a second poll fetches
+    # the tail — no message is lost or double-processed
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+
+    class TruncatingSession(FakeSession):
+        def fetch_since(self, last_seen_uid):
+            batch = super().fetch_since(last_seen_uid)
+            batch.messages = batch.messages[:3]   # simulates the aggregate break
+            return batch
+
+    session = TruncatingSession(raws=[
+        (1, build_raw(message_id="<m1@x>")),
+        (2, build_raw(message_id="<m2@x>", attachments=[("b.pdf", b"%PDF-2")])),
+        (3, build_raw(message_id="<m3@x>", attachments=[("c.pdf", b"%PDF-3")])),
+        (4, build_raw(message_id="<m4@x>", attachments=[("d.pdf", b"%PDF-4")])),
+        (5, build_raw(message_id="<m5@x>", attachments=[("e.pdf", b"%PDF-5")])),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    org = store.get_org(org_id)
+    mailbox = store.get_mailbox(mailbox_id)
+    result = await poll_mailbox_once(store, client, mailbox, org)
+
+    assert result.documents_uploaded == 3
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 3
+
+    second = await poll_mailbox_once(store, client, store.get_mailbox(mailbox_id), org)
+
+    assert second.documents_uploaded == 2
+    assert len(client.uploads) == 5
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 5
 
 
 async def test_poll_never_raises_on_internal_error(store, monkeypatch):

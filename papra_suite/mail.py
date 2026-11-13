@@ -10,6 +10,7 @@ import imaplib
 import logging
 import re
 import sqlite3
+import ssl
 from dataclasses import dataclass, field
 from email import message_from_bytes
 from email.header import decode_header, make_header
@@ -21,6 +22,13 @@ from papra_suite.pipeline import enqueue_ocr_job
 from papra_suite.store import Mailbox, Org, Store
 
 logger = logging.getLogger(__name__)
+
+# imaplib's implicit TLS context verifies NOTHING (CERT_NONE, no hostname
+# check): an on-path attacker with any self-signed certificate would capture
+# the mailbox LOGIN credentials. One shared module-level context carries the
+# platform trust store and hostname checking into every TLS connection
+# (contexts are safe to share: the handshake is per-connection state).
+_SSL_CONTEXT = ssl.create_default_context()
 
 MAX_FILENAME_LENGTH = 120
 PDF_MAGIC = b"%PDF-"
@@ -108,11 +116,25 @@ def parse_message(raw: bytes) -> ParsedMessage:
         if part.get_content_maintype() == "multipart":
             continue
         payload = part.get_payload(decode=True)
-        if payload is None:
-            continue
         filename = part.get_filename()
+        if payload is None:
+            # message/rfc822 forwards carry a nested message, not bytes (the
+            # walk below already descends into them and extracts their PDFs).
+            # A NAMED part landing here is an attachment the spec says must
+            # be logged and skipped — never silently dropped into neither list.
+            if filename is not None:
+                name = sanitize_filename(_decode_header_value(filename))
+                parsed.skipped_attachments.append(name)
+                logger.info("skipped non-pdf attachment %s (no decodable payload)", name)
+            continue
         if filename is None:
-            continue  # body text or inline part without a name: not an attachment
+            # body text or an inline part without a name: not an attachment —
+            # unless the payload smells like a PDF (body text never starts
+            # with %PDF-): a filename-less application/pdf part must be
+            # ingested under the fallback name, not silently dropped.
+            if sniff_is_pdf(payload):
+                parsed.pdf_attachments.append(Attachment(sanitize_filename(None), payload))
+            continue
         # RFC 2047 encoded words survive get_filename() undecoded; decode
         # before sanitizing or the encoded word becomes the document name
         # (and M3's title worker falls back to it). Same ruling as the subject.
@@ -178,13 +200,17 @@ class MailboxSession:
         # Fail-closed on an unrecognized ssl_mode (legacy/hand-edited rows):
         # an unknown value must never silently fall through to plaintext
         # IMAP, which would send the credentials in cleartext.
+        # timeout: a stalled server must fail the poll (and count toward the
+        # failure accounting), not wedge the poll task forever on a socket read
         if self._ssl_mode == "ssl":
-            self._imap = imaplib.IMAP4_SSL(self._host, self._port)
+            self._imap = imaplib.IMAP4_SSL(
+                self._host, self._port, ssl_context=_SSL_CONTEXT, timeout=30
+            )
         elif self._ssl_mode == "starttls":
-            self._imap = imaplib.IMAP4(self._host, self._port)
-            self._imap.starttls()
+            self._imap = imaplib.IMAP4(self._host, self._port, timeout=30)
+            self._imap.starttls(ssl_context=_SSL_CONTEXT)
         elif self._ssl_mode == "plain":
-            self._imap = imaplib.IMAP4(self._host, self._port)
+            self._imap = imaplib.IMAP4(self._host, self._port, timeout=30)
         else:
             raise ValueError(
                 f"unknown ssl_mode {self._ssl_mode!r}; refusing to connect "
@@ -342,7 +368,10 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
                 if not prefix_failed:
                     candidate_last_seen = uid
                 continue
-            parsed = parse_message(raw)
+            # parse_message on a crafted 22MB multipart measured a 238ms
+            # event-loop block: MIME parsing must run off the loop like every
+            # other blocking call in this poller (decisions doc §3)
+            parsed = await asyncio.to_thread(parse_message, raw)
             # Run the admin-supplied regex off the event loop under a timeout:
             # a super-linear pattern against a crafted subject must degrade
             # to a bounded non-match, never a frozen loop.
