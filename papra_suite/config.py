@@ -68,6 +68,14 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
         # request time — the check command must reject it up front instead.
         if not parsed.hostname:
             raise ConfigError(f"{name} must include a host, got: {value!r}")
+        # httpx merges a base URL's query string into every request path
+        # (e.g. "http://papra:1221?token=abc" + "/api/..." -> garbage), so
+        # every call would 404. A non-empty query must be rejected. An empty
+        # query ("http://papra:1221?") or a fragment ("...#frag") is harmless.
+        if parsed.query:
+            raise ConfigError(
+                f"{name} must not contain a query string, got: {value!r}"
+            )
         if _has_nondisplay_chars(parsed.hostname) or _has_nondisplay_chars(value):
             raise ConfigError(
                 f"{name} must not contain whitespace or control characters, got: {value!r}"

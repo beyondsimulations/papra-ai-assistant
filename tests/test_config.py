@@ -187,6 +187,32 @@ def test_required_values_are_stripped():
     assert config.papra_api_key == "ppapi_x"
 
 
+def test_query_bearing_base_url_rejected():
+    # "http://papra:1221?token=abc" parses fine, but httpx merges the query
+    # into every request path — every call would 404. Must be rejected.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221?token=abc"})
+
+
+def test_empty_query_base_url_still_passes():
+    # "http://papra:1221?" has an empty query — harmless, must pass.
+    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221?"})
+    assert config.papra_base_url == "http://papra:1221?"
+
+
+def test_fragment_only_base_url_still_passes():
+    # "http://papra:1221#frag" has a fragment but no query — harmless.
+    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221#frag"})
+    assert config.papra_base_url == "http://papra:1221#frag"
+
+
+def test_whitespace_only_int_env_uses_default():
+    # _int_env must strip before the emptiness check, otherwise "   " hits
+    # int("   ") -> ValueError instead of falling back to the default.
+    config = load_config({**BASE_ENV, "OCR_MAX_PAGES": "   "})
+    assert config.ocr_max_pages == 50
+
+
 def test_data_dir_default():
     # The documented default data dir when DATA_DIR is unset.
     config = load_config(BASE_ENV)

@@ -38,6 +38,9 @@ def test_output_is_json_lines_with_expected_keys(store, capsys):
     assert payload["logger"] == "test"
     assert payload["message"] == "hello world"
     assert "ts" in payload
+    # Pin tz-awareness: a naive datetime.now() would emit a local-time ts
+    # without a UTC offset.
+    assert payload["ts"].endswith("+00:00")
 
 
 def test_secrets_are_redacted_everywhere(store, capsys):
@@ -64,6 +67,24 @@ def test_ring_buffer_receives_lines(store):
     logging.getLogger("test").warning("watch out")
     lines = store.recent_log_lines(limit=10)
     assert any("watch out" in line for _, _, line in lines)
+    # Pin the ring buffer's ts tz-awareness, like the stdout sink's.
+    assert all(ts.endswith("+00:00") for ts, _, _ in lines)
+    # Pin the level: the WARNING record must be stored as "WARNING", not a
+    # hardcoded "INFO".
+    warning_entries = [(ts, level, line) for ts, level, line in lines if "watch out" in line]
+    assert warning_entries and warning_entries[0][1] == "WARNING"
+
+
+def test_json_output_keeps_unicode_readable(store, capsys):
+    """ensure_ascii=False must be kept: non-ASCII characters (e.g. an en
+    dash) must appear literally in the raw stdout JSON, not as a \u2013
+    escape sequence."""
+    setup_logging(store)
+    logging.getLogger("test").info("Rechnung 42 \u2013 Titel")
+    raw = capsys.readouterr().out
+    line = raw.strip().splitlines()[-1]
+    assert "\u2013" in line  # the literal en dash character
+    assert "\\u2013" not in line  # ...not the escaped form
 
 
 def test_ring_buffer_lines_are_redacted(store):

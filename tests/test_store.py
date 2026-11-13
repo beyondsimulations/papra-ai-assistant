@@ -164,6 +164,23 @@ def test_mark_job_done(store):
     assert done.error is None
 
 
+def test_mark_job_done_clears_stale_error(store):
+    """mark_job_done must clear error = NULL: a job that previously failed
+    (and was requeued) carries a stale error that must not survive into the
+    done state."""
+    job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                               content_hash="abc", payload={})
+    job = store.claim_next_job("ocr")
+    store.mark_job_failed(job.id, "boom", backoff_base_s=0)
+    assert store.get_job(job_id).status == "pending"
+
+    job = store.claim_next_job("ocr")
+    store.mark_job_done(job.id)
+    done = store.get_job(job_id)
+    assert done.status == "done"
+    assert done.error is None
+
+
 def test_list_jobs_filters_by_status(store):
     first_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
                                  content_hash="h1", payload={})
@@ -187,6 +204,8 @@ def test_mark_job_failed_requeues_with_backoff_then_fails(store):
     store.mark_job_failed(job.id, "boom", backoff_base_s=0)
     assert store.get_job(job_id).status == "pending"
     assert store.get_job(job_id).attempts == 1
+    # The requeue UPDATE must persist the error too, not just on final failure.
+    assert store.get_job(job_id).error == "boom"
 
     store.claim_next_job("ocr")
     store.mark_job_failed(job_id, "boom", backoff_base_s=0)
