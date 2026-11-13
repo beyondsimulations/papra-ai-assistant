@@ -389,6 +389,73 @@ def test_ipv6_error_does_not_echo_password():
     assert "secretpw" not in str(excinfo.value)
 
 
+def test_bind_bad_port_error_does_not_echo_password():
+    # Scheme-less bind values never contain "//", so the old regex scrubber
+    # never fired on them — the password reached stderr verbatim. The
+    # structural helper must keep the host for diagnosability but drop
+    # everything else.
+    with pytest.raises(ConfigError, match="DASHBOARD_BIND") as excinfo:
+        load_config({**BASE_ENV, "DASHBOARD_BIND": "u:secretpw@host:abc"})
+
+    assert "secretpw" not in str(excinfo.value)
+    assert "host" in str(excinfo.value)
+
+
+def test_bind_userinfo_rejected():
+    # "u:p@host:8080" used to be silently ACCEPTED with the userinfo
+    # dropped — nonsense for a listener bind. Userinfo in a bind is always
+    # a paste error and must be rejected outright, without echoing it.
+    with pytest.raises(ConfigError, match="DASHBOARD_BIND") as excinfo:
+        load_config({**BASE_ENV, "DASHBOARD_BIND": "u:secretpw@host:8080"})
+
+    assert "secretpw" not in str(excinfo.value)
+
+
+def test_schemeless_base_url_error_does_not_echo_password():
+    # "svc:secretpw@papra:1221" has no "//" for the old regex to anchor
+    # on; the scheme-check echo must not leak the password.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL") as excinfo:
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "svc:secretpw@papra:1221"})
+
+    assert "secretpw" not in str(excinfo.value)
+
+
+def test_single_slash_base_url_error_does_not_echo_password():
+    # "http:/..." (single slash) never matched the "//"-anchored regex.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL") as excinfo:
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http:/u:secretpw@papra:1221"})
+
+    assert "secretpw" not in str(excinfo.value)
+
+
+def test_backslash_base_url_error_does_not_echo_password():
+    # "http:\\..." equally bypassed the "//"-anchored regex.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL") as excinfo:
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http:\\u:secretpw@papra:1221"})
+
+    assert "secretpw" not in str(excinfo.value)
+
+
+def test_secret_in_path_base_url_does_not_echo_password():
+    # "http://u:secretpw/q@papra:1221": the secret sits in the netloc but
+    # the "@" lands in the path, defeating the userinfo regex; the echo
+    # must never carry path text.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL") as excinfo:
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://u:secretpw/q@papra:1221"})
+
+    assert "secretpw" not in str(excinfo.value)
+
+
+def test_multi_at_password_fully_scrubbed_from_echo():
+    # "ftp://u:secretpw@x@papra:1221": the password itself contains "@",
+    # so the old regex only stripped up to the first "@" and leaked "x@".
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL") as excinfo:
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "ftp://u:secretpw@x@papra:1221"})
+
+    assert "secretpw" not in str(excinfo.value)
+    assert "x@" not in str(excinfo.value)
+
+
 def test_query_stripped_from_echo():
     # The query check itself does not echo, but earlier checks (e.g. scheme)
     # might; the sanitizing helper must also strip query strings, which can

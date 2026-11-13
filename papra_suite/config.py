@@ -1,5 +1,4 @@
 import os
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,13 +32,26 @@ DEFAULT_BIND = "127.0.0.1:8080"
 
 
 def _safe_echo(value: str) -> str:
-    # Strip userinfo ("user:pass@" between "//" and the host) and the query
-    # component ("?..." onward) before echoing a value in an error message:
-    # __main__ prints ConfigError to stderr unredacted, and both can carry
-    # secrets even when a later check (credentials/query) would have rejected
-    # the value without echoing it.
-    redacted = re.sub(r"//[^/@]*@", "//", value)
-    return re.sub(r"\?.*", "", redacted)
+    """Echo only scheme://host — never userinfo, port text, path, or query."""
+    # __main__ prints ConfigError messages to stderr unredacted, and a raw
+    # value can hide a password in the userinfo, the port text, the path or
+    # the query. Regex scrubbing is bypassable (scheme-less values never
+    # contain "//", single-slash/backslash forms, secrets in the path,
+    # passwords containing "@"), so echo ONLY what urlparse can structurally
+    # identify: the scheme (if any) and the cleaned hostname. The port is
+    # deliberately NOT accessed — a bad port raises ValueError, and the echo
+    # sites are exactly the bad-port error paths; the host alone is enough
+    # diagnosability.
+    probe = value if "//" in value else f"//{value}"
+    try:
+        parsed = urlparse(probe)
+        host = parsed.hostname  # None or cleaned host
+    except ValueError:
+        return "<unparseable value>"
+    if not host:
+        return "<unparseable value>"
+    scheme = parsed.scheme
+    return f"{scheme}://{host}" if scheme else f"//{host}"
 
 
 def _has_nondisplay_chars(text: str) -> bool:
@@ -180,6 +192,12 @@ def _parse_bind(raw: str) -> tuple[str, int]:
         raise ConfigError(
             f"DASHBOARD_BIND must be 'host:port', got: {_safe_echo(raw)!r}"
         )
+    # Userinfo in a listener bind is always a paste error (a bind address
+    # carries no credentials); silently dropping it — as urlparse's
+    # hostname accessor does — would bind a host the operator never named.
+    # Do not echo the value: the userinfo may embed a password.
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigError("DASHBOARD_BIND must not contain credentials")
     if _has_nondisplay_chars(parsed.hostname) or _has_nondisplay_chars(raw):
         raise ConfigError(
             "DASHBOARD_BIND must not contain whitespace or control characters,"
