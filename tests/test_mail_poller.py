@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from papra_suite.mail import poll_mailbox_once
+from papra_suite.mail import PollResult, poll_mailbox_once
 from papra_suite.store import Mailbox, Org, Store
 
 
@@ -340,6 +340,25 @@ async def test_upload_409_counts_as_already_ingested(store, monkeypatch):
     second = await poll_mailbox_once(store, client, updated, org)
     assert second.messages_failed == 0 and second.error is None
     assert second.documents_uploaded == 0 and client.uploads == []
+
+
+async def test_poll_survives_store_errors_in_recording(store, monkeypatch):
+    import sqlite3
+
+    def _locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "record_poll_failure", _locked)
+    session = FakeSession(fail_on_connect=ConnectionRefusedError("refused"))
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    # the store error must not escape poll_mailbox_once (never-raises):
+    # the result still reports the connection failure
+    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+
+    assert isinstance(result, PollResult)
+    assert result.error is not None and "refused" in result.error
+    assert result.documents_uploaded == 0
 
 
 async def test_poll_connection_failure_disables_after_three(store, monkeypatch):

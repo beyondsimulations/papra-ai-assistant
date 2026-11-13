@@ -63,6 +63,21 @@ def test_parse_message_decodes_rfc2047_subject():
     assert subject_matches(parsed.subject, ".*über.*") is True
 
 
+def test_parse_message_decodes_rfc2047_filenames():
+    # non-ASCII attachment filenames are RFC 2047 encoded on the wire; the
+    # encoded word must not survive into the (Papra document / M3 title)
+    # filename — decode before sanitize, same ruling as the subject
+    raw = build_raw(attachments=[
+        ("Rechnung 2026 – November.pdf", PDF_BYTES, ("application", "pdf")),
+        ("Foto – Dezember.jpg", b"\xff\xd8jpeg", ("image", "jpeg")),
+    ])
+    parsed = parse_message(raw)
+    assert [a.filename for a in parsed.pdf_attachments] == ["Rechnung 2026 – November.pdf"]
+    assert parsed.skipped_attachments == ["Foto – Dezember.jpg"]
+    for name in [a.filename for a in parsed.pdf_attachments] + parsed.skipped_attachments:
+        assert "=?utf-8" not in name
+
+
 def test_parse_message_without_message_id():
     raw = build_raw(message_id=None)
     parsed = parse_message(raw)

@@ -9,6 +9,7 @@ import hashlib
 import imaplib
 import logging
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from email import message_from_bytes
 from email.header import decode_header, make_header
@@ -88,6 +89,10 @@ def parse_message(raw: bytes) -> ParsedMessage:
         filename = part.get_filename()
         if filename is None:
             continue  # body text or inline part without a name: not an attachment
+        # RFC 2047 encoded words survive get_filename() undecoded; decode
+        # before sanitizing or the encoded word becomes the document name
+        # (and M3's title worker falls back to it). Same ruling as the subject.
+        filename = _decode_header_value(filename)
         if sniff_is_pdf(payload):
             parsed.pdf_attachments.append(Attachment(sanitize_filename(filename), payload))
         else:
@@ -323,12 +328,16 @@ def _record_success_quietly(store: Store, mailbox_id: str, *, last_seen_uid: int
                             uidvalidity: str | None) -> None:
     try:
         store.record_poll_success(mailbox_id, last_seen_uid=last_seen_uid, uidvalidity=uidvalidity)
-    except ValueError:
-        pass  # mailbox not persisted (unit fixtures): nothing to record
+    except (ValueError, sqlite3.Error) as error:
+        # mailbox not persisted (unit fixtures) or the store is unavailable
+        # (locked db, disk full): the poller's never-raises guarantee holds
+        logger.error("failed to record poll success for mailbox %s: %s", mailbox_id, error)
 
 
 def _record_failure_quietly(store: Store, mailbox_id: str, error: str) -> None:
     try:
         store.record_poll_failure(mailbox_id, error)
-    except ValueError:
-        pass  # mailbox not persisted (unit fixtures): nothing to record
+    except (ValueError, sqlite3.Error) as record_error:
+        # mailbox not persisted (unit fixtures) or the store is unavailable
+        # (locked db, disk full): the poller's never-raises guarantee holds
+        logger.error("failed to record poll failure for mailbox %s: %s", mailbox_id, record_error)
