@@ -38,6 +38,16 @@ def _require(env: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _require_base_url(env: Mapping[str, str], name: str) -> str:
+    # Validate the post-rstrip result: a slash-only value like "/" passes the
+    # non-empty check but strips to "", which would make every client call fail
+    # at runtime. The check command must not bless such a config.
+    value = _require(env, name).rstrip("/")
+    if not value:
+        raise ConfigError(f"{name} must not be empty")
+    return value
+
+
 def _int_env(env: Mapping[str, str], name: str, default: int) -> int:
     raw = env.get(name, "").strip()
     if not raw:
@@ -67,9 +77,9 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
     host, port = _parse_bind(env.get("DASHBOARD_BIND", "").strip() or DEFAULT_BIND)
 
     return AppConfig(
-        papra_base_url=_require(env, "PAPRA_BASE_URL").rstrip("/"),
+        papra_base_url=_require_base_url(env, "PAPRA_BASE_URL"),
         papra_api_key=_require(env, "PAPRA_API_KEY"),
-        llm_base_url=_require(env, "LLM_BASE_URL").rstrip("/"),
+        llm_base_url=_require_base_url(env, "LLM_BASE_URL"),
         llm_api_key=_require(env, "LLM_API_KEY"),
         title_model=_require(env, "TITLE_MODEL"),
         ocr_model=_require(env, "OCR_MODEL"),

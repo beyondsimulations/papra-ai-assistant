@@ -32,6 +32,16 @@ def test_load_config_strips_trailing_slashes():
     assert config.papra_base_url == "http://papra:1221"
 
 
+def test_slash_only_base_url_rejected():
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "/"})
+
+
+def test_slash_only_llm_url_rejected():
+    with pytest.raises(ConfigError, match="LLM_BASE_URL"):
+        load_config({**BASE_ENV, "LLM_BASE_URL": "//"})
+
+
 def test_missing_required_var_names_the_var():
     env = dict(BASE_ENV)
     del env["PAPRA_API_KEY"]

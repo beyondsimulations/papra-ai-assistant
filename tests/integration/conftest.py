@@ -1,3 +1,4 @@
+import os
 import time
 import uuid
 
@@ -36,6 +37,16 @@ def _probe_readiness(url: str, *, readiness_timeout_s: float,
         time.sleep(poll_interval_s)
 
 
+def _skip_or_fail(reason: str) -> None:
+    # `make test` exports PAPRA_REQUIRE_STACK=1: the stack it just brought up
+    # MUST answer, so an expired readiness window is a hard failure, not a
+    # silent skip that would let `make test` exit green without running the
+    # round-trip. Without the flag (manual runs), keep skipping.
+    if os.environ.get("PAPRA_REQUIRE_STACK") == "1":
+        pytest.fail(f"{reason} (PAPRA_REQUIRE_STACK=1)")
+    pytest.skip(reason)
+
+
 def _papra_is_up(*, readiness_timeout_s: float = 0.0) -> bool:
     return _probe_readiness(PAPRA_TEST_URL, readiness_timeout_s=readiness_timeout_s)
 
@@ -43,7 +54,7 @@ def _papra_is_up(*, readiness_timeout_s: float = 0.0) -> bool:
 @pytest.fixture(scope="session")
 def papra_stack():
     if not _papra_is_up(readiness_timeout_s=15.0):
-        pytest.skip("scratch Papra not running; use `make test`")
+        _skip_or_fail("scratch Papra not running; use `make test`")
 
     # unique per session so a reused container cannot collide
     suffix = uuid.uuid4().hex[:8]

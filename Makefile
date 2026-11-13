@@ -13,4 +13,4 @@ test-unit:
 
 test:
 	docker compose -f docker-compose.test.yml up -d --wait
-	$(PYTEST); status=$$?; docker compose -f docker-compose.test.yml down -v; exit $$status
+	PAPRA_REQUIRE_STACK=1 $(PYTEST); status=$$?; docker compose -f docker-compose.test.yml down -v; exit $$status
