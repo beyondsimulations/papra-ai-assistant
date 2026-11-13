@@ -97,6 +97,34 @@ async def test_delete_after_download_removes_message(ingestion_stack):
     imap.logout()
 
 
+async def test_resent_document_409_is_swallowed(ingestion_stack):
+    store, mailbox, org, client, papra_org_id = ingestion_stack
+    inject_message(
+        to=mailbox.username, subject="Rechnung 42",
+        attachments=[("rechnung.pdf", PDF_BYTES, ("application", "pdf"))],
+    )
+    result = await poll_mailbox_once(store, client, mailbox, org)
+    assert result.documents_uploaded == 1 and result.messages_failed == 0
+
+    # same PDF bytes, different subject -> new message-id -> passes our
+    # dedup hash, but papra 409s on its per-org content hash
+    inject_message(
+        to=mailbox.username, subject="FW: Rechnung 42 (resent)",
+        attachments=[("rechnung.pdf", PDF_BYTES, ("application", "pdf"))],
+    )
+    second = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id), org)
+
+    assert second.messages_failed == 0 and second.error is None
+
+    # the resent message is marked seen: a third poll finds nothing new
+    third = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id), org)
+    assert third.messages_scanned == 0 and third.messages_failed == 0
+
+    updated = store.get_mailbox(mailbox.id)
+    assert updated.enabled is True and updated.last_error is None
+    assert updated.consecutive_failures == 0
+
+
 async def test_wrong_password_disables_mailbox_after_three_polls(ingestion_stack):
     store, mailbox, org, client, _ = ingestion_stack
     mailbox_id = store.create_mailbox(

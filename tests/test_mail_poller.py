@@ -60,14 +60,18 @@ class FakeSession:
 
 
 class StubClient:
-    def __init__(self, fail_for=()):
+    def __init__(self, fail_for=(), conflict_for=()):
         self.fail_for = set(fail_for)   # filenames that should fail
+        self.conflict_for = set(conflict_for)  # filenames papra already has (409)
         self.uploads = []
 
     async def create_document(self, org_id, filename, content):
         if filename in self.fail_for:
             from papra_suite.papra_client import PapraError
             raise PapraError(f"upload failed for {filename}", 500)
+        if filename in self.conflict_for:
+            from papra_suite.papra_client import PapraError
+            raise PapraError("document.already_exists", 409)
         document = {"id": f"doc_{len(self.uploads)}", "name": filename}
         self.uploads.append((org_id, filename, content))
         return document
@@ -306,6 +310,36 @@ async def test_poll_never_raises_on_internal_error(store, monkeypatch):
 
     assert result.error is not None and "boom" in result.error
     assert session.closed is True
+
+
+async def test_upload_409_counts_as_already_ingested(store, monkeypatch):
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    session = FakeSession(raws=[
+        (3, build_raw(message_id="<m409@x>", attachments=[("dupe.pdf", b"%PDF-1")])),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient(conflict_for={"dupe.pdf"})
+
+    org = store.get_org(org_id)
+    mailbox = store.get_mailbox(mailbox_id)
+    result = await poll_mailbox_once(store, client, mailbox, org)
+
+    # 409 = already ingested in papra: success, not a per-message failure
+    assert result.messages_failed == 0 and result.error is None
+    assert result.documents_uploaded == 0
+    assert session.seen == [3]
+    assert store.claim_next_job("ocr") is None   # no job: document pre-exists
+    updated = store.get_mailbox(mailbox_id)
+    assert updated.last_seen_uid == 3
+    assert updated.last_error is None and updated.consecutive_failures == 0
+
+    # dedup hash recorded: a re-poll uploads nothing and still succeeds
+    second = await poll_mailbox_once(store, client, updated, org)
+    assert second.messages_failed == 0 and second.error is None
+    assert second.documents_uploaded == 0 and client.uploads == []
 
 
 async def test_poll_connection_failure_disables_after_three(store, monkeypatch):

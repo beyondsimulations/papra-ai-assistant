@@ -256,6 +256,18 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
                         org.papra_org_id, attachment.filename, attachment.content
                     )
                 except PapraError as error:
+                    if error.status == 409:
+                        # Papra dedups by content hash per org: a re-sent
+                        # document 409s with document.already_exists. That is
+                        # an already-ingested SUCCESS, not a failure — record
+                        # the dedup hash (no re-upload on later polls), no OCR
+                        # job (the M3 sweep covers pre-existing documents).
+                        store.add_dedup(attachment_hash)
+                        logger.info(
+                            "attachment %s already ingested in papra (409)",
+                            attachment.filename,
+                        )
+                        continue
                     uploads_ok = False
                     result.messages_failed += 1
                     logger.error("upload failed for %s: %s", attachment.filename, error)
