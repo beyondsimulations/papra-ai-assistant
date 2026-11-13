@@ -27,7 +27,8 @@ class FakeImap:
 
     def __init__(self, search_uids=(1, 2, 3), bodies=None, fetch_responses=None,
                  sizes=None, size_responses=None, capabilities=("IMAP4REV1",),
-                 deleted_uids=()):
+                 deleted_uids=(), no_store=False, no_uid_expunge=False,
+                 no_search_deleted=False, no_expunge=False):
         self.search_uids = list(search_uids)
         self.bodies = bodies or {}                    # uid -> raw bytes (well-formed)
         self.fetch_responses = fetch_responses or {}  # uid -> raw body-fetch_data list
@@ -40,23 +41,37 @@ class FakeImap:
         self.store_calls = []        # (uid, mode, flags) STOREs issued
         self.uid_expunge_calls = []  # uid-sets passed to UID EXPUNGE
         self.expunge_calls = 0       # plain (mailbox-wide) EXPUNGEs issued
+        # M2 carry-over hardening: any of these makes the corresponding
+        # tagged response come back as ("NO", [None])
+        self.no_store = no_store
+        self.no_uid_expunge = no_uid_expunge
+        self.no_search_deleted = no_search_deleted
+        self.no_expunge = no_expunge
 
     def expunge(self):
         self.expunge_calls += 1
+        if self.no_expunge:
+            return ("NO", [None])
         return ("OK", [None])
 
     def uid(self, command, *args):
         if command == "SEARCH":
             if "DELETED" in args:
+                if self.no_search_deleted:
+                    return ("NO", [None])
                 payload = " ".join(str(u) for u in sorted(self.deleted_uids)).encode()
                 return ("OK", [payload])
             payload = " ".join(str(u) for u in self.search_uids).encode()
             return ("OK", [payload])
         if command == "STORE":
             self.store_calls.append((int(args[0]), args[1], args[2]))
+            if self.no_store:
+                return ("NO", [None])
             return ("OK", [b"Store completed"])
         if command == "EXPUNGE":
             self.uid_expunge_calls.append(args[0])
+            if self.no_uid_expunge:
+                return ("NO", [None])
             return ("OK", [None])
         uid = int(args[0])
         if args[1] == "(RFC822.SIZE)":
@@ -434,3 +449,78 @@ def test_subject_matches_truncates_beyond_cap():
     assert subject_matches("x" * 1000 + "needle", "needle") is False
     # a match within the first 1000 chars still works on a long subject
     assert subject_matches("needle" + "x" * 2000, "needle") is True
+
+
+def test_mark_seen_raises_on_store_no():
+    # M2 carry-over: an unchecked ("NO", ...) STORE in mark_seen would mean
+    # the \Seen flags were never set — the message would be re-fetched every
+    # poll with no error surfaced. The NO must raise into the poller's
+    # never-raises guard (failure accounting engages).
+    session = make_session()
+    session._imap = FakeImap(no_store=True)
+
+    with pytest.raises(imaplib.IMAP4.error, match="STORE"):
+        session.mark_seen([1])
+
+
+def test_delete_and_expunge_raises_on_store_no():
+    session = make_session()
+    session._imap = FakeImap(capabilities=("IMAP4REV1", "UIDPLUS"), no_store=True)
+
+    with pytest.raises(imaplib.IMAP4.error, match="STORE"):
+        session.delete_and_expunge([2])
+
+    assert session._imap.uid_expunge_calls == []  # the expunge never runs
+
+
+def test_delete_and_expunge_raises_on_uid_expunge_no():
+    # the \Deleted flags ARE set, but a failed UID EXPUNGE must not be
+    # mistaken for success: the messages stay flagged (harmless) and the
+    # error flows into the poller's failure accounting
+    session = make_session()
+    session._imap = FakeImap(
+        capabilities=("IMAP4REV1", "UIDPLUS"), no_uid_expunge=True
+    )
+
+    with pytest.raises(imaplib.IMAP4.error, match="EXPUNGE"):
+        session.delete_and_expunge([2])
+
+    assert session._imap.store_calls == [(2, "+FLAGS", "(\\Deleted)")]
+
+
+def test_delete_and_expunge_raises_on_search_deleted_no():
+    # no UIDPLUS: the plain-EXPUNGE safety check needs UID SEARCH DELETED;
+    # a NO there means we cannot know whether foreign mail would be
+    # destroyed — raise rather than guess (fail closed)
+    session = make_session()
+    session._imap = FakeImap(no_search_deleted=True)
+
+    with pytest.raises(imaplib.IMAP4.error, match="SEARCH"):
+        session.delete_and_expunge([3, 4])
+
+    assert session._imap.expunge_calls == 0  # nothing destroyed
+
+
+def test_delete_and_expunge_raises_on_plain_expunge_no():
+    session = make_session()
+    session._imap = FakeImap(deleted_uids={3, 4}, no_expunge=True)
+
+    with pytest.raises(imaplib.IMAP4.error, match="EXPUNGE"):
+        session.delete_and_expunge([3, 4])
+
+
+def test_select_inbox_raises_on_select_no():
+    # a failed SELECT (mailbox missing, permissions) must not fall through
+    # into fetching against a stale/unselected mailbox state
+    class _NoSelectImap:
+        def select(self, mailbox):
+            return ("NO", [None])
+
+        def response(self, key):
+            return ("OK", [b"UIDVALIDITY 1"])
+
+    session = make_session()
+    session._imap = _NoSelectImap()
+
+    with pytest.raises(imaplib.IMAP4.error, match="select"):
+        session.select_inbox()

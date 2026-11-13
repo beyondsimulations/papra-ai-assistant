@@ -299,20 +299,31 @@ class MailboxSession:
 
     def mark_seen(self, uids: list[int]) -> None:
         for uid in uids:
-            self._imap.uid("STORE", str(uid), "+FLAGS", "(\\Seen)")
+            status, _data = self._imap.uid("STORE", str(uid), "+FLAGS", "(\\Seen)")
+            if status != "OK":
+                # a NO here means the flags were NOT set: the message would be
+                # re-fetched forever without surfacing — raise into the
+                # poller's never-raises guard (failure accounting engages)
+                raise imaplib.IMAP4.error(f"UID STORE \\Seen failed for {uid}")
 
     def delete_and_expunge(self, uids: list[int]) -> None:
         if not uids:
             return
         for uid in uids:
-            self._imap.uid("STORE", str(uid), "+FLAGS", "(\\Deleted)")
+            status, _data = self._imap.uid("STORE", str(uid), "+FLAGS", "(\\Deleted)")
+            if status != "OK":
+                raise imaplib.IMAP4.error(f"UID STORE \\Deleted failed for {uid}")
         # imaplib parses the CAPABILITY response at connect time and exposes
         # it as `capabilities` (an uppercase tuple of extension names).
         capabilities = getattr(self._imap, "capabilities", ()) or ()
         if "UIDPLUS" in capabilities:
             # RFC 4315 UID EXPUNGE: only our uids are removed — an operator's
             # flagged-but-unexpunged message is untouched.
-            self._imap.uid("EXPUNGE", ",".join(str(uid) for uid in uids))
+            status, _data = self._imap.uid(
+                "EXPUNGE", ",".join(str(uid) for uid in uids)
+            )
+            if status != "OK":
+                raise imaplib.IMAP4.error("UID EXPUNGE failed")
             return
         # Fallback (no UIDPLUS): a plain EXPUNGE destroys EVERY \Deleted
         # message in the mailbox — including mail an operator flagged in
@@ -325,7 +336,9 @@ class MailboxSession:
             raise imaplib.IMAP4.error("UID SEARCH DELETED failed")
         deleted = {int(u) for u in data[0].split()} if data and data[0] else set()
         if deleted == set(uids):
-            self._imap.expunge()
+            status, _data = self._imap.expunge()
+            if status != "OK":
+                raise imaplib.IMAP4.error("EXPUNGE failed")
         else:
             logger.warning(
                 "skipping expunge: %d foreign \\Deleted message(s) in the "

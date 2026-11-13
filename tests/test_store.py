@@ -642,3 +642,71 @@ def test_create_mailbox_accepts_valid_ssl_modes(store):
             ssl_mode=mode,
         )
         assert store.get_mailbox(mailbox_id).ssl_mode == mode
+
+
+def test_claim_next_job_retries_when_race_steals_candidate(tmp_path):
+    """M2 carry-over: the conditional-claim retry branch, deterministically.
+
+    A steal committed between the claim's SELECT and UPDATE must lead to
+    rowcount == 0 and the loop claiming the NEXT pending job — with the
+    stolen job untouched by our claim. The store is constructed inside the
+    test (not via the fixture) so the thief can open the SAME db file.
+    """
+    db_path = tmp_path / "race.db"
+    store = Store(db_path)
+    store.migrate()
+    try:
+        for i in range(3):
+            store.enqueue_job(kind="ocr", papra_org_id="org_1",
+                              document_id=f"doc_{i}", content_hash=f"h{i}", payload={})
+
+        class RacingConnection:
+            """Delegates to the real connection; steals the first claimed job
+            via a second connection between the claim's SELECT and UPDATE."""
+
+            def __init__(self, real):
+                self._real = real
+                self._stolen = False
+
+            def execute(self, sql, params=()):
+                if not self._stolen and sql.startswith("UPDATE jobs SET status = 'running'"):
+                    self._stolen = True
+                    # the thief commits a steal BEFORE our UPDATE runs
+                    thief = sqlite3.connect(db_path, timeout=5)
+                    thief.execute("BEGIN IMMEDIATE")
+                    thief.execute(
+                        "UPDATE jobs SET status = 'running' WHERE document_id = 'doc_0'"
+                    )
+                    thief.commit()
+                    thief.close()
+                return self._real.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def __enter__(self):
+                self._real.__enter__()
+                return self
+
+            def __exit__(self, *exc_info):
+                return self._real.__exit__(*exc_info)
+
+        original = store._conn
+        store._conn = RacingConnection(original)
+        try:
+            job = store.claim_next_job("ocr")
+            assert job.document_id == "doc_1"  # doc_0 was stolen; loop retried
+        finally:
+            store._conn = original
+
+        # the stolen job's status is untouched by our claim: it stays
+        # 'running' from the thief's write, and doc_2 is still pending
+        statuses = {
+            row["document_id"]: row["status"]
+            for row in store._conn.execute(
+                "SELECT document_id, status FROM jobs"
+            ).fetchall()
+        }
+        assert statuses == {"doc_0": "running", "doc_1": "running", "doc_2": "pending"}
+    finally:
+        store.close()
