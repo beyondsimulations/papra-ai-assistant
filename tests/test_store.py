@@ -247,6 +247,35 @@ def test_failed_migration_is_rolled_back_atomically(tmp_path, monkeypatch):
     fresh.close()
 
 
+def test_job_payload_roundtrip(store):
+    """The payload dict must survive enqueue -> claim -> get unchanged;
+    a mutation like json.dumps({}) must not pass silently."""
+    payload = {"page_count": 2, "filename": "a b.pdf"}
+    job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                               content_hash="abc", payload=payload)
+
+    claimed = store.claim_next_job("ocr")
+    assert claimed is not None
+    assert claimed.payload == payload
+
+    fetched = store.get_job(job_id)
+    assert fetched is not None
+    assert fetched.payload == payload
+
+
+def test_list_jobs_newest_first(store):
+    """list_jobs must return the newest job first (ORDER BY created_at DESC);
+    the dashboard queue view relies on this ordering."""
+    a_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_a",
+                             content_hash="h1", payload={})
+    time.sleep(0.01)
+    b_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_b",
+                             content_hash="h2", payload={})
+
+    assert [job.document_id for job in store.list_jobs()] == ["doc_b", "doc_a"]
+    assert [job.id for job in store.list_jobs()] == [b_id, a_id]
+
+
 def test_failed_job_is_not_claimable_during_backoff(store):
     job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
                                content_hash="abc", payload={})

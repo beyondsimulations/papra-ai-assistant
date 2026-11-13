@@ -76,3 +76,34 @@ def test_invalid_integer_env_raises_config_error():
 def test_dashboard_bind_out_of_range_port_raises_config_error():
     with pytest.raises(ConfigError, match="DASHBOARD_BIND"):
         load_config({**BASE_ENV, "DASHBOARD_BIND": "127.0.0.1:99999"})
+
+
+def test_malformed_ipv6_bind_raises_config_error():
+    # A dropped closing bracket makes urlparse itself raise ValueError
+    # ("Invalid IPv6 URL") before the .port guard; this must surface as a
+    # ConfigError, not a traceback.
+    with pytest.raises(ConfigError, match="DASHBOARD_BIND"):
+        load_config({**BASE_ENV, "DASHBOARD_BIND": "[::1:8080"})
+
+
+def test_scheme_only_base_url_rejected():
+    # "http://" rstrips to "http:" — non-empty, but not a usable URL.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://"})
+
+
+def test_schemeless_base_url_rejected():
+    # "papra:1221" parses as scheme "papra" with empty netloc.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "papra:1221"})
+
+
+def test_protocol_relative_base_url_rejected():
+    # "//papra:1221" has no scheme at all.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "//papra:1221"})
+
+
+def test_valid_base_urls_still_pass():
+    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "https://host.example"})
+    assert config.papra_base_url == "https://host.example"

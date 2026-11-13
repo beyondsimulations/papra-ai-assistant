@@ -41,10 +41,15 @@ def _require(env: Mapping[str, str], name: str) -> str:
 def _require_base_url(env: Mapping[str, str], name: str) -> str:
     # Validate the post-rstrip result: a slash-only value like "/" passes the
     # non-empty check but strips to "", which would make every client call fail
-    # at runtime. The check command must not bless such a config.
+    # at runtime. Likewise scheme-less ("papra:1221") or scheme-only
+    # ("http://" -> "http:") values must not be blessed. The check command
+    # must not bless such a config.
     value = _require(env, name).rstrip("/")
     if not value:
         raise ConfigError(f"{name} must not be empty")
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ConfigError(f"{name} must be an http(s) URL, got: {value!r}")
     return value
 
 
@@ -59,12 +64,15 @@ def _int_env(env: Mapping[str, str], name: str, default: int) -> int:
 
 
 def _parse_bind(raw: str) -> tuple[str, int]:
-    parsed = urlparse(f"//{raw}")
     try:
+        parsed = urlparse(f"//{raw}")
+        # A malformed IPv6 literal (e.g. "[::1:8080") makes urlparse itself
+        # raise ValueError("Invalid IPv6 URL"), not just the .port access.
         port = parsed.port
     except ValueError:
+        # Covers both a malformed IPv6 literal and an out-of-range port.
         raise ConfigError(
-            f"DASHBOARD_BIND port must be between 0 and 65535, got: {raw!r}"
+            f"DASHBOARD_BIND must be 'host:port' with a valid port, got: {raw!r}"
         ) from None
     if not parsed.hostname or port is None:
         raise ConfigError(f"DASHBOARD_BIND must be 'host:port', got: {raw!r}")
