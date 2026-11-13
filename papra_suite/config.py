@@ -40,11 +40,12 @@ def _has_nondisplay_chars(text: str) -> bool:
 
 
 def _has_control_chars(text: str) -> bool:
-    # Spaces and tabs are legitimate inside header values (h11 accepts them,
-    # e.g. an API key with an internal space just yields 401s), but control
-    # characters are not: h11 rejects them at send time (LocalProtocolError),
-    # turning a deterministic config error into a misleading TransportError
-    # after retries. Screen only non-printable/control characters.
+    # Spaces are legitimate inside header values (h11 accepts them, e.g. an
+    # API key with an internal space just yields 401s), but tabs are rejected
+    # as likely paste errors, and control characters are not: h11 rejects them
+    # at send time (LocalProtocolError), turning a deterministic config error
+    # into a misleading TransportError after retries. Screen ord(ch) < 32
+    # (which includes tabs) plus DEL.
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in text)
 
 

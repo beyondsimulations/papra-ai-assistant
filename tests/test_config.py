@@ -247,10 +247,17 @@ def test_nul_byte_in_api_key_rejected():
 
 
 def test_internal_space_in_api_key_accepted():
-    # h11 accepts spaces/tabs inside header values (mere 401s), so a key
+    # h11 accepts spaces inside header values (mere 401s), so a key
     # with an internal space is legitimate and must not be rejected.
     config = load_config({**BASE_ENV, "PAPRA_API_KEY": "ppapi_key with spaces"})
     assert config.papra_api_key == "ppapi_key with spaces"
+
+
+def test_internal_tab_in_api_key_rejected():
+    # Decision: keep the safe-side predicate (ord(ch) < 32 rejects tabs) —
+    # a tab inside a secret is essentially always a paste error.
+    with pytest.raises(ConfigError, match="PAPRA_API_KEY"):
+        load_config({**BASE_ENV, "PAPRA_API_KEY": "ppapi_key" + chr(9) + "with-tab"})
 
 
 def test_vertical_tab_in_admin_password_rejected():
