@@ -265,8 +265,12 @@ async def test_poll_loop_survives_get_org_failure():
     from papra_suite.pipeline import _poll_loop
 
     class FailingOrgStore:
-        def __init__(self):
+        def __init__(self, mailbox):
+            self.mailbox = mailbox
             self.calls = 0
+
+        def get_mailbox(self, mailbox_id):
+            return self.mailbox  # the fixed loop re-fetches the row each iteration
 
         def get_org(self, org_id):
             self.calls += 1
@@ -274,10 +278,193 @@ async def test_poll_loop_survives_get_org_failure():
                 raise RuntimeError("sqlite: database is locked")
             raise KeyboardInterrupt()  # stop seam (BaseException passes the guard)
 
-    store = FailingOrgStore()
-    mailbox = SimpleNamespace(id="mb_1", org_id="org_1", poll_interval_s=0)
+    mailbox = SimpleNamespace(id="mb_1", org_id="org_1", poll_interval_s=0,
+                              enabled=True)
+    store = FailingOrgStore(mailbox)
 
     with pytest.raises(KeyboardInterrupt):
         await _poll_loop(store, papra=None, mailbox=mailbox)
 
     assert store.calls == 3  # the loop survived BOTH get_org failures
+
+
+async def test_poll_loop_polls_with_fresh_mailbox_row(tmp_path, monkeypatch):
+    """Fresh-row pin: each iteration must re-fetch the mailbox from the
+    store. Polling the startup snapshot forever would ignore the persisted
+    UID cursor (every poll re-fetches the whole mailbox; once the prefix
+    exceeds MAX_POLL_BYTES, newer mail is NEVER reached) and the disable
+    flag. Advancing the row's last_seen_uid between iterations must be
+    observed by the NEXT poll.
+    """
+    import papra_suite.mail as mail_mod
+    from papra_suite.pipeline import _poll_loop
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_1", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
+                                      username="u", password="p", poll_interval_s=0)
+    captured = []
+
+    class _StopLoop(BaseException):
+        pass
+
+    async def fake_poll(store_arg, papra, mailbox, org):
+        captured.append(mailbox.last_seen_uid)
+        # simulate a successful poll persisting a new UID cursor
+        store_arg.record_poll_success(
+            mailbox.id, last_seen_uid=(mailbox.last_seen_uid or 0) + 10,
+            uidvalidity="v1",
+        )
+        if len(captured) >= 2:
+            raise _StopLoop()
+
+    monkeypatch.setattr(mail_mod, "poll_mailbox_once", fake_poll)
+    with pytest.raises(_StopLoop):
+        await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+
+    # iteration 1 saw the initial (None) cursor; iteration 2 must have seen
+    # the PERSISTED cursor (10) — a stale-snapshot mutant sees None twice
+    assert captured == [None, 10]
+    store.close()
+
+
+async def test_poll_loop_stops_when_mailbox_disabled_mid_loop(tmp_path, monkeypatch, caplog):
+    """A mailbox disabled at runtime (consecutive failures) must stop its
+    poll loop — the disable flag must not be inert."""
+    import logging
+
+    import papra_suite.mail as mail_mod
+    from papra_suite.pipeline import _poll_loop
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_1", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
+                                      username="u", password="p", poll_interval_s=0)
+    polls = []
+
+    async def failing_poll(store_arg, papra, mailbox, org):
+        polls.append(mailbox.id)
+        store_arg.record_poll_failure(mailbox.id, "boom", disable_after=1)
+
+    monkeypatch.setattr(mail_mod, "poll_mailbox_once", failing_poll)
+    with caplog.at_level(logging.INFO):
+        await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+
+    assert polls == [mailbox_id]  # one poll, then the disabled row stopped the loop
+    assert any("deleted or disabled" in record.getMessage() for record in caplog.records)
+    store.close()
+
+
+async def test_poll_loop_stops_when_mailbox_deleted_mid_loop(tmp_path, monkeypatch, caplog):
+    """A mailbox deleted at runtime must stop its poll loop (get_mailbox
+    returns None), not keep polling a ghost row."""
+    import logging
+
+    import papra_suite.mail as mail_mod
+    from papra_suite.pipeline import _poll_loop
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_1", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
+                                      username="u", password="p", poll_interval_s=0)
+    polls = []
+
+    async def deleting_poll(store_arg, papra, mailbox, org):
+        polls.append(mailbox.id)
+        store_arg.delete_mailbox(mailbox.id)
+
+    monkeypatch.setattr(mail_mod, "poll_mailbox_once", deleting_poll)
+    with caplog.at_level(logging.INFO):
+        await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+
+    assert polls == [mailbox_id]
+    assert any("deleted or disabled" in record.getMessage() for record in caplog.records)
+    store.close()
+
+
+async def test_poll_loop_survives_missing_org_without_disable_storm(
+        tmp_path, monkeypatch, caplog):
+    """Org-None guard pin: a mailbox whose org_id points at a deleted org
+    must be skipped (logged, no poll) — the loop survives and the mailbox is
+    NOT dragged into the 3-failure disable storm by polls against a ghost
+    org. Dropping the guard fails this test (poll runs, failures recorded).
+    """
+    import logging
+
+    import papra_suite.mail as mail_mod
+    from papra_suite.pipeline import _poll_loop
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_1", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
+                                      username="u", password="p", poll_interval_s=0)
+    store._conn.execute("PRAGMA foreign_keys=OFF")  # simulate the org being
+    with store._conn:  # deleted out from under the mailbox (FK bypassed)
+        store._conn.execute("DELETE FROM orgs WHERE id = ?", (org_id,))
+    store._conn.execute("PRAGMA foreign_keys=ON")
+
+    poll_calls = []
+
+    async def ghost_org_poll(store_arg, papra, mailbox, org):
+        poll_calls.append(org)  # must NEVER run: org is None
+
+    monkeypatch.setattr(mail_mod, "poll_mailbox_once", ghost_org_poll)
+
+    state = {"n": 0}
+
+    def get_org(org_id):
+        state["n"] += 1
+        if state["n"] > 2:  # stop seam after the loop survived 2 iterations
+            raise KeyboardInterrupt()
+        return None  # the org is gone
+
+    store.get_org = get_org
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(KeyboardInterrupt):
+            await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+
+    assert poll_calls == []  # the guard held: no poll against a missing org
+    mailbox = store.get_mailbox(mailbox_id)
+    assert mailbox.enabled  # no disable storm
+    assert mailbox.consecutive_failures == 0
+    assert mailbox.last_error is None
+    assert any("not found" in record.getMessage() for record in caplog.records)
+    store.close()
+
+
+async def test_serve_with_sweep_disabled_spawns_no_sweep_task(tmp_path, monkeypatch):
+    """Sweep-disable guard pin: serve with SWEEP_INTERVAL_S=0 must NOT
+    spawn the sweep task. A monkeypatched sweep_once records invocations;
+    dropping the `> 0` guard fails this test (the sweep runs)."""
+    import papra_suite.pipeline as pipeline_mod
+    from papra_suite.pipeline import SweepResult
+
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})  # SWEEP_INTERVAL_S=0
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.create_org(papra_org_id="org_1", name="Org")  # no mailboxes
+
+    sweeps = []
+
+    async def recording_sweep(store_arg, papra):
+        sweeps.append(store_arg)
+        return SweepResult()
+
+    monkeypatch.setattr(pipeline_mod, "sweep_once", recording_sweep)
+
+    stop = asyncio.Event()
+
+    async def set_stop_later():
+        await asyncio.sleep(0.2)
+        stop.set()
+
+    asyncio.get_running_loop().create_task(set_stop_later())
+    await serve(config, stop=stop, store=store)
+
+    assert sweeps == []  # the sweep task never spawned
+    assert not _dangling_serve_tasks()
+    store.close()

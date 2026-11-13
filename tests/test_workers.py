@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -514,6 +515,105 @@ async def test_worker_loop_backs_off_papra_5xx(store):
     assert job.status == "pending" and job.attempts == 1  # normal backoff
 
 
+async def test_worker_loop_fails_llm_4xx_immediately(store):
+    """4xx permanence must apply to ANY client error carrying .status, not
+    just PapraError: an LLM 404 (model typo) must fail the job on the first
+    attempt instead of re-downloading + re-rendering 3 times per job."""
+    from papra_suite.llm_client import LLMError
+
+    make_job(store)
+
+    async def handler(job):
+        raise LLMError("model not found", 404)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 1:
+            raise KeyboardInterrupt()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    job = store.list_jobs()[0]
+    assert job.status == "failed"  # permanent — no 3-attempt backoff
+    assert job.attempts == 1
+    assert "model not found" in job.error
+
+
+async def test_worker_loop_backs_off_llm_5xx(store):
+    """LLM 5xx keeps the normal retry policy: pending with backoff."""
+    from papra_suite.llm_client import LLMError
+
+    make_job(store)
+
+    async def handler(job):
+        raise LLMError("overloaded", 503)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 1:
+            raise KeyboardInterrupt()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    job = store.list_jobs()[0]
+    assert job.status == "pending" and job.attempts == 1  # normal backoff
+
+
+async def test_run_ocr_job_renders_off_the_event_loop(store, config, monkeypatch):
+    """to_thread(render_page) pin: rendering is CPU-bound and must run OFF the
+    event loop. A 5ms ticker runs concurrently with run_ocr_job; a render
+    that sleeps 0.3s (simulated CPU work) must not stall the ticker. A
+    direct (non-to_thread) call blocks the loop for ~0.3s and fails here."""
+    import time
+
+    import fitz
+
+    pdf = fitz.open()
+    pdf.new_page()
+    papra = StubPapra(pdf.tobytes())
+    pdf.close()
+    llm, _ = make_llm(["# md"])
+
+    def slow_render_page(pdf_bytes, index, *, dpi, pixel_budget):
+        time.sleep(0.3)  # simulated CPU-bound render
+        return b"fake-png"
+
+    monkeypatch.setattr(pipeline_mod, "render_page", slow_render_page)
+
+    gaps: list[float] = []
+    stop_ticker = asyncio.Event()
+
+    async def ticker():
+        last = time.monotonic()
+        while not stop_ticker.is_set():
+            await asyncio.sleep(0.005)
+            now = time.monotonic()
+            gaps.append(now - last)
+            last = now
+
+    ticker_task = asyncio.get_running_loop().create_task(ticker())
+    try:
+        await run_ocr_job(papra, llm, make_job(store), config=config)
+    finally:
+        stop_ticker.set()
+        await ticker_task
+
+    assert gaps  # the ticker actually ran during the render
+    assert max(gaps) < 0.1  # loop stayed responsive (~5ms cadence)
+
+
 async def test_sweep_once_enqueues_for_unseen_pdfs_only(store):
     papra = StubPapra()
     result = await sweep_once(store, papra)
@@ -692,6 +792,41 @@ async def test_sweep_once_terminates_on_never_short_listing(store, caplog):
     assert result.documents_checked == MAX_SWEEP_PAGES * SWEEP_PAGE_SIZE
     assert any(record.levelno == logging.WARNING and "org_1" in record.getMessage()
                for record in caplog.records)
+
+
+async def test_sweep_covers_large_orgs_across_passes(store, caplog):
+    """Sweep-offset pin: an org larger than MAX_SWEEP_PAGES * SWEEP_PAGE_SIZE
+    documents must EVENTUALLY have every document swept. Pass 1 exhausts the
+    cap (5000 docs) and persists the page offset; pass 2 resumes and reaches
+    the short page (offset reset); pass 3 finds nothing left. A restart-at-
+    page-0 mutant never sweeps docs 5000-5999 and fails here."""
+    papra = ManyDocsPapra(6000)  # 120 full pages of 50
+
+    with caplog.at_level(logging.WARNING):
+        first = await sweep_once(store, papra)
+
+    assert first.jobs_enqueued == MAX_SWEEP_PAGES * SWEEP_PAGE_SIZE  # 5000
+    assert store.get_setting("sweep_offset:org_1") == "100"  # resume point saved
+    assert any(record.levelno == logging.WARNING and "org_1" in record.getMessage()
+               and "1000" in record.getMessage()  # remaining estimate
+               for record in caplog.records)
+
+    second = await sweep_once(store, papra)
+    assert second.jobs_enqueued == 1000  # docs 5000-5999, resumed at page 100
+    assert store.get_setting("sweep_offset:org_1") == "0"  # short page -> reset
+
+    third = await sweep_once(store, papra)
+    assert third.jobs_enqueued == 0  # fully caught up; nothing left to enqueue
+    # pass 3 re-walked the seen prefix from page 0 and hit the cap again
+    # (bounded per-pass work; the seen-table gate skips processed docs)
+    assert store.get_setting("sweep_offset:org_1") == "100"
+
+    fourth = await sweep_once(store, papra)
+    assert fourth.jobs_enqueued == 0
+    assert fourth.documents_checked == 1000  # resumed at 100, short page at 120
+    assert store.get_setting("sweep_offset:org_1") == "0"  # reset on the short page
+    # every one of the 6000 documents made it into the seen table eventually
+    assert all(store.document_seen("org_1", f"doc_{i}") for i in range(6000))
 
 
 async def test_sweep_once_is_idempotent(store):

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from papra_suite.llm_client import LLMClient
 from papra_suite.ocr import OCR_SYSTEM_PROMPT, assemble_markdown, page_count, render_page
-from papra_suite.papra_client import PapraClient, PapraError
+from papra_suite.papra_client import PapraClient
 from papra_suite.store import Job, Store
 from papra_suite.titles import generate_title
 
@@ -209,10 +209,22 @@ async def _poll_loop(store: Store, papra: PapraClient, mailbox) -> None:
     from papra_suite.mail import poll_mailbox_once
 
     while True:
+        # Re-fetch the mailbox row EVERY iteration: the snapshot passed at
+        # startup goes stale immediately. Polling it forever would ignore the
+        # persisted UID cursor (re-fetching the whole mailbox each poll) and
+        # the enabled flag (a mailbox disabled at runtime must stop the loop).
+        mailbox_id = mailbox.id
+        mailbox = store.get_mailbox(mailbox_id)
+        if mailbox is None or not mailbox.enabled:
+            logger.info("poll loop stopping: mailbox %s deleted or disabled", mailbox_id)
+            break
         try:
             org = store.get_org(mailbox.org_id)
             if org is not None:
                 await poll_mailbox_once(store, papra, mailbox, org)
+            else:
+                logger.info("poll loop: org %s for mailbox %s not found; skipping",
+                            mailbox.org_id, mailbox.id)
         except Exception:  # noqa: BLE001 - an org lookup or poll failure must not kill the loop
             logger.exception("poll loop error for mailbox %s", mailbox.id)
         await asyncio.sleep(mailbox.poll_interval_s)
@@ -267,8 +279,13 @@ async def worker_loop(store: Store, *, kind: str, handler,
                 # a deleted document (404) riding the 3-attempt backoff is
                 # ~2.5 minutes of futile retries. Fail such jobs permanently
                 # on the first attempt; 5xx/429/other errors keep the backoff.
-                if (isinstance(error, PapraError) and error.status is not None
-                        and 400 <= error.status < 500 and error.status != 429):
+                # 4xx (except 429) never auto-retries (decisions §6), from
+                # ANY client: a deleted document (PapraError 404) or a bad
+                # model name (LLMError 404) riding the 3-attempt backoff is
+                # ~2.5 minutes of futile retries. Fail such jobs permanently
+                # on the first attempt; 5xx/429/other errors keep the backoff.
+                status = getattr(error, "status", None)
+                if status is not None and 400 <= status < 500 and status != 429:
                     store.mark_job_failed(job.id, str(error), max_attempts=1)
                 else:
                     store.mark_job_failed(job.id, str(error))
@@ -292,13 +309,28 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
     a page returning fewer than SWEEP_PAGE_SIZE documents ends the org.
     Enqueuing never creates new Papra documents, so pagination is stable
     while iterating.
+
+    Orgs larger than MAX_SWEEP_PAGES * SWEEP_PAGE_SIZE documents cannot be
+    covered in one pass, so each org persists its next page index in the
+    settings table (key "sweep_offset:<papra_org_id>"): a pass that exhausts
+    the cap resumes where it stopped, and a pass that reaches a SHORT page
+    (org fully caught up) resets the offset to 0. This guarantees eventual
+    coverage of arbitrarily large orgs with bounded per-pass listing work.
     """
     result = SweepResult()
     for org in store.list_orgs():
-        page_index = 0
+        offset_key = f"sweep_offset:{org.papra_org_id}"
+        try:
+            offset = int(store.get_setting(offset_key) or "0")
+        except ValueError:
+            offset = 0  # a corrupt offset must not wedge the sweep
+        page_index = offset
+        short_page = False
+        cap_exhausted = False
+        count = 0
         while True:
             try:
-                documents, _count = await papra.list_documents(
+                documents, count = await papra.list_documents(
                     org.papra_org_id, page_index=page_index,
                     page_size=SWEEP_PAGE_SIZE,
                     sort_field="createdAt", sort_order="desc",
@@ -354,13 +386,28 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
                                  document_id, org.papra_org_id, error)
                     result.errors += 1
             if len(documents) < SWEEP_PAGE_SIZE:
+                short_page = True
                 break
             page_index += 1
-            if page_index >= MAX_SWEEP_PAGES:
-                logger.warning(
-                    "sweep: stopping after %d pages for org %s (listing may ignore pagination)",
-                    MAX_SWEEP_PAGES, org.papra_org_id)
+            if page_index >= offset + MAX_SWEEP_PAGES:
+                cap_exhausted = True
                 break
+        if short_page:
+            # The org is fully caught up: restart from page 0 next pass so
+            # new documents (sorted desc by createdAt) are found quickly.
+            store.set_setting(offset_key, "0")
+        elif cap_exhausted:
+            # The page cap stopped us mid-org: persist the page index reached
+            # so the NEXT pass continues where this one stopped. Without the
+            # offset, an org larger than MAX_SWEEP_PAGES * SWEEP_PAGE_SIZE
+            # documents would NEVER have its tail swept (every pass restarts
+            # at page 0). The seen-table gate skips processed docs cheaply.
+            store.set_setting(offset_key, str(page_index))
+            remaining = max(0, (count or 0) - page_index * SWEEP_PAGE_SIZE)
+            logger.warning(
+                "sweep: page cap reached for org %s after %d pages; resuming at "
+                "page %d next pass (~%d documents remaining)",
+                org.papra_org_id, MAX_SWEEP_PAGES, page_index, remaining)
     return result
 
 

@@ -53,3 +53,25 @@ def test_check_config_error_exits_two(monkeypatch, capsys, tmp_path):
     stderr = capsys.readouterr().err
     assert "configuration error" in stderr
     assert "PAPRA_API_KEY" in stderr
+
+
+def test_serve_subcommand_runs_serve(monkeypatch, tmp_path):
+    """Serve-wiring pin: `papra-suite serve` must actually reach
+    asyncio.run(serve(config)). A recording coroutine stands in for serve;
+    dropping the asyncio.run call (or the subcommand branch) fails here."""
+    import papra_suite.pipeline as pipeline_mod
+
+    calls = []
+
+    async def recording_serve(config):
+        calls.append(config)
+
+    monkeypatch.setattr(pipeline_mod, "serve", recording_serve)
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "serve"])
+
+    assert main() == 0
+    assert len(calls) == 1  # serve was reached with the loaded config
+    assert calls[0].data_dir == tmp_path
