@@ -6,6 +6,7 @@ retry on 429 + all 5xx + network errors; other 4xx fail permanently.
 
 import asyncio
 import base64
+import json
 
 import httpx
 
@@ -71,7 +72,17 @@ class LLMClient:
                 await asyncio.sleep(self._backoff_base_s * 4**attempt)
                 continue
             if response.is_success:
-                return response.json()["choices"][0]["message"]["content"].strip()
+                try:
+                    return response.json()["choices"][0]["message"]["content"].strip()
+                except (json.JSONDecodeError, KeyError, IndexError, AttributeError) as error:
+                    # A 2xx body is not guaranteed to be a well-formed chat
+                    # completions payload; surface it as LLMError (not a raw
+                    # JSONDecodeError/KeyError) so callers' never-raises/
+                    # fallback contracts hold.
+                    raise LLMError(
+                        f"malformed chat completions response: {response.text[:200]}",
+                        response.status_code,
+                    ) from error
             raise LLMError(
                 f"chat completions failed: {response.status_code} {response.text[:200]}",
                 response.status_code,

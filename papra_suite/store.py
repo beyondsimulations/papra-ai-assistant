@@ -389,6 +389,11 @@ class Store:
             row = self._conn.execute("SELECT * FROM orgs WHERE id = ?", (org_id,)).fetchone()
         return Org(row["id"], row["papra_org_id"], row["name"]) if row else None
 
+    def list_orgs(self) -> list[Org]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM orgs ORDER BY papra_org_id").fetchall()
+        return [Org(row["id"], row["papra_org_id"], row["name"]) for row in rows]
+
     def get_org_by_papra_id(self, papra_org_id: str) -> Org | None:
         with self._lock:
             row = self._conn.execute(

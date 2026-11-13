@@ -178,3 +178,30 @@ async def test_image_without_user_message_raises():
     async with make_client(handler) as client:
         with pytest.raises(LLMError):
             await client.chat([{"role": "system", "content": "sys"}], image=b"x")
+
+
+async def test_malformed_invalid_json_body_raises_llm_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>not json</html>")
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError, match="malformed chat completions response"):
+            await client.chat([{"role": "user", "content": "hi"}])
+
+
+async def test_malformed_missing_choices_key_raises_llm_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"unexpected": "shape"})
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError, match="malformed chat completions response"):
+            await client.chat([{"role": "user", "content": "hi"}])
+
+
+async def test_malformed_empty_choices_list_raises_llm_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": []})
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError, match="malformed chat completions response"):
+            await client.chat([{"role": "user", "content": "hi"}])
