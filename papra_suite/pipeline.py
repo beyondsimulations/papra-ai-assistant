@@ -136,9 +136,15 @@ async def serve(config, *, stop: asyncio.Event | None = None,
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         for client in built_clients:
-            await client.aclose()
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - one failing close must not skip the rest
+                logger.exception("error closing client during shutdown")
         if owns_store:
-            store.close()
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("error closing store during shutdown")
 
 
 async def _poll_loop(store: Store, papra: PapraClient, mailbox) -> None:

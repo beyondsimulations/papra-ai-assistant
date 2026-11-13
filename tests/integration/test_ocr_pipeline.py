@@ -13,8 +13,9 @@ from tests.fakes.llm_server import FakeLLMServer
 
 pytestmark = pytest.mark.integration
 
+SEARCH_PHRASE = "quokka-marmalade-ocr"  # only in OCR content, never in the source PDF
 PAGE_ONE_MARKDOWN = "# Rechnung Nr. 42\n\nVielen Dank für Ihre Bestellung."
-PAGE_TWO_MARKDOWN = "## Zahlungsbedingungen\n\nZahlbar bis 15.11.2026."
+PAGE_TWO_MARKDOWN = f"## Zahlungsbedingungen\n\nZahlbar bis 15.11.2026.\n\n{SEARCH_PHRASE}"
 
 
 def make_german_pdf() -> bytes:
@@ -81,9 +82,10 @@ async def test_ocr_and_title_end_to_end(stack):
         title_jobs = [j for j in store.list_jobs() if j.kind == "title"]
         assert len(title_jobs) == 1
 
-        # content is searchable in Papra (spec acceptance 5's mail-path analog)
+        # content is searchable in Papra (spec acceptance 5's mail-path analog);
+        # SEARCH_PHRASE exists only in the OCR-written content, never in the source PDF
         documents, count = await papra.list_documents(
-            org_id, search_query="Zahlbar bis 15.11.2026")
+            org_id, search_query=SEARCH_PHRASE)
         assert document_id in {d["id"] for d in documents}
 
         # title worker
@@ -96,6 +98,13 @@ async def test_ocr_and_title_end_to_end(stack):
         page_request = server.requests[0]
         content_part = page_request["messages"][1]["content"][1]
         assert content_part["type"] == "image_url"
+        # page 2 request also carries an image_url content part
+        page_two_request = server.requests[1]
+        page_two_part = page_two_request["messages"][1]["content"][1]
+        assert page_two_part["type"] == "image_url"
+        # the title request's user message is a plain string (no image)
+        title_request = server.requests[2]
+        assert isinstance(title_request["messages"][1]["content"], str)
     finally:
         server.stop()
         if ocr_llm is not None:
