@@ -802,15 +802,57 @@ async def test_poll_kills_an_unbounded_validation_probe(store, monkeypatch):
     assert session.closed is True
 
 
+class StubMatcher:
+    """A matcher that answers every search with one fixed outcome.
+
+    Lets a test drive the poll site's decision for a single outcome (the
+    child-died classes) without paying for a real catastrophic search, so the
+    split between TIMEOUT (retire) and UNAVAILABLE (do not retire) can be
+    asserted against the same fixture.
+    """
+
+    def __init__(self, outcome):
+        import re as _re
+
+        self._ignorecase = _re.IGNORECASE
+        self.outcome = outcome
+        self.searches: list[tuple[str, str]] = []
+        self.validated: list[str | None] = []
+        self.closed = False
+
+    async def search(self, pattern, subject, *, timeout_s, flags=None):
+        self.searches.append((pattern, subject))
+        return self.outcome
+
+    async def validate(self, pattern, *, timeout_s):
+        self.validated.append(pattern)
+        return None
+
+    async def aclose(self):
+        self.closed = True
+
+
 async def test_poll_degrades_when_the_regex_child_cannot_run(store, monkeypatch, caplog):
-    """A child that cannot be started must degrade like a timeout — non-match
-    plus a WARNING, poll continues, cursor advances — never crash the poll
-    loop or freeze it (there is always a next poll to try again on).
+    r"""CONTRACT CHANGE (round-4 review, decided deliberately): a child that
+    cannot be STARTED is not a filter miss.
+
+    The old contract degraded UNAVAILABLE to a non-match, \Seen the message and
+    moved the cursor past it. Two reviewers and the orchestrator measured the
+    result: a well-formed `Rechnung 4711` on a filtered mailbox ended
+    `uploaded=0 error=None` with the cursor advanced and never re-fetched —
+    permanent silent ingestion loss for every filtered mailbox whenever the
+    child cannot run at all (venv interpreter replaced under a running daemon,
+    RLIMIT_NPROC/TasksMax, fd exhaustion), and matcher.validate was skipped the
+    same way. This is not a test being weakened: the assertions got stricter.
+    "cannot decide" must stop the poll visibly (result.error +
+    record_poll_failure + the 3-strike path) and must leave the mail re-fetchable.
+    TIMEOUT still retires — that is what stops C1 re-poisoning, and its
+    companion assertion below pins it in the same fixture.
     """
     import sys
 
     import papra_suite.mail as mail_mod
-    from papra_suite.safematch import KillableMatcher
+    from papra_suite.safematch import KillableMatcher, MatchOutcome
 
     org_id = store.create_org(papra_org_id="org_papra", name="Test")
     mailbox_id = store.create_mailbox(
@@ -834,12 +876,182 @@ async def test_poll_degrades_when_the_regex_child_cannot_run(store, monkeypatch,
             timeout=60,
         )
 
-    assert result.error is None                  # degradation, not a poll failure
-    assert result.documents_uploaded == 0        # an unanswered match never ingests
-    assert session.seen == [4]                   # the message is still retired
-    assert store.get_mailbox(mailbox_id).last_seen_uid == 4
-    assert store.get_mailbox(mailbox_id).enabled is True
-    assert any("subject filter" in record.getMessage() for record in caplog.records)
+    mailbox = store.get_mailbox(mailbox_id)
+    # the poll FAILS visibly instead of reporting an empty success
+    assert result.error is not None
+    assert "regex child" in result.error
+    assert result.documents_uploaded == 0        # an unanswered filter never ingests
+    # ...and nothing about this mail moved: no \Seen, no cursor, next poll re-fetches
+    assert session.seen == []
+    assert mailbox.last_seen_uid is None
+    assert mailbox.consecutive_failures == 1     # failure counted toward 3-strike
+    assert mailbox.last_error is not None
+    assert mailbox.enabled is True               # one failure is not the 3rd strike
+
+    # companion: TIMEOUT keeps the retired-and-advanced behaviour EXACTLY. A
+    # killed per-message search is a DECIDED non-match (the budget was spent on
+    # this subject), and retiring it is what stops the poison mail from being
+    # re-fetched and re-armed on the next poll.
+    other_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=".*rechnung.*",
+    )
+    timeout_session = FakeSession(
+        raws=[(9, build_raw(subject="Rechnung 42", message_id="<m9@x>"))]
+    )
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: timeout_session)
+    timeout_result = await asyncio.wait_for(
+        poll_mailbox_once(store, StubClient(), store.get_mailbox(other_id),
+                          store.get_org(org_id), matcher=StubMatcher(MatchOutcome.TIMEOUT)),
+        timeout=60,
+    )
+    assert timeout_result.error is None          # decided, so not a poll failure
+    assert timeout_result.documents_uploaded == 0
+    assert timeout_session.seen == [9]           # still retired
+    assert store.get_mailbox(other_id).last_seen_uid == 9
+    assert store.get_mailbox(other_id).consecutive_failures == 0
+
+
+async def test_poll_stops_without_retiring_mail_when_a_match_cannot_be_decided(
+    store, monkeypatch
+):
+    """UNAVAILABLE during the per-message match freezes the cursor mid-poll.
+
+    Already-uploaded mail keeps its progress (upload + dedup + OCR job all
+    happened before the undecided message); the undecided message is NOT
+    \Seen and the cursor does not pass it, so the next poll re-fetches it.
+    Re-delivery is safe because the dedup hash already exists.
+    """
+    from papra_suite.safematch import MatchOutcome
+
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=".*rechnung.*",
+    )
+    session = FakeSession(raws=[
+        (5, build_raw(subject="Rechnung 5", message_id="<m5@x>")),
+        (6, build_raw(subject="Rechnung 6", message_id="<m6@x>")),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+    matcher = StubMatcher(MatchOutcome.UNAVAILABLE)
+
+    result = await asyncio.wait_for(
+        poll_mailbox_once(store, client, store.get_mailbox(mailbox_id),
+                          store.get_org(org_id), matcher=matcher),
+        timeout=60,
+    )
+
+    mailbox = store.get_mailbox(mailbox_id)
+    assert result.error is not None and "uid=5" in result.error
+    assert result.documents_uploaded == 0        # undecided: nothing ingested
+    assert session.seen == []                    # neither message was \Seen
+    assert mailbox.last_seen_uid is None         # cursor frozen -> re-fetch next poll
+    assert mailbox.consecutive_failures == 1
+
+
+async def test_poll_keeps_earlier_uploads_when_a_later_match_cannot_be_decided(
+    store, monkeypatch
+):
+    """A mid-poll UNAVAILABLE must not rewind progress already made: the first
+    message matched and uploaded before the second one became undecided, and
+    that upload (dedup hash + OCR job) survives the stopped poll. Re-delivery
+    after the cursor unfreezes is then a dedup no-op, not a double ingest.
+    """
+    from papra_suite.safematch import MatchOutcome
+
+    class FirstMatchesThenUnavailable:
+        def __init__(self):
+            self.calls = 0
+            self.closed = False
+
+        async def search(self, pattern, subject, *, timeout_s, flags=None):
+            self.calls += 1
+            if self.calls == 1:
+                return MatchOutcome.MATCH
+            return MatchOutcome.UNAVAILABLE
+
+        async def validate(self, pattern, *, timeout_s):
+            return None
+
+        async def aclose(self):
+            self.closed = True
+
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=".*rechnung.*",
+    )
+    session = FakeSession(raws=[
+        (5, build_raw(subject="Rechnung 5", message_id="<m5@x>")),
+        (6, build_raw(subject="Rechnung 6", message_id="<m6@x>")),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    result = await asyncio.wait_for(
+        poll_mailbox_once(store, client, store.get_mailbox(mailbox_id),
+                          store.get_org(org_id), matcher=FirstMatchesThenUnavailable()),
+        timeout=60,
+    )
+
+    assert result.documents_uploaded == 1                  # the answered match stands
+    assert [u[1] for u in client.uploads] == ["a.pdf"]
+    assert store.dedup_exists(poll_dedup_hash(mailbox_id, "<m5@x>", "a.pdf"))
+    ocr_jobs = [job for job in store.list_jobs() if job.kind == "ocr"]
+    assert [job.status for job in ocr_jobs] == ["pending"]
+    assert result.error is not None                        # the stopped poll is visible
+    assert session.seen == []                              # nothing was \Seen
+    assert store.get_mailbox(mailbox_id).last_seen_uid is None
+
+
+def poll_dedup_hash(mailbox_id, message_id, filename):
+    from papra_suite.mail import dedup_hash
+
+    return dedup_hash(mailbox_id, message_id, filename, len(b"%PDF-1"))
+
+
+async def test_poll_fails_when_the_filter_cannot_be_prevalidated(store, monkeypatch):
+    r"""A mailbox whose filter cannot be EVALUATED must not poll "successfully".
+
+    KillableMatcher.validate swallowed MatcherUnavailable and logged
+    "pre-validation skipped", so a mailbox with a dead child polled GREEN
+    forever — and the catastrophic-pattern rejection that gate exists to
+    enforce stopped being enforced at all. UNAVAILABLE from the gate now runs
+    into the same poll-failure path as a rejected pattern: error visible,
+    nothing processed, no \Seen. Red today: the swallowed skip let the poll
+    scan the message and retire it.
+    """
+    import sys
+
+    import papra_suite.mail as mail_mod
+    from papra_suite.safematch import KillableMatcher
+
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=r"(a|aa)+b",
+    )
+    session = FakeSession(raws=[(1, build_raw(subject="a" * 5000, message_id="<x@x>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    monkeypatch.setattr(
+        mail_mod, "KillableMatcher",
+        lambda: KillableMatcher(command=[sys.executable, "-c", "import sys; sys.exit(3)"]),
+    )
+
+    result = await asyncio.wait_for(
+        poll_mailbox_once(store, StubClient(), store.get_mailbox(mailbox_id),
+                          store.get_org(org_id)),
+        timeout=60,
+    )
+
+    assert result.error is not None and "regex child" in result.error
+    assert result.messages_scanned == 0              # rejected before processing
+    assert session.seen == []
+    mailbox = store.get_mailbox(mailbox_id)
+    assert mailbox.consecutive_failures == 1
+    assert mailbox.last_error is not None
 
 
 async def test_poll_with_unsafe_subject_filter_records_failure(store, monkeypatch):

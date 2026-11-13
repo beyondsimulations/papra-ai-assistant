@@ -13,18 +13,34 @@ they land mid-search. The loop stays free while the child burns CPU.
 
 CONTRACT. Every request either gets an answer or is decided by a kill, and
 the caller never blocks past its budget:
-  * MatchOutcome.TIMEOUT   — the budget expired, the child was killed
-  * MatchOutcome.UNAVAILABLE — no child could be used; the caller degrades
+  * MatchOutcome.TIMEOUT   — the budget expired, the child was killed, so
+                             the request is DECIDED (the poller counts it as a
+                             non-match and retires the mail)
+  * MatchOutcome.UNAVAILABLE — no child could be used, so NOTHING was
+                             decided: the caller must stop and report it, and
+                             must never degrade it into "the filter said no"
 The child is lazy (a mailbox without a filter never spawns one), carries one
 request at a time, and is disposable: a blown budget, a crash, an EOF, or a
 garbled reply retires it and the next request gets a fresh one — with a
 bounded number of retries, so a child that dies on every attempt degrades
-instead of looping forever. aclose() kills the child and is idempotent, so
-the owner's teardown (serve shutdown, task death, mailbox removal) cannot
-leave an orphan behind: teardown returns only once the child has been reaped
+instead of looping forever. aclose() kills the child and is idempotent: for
+COOPERATIVE teardown (serve shutdown via the stop event or cancellation, task
+death, mailbox removal) teardown returns only once the child has been reaped
 (SIGTERM, wait, SIGKILL, longer wait — both signals waited on, and the child
-that a cancelled or closed matcher leaves behind is killed by the spawn that
+a cancelled or closed matcher leaves behind is killed by the spawn that
 created it, never abandoned).
+
+Cooperative teardown therefore means: the matcher is closed, and closing it
+terminates the child and awaits its exit. That is a statement about the
+teardowns that actually run, not about how long a child process can live.
+Where the parent never gets to clean up — SIGKILL or OOM death, an event loop
+that died with it, a container stopped past its grace period — two things end
+the child, and neither is ours: an IDLE one sees stdin close and returns (an
+orphan measured 0.3 s after its parent, no alarm involved), and one in the
+middle of an operation ends itself at the deadline_s in the request it is
+running, on platforms that have SIGALRM (see papra_suite/regex_worker.py —
+without SIGALRM there is no self-bound, which is why this module keeps killing
+the children it can still reach).
 """
 
 import asyncio
@@ -50,8 +66,21 @@ REAP_GRACE_S = 2.0
 # Requests are retried against a replacement child at most this often: a
 # child that dies on every attempt must degrade, not spin.
 MAX_CHILD_RETRIES = 2
+# Every request carries the deadline the CHILD must hold itself to: this
+# process's budget plus a grace that lets the parent's own kill land first.
+# It exists because the parent is not a trustworthy watchdog: SIGKILL the
+# parent (or OOM it, or lose its event loop) mid-search and the child is an
+# orphan at ppid=1 with nothing left to signal it — measured, 100 CPU-seconds
+# and still climbing. The child enforces this number with SIGALRM (see
+# regex_worker.py); the parent still kills children it is waiting on itself.
+SELF_DEADLINE_GRACE_S = 2.0
 
-DEFAULT_COMMAND = (sys.executable, "-m", "papra_suite.regex_worker")
+# -P (PYTHONSAFEPATH): do not put the cwd on sys.path. `-m` otherwise makes
+# sys.path[0] the working directory, so a shadowing papra_suite/ next to the
+# daemon would answer the filter instead of the pinned package; _child_env()
+# below is what makes the REAL package importable, and -P is what keeps that
+# pin from being outranked.
+DEFAULT_COMMAND = (sys.executable, "-P", "-m", "papra_suite.regex_worker")
 
 
 class MatchOutcome(str, enum.Enum):
@@ -95,12 +124,16 @@ def _parse_reply(reply_line: bytes, request_id: int) -> tuple[dict | None, str]:
 def _child_env() -> dict:
     """Parent environment plus a PYTHONPATH pin at this package's parent.
 
-    The child is started with `-m papra_suite.regex_worker`, which needs the
-    package importable in a fresh interpreter. Depending on how the service
+    The child is started with `-P -m papra_suite.regex_worker`, which needs
+    the package importable in a fresh interpreter. Depending on how the service
     was launched (installed, `python -m papra_suite`, a test run that gets
     its sys.path from a root conftest) that is not guaranteed by the inherited
-    environment alone, and a child that cannot import the package would
-    silently degrade every subject filter to non-match.
+    environment alone, and a child that cannot import the package answers
+    nothing: the filter cannot decide, so the filtered poll stops with
+    MatcherUnavailable rather than ingesting on its own (see mail.py).
+    `-P` is what makes this pin the whole story rather than one candidate among
+    several: without it `-m` puts the working directory at the head of sys.path,
+    where a shadowing papra_suite/ would outrank the pin.
     """
     import papra_suite
 
@@ -111,6 +144,16 @@ def _child_env() -> dict:
         package_root + os.pathsep + existing if existing else package_root
     )
     return env
+
+
+def _self_deadline_s(timeout_s: float) -> float:
+    """The wall-clock bound the child enforces on itself for one request.
+
+    Always longer than the parent's own budget, so in the normal case the
+    parent's kill (or its aclose()) is what ends the child and the alarm is
+    only ever seen by the orphan the parent could not reach.
+    """
+    return timeout_s + SELF_DEADLINE_GRACE_S
 
 
 class KillableMatcher:
@@ -154,7 +197,9 @@ class KillableMatcher:
 
         Returns MATCH/NOMATCH, TIMEOUT when the budget expired (the child is
         dead, the next call respawns), or UNAVAILABLE when no child could run
-        at all. Never raises: the poll site must keep ingesting either way.
+        at all. Never raises — but UNAVAILABLE is NOT an answer: it is this
+        module's way of saying "nothing was decided", and the caller decides
+        what that means (the poller stops and reports; see mail.py).
         """
         try:
             reply = await self._request(
@@ -184,10 +229,12 @@ class KillableMatcher:
         rejection — a pattern whose probe timing does not terminate inside
         the budget is exactly the class the gate exists to refuse.
 
-        An empty pattern needs no validation and must not start a child. If
-        no child can run at all the gate is SKIPPED with a WARNING: the
-        killable per-message search is what protects the process, so a broken
-        child costs the early rejection, never the process.
+        An empty pattern needs no validation and must not start a child. A
+        child that cannot run at all raises MatcherUnavailable INSTEAD of the
+        gate being skipped: a mailbox whose filter cannot be evaluated must not
+        poll "successfully". This early gate is the only place an unusable
+        filter is refused at all, and skipping it left the mailbox looking
+        healthy while every message burned its match budget in a dead child.
         """
         if not pattern:
             return
@@ -201,12 +248,6 @@ class KillableMatcher:
                 f"subject filter is unsafe: validation exceeded {timeout_s}s "
                 "and was killed"
             ) from error
-        except MatcherUnavailable as error:
-            logger.warning(
-                "subject filter pre-validation skipped, no regex child available: %s",
-                error,
-            )
-            return
         if "error" in reply:
             raise ValueError(str(reply["error"]))
 
@@ -238,7 +279,10 @@ class KillableMatcher:
                 process = await self._ensure_process()
                 self._next_id += 1
                 request_id = self._next_id
-                line = json.dumps({"id": request_id, **payload}).encode("utf-8") + b"\n"
+                request = {"id": request_id,
+                           "deadline_s": _self_deadline_s(timeout_s),
+                           **payload}
+                line = json.dumps(request).encode("utf-8") + b"\n"
                 try:
                     process.stdin.write(line)
                     await process.stdin.drain()

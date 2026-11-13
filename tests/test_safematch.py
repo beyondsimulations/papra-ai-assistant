@@ -11,6 +11,7 @@ bounded retries, and teardown leaves no orphan process behind.
 """
 
 import asyncio
+import contextlib
 import os
 import signal
 import sys
@@ -18,7 +19,8 @@ import time
 
 import pytest
 
-from papra_suite.safematch import KillableMatcher, MatchOutcome
+import papra_suite.safematch as safematch
+from papra_suite.safematch import KillableMatcher, MatcherUnavailable, MatchOutcome
 
 # The anchored-literal class: its ambiguous group sits behind the literal, so
 # validate_subject_filter's probes (which never carry that literal) measure
@@ -26,6 +28,9 @@ from papra_suite.safematch import KillableMatcher, MatchOutcome
 # matching prefix — this is the residual the killable child exists to bound.
 CATASTROPHIC = r"(Rechnung|Invoice)\s*(\d+\s*)+$"
 CRAFTED_SUBJECT = "Rechnung " + "1" * 40 + "!"
+# The per-request budget these tests hand the child (kept short so the
+# self-deadline fires inside the test, not after a real 2s poll).
+SUBJECT_BUDGET_S = 2.0
 # The class the ratio gate does catch (probe near-misses hit its ambiguity).
 GATED_PATTERN = r"(a|aa)+b"
 
@@ -133,18 +138,26 @@ async def test_child_killed_between_requests_is_retried_on_the_respawn():
 
 async def test_a_child_that_dies_every_time_degrades_without_hanging():
     """Bounded retries, then degrade: a broken child must never wedge the
-    poll loop and must never raise out of search()."""
+    poll loop and must never raise out of search().
+
+    CONTRACT CHANGE (round-4 review, decided deliberately): validate() no
+    longer degrades to "skipped". An unusable child means the gate decided
+    NOTHING, and a mailbox that polls green with an inert filter is worse than
+    one that fails: search() still reports UNAVAILABLE (never raises), while
+    validate() raises MatcherUnavailable so the caller can fail the poll. The
+    assertion below got stricter, not looser; test_mail_poller asserts the
+    poll-site consequence (mail un-retired, cursor frozen, failure counted).
+    """
     matcher = KillableMatcher(command=[sys.executable, "-c", "import sys; sys.exit(3)"])
     try:
         outcome = await asyncio.wait_for(
             matcher.search("needle", "the needle", timeout_s=5.0), timeout=60
         )
         assert outcome is MatchOutcome.UNAVAILABLE
-        # validation cannot run either: it degrades to "skipped" (the killable
-        # per-message search is what protects the process), never a crash
-        assert await asyncio.wait_for(
-            matcher.validate(GATED_PATTERN, timeout_s=5.0), timeout=60
-        ) is None
+        # validation cannot run either, and that is a FAILURE, not a pass:
+        # a filter that was never evaluated must not look like a safe filter
+        with pytest.raises(MatcherUnavailable):
+            await asyncio.wait_for(matcher.validate(GATED_PATTERN, timeout_s=5.0), timeout=60)
     finally:
         await matcher.aclose()
 
@@ -387,5 +400,226 @@ async def test_validate_accepts_realistic_operator_patterns():
     try:
         for pattern in realistic:
             await matcher.validate(pattern, timeout_s=30.0)
+    finally:
+        await matcher.aclose()
+
+
+# --- The child bounds ITSELF: the parent may be dead when the budget ends ---
+
+# The parent owns the NUMBER (it sends deadline_s with every request); the
+# child owns the ENFORCEMENT. Without it the only watchdog was the parent, and
+# `kill -9` on the parent while the child was backtracking left an orphan at
+# ppid=1 burning CPU (measured: still running 100 s later, 98 CPU-seconds,
+# killed by hand) — and because the cursor had not advanced, every restart
+# re-armed and could add another orphan.
+ORPHAN_HARNESS = """
+import asyncio
+import os
+import signal
+
+from papra_suite.safematch import KillableMatcher
+
+
+async def main():
+    matcher = KillableMatcher()
+    task = asyncio.create_task(matcher.search({pattern!r}, {subject!r},
+                                              timeout_s={budget}))
+    for _ in range(4000):
+        if matcher.pid is not None:
+            break
+        await asyncio.sleep(0.005)
+    print(matcher.pid, flush=True)
+    await asyncio.sleep(0.3)            # let the search get properly underway
+    os.kill(os.getpid(), signal.SIGKILL)  # the parent the ONLY watchdog was
+
+
+asyncio.run(main())
+"""
+
+
+async def _read_child_pid(stdout) -> int:
+    """One line from the harness: the pid of the child it left behind."""
+    line = await asyncio.wait_for(stdout.readline(), timeout=90)
+    assert line, "the orphan harness died before reporting its child"
+    return int(line)
+
+
+async def test_an_orphaned_child_kills_itself_when_the_parent_is_sigkilled():
+    """The self-deadline is the last line of defence, and it must be the
+    child's: SIGALRM has no Python handler installed here, so its default
+    disposition terminates the process even mid-re.search, where nothing this
+    interpreter could run would ever get a turn.
+
+    Measured before the fix: the harness's SIGKILL left the child at ppid=1
+    still burning a core (98 CPU-seconds after 100 s, killed by hand).
+    """
+    from papra_suite.safematch import _child_env
+
+    harness = ORPHAN_HARNESS.format(pattern=CATASTROPHIC, subject=CRAFTED_SUBJECT,
+                                    budget=SUBJECT_BUDGET_S)
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", harness,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=_child_env(),
+    )
+    child_pid = await _read_child_pid(proc.stdout)
+    armed = time.monotonic()          # the alarm went in with this request
+    await asyncio.wait_for(proc.wait(), timeout=30)
+    assert proc.returncode == -9, "the harness must die of its own SIGKILL"
+
+    try:
+        # the child is still mid-search when the parent dies: it has to be
+        # alive to be orphaned, and this is what the self-deadline is for
+        os.kill(child_pid, 0)
+        deadline = armed + SUBJECT_BUDGET_S + safematch.SELF_DEADLINE_GRACE_S + 6.0
+        while True:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, (
+                f"orphaned regex child {child_pid} was still running "
+                f"{SUBJECT_BUDGET_S}s after its parent was SIGKILLed: the child "
+                "has no wall-clock self-deadline and will burn CPU forever"
+            )
+            await asyncio.sleep(0.05)
+    finally:
+        with contextlib.suppress(ProcessLookupError):   # never leave a burner
+            os.kill(child_pid, signal.SIGKILL)
+
+
+async def test_an_idle_child_is_not_killed_by_its_own_deadline(monkeypatch):
+    """The self-deadline arms around an OPERATION, not around the child's
+    life: one child is reused across a whole poll loop's life, so killing an
+    idle one between requests would turn the safety net into the outage.
+
+    A tiny grace makes the alarm that WOULD have fired land well inside the
+    sleep below; the alarm being cancelled on completion is what keeps the
+    same child alive and answering afterwards.
+    """
+    import papra_suite.safematch as safematch_mod
+
+    monkeypatch.setattr(safematch_mod, "SELF_DEADLINE_GRACE_S", 0.0)
+    matcher = KillableMatcher()
+    try:
+        assert await matcher.search("needle", "the needle", timeout_s=0.5) \
+            is MatchOutcome.MATCH
+        pid = matcher.pid
+        assert pid is not None
+        await asyncio.sleep(1.5)        # past the 1s alarm that request armed
+        os.kill(pid, 0)                 # still in the process table
+        assert matcher.pid == pid
+        assert await matcher.search("needle", "the needle", timeout_s=10.0) \
+            is MatchOutcome.MATCH
+        assert matcher.pid == pid       # the SAME child, never respawned
+    finally:
+        await matcher.aclose()
+
+
+async def test_a_request_without_a_deadline_is_still_answered():
+    """deadline_s is the parent's number, not a protocol requirement: a
+    hand-made request (or a parent from before the field existed) must still
+    be served, on the child's own conservative default."""
+    import json
+
+    from papra_suite.safematch import DEFAULT_COMMAND, _child_env
+
+    proc = await asyncio.create_subprocess_exec(
+        *DEFAULT_COMMAND,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL, env=_child_env(),
+    )
+    try:
+        proc.stdin.write(json.dumps({"id": 1, "op": "search", "pattern": "needle",
+                                     "subject": "the needle", "flags": 2}).encode() + b"\n")
+        await proc.stdin.drain()
+        reply = json.loads(await asyncio.wait_for(proc.stdout.readline(), timeout=20))
+        assert reply == {"id": 1, "matched": True}
+    finally:
+        proc.kill()
+        await proc.wait()
+
+
+# --- the import path the child actually uses -------------------------------
+
+# A papra_suite/ package that answers "matched" to everything and passes every
+# validation: if the child ever imports THIS copy instead of the pinned one,
+# the subject filter stops being a gate and reports what an attacker chose.
+HOSTILE_WORKER = '''
+import json
+import sys
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    if request.get("op") == "validate":
+        reply = {"id": request.get("id"), "ok": True}
+    else:
+        reply = {"id": request.get("id"), "matched": True}
+    sys.stdout.write(json.dumps(reply) + "\\n")
+    sys.stdout.flush()
+'''
+
+
+def _write_shadow_package(root) -> None:
+    package = root / "papra_suite"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "regex_worker.py").write_text(HOSTILE_WORKER, encoding="utf-8")
+
+
+async def _ask_worker(command, cwd, request: dict) -> dict | None:
+    """One raw request to DEFAULT_COMMAND (or a mutant of it) from `cwd`."""
+    import json
+
+    from papra_suite.safematch import _child_env
+
+    proc = await asyncio.create_subprocess_exec(
+        *command, cwd=str(cwd),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL, env=_child_env(),
+    )
+    try:
+        proc.stdin.write(json.dumps(request).encode() + b"\n")
+        await proc.stdin.drain()
+        line = await asyncio.wait_for(proc.stdout.readline(), timeout=20)
+        return json.loads(line) if line else None
+    finally:
+        proc.kill()
+        await proc.wait()
+
+
+async def test_the_child_ignores_a_shadowing_package_in_its_cwd(tmp_path, monkeypatch):
+    """`python -m` puts the CWD ahead of the PYTHONPATH pin, so without -P a
+    papra_suite/ next to the daemon's working directory answers the operator's
+    filter instead of the shipped one — a silent parent/child divergence for
+    any script or console-script launch, and the shape the pin's docstring is
+    about. -P (PYTHONSAFEPATH) keeps the cwd off sys.path so the pin wins.
+    """
+    shadow = tmp_path / "shadow"
+    _write_shadow_package(shadow)
+    monkeypatch.chdir(shadow)
+    request = {"id": 1, "op": "search", "pattern": "needle", "subject": "haystack",
+               "flags": 2}
+
+    # control: the shadow really does win when the cwd is on the path, so the
+    # assertion below cannot pass vacuously
+    from papra_suite.safematch import DEFAULT_COMMAND
+
+    shadowed = await _ask_worker([DEFAULT_COMMAND[0], "-m", "papra_suite.regex_worker"],
+                                 shadow, request)
+    assert shadowed == {"id": 1, "matched": True}
+
+    matcher = KillableMatcher()
+    try:
+        # the shipped gate answers: the pattern does not match, and the
+        # catastrophic pattern is still refused
+        assert await matcher.search("needle", "haystack", timeout_s=10.0) \
+            is MatchOutcome.NOMATCH
+        with pytest.raises(ValueError, match="unsafe"):
+            await matcher.validate(GATED_PATTERN, timeout_s=30.0)
     finally:
         await matcher.aclose()

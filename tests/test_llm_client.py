@@ -389,3 +389,63 @@ async def test_malformed_top_level_array_raises_llm_error():
         with pytest.raises(LLMError, match="malformed chat completions response") as excinfo:
             await client.chat([{"role": "user", "content": "hi"}])
     assert excinfo.value.status == 200
+
+
+async def test_null_content_with_length_finish_reason_is_one_permanent_request():
+    """{"content": null, "finish_reason": "length"} is the truncated case with
+    an EMPTY body. Reading the content with choice["message"]["content"] raises
+    TypeError inside the parse wrap, so the response came back as
+    LLMError(malformed…, status=200, permanent=False): neither the 4xx rule nor
+    `permanent` applied, and the job rode all three attempts (~2.5 min of
+    backoff and three identical vision calls) instead of failing once. The
+    finish_reason gate has to be reached BEFORE the body is judged complete.
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=completion_body(None, "length"))
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError) as excinfo:
+            await client.chat([{"role": "user", "content": "x"}])
+
+    assert calls["n"] == 1                      # no retry storm on a deterministic answer
+    assert excinfo.value.permanent is True
+    assert excinfo.value.status is None
+    assert "length" in str(excinfo.value)
+
+
+async def test_null_content_with_a_normal_finish_reason_is_the_malformed_error():
+    """The other half: null content with no truncation to blame stays the
+    malformed-body error the client has always raised (status 200 so callers
+    can see it came from a 2xx, retryable because a different attempt might
+    actually answer)."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=completion_body(None, "stop"))
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError, match="malformed chat completions response") as excinfo:
+            await client.chat([{"role": "user", "content": "x"}])
+
+    assert excinfo.value.status == 200
+    assert excinfo.value.permanent is False
+    assert calls["n"] == 1     # malformed is raised, not retried, like every other body error
+
+
+async def test_absent_content_key_with_content_filter_is_permanent_too():
+    """Same gate for the key being absent entirely: content_filter still owns
+    the verdict, so the absence must not be what the caller is told about."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {},
+                                                      "finish_reason": "content_filter"}]})
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError) as excinfo:
+            await client.chat([{"role": "user", "content": "x"}])
+
+    assert excinfo.value.permanent is True
+    assert "content_filter" in str(excinfo.value)

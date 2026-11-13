@@ -20,7 +20,7 @@ from email.message import Message
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.papra_client import PapraClient, PapraError
 from papra_suite.pipeline import enqueue_ocr_job
-from papra_suite.safematch import KillableMatcher, MatchOutcome
+from papra_suite.safematch import KillableMatcher, MatcherUnavailable, MatchOutcome
 from papra_suite.store import Mailbox, Org, Store
 
 logger = logging.getLogger(__name__)
@@ -472,8 +472,13 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
     all messages of a poll and is killed together with the task (serve
     shutdown, mailbox deleted/disabled, task death). A caller that injects
     nothing gets a private matcher, closed on the way out of here — so the
-    killable filter cannot be forgotten by a caller, and no path leaves an
-    orphan regex_worker behind.
+    killable filter cannot be forgotten by a caller: the teardowns that run (a
+    return, an exception, a cancelled task) close the matcher, which terminates
+    the child and awaits its exit. What that cannot cover is a parent that runs
+    no teardown at all — SIGKILL or OOM death, an event loop that died with it,
+    a container stopped past its grace period. An idle child outliving that
+    exits on closed stdin; one inside an operation is bounded by the deadline
+    that request carries (see regex_worker.py, and its SIGALRM caveat).
     """
     if matcher is not None:
         return await _poll_mailbox_once(store, client, mailbox, org, matcher)
@@ -491,9 +496,19 @@ async def _subject_filter_match(matcher: KillableMatcher, subject: str | None,
     Mirrors subject_matches' cheap branches (no pattern matches everything,
     a missing subject matches nothing) so the sync helper and the production
     path keep answering the same question, then runs the actual regex in the
-    child. A killed match (TIMEOUT) and a child that cannot run at all
-    (UNAVAILABLE) are both NON-MATCHES plus a WARNING: the poll continues,
-    \Seen and the cursor advance, and the next poll is not poisoned again.
+    child.
+
+    THE SPLIT (round-4 review): an UNANSWERED filter is not a decided one.
+      * TIMEOUT — the budget was spent on THIS subject and the search was
+        killed: a DECIDED non-match. Warning, non-match, and the poll retires
+        the message (\Seen + cursor), which is what stops poison mail from
+        being re-fetched and re-killed on every poll.
+      * UNAVAILABLE — no child could run at all, so nothing was decided.
+        Raises MatcherUnavailable: the poll stops with an error, the cursor
+        does not advance past THAT message (anything decided earlier in the same
+        poll keeps its own progress) and the mail is re-fetched, because
+        retiring it here was silent ingestion loss — the failure also becomes
+        visible through record_poll_failure and the 3-strike path.
     Degrading to a non-match rather than to a match is deliberate — an
     unanswered filter must never ingest mail on its own.
     """
@@ -510,9 +525,10 @@ async def _subject_filter_match(matcher: KillableMatcher, subject: str | None,
             SUBJECT_FILTER_TIMEOUT_S, uid,
         )
     elif outcome is MatchOutcome.UNAVAILABLE:
-        logger.warning(
-            "subject filter could not be evaluated on uid=%s (no regex child "
-            "available); treating the message as a non-match", uid
+        raise MatcherUnavailable(
+            f"subject filter could not be evaluated on uid={uid}: the regex child "
+            "cannot run, so this message was left un-retired and the cursor did "
+            "not advance past it"
         )
     return outcome is MatchOutcome.MATCH
 
@@ -532,7 +548,9 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
         # instead of the process paying for the pattern one message at a time.
         # It runs in the killable child, so a pattern whose probe never
         # terminates ((a+)+\d+$) is killed and rejected here rather than
-        # freezing the loop before a single mail is read.
+        # freezing the loop before a single mail is read. A child that cannot
+        # run at all raises MatcherUnavailable into this same handler: a mailbox
+        # whose filter cannot be evaluated must not poll "successfully".
         await matcher.validate(mailbox.subject_filter,
                                timeout_s=SUBJECT_VALIDATION_TIMEOUT_S)
         await asyncio.to_thread(session.connect)
@@ -581,8 +599,11 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
             # on "Rechnung 111...!") is killed at SUBJECT_FILTER_TIMEOUT_S:
             # the kernel delivers the signal, so unlike a wait_for around a
             # search here (which cannot fire while re.search holds the GIL)
-            # the budget actually ends the match, the event loop stays free
-            # for the whole run, and the cursor still advances below.
+            # the budget actually ends the match and the event loop stays free.
+            # A KILLED search is decided, so the cursor still advances below and
+            # the poison mail is not re-armed on the next poll; a child that
+            # cannot run at all raises (see _subject_filter_match) and this poll
+            # stops WITHOUT retiring the message or advancing the cursor.
             matched = await _subject_filter_match(
                 matcher, parsed.subject, mailbox.subject_filter, uid=uid
             )

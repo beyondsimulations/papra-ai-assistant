@@ -88,7 +88,16 @@ class LLMClient:
             if response.is_success:
                 try:
                     choice = response.json()["choices"][0]
-                    content = choice["message"]["content"].strip()
+                    # .get("content"), NOT ["content"].strip(): a server that
+                    # hit its output cap answers
+                    # {"content": null, "finish_reason": "length"}, and a raise
+                    # here would report that as a RETRYABLE malformed body
+                    # (status 200, permanent=False) — neither the 4xx rule nor
+                    # the permanence flag would apply, and a deterministic
+                    # truncation would ride all three attempts (three identical
+                    # vision calls plus ~2.5 min of backoff) instead of failing
+                    # once. Read it, then let the finish_reason gate decide.
+                    content = choice["message"].get("content")
                     finish_reason = choice.get("finish_reason")
                 except Exception as error:  # noqa: BLE001
                     # A 2xx body is not guaranteed to be a well-formed chat
@@ -109,10 +118,20 @@ class LLMClient:
                 if finish_reason in ("length", "content_filter"):
                     raise LLMError(
                         f"chat completion ended early: finish_reason={finish_reason} "
-                        f"after {len(content)} characters",
+                        f"after {len(content) if isinstance(content, str) else 0} characters",
                         None,
                         permanent=True,
                     )
+                if not isinstance(content, str):
+                    # nothing to hand back and nothing truncated to blame: this
+                    # is the malformed-body error it always was (a non-string
+                    # content, e.g. a parts list, lands here too rather than
+                    # escaping as an AttributeError from .strip())
+                    raise LLMError(
+                        f"malformed chat completions response: {response.text[:200]}",
+                        response.status_code,
+                    )
+                content = content.strip()
                 if finish_reason is not None and finish_reason != "stop":
                     # Unknown reasons (servers invent their own) stay usable but
                     # must not pass silently.

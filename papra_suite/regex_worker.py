@@ -10,10 +10,32 @@ kernel at any moment, which is the bound the subject filter actually needs.
 
 PROTOCOL (newline-delimited JSON, one request -> exactly one reply line):
     in:  {"id": int, "op": "search"|"validate", "pattern": str,
-          "subject": str, "flags": int}
+          "subject": str, "flags": int, "deadline_s": float (optional)}
     out: {"id": int, "matched": bool}      search success
          {"id": int, "ok": true}           validate success
          {"id": int, "error": str}         any rejection or failure
+
+WHY THE CHILD ALSO KILLS ITSELF. The parent's budget is enforced by the
+parent, and the parent is not a trustworthy watchdog: SIGKILL or OOM it mid-
+search and this process is an orphan at ppid=1 with nobody left to signal it
+(measured: still pinning a core 100 s later, 98 CPU-seconds — and since the
+cursor had not advanced, every restart re-armed another one). The self-check
+between requests cannot help either, because a process blocked inside
+re.search never returns to it. So each operation is wrapped in a wall-clock
+self-deadline (deadline_s from the request; the parent owns the number) armed
+with SIGALRM and NO Python handler: with no handler installed, SIGALRM's
+default disposition terminates the process, which the kernel can do mid-
+re.search where nothing this interpreter runs ever could. The alarm is
+cancelled the moment an operation finishes, so an idle child — the normal
+state, one child reused across a whole poll loop's life — is never killed
+between requests; an idle orphan ends a different way, by stdin EOF in main().
+
+TWO THINGS THIS IS NOT. It is not a child-lifetime bound: it bounds the ONE
+operation that is running, and an idle child has no alarm pending. And it is
+not portable: signal.alarm needs SIGALRM, so on a platform without it (Windows)
+this module cannot bound itself at all and the parent's kill is all there is
+(see _NO_SELF_DEADLINE). The whole-second granularity of signal.alarm also
+makes this an order-of-magnitude bound, not a wall-clock promise.
 
 HARD RULE: stdout IS the protocol channel. Nothing else may ever be written
 to it — a stray print desynchronises (or, worse, silently mis-answers) the
@@ -25,6 +47,8 @@ stderr to DEVNULL: an unread, full stderr pipe would block the child).
 
 import json
 import logging
+import math
+import signal
 import sys
 
 # See the HARD RULE above: an imported module must not be able to write a
@@ -40,6 +64,43 @@ def _reply(stream, payload: dict) -> None:
     # to the same string), so no locale/encoding setting can corrupt a reply.
     stream.write((json.dumps(payload) + "\n").encode("ascii", "backslashreplace"))
     stream.flush()
+
+
+# A request with no deadline_s is a hand-made one (a foreign caller, a test, an
+# older parent): serve it, but on this conservative bound rather than on none.
+DEFAULT_DEADLINE_S = 300.0
+_NO_SELF_DEADLINE = not hasattr(signal, "SIGALRM")   # e.g. Windows
+
+
+def _self_deadline_s(request: dict) -> float:
+    """The request's own bound, or DEFAULT_DEADLINE_S when it did not send one."""
+    try:
+        deadline = float(request.get("deadline_s"))
+    except (TypeError, ValueError):
+        return DEFAULT_DEADLINE_S
+    if deadline != deadline or deadline <= 0:   # NaN, null, negative, zero
+        return DEFAULT_DEADLINE_S
+    return deadline
+
+
+def _arm_self_deadline(seconds: float) -> None:
+    """SIGALRM with no handler installed: the default disposition kills us.
+
+    Deliberately NO signal.signal() call anywhere in this module: a Python
+    handler could not run while re.search holds the interpreter, and
+    installing one would also replace the terminating disposition that makes
+    this work. signal.alarm() has whole-second granularity, so round up.
+    """
+    if _NO_SELF_DEADLINE:
+        return
+    signal.alarm(max(1, math.ceil(seconds)))
+
+
+def _disarm_self_deadline() -> None:
+    """An idle child is not an overrun one: the bound covers ONE operation."""
+    if _NO_SELF_DEADLINE:
+        return
+    signal.alarm(0)
 
 
 def _handle(request: dict) -> dict:
@@ -86,7 +147,12 @@ def main() -> int:
         except (UnicodeDecodeError, ValueError, TypeError) as error:
             _reply(stdout, {"id": None, "error": f"malformed request: {error}"})
             continue
-        _reply(stdout, _handle(request))
+        _arm_self_deadline(_self_deadline_s(request))
+        try:
+            reply = _handle(request)
+        finally:
+            _disarm_self_deadline()   # only reached if the alarm did not fire
+        _reply(stdout, reply)
 
 
 if __name__ == "__main__":
