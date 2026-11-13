@@ -477,6 +477,126 @@ def test_wal_retry_deadline_raises(tmp_path, monkeypatch):
     assert time.perf_counter() - start < 5.0
 
 
+# -- orgs and mailboxes -----------------------------------------------------
+
+def test_org_roundtrip(store):
+    org_id = store.create_org(papra_org_id="org_abc", name="Test Org")
+    org = store.get_org(org_id)
+    assert org is not None and org.papra_org_id == "org_abc" and org.name == "Test Org"
+    assert store.get_org_by_papra_id("org_abc").id == org_id
+    assert store.get_org("nope") is None
+    assert store.get_org_by_papra_id("nope") is None
+
+
+def test_create_org_is_idempotent_on_papra_id(store):
+    first = store.create_org(papra_org_id="org_abc", name="A")
+    second = store.create_org(papra_org_id="org_abc", name="A")
+    assert first == second
+
+
+def test_mailbox_roundtrip(store):
+    org_id = store.create_org(papra_org_id="org_abc", name="Org")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.example.com", port=993,
+        username="user", password="pass", subject_filter=".*rechnung.*",
+    )
+    mailbox = store.get_mailbox(mailbox_id)
+    assert mailbox is not None
+    assert mailbox.host == "imap.example.com" and mailbox.port == 993
+    assert mailbox.username == "user" and mailbox.password == "pass"
+    assert mailbox.ssl_mode == "ssl" and mailbox.poll_interval_s == 300
+    assert mailbox.subject_filter == ".*rechnung.*"
+    assert mailbox.delete_after_download is False and mailbox.enabled is True
+    assert mailbox.last_seen_uid is None and mailbox.uidvalidity is None
+    assert mailbox.consecutive_failures == 0
+    assert mailbox in store.list_mailboxes()
+    store.delete_mailbox(mailbox_id)
+    assert store.get_mailbox(mailbox_id) is None
+
+
+def test_list_mailboxes_enabled_only(store):
+    org_id = store.create_org(papra_org_id="org_abc", name="Org")
+    active = store.create_mailbox(org_id=org_id, host="h1", port=993, username="u", password="p")
+    store.create_mailbox(org_id=org_id, host="h2", port=993, username="u", password="p")
+    # disable the first via three recorded failures
+    for _ in range(3):
+        store.record_poll_failure(active, "auth failed")
+    enabled = store.list_mailboxes(enabled_only=True)
+    assert [m.id for m in enabled if m.id == active] == []
+
+
+def test_record_poll_success_and_failure_reject_unknown_mailbox(store):
+    with pytest.raises(ValueError, match="unknown mailbox"):
+        store.record_poll_success("nope", last_seen_uid=1, uidvalidity="1")
+    with pytest.raises(ValueError, match="unknown mailbox"):
+        store.record_poll_failure("nope", "boom")
+
+
+def test_record_poll_success_clears_failure_state(store):
+    org_id = store.create_org(papra_org_id="org_abc", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="h", port=993, username="u", password="p")
+    store.record_poll_failure(mailbox_id, "boom")
+    store.record_poll_success(mailbox_id, last_seen_uid=42, uidvalidity="111")
+    mailbox = store.get_mailbox(mailbox_id)
+    assert mailbox.last_seen_uid == 42 and mailbox.uidvalidity == "111"
+    assert mailbox.last_error is None and mailbox.consecutive_failures == 0
+    assert mailbox.last_poll_at is not None
+
+
+def test_record_poll_failure_disables_after_threshold(store):
+    org_id = store.create_org(papra_org_id="org_abc", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="h", port=993, username="u", password="p")
+    store.record_poll_failure(mailbox_id, "boom 1")
+    store.record_poll_failure(mailbox_id, "boom 2")
+    assert store.get_mailbox(mailbox_id).enabled is True
+    assert store.get_mailbox(mailbox_id).consecutive_failures == 2
+    store.record_poll_failure(mailbox_id, "boom 3")
+    mailbox = store.get_mailbox(mailbox_id)
+    assert mailbox.enabled is False
+    assert mailbox.consecutive_failures == 3
+    assert "boom 3" in mailbox.last_error
+
+
+def test_record_poll_failure_truncates_long_errors(store):
+    org_id = store.create_org(papra_org_id="org_abc", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="h", port=993, username="u", password="p")
+    store.record_poll_failure(mailbox_id, "x" * 5000)
+    assert len(store.get_mailbox(mailbox_id).last_error) <= 500
+
+
+# -- job safety (M2 entry requirements) ---------------------------------------
+
+def test_recover_running_jobs_resets_to_pending(store):
+    job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                                content_hash="abc", payload={})
+    store.claim_next_job("ocr")
+    assert store.get_job(job_id).status == "running"
+    assert store.recover_running_jobs() == 1
+    recovered = store.get_job(job_id)
+    assert recovered.status == "pending" and recovered.attempts == 0
+    # claimable again immediately (next_attempt_at reset to now)
+    assert store.claim_next_job("ocr").id == job_id
+    assert store.recover_running_jobs() == 0
+
+
+def test_claim_next_job_survives_lost_race(store):
+    # simulate another instance stealing the job between SELECT and UPDATE:
+    # enqueue two, claim one externally via raw SQL, then claim via the API
+    store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                      content_hash="h1", payload={})
+    store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_2",
+                      content_hash="h2", payload={})
+    store._conn.execute("UPDATE jobs SET status = 'done' WHERE document_id = 'doc_1'")
+    store._conn.commit()
+    job = store.claim_next_job("ocr")
+    assert job.document_id == "doc_2" and job.status == "running"
+
+
+def test_mark_job_failed_unknown_job_raises(store):
+    with pytest.raises(ValueError, match="unknown job"):
+        store.mark_job_failed("no-such-job", "boom")
+
+
 def test_wal_retry_raises_fast_on_fatal_error(tmp_path):
     """A non-lock OperationalError at WAL-pragma time (e.g. an unwritable
     data dir: the pre-created db opens read-only, so PRAGMA journal_mode=WAL

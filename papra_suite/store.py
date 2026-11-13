@@ -125,6 +125,33 @@ MIGRATIONS = [_migration_001_initial]
 
 
 @dataclass
+class Org:
+    id: str
+    papra_org_id: str
+    name: str
+
+
+@dataclass
+class Mailbox:
+    id: str
+    org_id: str
+    host: str
+    port: int
+    username: str
+    password: str
+    ssl_mode: str
+    poll_interval_s: int
+    subject_filter: str | None
+    delete_after_download: bool
+    enabled: bool
+    last_seen_uid: int | None
+    uidvalidity: str | None
+    last_poll_at: str | None
+    last_error: str | None
+    consecutive_failures: int
+
+
+@dataclass
 class Job:
     id: str
     kind: str
@@ -138,6 +165,18 @@ class Job:
     error: str | None
     created_at: str
     updated_at: str
+
+
+def _row_to_mailbox(row: sqlite3.Row) -> Mailbox:
+    return Mailbox(
+        id=row["id"], org_id=row["org_id"], host=row["host"], port=row["port"],
+        username=row["username"], password=row["password"], ssl_mode=row["ssl_mode"],
+        poll_interval_s=row["poll_interval_s"], subject_filter=row["subject_filter"],
+        delete_after_download=bool(row["delete_after_download"]),
+        enabled=bool(row["enabled"]), last_seen_uid=row["last_seen_uid"],
+        uidvalidity=row["uidvalidity"], last_poll_at=row["last_poll_at"],
+        last_error=row["last_error"], consecutive_failures=row["consecutive_failures"],
+    )
 
 
 def _row_to_job(row: sqlite3.Row) -> Job:
@@ -163,6 +202,9 @@ class Store:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # Timestamp of the last recover_running_jobs() pass on this instance;
+        # None until the first recovery, which reclaims every running job.
+        self._last_recover_at: str | None = None
         # Journal-mode changes do NOT honor busy_timeout: on a fresh (non-WAL)
         # database, if another process holds a write lock, the WAL pragma
         # fails immediately with "database is locked". Retry within a bounded
@@ -249,19 +291,25 @@ class Store:
     def claim_next_job(self, kind: str) -> Job | None:
         now = _now()
         with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT * FROM jobs WHERE kind = ? AND status = 'pending' "
-                "AND next_attempt_at <= ? ORDER BY created_at LIMIT 1",
-                (kind, now),
-            ).fetchone()
-            if row is None:
-                return None
-            self._conn.execute(
-                "UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ?",
-                (now, row["id"]),
-            )
-            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
-        return _row_to_job(row)
+            while True:
+                row = self._conn.execute(
+                    "SELECT * FROM jobs WHERE kind = ? AND status = 'pending' "
+                    "AND next_attempt_at <= ? ORDER BY created_at LIMIT 1",
+                    (kind, now),
+                ).fetchone()
+                if row is None:
+                    return None
+                cursor = self._conn.execute(
+                    "UPDATE jobs SET status = 'running', updated_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (now, row["id"]),
+                )
+                if cursor.rowcount == 1:
+                    row = self._conn.execute(
+                        "SELECT * FROM jobs WHERE id = ?", (row["id"],)
+                    ).fetchone()
+                    return _row_to_job(row)
+                # lost the race against another instance: try the next candidate
 
     def get_job(self, job_id: str) -> Job | None:
         with self._lock:
@@ -282,6 +330,8 @@ class Store:
             row = self._conn.execute(
                 "SELECT attempts FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown job: {job_id}")
             attempts = row["attempts"] + 1
             if attempts >= max_attempts:
                 self._conn.execute(
@@ -317,6 +367,123 @@ class Store:
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [_row_to_job(row) for row in rows]
+
+    # -- orgs ---------------------------------------------------------------
+
+    def create_org(self, *, papra_org_id: str, name: str) -> str:
+        org_id = uuid.uuid4().hex
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO orgs (id, papra_org_id, name) VALUES (?, ?, ?)",
+                (org_id, papra_org_id, name),
+            )
+            row = self._conn.execute(
+                "SELECT id FROM orgs WHERE papra_org_id = ?", (papra_org_id,)
+            ).fetchone()
+        return row["id"]
+
+    def get_org(self, org_id: str) -> Org | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM orgs WHERE id = ?", (org_id,)).fetchone()
+        return Org(row["id"], row["papra_org_id"], row["name"]) if row else None
+
+    def get_org_by_papra_id(self, papra_org_id: str) -> Org | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM orgs WHERE papra_org_id = ?", (papra_org_id,)
+            ).fetchone()
+        return Org(row["id"], row["papra_org_id"], row["name"]) if row else None
+
+    # -- mailboxes ------------------------------------------------------------
+
+    def create_mailbox(self, *, org_id: str, host: str, port: int, username: str,
+                       password: str, ssl_mode: str = "ssl", poll_interval_s: int = 300,
+                       subject_filter: str | None = None,
+                       delete_after_download: bool = False) -> str:
+        mailbox_id = uuid.uuid4().hex
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO mailboxes (id, org_id, host, port, username, password, "
+                "ssl_mode, poll_interval_s, subject_filter, delete_after_download) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mailbox_id, org_id, host, port, username, password, ssl_mode,
+                 poll_interval_s, subject_filter, int(delete_after_download)),
+            )
+        return mailbox_id
+
+    def get_mailbox(self, mailbox_id: str) -> Mailbox | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mailboxes WHERE id = ?", (mailbox_id,)
+            ).fetchone()
+        return _row_to_mailbox(row) if row else None
+
+    def list_mailboxes(self, *, enabled_only: bool = False) -> list[Mailbox]:
+        query = "SELECT * FROM mailboxes"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY id"
+        with self._lock:
+            rows = self._conn.execute(query).fetchall()
+        return [_row_to_mailbox(row) for row in rows]
+
+    def delete_mailbox(self, mailbox_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM mailboxes WHERE id = ?", (mailbox_id,))
+
+    def record_poll_success(self, mailbox_id: str, *, last_seen_uid: int,
+                            uidvalidity: str | None) -> None:
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT 1 FROM mailboxes WHERE id = ?", (mailbox_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown mailbox: {mailbox_id}")
+            self._conn.execute(
+                "UPDATE mailboxes SET last_seen_uid = ?, uidvalidity = ?, last_poll_at = ?, "
+                "last_error = NULL, consecutive_failures = 0 WHERE id = ?",
+                (last_seen_uid, uidvalidity, _now(), mailbox_id),
+            )
+
+    def record_poll_failure(self, mailbox_id: str, error: str, *,
+                            disable_after: int = 3) -> None:
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT consecutive_failures FROM mailboxes WHERE id = ?", (mailbox_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown mailbox: {mailbox_id}")
+            failures = row["consecutive_failures"] + 1
+            self._conn.execute(
+                "UPDATE mailboxes SET consecutive_failures = ?, last_error = ?, "
+                "last_poll_at = ?, enabled = ? WHERE id = ?",
+                (failures, error[:500], _now(), 0 if failures >= disable_after else 1,
+                 mailbox_id),
+            )
+
+    # -- job safety ------------------------------------------------------------
+
+    def recover_running_jobs(self) -> int:
+        """Reset stale running jobs to pending (restart survival).
+
+        The first call on a Store instance recovers every running job (these
+        can only be orphans from a previous process). Later calls only recover
+        jobs whose running state predates the previous recovery pass, so a
+        job legitimately claimed after it is never clobbered.
+        """
+        now = _now()
+        with self._lock, self._conn:
+            query = (
+                "UPDATE jobs SET status = 'pending', next_attempt_at = ?, updated_at = ? "
+                "WHERE status = 'running'"
+            )
+            params: tuple = (now, now)
+            if self._last_recover_at is not None:
+                query += " AND updated_at < ?"
+                params = params + (self._last_recover_at,)
+            cursor = self._conn.execute(query, params)
+            self._last_recover_at = now
+            return cursor.rowcount
 
     # -- documents seen-table ------------------------------------------------
 
