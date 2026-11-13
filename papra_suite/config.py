@@ -39,10 +39,22 @@ def _has_nondisplay_chars(text: str) -> bool:
     return any(ch.isspace() or not ch.isprintable() for ch in text)
 
 
+def _has_control_chars(text: str) -> bool:
+    # Spaces and tabs are legitimate inside header values (h11 accepts them,
+    # e.g. an API key with an internal space just yields 401s), but control
+    # characters are not: h11 rejects them at send time (LocalProtocolError),
+    # turning a deterministic config error into a misleading TransportError
+    # after retries. Screen only non-printable/control characters.
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in text)
+
+
 def _require(env: Mapping[str, str], name: str) -> str:
     value = env.get(name, "").strip()
     if not value:
         raise ConfigError(f"Missing required environment variable: {name}")
+    if _has_control_chars(value):
+        # Do not echo the value: it may be a secret.
+        raise ConfigError(f"{name} must not contain control characters")
     return value
 
 
@@ -100,6 +112,11 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
                 f"{name} must not contain whitespace or control characters, got: {value!r}"
             )
         parsed.port  # noqa: B018 — property access validates the port
+        # "http://papra:0": urlparse returns port 0 without raising, but httpx
+        # keeps it and every request fails with ConnectError — same class as
+        # the papra:99999/papra:abc cases. Port None is fine (scheme default).
+        if parsed.port == 0:
+            raise ConfigError(f"{name} must not use port 0, got: {value!r}")
     except ValueError:
         # Covers non-numeric, out-of-range (0-65535) and trailing-garbage
         # ports, plus malformed IPv6 literals; urlparse raises on .port

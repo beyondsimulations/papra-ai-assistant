@@ -118,6 +118,33 @@ def test_non_numeric_port_base_url_rejected():
         load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:abc"})
 
 
+def test_port_zero_base_url_rejected():
+    # "http://papra:0": urlparse returns port 0 without raising, but httpx
+    # keeps it and every request fails with ConnectError — same class as the
+    # papra:99999/papra:abc cases. Port 0 is only valid for a listener
+    # (ephemeral port), never for a client base URL.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:0"})
+
+
+def test_normal_port_base_url_accepted():
+    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221"})
+    assert config.papra_base_url == "http://papra:1221"
+
+
+def test_portless_base_url_accepted():
+    # No port means the scheme default (80/443) — must still pass.
+    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra"})
+    assert config.papra_base_url == "http://papra"
+
+
+def test_dashboard_bind_port_zero_accepted():
+    # Port 0 is the standard ephemeral-port convention for a listener and
+    # must stay accepted in _parse_bind (only client base URLs reject it).
+    config = load_config({**BASE_ENV, "DASHBOARD_BIND": "127.0.0.1:0"})
+    assert config.dashboard_port == 0
+
+
 def test_out_of_range_port_base_url_rejected():
     # "http://papra:99999" — out of the 0-65535 range.
     with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
@@ -204,6 +231,31 @@ def test_whitespace_only_api_key_rejected():
 def test_required_values_are_stripped():
     config = load_config({**BASE_ENV, "PAPRA_API_KEY": "  ppapi_x  "})
     assert config.papra_api_key == "ppapi_x"
+
+
+def test_control_chars_in_api_key_rejected():
+    # "abc\rX-Injected: 1" passes the strip but h11 rejects the control char
+    # at send time (LocalProtocolError -> TransportError), turning a
+    # deterministic config error into 3 retries + a misleading PapraError.
+    with pytest.raises(ConfigError, match="PAPRA_API_KEY"):
+        load_config({**BASE_ENV, "PAPRA_API_KEY": "abc\rX-Injected: 1"})
+
+
+def test_nul_byte_in_api_key_rejected():
+    with pytest.raises(ConfigError, match="PAPRA_API_KEY"):
+        load_config({**BASE_ENV, "PAPRA_API_KEY": "abc" + chr(0) + "def"})
+
+
+def test_internal_space_in_api_key_accepted():
+    # h11 accepts spaces/tabs inside header values (mere 401s), so a key
+    # with an internal space is legitimate and must not be rejected.
+    config = load_config({**BASE_ENV, "PAPRA_API_KEY": "ppapi_key with spaces"})
+    assert config.papra_api_key == "ppapi_key with spaces"
+
+
+def test_vertical_tab_in_admin_password_rejected():
+    with pytest.raises(ConfigError, match="ADMIN_PASSWORD"):
+        load_config({**BASE_ENV, "ADMIN_PASSWORD": "pass" + chr(11) + "word"})
 
 
 def test_query_bearing_base_url_rejected():

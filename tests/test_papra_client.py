@@ -182,6 +182,34 @@ async def test_list_documents_passes_search_query():
     }
 
 
+async def test_list_documents_plumbs_non_default_pagination():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"documents": [DOC], "documentsCount": 7})
+
+    async with make_client(handler) as client:
+        await client.list_documents(
+            ORG,
+            page_index=2,
+            page_size=10,
+            sort_field="name",
+            sort_order="asc",
+            search_query="x",
+        )
+    # All-default pagination elsewhere would pass even if list_documents
+    # hardcoded the defaults and ignored its arguments — pin that non-default
+    # arguments are actually plumbed through to the query params.
+    assert seen["params"] == {
+        "pageIndex": "2",
+        "pageSize": "10",
+        "sortField": "name",
+        "sortOrder": "asc",
+        "searchQuery": "x",
+    }
+
+
 async def test_list_documents_falls_back_when_count_missing():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"documents": [DOC]})
