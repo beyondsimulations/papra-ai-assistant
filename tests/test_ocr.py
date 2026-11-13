@@ -31,8 +31,10 @@ def test_render_pages_caps_and_warns(caplog):
     pdf = make_pdf([f"page {i}" for i in range(5)])
     pages = render_pages(pdf, dpi=72, max_pages=3, pixel_budget=2_000_000)
     assert len(pages) == 3
-    assert any("2 additional page" in record.getMessage().lower() or
-               "skipped" in record.getMessage().lower() for record in caplog.records)
+    # pin the exact skipped count — an always-true "skipped" arm would
+    # match the format string even if the count were wrong
+    assert any("2 additional pages" in record.getMessage().lower()
+               for record in caplog.records)
 
 
 def test_render_pages_downscales_over_pixel_budget():

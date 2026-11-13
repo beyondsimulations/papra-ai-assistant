@@ -1,4 +1,5 @@
 import httpx
+import pytest
 
 from papra_suite.llm_client import LLMClient
 from papra_suite.titles import (
@@ -56,3 +57,28 @@ async def test_generate_title_falls_back_on_llm_failure(caplog):
     title = await generate_title(llm, filename="rechnung-42.pdf", excerpt="inhalt")
     assert title == "rechnung-42.pdf"
     assert any("failed" in r.getMessage().lower() for r in caplog.records)
+
+
+@pytest.mark.parametrize("response", [
+    # non-UTF-8 2xx body (UnicodeDecodeError at parse time)
+    httpx.Response(200, content=b"\x80\x81\x82 not utf8 \xff"),
+    # message as a string instead of a dict (TypeError)
+    httpx.Response(200, json={"choices": [{"message": "plain string"}]}),
+    # top-level JSON array (TypeError)
+    httpx.Response(200, json=[1, 2, 3]),
+], ids=["non-utf8", "message-as-string", "top-level-array"])
+async def test_generate_title_falls_back_on_malformed_2xx(response):
+    """Any malformed 2xx body must surface as LLMError so the filename
+    fallback engages — a raw UnicodeDecodeError/TypeError would instead
+    kill the title job permanently."""
+    responses = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        responses["n"] += 1
+        return response
+
+    llm = LLMClient("http://llm.test", "k", "m", backoff_base_s=0.0,
+                    transport=httpx.MockTransport(handler))
+    title = await generate_title(llm, filename="rechnung-42.pdf", excerpt="inhalt")
+    assert title == "rechnung-42.pdf"
+    assert responses["n"] == 1  # a 2xx parse failure is permanent, not retried

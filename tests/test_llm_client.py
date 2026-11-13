@@ -205,3 +205,37 @@ async def test_malformed_empty_choices_list_raises_llm_error():
     async with make_client(handler) as client:
         with pytest.raises(LLMError, match="malformed chat completions response"):
             await client.chat([{"role": "user", "content": "hi"}])
+
+
+async def test_malformed_non_utf8_body_raises_llm_error():
+    # invalid UTF-8 (not a BOM) escapes json.loads as UnicodeDecodeError —
+    # the parse wrap must convert it, not leak it
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"\x80\x81\x82 not utf8 \xff")
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError, match="malformed chat completions response") as excinfo:
+            await client.chat([{"role": "user", "content": "hi"}])
+    assert excinfo.value.status == 200
+
+
+async def test_malformed_message_as_string_raises_llm_error():
+    # message is a string, not a dict: ["content"] raises TypeError
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": "plain string"}]})
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError, match="malformed chat completions response") as excinfo:
+            await client.chat([{"role": "user", "content": "hi"}])
+    assert excinfo.value.status == 200
+
+
+async def test_malformed_top_level_array_raises_llm_error():
+    # a top-level JSON array: ["choices"] on a list raises TypeError
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2, 3])
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError, match="malformed chat completions response") as excinfo:
+            await client.chat([{"role": "user", "content": "hi"}])
+    assert excinfo.value.status == 200

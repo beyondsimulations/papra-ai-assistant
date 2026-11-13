@@ -1,13 +1,17 @@
 import hashlib
 import json
 import logging
+import sqlite3
 
 import httpx
 import pytest
 
+import papra_suite.pipeline as pipeline_mod
 from papra_suite.config import load_config
+from papra_suite.papra_client import PapraError
 from papra_suite.pipeline import (
     MAX_SWEEP_PAGES,
+    OCR_MAX_DOCUMENT_BYTES,
     SWEEP_PAGE_SIZE,
     SweepResult,
     on_job_done,
@@ -41,10 +45,16 @@ class StubPapra:
     async def download_file(self, org_id, document_id):
         return self.pdf
 
+    async def get_document(self, org_id, document_id):
+        return self.documents[org_id][document_id]
+
     async def update_document(self, org_id, document_id, *, name=None, content=None):
         self.content_updates.append((document_id, name, content))
+        doc = self.documents[org_id][document_id]
         if name:
-            self.documents[org_id][document_id]["name"] = name
+            doc["name"] = name
+        if content is not None:
+            doc["content"] = content
 
     async def list_documents(self, org_id, *, page_index=0, page_size=100,
                              search_query=None, sort_field="createdAt",
@@ -131,6 +141,46 @@ async def test_run_ocr_job_raises_on_zero_page_pdf(store, config):
     assert papra.content_updates == []  # nothing written back
 
 
+async def test_run_ocr_job_renders_pages_lazily(store, config, monkeypatch):
+    """Pin the lazy path: run_ocr_job must call render_page once per page
+    index (off the loop via asyncio.to_thread), not render_pages upfront."""
+    import fitz
+
+    pdf = fitz.open()
+    for _ in range(3):
+        pdf.new_page()
+    papra = StubPapra(pdf.tobytes())
+    pdf.close()
+    llm, calls = make_llm(["# a", "# b", "# c"])
+
+    rendered: list[int] = []
+
+    def spy_render_page(pdf_bytes, index, *, dpi, pixel_budget):
+        rendered.append(index)
+        return b"fake-png"
+
+    monkeypatch.setattr(pipeline_mod, "render_page", spy_render_page)
+
+    markdown = await run_ocr_job(papra, llm, make_job(store), config=config)
+
+    assert rendered == [0, 1, 2]  # one render call per page index
+    assert calls["n"] == 3
+    assert markdown == "# a\n\n# b\n\n# c"
+
+
+async def test_run_ocr_job_rejects_oversized_document(store, config):
+    """A document over OCR_MAX_DOCUMENT_BYTES must fail visibly instead of
+    being pulled into memory and rendered."""
+    papra = StubPapra(b"x" * (OCR_MAX_DOCUMENT_BYTES + 1))
+    llm, calls = make_llm(["# md"])
+
+    with pytest.raises(ValueError, match="too large"):
+        await run_ocr_job(papra, llm, make_job(store), config=config)
+
+    assert calls["n"] == 0
+    assert papra.content_updates == []
+
+
 def test_on_job_done_enqueues_title_job(store):
     job = make_job(store)
     on_job_done(store, job, ocr_result="# Rechnung\n\nInhalt")
@@ -159,13 +209,34 @@ def test_on_job_done_ignores_title_kind(store):
 
 async def test_run_title_job_writes_generated_name(store):
     papra = StubPapra()
+    # the title job's hash must match the document's CURRENT content
+    # (the stale-content guard compares them before generating)
+    current = "Rechnung Nr. 42 – aktuell archivierter Inhalt"
+    papra.documents["org_1"]["doc_1"]["content"] = current
+    content_hash = hashlib.sha256(current.encode()).hexdigest()
     llm, _ = make_llm(["Rechnung 42 – Möbel"])
-    job = make_job(store, kind="title", content_hash="th",
+    job = make_job(store, kind="title", content_hash=content_hash,
                    payload={"name": "rechnung.pdf", "excerpt": "Rechnung Nr. 42"})
 
     await run_title_job(papra, llm, job)
 
     assert papra.content_updates == [("doc_1", "Rechnung 42 – Möbel", None)]
+
+
+async def test_stale_title_job_skipped(store):
+    """A title job whose content_hash no longer matches the document must
+    NOT overwrite a newer title (decisions §2: consumers take the latest)."""
+    papra = StubPapra()
+    papra.documents["org_1"]["doc_1"]["content"] = "neuer Inhalt v2"
+    stale_hash = hashlib.sha256(b"alter Inhalt v1").hexdigest()
+    llm, calls = make_llm(["Titel aus v1 – sollte nie geschrieben werden"])
+    job = make_job(store, kind="title", content_hash=stale_hash,
+                   payload={"name": "rechnung.pdf", "excerpt": "alter Inhalt v1"})
+
+    await run_title_job(papra, llm, job)
+
+    assert papra.content_updates == []  # nothing overwritten
+    assert calls["n"] == 0  # no LLM call either
 
 
 async def test_worker_loop_processes_and_transitions(store, config):
@@ -291,6 +362,89 @@ async def test_worker_loop_marks_failures(store, config):
 
     job = store.list_jobs()[0]
     assert job.status == "pending" and job.attempts == 1 and "boom" in job.error
+
+
+async def test_worker_loop_survives_mark_job_failed_error(store, caplog):
+    """A sqlite error while RECORDING a failure must not kill the worker
+    task (the job would wedge 'running' until restart)."""
+    make_job(store)
+
+    async def handler(job):
+        raise RuntimeError("boom")
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 2:
+            raise KeyboardInterrupt()  # stop seam: the loop SURVIVED claim 2
+        return original_claim(kind)
+
+    def mark_job_failed(job_id, error, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    store.claim_next_job = claim
+    store.mark_job_failed = mark_job_failed
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    assert state["claims"] == 3  # loop kept going after the failed mark
+    assert any("vanished" in record.getMessage() for record in caplog.records)
+    # the job stays 'running' (the failure could not be recorded) — recovery
+    # at startup is the backstop, but the WORKER loop itself survived
+    assert store.list_jobs()[0].status == "running"
+
+
+async def test_worker_loop_fails_papra_4xx_immediately(store):
+    """Papra 4xx (except 429) never auto-retries (decisions §6): a 404 must
+    fail the job permanently on the first attempt, no backoff."""
+    make_job(store)
+
+    async def handler(job):
+        raise PapraError("GET file failed: 404 not found", 404)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 1:
+            raise KeyboardInterrupt()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    job = store.list_jobs()[0]
+    assert job.status == "failed"  # permanent — no 3-attempt backoff
+    assert job.attempts == 1
+    assert "404" in job.error
+
+
+async def test_worker_loop_backs_off_papra_5xx(store):
+    """Papra 5xx keeps the normal retry policy: pending with backoff."""
+    make_job(store)
+
+    async def handler(job):
+        raise PapraError("GET file failed: 503", 503)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 1:
+            raise KeyboardInterrupt()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    job = store.list_jobs()[0]
+    assert job.status == "pending" and job.attempts == 1  # normal backoff
 
 
 async def test_sweep_once_enqueues_for_unseen_pdfs_only(store):
@@ -455,3 +609,36 @@ async def test_sweep_once_is_idempotent(store):
     second = await sweep_once(store, papra)
     assert first.jobs_enqueued == 1 and second.jobs_enqueued == 0
     assert second.documents_checked == 2
+
+
+async def test_sweep_skips_oversized_document(store, caplog):
+    """A listing entry whose originalSize exceeds the cap is skipped via
+    metadata — recorded seen, no job, and NEVER downloaded."""
+
+    class OversizedPapra(StubPapra):
+        def __init__(self):
+            super().__init__()
+            self.download_calls = 0
+            self.documents = {"org_1": {
+                "doc_big": {
+                    "id": "doc_big", "name": "huge.pdf",
+                    "mimeType": "application/pdf",
+                    "originalSize": 200 * 1024 * 1024,
+                },
+            }}
+
+        async def download_file(self, org_id, document_id):
+            self.download_calls += 1
+            return self.pdf
+
+    papra = OversizedPapra()
+
+    with caplog.at_level(logging.WARNING):
+        result = await sweep_once(store, papra)
+
+    assert result.oversized_skipped == 1
+    assert result.jobs_enqueued == 0
+    assert store.document_seen("org_1", "doc_big")  # skip is permanent
+    assert papra.download_calls == 0  # never downloaded the huge body
+    assert any("oversized" in record.getMessage() and "doc_big" in record.getMessage()
+               for record in caplog.records)

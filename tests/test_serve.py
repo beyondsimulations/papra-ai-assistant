@@ -39,7 +39,10 @@ async def test_serve_runs_and_stops_cleanly(tmp_path):
     store = Store(tmp_path / "state.db")
     store.migrate()
     org_id = store.create_org(papra_org_id="org_1", name="Org")
-    store.create_mailbox(org_id=org_id, host="imap.invalid", port=993,
+    # 127.0.0.1:1 is a closed port: the connection is refused fast and
+    # deterministically (a DNS-based host like imap.invalid can stall in
+    # resolution, making the stop fire mid-connect and flake the assertion)
+    store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
                          username="u", password="p", poll_interval_s=3600)
 
     stop = asyncio.Event()
@@ -48,7 +51,7 @@ async def test_serve_runs_and_stops_cleanly(tmp_path):
         await asyncio.sleep(0.5)
         stop.set()
 
-    # poll attempts fail (imap.invalid) — the loop must survive them
+    # poll attempts fail (connection refused) — the loop must survive them
     asyncio.get_running_loop().create_task(set_stop_later())
     await serve(config, stop=stop, store=store)  # returns when stop is set
 

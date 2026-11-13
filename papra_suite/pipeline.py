@@ -7,11 +7,12 @@ M3 adds the OCR/title worker loops and the central transition handler.
 import asyncio
 import hashlib
 import logging
+import sqlite3
 from dataclasses import dataclass
 
 from papra_suite.llm_client import LLMClient
-from papra_suite.ocr import OCR_SYSTEM_PROMPT, assemble_markdown, render_pages
-from papra_suite.papra_client import PapraClient
+from papra_suite.ocr import OCR_SYSTEM_PROMPT, assemble_markdown, page_count, render_page
+from papra_suite.papra_client import PapraClient, PapraError
 from papra_suite.store import Job, Store
 from papra_suite.titles import generate_title
 
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 SWEEP_PAGE_SIZE = 50
 MAX_SWEEP_PAGES = 100  # hard cap: a listing endpoint that ignores pageIndex must not loop forever
 DEFAULT_DOCUMENT_NAME = "document.pdf"
+# Upper bound on downloaded document bytes for OCR and the sweep's hash step:
+# a hostile/huge document must fail visibly (or be skipped via listing
+# metadata) instead of being pulled into memory unbounded.
+OCR_MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
 
 
 @dataclass
@@ -28,21 +33,37 @@ class SweepResult:
     jobs_enqueued: int = 0
     non_pdf_skipped: int = 0
     errors: int = 0
+    oversized_skipped: int = 0
 
 
 async def run_ocr_job(papra: PapraClient, ocr_llm: LLMClient, job: Job, *,
                       config) -> str:
-    """Download, render, transcribe per page, write back; returns the markdown."""
+    """Download, render, transcribe per page, write back; returns the markdown.
+
+    Pages are rendered LAZILY, one at a time, off the event loop
+    (asyncio.to_thread): rendering is CPU-bound (0.6-3s for 50 pages) and
+    holding every page PNG across the per-page LLM calls would balloon
+    memory (~290MB for a crafted 50-page document).
+    """
     pdf_bytes = await papra.download_file(job.papra_org_id, job.document_id)
-    pages = render_pages(
-        pdf_bytes, dpi=config.ocr_dpi, max_pages=config.ocr_max_pages,
-        pixel_budget=config.ocr_page_pixel_budget,
-    )
-    if not pages:
+    if len(pdf_bytes) > OCR_MAX_DOCUMENT_BYTES:
+        raise ValueError(f"document too large for OCR: {len(pdf_bytes)} bytes")
+    total = page_count(pdf_bytes)
+    limit = min(total, config.ocr_max_pages)
+    if total > config.ocr_max_pages:
+        logger.warning(
+            "document has %d pages; skipped %d additional pages beyond max_pages=%d",
+            total, total - config.ocr_max_pages, config.ocr_max_pages,
+        )
+    if limit == 0:
         raise ValueError("document has no pages to transcribe")
     page_markdowns = []
-    for index, png in enumerate(pages):
-        logger.info("ocr: document %s page %d/%d", job.document_id, index + 1, len(pages))
+    for index in range(limit):
+        png = await asyncio.to_thread(
+            render_page, pdf_bytes, index,
+            dpi=config.ocr_dpi, pixel_budget=config.ocr_page_pixel_budget,
+        )
+        logger.info("ocr: document %s page %d/%d", job.document_id, index + 1, limit)
         page_markdowns.append(
             await ocr_llm.chat(
                 [
@@ -73,6 +94,22 @@ def on_job_done(store: Store, job: Job, *, ocr_result: str) -> None:
 
 
 async def run_title_job(papra: PapraClient, title_llm: LLMClient, job: Job) -> None:
+    """Generate and write a title — unless the document moved on (decisions §2).
+
+    A stale title job (content v1, still in backoff) must never overwrite a
+    title that a newer job (v2) already wrote from newer content: hash the
+    document's CURRENT content and compare to the job's content_hash first;
+    on mismatch, skip silently (the worker still marks the job done).
+    """
+    document = await papra.get_document(job.papra_org_id, job.document_id)
+    current_content = document.get("content") or ""
+    current_hash = hashlib.sha256(current_content.encode()).hexdigest()
+    if current_hash != job.content_hash:
+        logger.info(
+            "stale title job skipped: document content changed "
+            "(job %s for document %s)", job.id, job.document_id,
+        )
+        return
     title = await generate_title(
         title_llm, filename=job.payload.get("name", DEFAULT_DOCUMENT_NAME),
         excerpt=job.payload.get("excerpt", ""),
@@ -226,8 +263,16 @@ async def worker_loop(store: Store, *, kind: str, handler,
         except Exception as error:  # noqa: BLE001 - the loop must survive
             logger.error("job %s (%s) failed: %s", job.id, kind, error)
             try:
-                store.mark_job_failed(job.id, str(error))
-            except ValueError:
+                # Papra 4xx (except 429) never auto-retries (decisions §6):
+                # a deleted document (404) riding the 3-attempt backoff is
+                # ~2.5 minutes of futile retries. Fail such jobs permanently
+                # on the first attempt; 5xx/429/other errors keep the backoff.
+                if (isinstance(error, PapraError) and error.status is not None
+                        and 400 <= error.status < 500 and error.status != 429):
+                    store.mark_job_failed(job.id, str(error), max_attempts=1)
+                else:
+                    store.mark_job_failed(job.id, str(error))
+            except (ValueError, sqlite3.Error):
                 logger.error("job %s vanished before failure could be recorded", job.id)
 
 
@@ -270,6 +315,25 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
                     continue
                 try:
                     if _is_pdf(document):
+                        original_size = document.get("originalSize")
+                        if original_size is not None and original_size > OCR_MAX_DOCUMENT_BYTES:
+                            # Skip via listing metadata — never download the
+                            # oversize body just to hash it. Recorded as seen:
+                            # the skip is permanent, not retried every sweep.
+                            store.record_document_seen(
+                                papra_org_id=org.papra_org_id, papra_document_id=document_id,
+                                name=document.get("name", "document.pdf"),
+                                mime=document.get("mimeType", "application/pdf"),
+                                ingested_via="sweep",
+                            )
+                            logger.warning(
+                                "sweep: skipping oversized document %s in org %s "
+                                "(%d bytes > %d)",
+                                document_id, org.papra_org_id,
+                                original_size, OCR_MAX_DOCUMENT_BYTES,
+                            )
+                            result.oversized_skipped += 1
+                            continue
                         file_bytes = await papra.download_file(org.papra_org_id, document_id)
                         file_hash = hashlib.sha256(file_bytes).hexdigest()
                         enqueue_ocr_job(
