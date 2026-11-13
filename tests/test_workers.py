@@ -210,6 +210,70 @@ async def test_sweep_once_enqueues_for_unseen_pdfs_only(store):
     assert job.payload.get("name") == "rechnung.pdf"
 
 
+async def test_sweep_continues_past_download_failure(store):
+    class FlakyDownloadPapra(StubPapra):
+        """download_file fails for doc_1, succeeds for doc_2 (both PDFs)."""
+
+        def __init__(self):
+            super().__init__()
+            self.documents = {
+                "org_1": {
+                    "doc_1": {"id": "doc_1", "name": "broken.pdf", "mimeType": "application/pdf"},
+                    "doc_2": {"id": "doc_2", "name": "fine.pdf", "mimeType": "application/pdf"},
+                },
+            }
+
+        async def download_file(self, org_id, document_id):
+            if document_id == "doc_1":
+                raise RuntimeError("404 not found")
+            return self.pdf
+
+    papra = FlakyDownloadPapra()
+
+    first = await sweep_once(store, papra)
+
+    assert first.errors == 1
+    assert first.jobs_enqueued == 1  # doc_2 enrolled despite doc_1 failing
+    assert not store.document_seen("org_1", "doc_1")  # failed doc stays unseen
+    assert store.document_seen("org_1", "doc_2")
+
+    # a second sweep retries doc_1 (and fails again) but does not re-enqueue doc_2
+    second = await sweep_once(store, papra)
+    assert second.errors == 1
+    assert second.jobs_enqueued == 0
+    assert not store.document_seen("org_1", "doc_1")
+
+
+async def test_sweep_continues_past_org_listing_failure(store):
+    store.create_org(papra_org_id="org_2", name="Org 2")
+
+    class OrgListingFailsPapra(StubPapra):
+        """list_documents raises for org_1; org_2 still gets processed."""
+
+        def __init__(self):
+            super().__init__()
+            self.documents = {
+                "org_1": {},
+                "org_2": {
+                    "doc_3": {"id": "doc_3", "name": "report.pdf", "mimeType": "application/pdf"},
+                },
+            }
+
+        async def list_documents(self, org_id, *, page_size=100, search_query=None,
+                                 sort_field="createdAt", sort_order="desc"):
+            if org_id == "org_1":
+                raise RuntimeError("500 internal error")
+            docs = list(self.documents[org_id].values())
+            return docs, len(docs)
+
+    result = await sweep_once(store, OrgListingFailsPapra())
+
+    assert result.errors == 1
+    assert result.jobs_enqueued == 1  # org_2's PDF enrolled despite org_1 failing
+    job = store.claim_next_job("ocr")
+    assert job.papra_org_id == "org_2" and job.document_id == "doc_3"
+
+
 async def test_sweep_once_is_idempotent(store):
     papra = StubPapra()
     first = await sweep_once(store, papra)

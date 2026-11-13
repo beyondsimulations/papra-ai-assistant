@@ -25,6 +25,7 @@ class SweepResult:
     documents_checked: int = 0
     jobs_enqueued: int = 0
     non_pdf_skipped: int = 0
+    errors: int = 0
 
 
 async def run_ocr_job(papra: PapraClient, ocr_llm: LLMClient, job: Job, *,
@@ -108,31 +109,43 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
     """Record and enqueue OCR for externally-ingested documents (decisions §4)."""
     result = SweepResult()
     for org in store.list_orgs():
-        documents, _count = await papra.list_documents(
-            org.papra_org_id, page_size=SWEEP_PAGE_SIZE,
-            sort_field="createdAt", sort_order="desc",
-        )
+        try:
+            documents, _count = await papra.list_documents(
+                org.papra_org_id, page_size=SWEEP_PAGE_SIZE,
+                sort_field="createdAt", sort_order="desc",
+            )
+        except Exception as error:  # noqa: BLE001 - one org must not wedge the sweep
+            logger.error("sweep: listing documents for org %s failed: %s",
+                         org.papra_org_id, error)
+            result.errors += 1
+            continue
         for document in documents:
             result.documents_checked += 1
             document_id = document["id"]
             if store.document_seen(org.papra_org_id, document_id):
                 continue
-            if _is_pdf(document):
-                file_bytes = await papra.download_file(org.papra_org_id, document_id)
-                file_hash = hashlib.sha256(file_bytes).hexdigest()
-                enqueue_ocr_job(
-                    store, papra_org_id=org.papra_org_id, document_id=document_id,
-                    file_hash=file_hash, name=document.get("name", "document.pdf"),
-                    mime="application/pdf", ingested_via="sweep",
-                )
-                result.jobs_enqueued += 1
-            else:
-                store.record_document_seen(
-                    papra_org_id=org.papra_org_id, papra_document_id=document_id,
-                    name=document.get("name", ""), mime=document.get("mimeType", ""),
-                    ingested_via="sweep",
-                )
-                result.non_pdf_skipped += 1
+            try:
+                if _is_pdf(document):
+                    file_bytes = await papra.download_file(org.papra_org_id, document_id)
+                    file_hash = hashlib.sha256(file_bytes).hexdigest()
+                    enqueue_ocr_job(
+                        store, papra_org_id=org.papra_org_id, document_id=document_id,
+                        file_hash=file_hash, name=document.get("name", "document.pdf"),
+                        mime="application/pdf", ingested_via="sweep",
+                    )
+                    result.jobs_enqueued += 1
+                else:
+                    store.record_document_seen(
+                        papra_org_id=org.papra_org_id, papra_document_id=document_id,
+                        name=document.get("name", ""), mime=document.get("mimeType", ""),
+                        ingested_via="sweep",
+                    )
+                    result.non_pdf_skipped += 1
+            except Exception as error:  # noqa: BLE001 - one document must not wedge the sweep
+                logger.error("sweep: processing document %s in org %s failed: %s",
+                             document_id, org.papra_org_id, error)
+                result.errors += 1
+                continue
     return result
 
 
