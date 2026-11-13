@@ -153,12 +153,24 @@ async def test_list_documents_passes_search_query():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["params"] = dict(request.url.params)
-        return httpx.Response(200, json={"documents": [DOC], "documentsCount": 1})
+        return httpx.Response(200, json={"documents": [DOC], "documentsCount": 7})
 
     async with make_client(handler) as client:
         documents, count = await client.list_documents(ORG, search_query="invoice")
-    assert documents == [DOC] and count == 1
+    # count is the server-reported total (7), not len(documents) (1) —
+    # pinning the documentsCount contract against a len() fallback mutation.
+    assert documents == [DOC] and count == 7
     assert seen["params"]["searchQuery"] == "invoice"
+
+
+async def test_list_documents_falls_back_when_count_missing():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"documents": [DOC]})
+
+    async with make_client(handler) as client:
+        documents, count = await client.list_documents(ORG)
+    # Without documentsCount the documented fallback is len(documents).
+    assert documents == [DOC] and count == 1
 
 
 async def test_download_file_returns_bytes():

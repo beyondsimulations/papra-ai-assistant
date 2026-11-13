@@ -29,6 +29,14 @@ def test_settings_roundtrip(store):
     assert store.get_setting("key") == "value"
 
 
+def test_set_setting_upserts(store):
+    # Pins the ON CONFLICT(key) DO UPDATE branch: a plain INSERT would raise
+    # an IntegrityError on the second call instead of updating.
+    store.set_setting("key", "v1")
+    store.set_setting("key", "v2")
+    assert store.get_setting("key") == "v2"
+
+
 def test_enqueue_job_is_idempotent(store):
     first = store.enqueue_job(
         kind="ocr", papra_org_id="org_1", document_id="doc_1",
@@ -208,8 +216,26 @@ def test_document_seen_roundtrip(store):
     assert store.document_seen("org_1", "doc_1")
 
 
+def test_record_document_seen_is_idempotent(store):
+    # Pins INSERT OR IGNORE: a plain INSERT would raise an IntegrityError on
+    # the second call for the same (org, document) pair.
+    store.record_document_seen(papra_org_id="org_1", papra_document_id="doc_1",
+                                name="bill.pdf", mime="application/pdf", ingested_via="mail")
+    store.record_document_seen(papra_org_id="org_1", papra_document_id="doc_1",
+                                name="bill.pdf", mime="application/pdf", ingested_via="mail")
+    assert store.document_seen("org_1", "doc_1")
+
+
 def test_dedup_roundtrip(store):
     assert not store.dedup_exists("hash-1")
+    store.add_dedup("hash-1")
+    assert store.dedup_exists("hash-1")
+
+
+def test_add_dedup_is_idempotent(store):
+    # Pins INSERT OR IGNORE: a plain INSERT would violate the dedup_hashes
+    # primary key on the second call.
+    store.add_dedup("hash-1")
     store.add_dedup("hash-1")
     assert store.dedup_exists("hash-1")
 

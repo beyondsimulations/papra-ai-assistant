@@ -104,6 +104,30 @@ def test_protocol_relative_base_url_rejected():
         load_config({**BASE_ENV, "PAPRA_BASE_URL": "//papra:1221"})
 
 
+def test_empty_host_base_url_rejected():
+    # "http://:1221" has a netloc but no host; httpx would fail at request time.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://:1221"})
+
+
+def test_non_numeric_port_base_url_rejected():
+    # "http://papra:abc" — urlparse only raises on .port access.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:abc"})
+
+
+def test_out_of_range_port_base_url_rejected():
+    # "http://papra:99999" — out of the 0-65535 range.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:99999"})
+
+
+def test_trailing_garbage_after_port_base_url_rejected():
+    # "http://host:1221:extra" — port accessor sees "1221:extra".
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://host:1221:extra"})
+
+
 def test_valid_base_urls_still_pass():
     config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "https://host.example"})
     assert config.papra_base_url == "https://host.example"
