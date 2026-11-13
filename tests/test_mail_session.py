@@ -26,7 +26,8 @@ class FakeImap:
     """Minimal imaplib double: canned SEARCH result, per-uid FETCH responses."""
 
     def __init__(self, search_uids=(1, 2, 3), bodies=None, fetch_responses=None,
-                 sizes=None, size_responses=None):
+                 sizes=None, size_responses=None, capabilities=("IMAP4REV1",),
+                 deleted_uids=()):
         self.search_uids = list(search_uids)
         self.bodies = bodies or {}                    # uid -> raw bytes (well-formed)
         self.fetch_responses = fetch_responses or {}  # uid -> raw body-fetch_data list
@@ -34,11 +35,29 @@ class FakeImap:
         self.size_responses = size_responses or {}    # uid -> raw size-fetch_data list
         self.size_probes = []   # uids probed with (RFC822.SIZE)
         self.fetch_calls = []    # uids whose BODY.PEEK[] was actually fetched
+        self.capabilities = tuple(capabilities)   # imaplib exposes these at connect
+        self.deleted_uids = set(deleted_uids)     # what UID SEARCH DELETED reports
+        self.store_calls = []        # (uid, mode, flags) STOREs issued
+        self.uid_expunge_calls = []  # uid-sets passed to UID EXPUNGE
+        self.expunge_calls = 0       # plain (mailbox-wide) EXPUNGEs issued
+
+    def expunge(self):
+        self.expunge_calls += 1
+        return ("OK", [None])
 
     def uid(self, command, *args):
         if command == "SEARCH":
+            if "DELETED" in args:
+                payload = " ".join(str(u) for u in sorted(self.deleted_uids)).encode()
+                return ("OK", [payload])
             payload = " ".join(str(u) for u in self.search_uids).encode()
             return ("OK", [payload])
+        if command == "STORE":
+            self.store_calls.append((int(args[0]), args[1], args[2]))
+            return ("OK", [b"Store completed"])
+        if command == "EXPUNGE":
+            self.uid_expunge_calls.append(args[0])
+            return ("OK", [None])
         uid = int(args[0])
         if args[1] == "(RFC822.SIZE)":
             self.size_probes.append(uid)
@@ -276,6 +295,56 @@ def test_connect_unknown_ssl_mode_fails_closed(monkeypatch):
 
     with pytest.raises(ValueError, match="ssl_mode"):
         session.connect()
+
+
+def test_delete_and_expunge_uses_uid_expunge_with_uidplus():
+    # UIDPLUS advertised: RFC 4315 UID EXPUNGE removes ONLY our uids — an
+    # operator's flagged-but-unexpunged message in the same mailbox survives
+    session = make_session()
+    session._imap = FakeImap(
+        capabilities=("IMAP4REV1", "UIDPLUS"), deleted_uids={2, 7},
+    )
+
+    session.delete_and_expunge([2])
+
+    assert session._imap.store_calls == [(2, "+FLAGS", "(\\Deleted)")]
+    assert session._imap.uid_expunge_calls == ["2"]   # scoped to our uid
+    assert session._imap.expunge_calls == 0            # no mailbox-wide EXPUNGE
+
+
+def test_delete_and_expunge_plain_expunge_when_deleted_set_exactly_ours():
+    # no UIDPLUS: plain EXPUNGE destroys every \Deleted message, so it is
+    # only safe when the mailbox's deleted set is EXACTLY the uids we flagged
+    session = make_session()
+    session._imap = FakeImap(deleted_uids={3, 4})
+
+    session.delete_and_expunge([3, 4])
+
+    assert session._imap.store_calls == [
+        (3, "+FLAGS", "(\\Deleted)"), (4, "+FLAGS", "(\\Deleted)"),
+    ]
+    assert session._imap.expunge_calls == 1            # safe: the set is exactly ours
+    assert session._imap.uid_expunge_calls == []
+
+
+def test_delete_and_expunge_skips_expunge_on_foreign_deleted_mail(caplog):
+    # no UIDPLUS + a foreign \Deleted message (the operator flagged it in
+    # their own client without expunging): a plain EXPUNGE would permanently
+    # destroy it — the poll must SKIP the expunge and log a warning instead;
+    # our \Deleted flags stay (harmless, deduped on the next poll)
+    session = make_session()
+    session._imap = FakeImap(deleted_uids={2, 5})   # 5 is the operator's
+
+    with caplog.at_level("WARNING", logger="papra_suite.mail"):
+        session.delete_and_expunge([2])
+
+    assert session._imap.store_calls == [(2, "+FLAGS", "(\\Deleted)")]
+    assert session._imap.expunge_calls == 0           # nothing destroyed
+    assert session._imap.uid_expunge_calls == []
+    # NOTE: asserted on a p-free fragment — the redaction filter replaces
+    # every registered secret substring in log records, and earlier unit
+    # fixtures register "p" as a mailbox password secret
+    assert any("foreign \\Deleted" in record.message for record in caplog.records)
 
 
 def test_subject_matches_truncates_beyond_cap():

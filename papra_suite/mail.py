@@ -302,9 +302,36 @@ class MailboxSession:
             self._imap.uid("STORE", str(uid), "+FLAGS", "(\\Seen)")
 
     def delete_and_expunge(self, uids: list[int]) -> None:
+        if not uids:
+            return
         for uid in uids:
             self._imap.uid("STORE", str(uid), "+FLAGS", "(\\Deleted)")
-        self._imap.expunge()
+        # imaplib parses the CAPABILITY response at connect time and exposes
+        # it as `capabilities` (an uppercase tuple of extension names).
+        capabilities = getattr(self._imap, "capabilities", ()) or ()
+        if "UIDPLUS" in capabilities:
+            # RFC 4315 UID EXPUNGE: only our uids are removed — an operator's
+            # flagged-but-unexpunged message is untouched.
+            self._imap.uid("EXPUNGE", ",".join(str(uid) for uid in uids))
+            return
+        # Fallback (no UIDPLUS): a plain EXPUNGE destroys EVERY \Deleted
+        # message in the mailbox — including mail an operator flagged in
+        # their own client. Only expunge when the deleted set is exactly ours;
+        # otherwise skip: our \Deleted flags stay (harmless — the operator's
+        # client expunges their own mail), and the messages are re-fetched
+        # next poll but deduped.
+        status, data = self._imap.uid("SEARCH", None, "DELETED")
+        if status != "OK":
+            raise imaplib.IMAP4.error("UID SEARCH DELETED failed")
+        deleted = {int(u) for u in data[0].split()} if data and data[0] else set()
+        if deleted == set(uids):
+            self._imap.expunge()
+        else:
+            logger.warning(
+                "skipping expunge: %d foreign \\Deleted message(s) in the "
+                "mailbox; the operator's client will expunge their own mail",
+                len(deleted - set(uids)),
+            )
 
     def close(self) -> None:
         if self._imap is not None:

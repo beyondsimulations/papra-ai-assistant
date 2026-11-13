@@ -1,4 +1,5 @@
 import asyncio
+import imaplib
 import time
 from dataclasses import dataclass, field
 
@@ -511,6 +512,63 @@ async def test_filtered_message_does_not_advance_past_failure(store, monkeypatch
     # uid 2 was processed (subject-filtered -> seen), just not counted for advance
     assert session.seen == [2]
     assert result.messages_failed == 1 and result.error is None
+
+
+async def test_oversized_message_does_not_advance_past_failure(store, monkeypatch):
+    # pin the freeze guard on the oversized arm: a failed upload (uid 1)
+    # followed by an oversized message (uid 2) must NOT advance last_seen
+    # past the failure — deleting the `if not prefix_failed` guard on that
+    # arm strands uid 1 (silent loss)
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    session = FakeSession(
+        raws=[(1, build_raw(message_id="<m1@x>", attachments=[("bad.pdf", b"%PDF-1")]))],
+        oversized=[2],
+    )
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient(fail_for={"bad.pdf"})
+
+    org = store.get_org(org_id)
+    mailbox = store.get_mailbox(mailbox_id)
+    result = await poll_mailbox_once(store, client, mailbox, org)
+
+    # uid 1 failed: last_seen stays 0 so it stays re-fetchable
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 0
+    # the oversized uid 2 was still counted as processed
+    assert result.oversized_skipped == 1
+    assert result.messages_failed == 1
+
+
+async def test_store_stage_imap_error_never_raises(store, monkeypatch):
+    # pin the STORE-stage never-raises guard: an IMAP error inside
+    # mark_seen/delete_and_expunge must land in result.error (with failure
+    # accounting), never escape poll_mailbox_once — removing the try/except
+    # around the STORE stage lets the exception propagate and skips
+    # record_poll_failure entirely
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+
+    class ExplodingStoreSession(FakeSession):
+        def mark_seen(self, uids):
+            raise imaplib.IMAP4.error("STORE failed")
+
+    session = ExplodingStoreSession(raws=[(1, build_raw())])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    org = store.get_org(org_id)
+    mailbox = store.get_mailbox(mailbox_id)
+    result = await poll_mailbox_once(store, StubClient(), mailbox, org)
+
+    assert isinstance(result, PollResult)          # never raises
+    assert result.error is not None and "STORE failed" in result.error
+    assert session.closed is True
+    updated = store.get_mailbox(mailbox_id)
+    assert updated.consecutive_failures == 1       # failure accounting engaged
+    assert "STORE failed" in updated.last_error
 
 
 async def test_poll_advances_past_oversized_message(store, monkeypatch):

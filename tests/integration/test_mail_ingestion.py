@@ -97,6 +97,55 @@ async def test_delete_after_download_removes_message(ingestion_stack):
     imap.logout()
 
 
+async def test_expunge_does_not_destroy_operator_deleted_mail(ingestion_stack):
+    # C1 regression: a mailbox-wide EXPUNGE permanently destroys an
+    # operator's flagged-but-unexpunged mail when an unrelated poll runs.
+    # The operator flags message A \Deleted from their own client WITHOUT
+    # expunging (their client expunges on folder close later); our poll of a
+    # delete_after_download mailbox must remove ONLY our message B.
+    store, mailbox, org, client, papra_org_id = ingestion_stack
+    mailbox_id = store.create_mailbox(
+        org_id=org.id, host=mailbox.host, port=mailbox.port, username=mailbox.username,
+        password=mailbox.password, ssl_mode="plain", delete_after_download=True,
+    )
+    delete_mailbox = store.get_mailbox(mailbox_id)
+    # A: jpg-only -> the poller never flags it (no PDFs -> no delete)
+    inject_message(
+        to=mailbox.username, subject="Operator keeps",
+        attachments=[("photo.jpg", b"\xff\xd8 jpeg bytes", ("image", "jpeg"))],
+    )
+    # B: the PDF our delete_after_download mailbox will ingest and expunge
+    inject_message(
+        to=mailbox.username, subject="Suite ingests",
+        attachments=[("ingested.pdf", PDF_BYTES, ("application", "pdf"))],
+    )
+
+    import imaplib
+
+    imap = imaplib.IMAP4(mailbox.host, mailbox.port)
+    imap.login(mailbox.username, mailbox.password)
+    imap.select("INBOX")
+    _status, data = imap.uid("SEARCH", None, "ALL")
+    uids = sorted(int(u) for u in data[0].split())
+    assert len(uids) == 2
+    # operator convention: flag A \Deleted WITHOUT expunging
+    imap.uid("STORE", str(uids[0]), "+FLAGS", "(\\Deleted)")
+    imap.logout()
+
+    result = await poll_mailbox_once(store, client, delete_mailbox, org)
+
+    assert result.error is None and result.documents_uploaded == 1
+
+    imap = imaplib.IMAP4(mailbox.host, mailbox.port)
+    imap.login(mailbox.username, mailbox.password)
+    imap.select("INBOX")
+    _status, data = imap.uid("SEARCH", None, "ALL")
+    remaining = sorted(int(u) for u in data[0].split())
+    imap.logout()
+    # A (operator-flagged) must STILL EXIST; B (ours) is gone
+    assert remaining == [uids[0]]
+
+
 async def test_resent_document_409_is_swallowed(ingestion_stack):
     store, mailbox, org, client, papra_org_id = ingestion_stack
     inject_message(

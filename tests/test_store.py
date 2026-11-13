@@ -516,13 +516,17 @@ def test_mailbox_roundtrip(store):
 
 def test_list_mailboxes_enabled_only(store):
     org_id = store.create_org(papra_org_id="org_abc", name="Org")
-    active = store.create_mailbox(org_id=org_id, host="h1", port=993, username="u", password="p")
-    store.create_mailbox(org_id=org_id, host="h2", port=993, username="u", password="p")
+    disabled = store.create_mailbox(org_id=org_id, host="h1", port=993, username="u", password="p")
+    still_enabled = store.create_mailbox(
+        org_id=org_id, host="h2", port=993, username="u", password="p"
+    )
     # disable the first via three recorded failures
     for _ in range(3):
-        store.record_poll_failure(active, "auth failed")
-    enabled = store.list_mailboxes(enabled_only=True)
-    assert [m.id for m in enabled if m.id == active] == []
+        store.record_poll_failure(disabled, "auth failed")
+    # exact id-set comparison: the enabled mailbox IS returned, the disabled
+    # one is not (a filter returning nothing must not pass)
+    assert {m.id for m in store.list_mailboxes(enabled_only=True)} == {still_enabled}
+    assert {m.id for m in store.list_mailboxes()} == {disabled, still_enabled}
 
 
 def test_record_poll_success_and_failure_reject_unknown_mailbox(store):
