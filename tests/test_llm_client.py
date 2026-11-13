@@ -1,9 +1,11 @@
 import base64
 import logging
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from papra_suite import llm_client as llm_client_mod
 from papra_suite.llm_client import LLMClient, LLMError
 
 # sentinel: the finish_reason KEY is absent from the response body
@@ -173,6 +175,43 @@ async def test_backoff_sleeps_between_attempts():
         start = time.monotonic()
         await client.chat([{"role": "user", "content": "x"}])
         assert time.monotonic() - start >= 0.24  # 0.05 + 0.20
+
+
+async def test_transport_errors_back_off_then_raise_llm_error(monkeypatch):
+    """Transport-retry arm pin, both halves at once: kills narrowing
+    `except httpx.TransportError` to `except httpx.ConnectError` (a HUNG vision
+    call raises httpx.ReadTimeout, a TimeoutException — the raw error would
+    then escape chat(), and because titles.generate_title catches only LLMError
+    the designed filename fallback never engages and the title job ends
+    permanently failed) and kills deleting this arm's backoff sleep, which the
+    existing 5xx backoff test cannot see."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ReadTimeout("read timed out")
+
+    # The SCHEDULE is the contract, so the sleeps are observed rather than
+    # timed: a wall-clock floor can be met by scheduler load alone. The stub is
+    # swapped into THIS module's `asyncio` name only, so the shared asyncio
+    # module (httpx internals included) keeps its real sleep.
+    slept: list[float] = []
+
+    async def spy_sleep(seconds, *args, **kwargs):
+        slept.append(seconds)
+
+    monkeypatch.setattr(llm_client_mod, "asyncio", SimpleNamespace(sleep=spy_sleep))
+
+    async with LLMClient(
+        "http://llm.test", "k", "m", backoff_base_s=0.05,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(LLMError) as excinfo:
+            await client.chat([{"role": "user", "content": "x"}])
+
+    assert calls["n"] == 3  # the same 3-attempt budget ConnectError gets
+    assert excinfo.value.status is None  # wrapped, statusless — not a raw timeout
+    assert slept == [0.05, 0.2]  # backoff_base_s * 4**attempt between attempts
 
 
 # --- Pins required by the Task 1 review: previously unpinned branches ---

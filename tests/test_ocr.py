@@ -1,6 +1,11 @@
 import fitz
 
-from papra_suite.ocr import OCR_SYSTEM_PROMPT, assemble_markdown, render_pages
+from papra_suite.ocr import (
+    OCR_SYSTEM_PROMPT,
+    assemble_markdown,
+    render_page,
+    render_pages,
+)
 
 
 def make_pdf(pages: list[str]) -> bytes:
@@ -48,6 +53,21 @@ def test_render_pages_downscales_over_pixel_budget():
     # budget^2/base_pixels (~1.1k) pixels — far below the lower bound.
     # Mutation: `** 0.5` -> linear -> this lower bound fails.
     assert budget * 0.85 <= pixmap.width * pixmap.height <= budget * 1.05
+
+
+def test_render_page_scales_the_raster_with_the_configured_dpi():
+    """dpi pin for the live render helper: kills `zoom = dpi / 72.0` ->
+    `zoom = 1.0`. The only other dpi-sensitive test normalises its expectation
+    to the pixel budget, so a dpi-blind render still lands exactly on the
+    budget and passes; here the budget is deliberately huge, so the raster size
+    can only come from the dpi (a dpi-blind render ships 72 dpi images to the
+    vision model and dense pages silently degrade)."""
+    pdf = make_pdf(["dense"])
+    small = fitz.Pixmap(render_page(pdf, 0, dpi=72, pixel_budget=10**12))
+    big = fitz.Pixmap(render_page(pdf, 0, dpi=144, pixel_budget=10**12))
+    assert big.width > small.width * 1.8  # 2x dpi -> ~2x linear resolution
+    assert big.height > small.height * 1.8
+    assert big.width * big.height < 10**12  # the budget was not the limiter
 
 
 def test_render_pages_empty_pdf():

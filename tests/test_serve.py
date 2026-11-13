@@ -238,6 +238,156 @@ async def test_serve_spawns_sweep_loop(tmp_path, monkeypatch):
     store.close()
 
 
+async def test_serve_spawns_title_worker_and_one_ocr_worker_per_concurrency(tmp_path):
+    """Worker-spawn wiring pin: kills deleting the `title-worker` task (OCR
+    content still gets written back, but no document ever gets a generated
+    title — only filenames, forever) and kills
+    `for _ in range(config.ocr_concurrency)` -> `range(1)` (the operator's
+    OCR_CONCURRENCY=3 silently degrades to serial OCR). serve's sweep spawn and
+    poller are pinned elsewhere; nothing inspected worker task names or counts."""
+    config = load_config({**BASE_ENV, "OCR_CONCURRENCY": "3",
+                          "DATA_DIR": str(tmp_path)})
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.create_org(papra_org_id="org_1", name="Org")  # no mailboxes, no jobs
+
+    stop = asyncio.Event()
+    names: list[str] = []
+
+    async def snapshot_then_stop():
+        # serve builds its whole task list before its first await, so these
+        # tasks already exist here — the snapshot cannot lose a race.
+        await asyncio.sleep(0)
+        names.extend(task.get_name() for task in asyncio.all_tasks())
+        stop.set()
+
+    asyncio.get_running_loop().create_task(snapshot_then_stop())
+    await serve(config, stop=stop, store=store)
+
+    assert names.count("title-worker") == 1  # exactly one title worker
+    assert names.count("ocr-worker") == 3  # one per OCR_CONCURRENCY, not one
+    assert not _dangling_serve_tasks()
+    store.close()
+
+
+async def test_sweep_loop_survives_an_escaping_sweep_failure(tmp_path, caplog):
+    """Sweep-guard pin: kills removing the try/except around `sweep_once` in
+    `_sweep_loop`. Failures really do escape the shipped sweep_once — a listing
+    entry without `id` raises KeyError outside its inner guards — and `serve`
+    only logs `task sweep exited unexpectedly` without restarting, so the
+    removed guard means externally uploaded PDFs are never discovered or OCR'd
+    until the process restarts."""
+    import logging
+
+    class EscapingSweepPapra:
+        """Iteration 1: a listing entry with no `id` (API drift) -> KeyError
+        escapes sweep_once. Iteration 2: the stop seam (BaseException passes
+        the guard), so reaching it proves the loop survived iteration 1."""
+
+        def __init__(self):
+            self.listings = 0
+
+        async def list_documents(self, org_id, **kwargs):
+            self.listings += 1
+            if self.listings == 1:
+                return [{"name": "no-id.pdf", "mimeType": "application/pdf"}], 1
+            raise KeyboardInterrupt()
+
+    from papra_suite.pipeline import _sweep_loop
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.create_org(papra_org_id="org_1", name="Org")
+    papra = EscapingSweepPapra()
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(KeyboardInterrupt):
+            await _sweep_loop(store, papra, interval_s=0)
+
+    assert papra.listings == 2  # the loop SURVIVED the escaping KeyError
+    assert any("sweep loop error" in record.getMessage() for record in caplog.records)
+    store.close()
+
+
+async def test_poll_loop_sleeps_for_the_mailbox_poll_interval(tmp_path, monkeypatch):
+    """Poll-cadence pin: kills `await asyncio.sleep(mailbox.poll_interval_s)` ->
+    `asyncio.sleep(0)`, which polls every mailbox back-to-back (each poll
+    re-selects and re-fetches up to MAX_POLL_BYTES) and hammers the operator's
+    IMAP server instead of the configured cadence. Every existing poll-loop test
+    uses interval 0 or an exception stop seam, so the sleep argument was never
+    observed."""
+    from types import SimpleNamespace
+
+    import papra_suite.mail as mail_mod
+    from papra_suite.pipeline import _poll_loop
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_1", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
+                                      username="u", password="p", poll_interval_s=45)
+    polls = []
+
+    class _StopLoop(BaseException):
+        pass
+
+    async def fake_poll(store_arg, papra, mailbox, org, *, matcher=None):
+        polls.append(mailbox.id)
+        if len(polls) >= 3:
+            raise _StopLoop()
+
+    monkeypatch.setattr(mail_mod, "poll_mailbox_once", fake_poll)
+    # The stub replaces the pipeline MODULE's `asyncio` name only, so the shared
+    # asyncio module (the poll loop's regex-child teardown included) keeps its
+    # real sleep and cannot pollute the observed cadence.
+    slept: list[float] = []
+
+    async def spy_sleep(seconds, *args, **kwargs):
+        slept.append(seconds)
+
+    from papra_suite import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "asyncio", SimpleNamespace(sleep=spy_sleep))
+    with pytest.raises(_StopLoop):
+        await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+
+    assert slept == [45, 45]  # the configured cadence, not a hot spin
+    assert polls == [mailbox_id, mailbox_id, mailbox_id]  # 3 polls, 2 sleeps in between
+    store.close()
+
+
+async def test_serve_survives_store_close_failure(tmp_path, monkeypatch):
+    """Shutdown store-guard pin: kills removing the try/except around
+    `store.close()` in serve's shutdown. Its twin for the CLIENT closes is
+    pinned only with a non-raising recorder, so the store guard is never
+    executed: a busy sqlite handle or a disk error during the close of an
+    otherwise clean shutdown would propagate out of serve -> an asyncio.run
+    traceback, and main() would never return 0."""
+    original_close = Store.close
+    close_attempts = []
+
+    def failing_close(self):
+        close_attempts.append(True)
+        try:
+            original_close(self)  # release the sqlite handle anyway
+        finally:
+            raise RuntimeError("close failed")
+
+    monkeypatch.setattr(Store, "close", failing_close)
+
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})
+    stop = asyncio.Event()
+
+    async def set_stop_later():
+        await asyncio.sleep(0.2)
+        stop.set()
+
+    asyncio.get_running_loop().create_task(set_stop_later())
+    await serve(config, stop=stop)  # NO injected store: serve owns the close
+
+    assert close_attempts == [True]  # the close was attempted and absorbed
+    assert not _dangling_serve_tasks()
+
+
 async def test_serve_closes_remaining_clients_when_one_close_fails(
         tmp_path, monkeypatch):
     """Close-guard pin: one built client's aclose raising must not skip the

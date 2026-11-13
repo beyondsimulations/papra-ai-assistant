@@ -174,6 +174,75 @@ async def test_run_ocr_job_renders_pages_lazily(store, config, monkeypatch):
     assert markdown == "# a\n\n# b\n\n# c"
 
 
+async def test_run_ocr_job_caps_pages_at_ocr_max_pages(store, monkeypatch, caplog):
+    """OCR_MAX_PAGES cap on the LIVE path: kills `limit = min(total,
+    config.ocr_max_pages)` -> `limit = total` (one document then costs a vision
+    call per page of the whole PDF, the cost/time blow-up the knob exists to
+    prevent) and kills `if total > config.ocr_max_pages:` -> never warning.
+    The render_pages cap test cannot cover this: production counts pages and
+    renders them lazily, it never calls render_pages."""
+    import fitz
+
+    pdf = fitz.open()
+    for _ in range(3):
+        pdf.new_page()
+    papra = StubPapra(pdf.tobytes())
+    pdf.close()
+    llm, calls = make_llm(["# a", "# b", "# c"])
+    capped = load_config({**BASE_ENV, "DATA_DIR": "/tmp/x", "OCR_MAX_PAGES": "2"})
+
+    rendered: list[int] = []
+
+    def spy_render_page(pdf_bytes, index, *, dpi, pixel_budget):
+        rendered.append(index)
+        return b"fake-png"
+
+    monkeypatch.setattr(pipeline_mod, "render_page", spy_render_page)
+
+    with caplog.at_level(logging.WARNING):
+        markdown = await run_ocr_job(papra, llm, make_job(store), config=capped)
+
+    assert rendered == [0, 1]  # page 3 is never rendered (the memory bound)
+    assert calls["n"] == 2  # page 3 never reaches the vision model (the cost bound)
+    assert "skipped 1 additional pages" in caplog.text  # and the skip is visible
+    assert markdown == "# a\n\n# b"
+
+
+async def test_run_ocr_job_forwards_configured_dpi_and_pixel_budget(store, monkeypatch):
+    """Config -> render argument flow: kills `dpi=config.ocr_dpi` -> `dpi=72`
+    (every page then reaches the vision model at 72 dpi no matter what OCR_DPI
+    says, silently degrading dense pages) and
+    `pixel_budget=config.ocr_page_pixel_budget` -> a huge constant (which
+    re-opens the memory bound the per-page lazy rendering exists to provide).
+    The other run_ocr_job spies take **kwargs and assert page indices only, so
+    this flow was otherwise unobserved."""
+    import fitz
+
+    pdf = fitz.open()
+    pdf.new_page()
+    papra = StubPapra(pdf.tobytes())
+    pdf.close()
+    llm, _ = make_llm(["# a"])
+    # Deliberately NOT the shipped defaults (150 / 2_000_000): with those a
+    # mutant that hardcodes the defaults instead of reading the config would
+    # look like correct wiring.
+    custom = load_config({**BASE_ENV, "DATA_DIR": "/tmp/x", "OCR_DPI": "177",
+                          "OCR_PAGE_PIXEL_BUDGET": "123456"})
+
+    seen: list[tuple[int, int]] = []
+
+    def spy_render_page(pdf_bytes, index, *, dpi, pixel_budget):
+        seen.append((dpi, pixel_budget))
+        return b"fake-png"
+
+    monkeypatch.setattr(pipeline_mod, "render_page", spy_render_page)
+
+    await run_ocr_job(papra, llm, make_job(store), config=custom)
+
+    assert custom.ocr_dpi != 150 and custom.ocr_page_pixel_budget != 2_000_000
+    assert seen == [(custom.ocr_dpi, custom.ocr_page_pixel_budget)]
+
+
 async def test_run_ocr_job_rejects_oversized_document(store, config):
     """A document over OCR_MAX_DOCUMENT_BYTES must fail visibly instead of
     being pulled into memory and rendered."""
@@ -243,6 +312,24 @@ async def test_stale_title_job_skipped(store):
 
     assert papra.content_updates == []  # nothing overwritten
     assert calls["n"] == 0  # no LLM call either
+
+
+async def test_run_title_job_missing_content_is_treated_as_empty(store):
+    """`document.get("content") or ""` pin: kills dropping the `or ""`. A
+    get_document response with no content key (or an explicit null) then raises
+    AttributeError inside run_title_job — 3 attempts and a permanently failed
+    title job — instead of the designed "content differs => skip quietly".
+    Every other title test pre-seeds documents[...]["content"], so that arm was
+    never exercised."""
+    papra = StubPapra()  # documents["org_1"]["doc_1"] carries NO "content" key
+    llm, calls = make_llm(["Titel"])
+    job = make_job(store, kind="title", content_hash="hash-of-real-content",
+                   payload={"name": "rechnung.pdf", "excerpt": "x"})
+
+    await run_title_job(papra, llm, job)  # must not raise AttributeError
+
+    assert papra.content_updates == []  # empty current content != the job's hash
+    assert calls["n"] == 0  # skipped quietly, exactly like a stale job
 
 
 async def test_worker_loop_processes_and_transitions(store, config):
@@ -787,6 +874,28 @@ async def test_sweep_is_pdf_falls_back_to_pdf_name(store):
     job = store.claim_next_job("ocr")
     assert job is not None and job.document_id == "doc_scan"
     assert store.document_seen("org_1", "doc_notes")  # skip is permanent
+
+
+async def test_sweep_matches_uppercase_pdf_extension(store):
+    """Case-insensitivity pin on the extension fallback: kills dropping
+    `.lower()` from `_is_pdf`. A listing entry named `Scan.PDF` with no mimeType
+    is then classified NON-pdf, recorded as seen (a permanent skip, never
+    retried by a later sweep) and never OCR'd — it only shows up as a count in
+    non_pdf_skipped. The existing fallback test uses lower-case names only."""
+
+    class UpperPdfPapra(StubPapra):
+        def __init__(self):
+            super().__init__()
+            self.documents = {"org_1": {
+                "doc_scan": {"id": "doc_scan", "name": "Scan.PDF"},  # no mimeType
+            }}
+
+    result = await sweep_once(store, UpperPdfPapra())
+
+    assert result.jobs_enqueued == 1  # `Scan.PDF` is a document to transcribe
+    assert result.non_pdf_skipped == 0  # not silently skipped-and-forgotten
+    job = store.claim_next_job("ocr")
+    assert job is not None and job.document_id == "doc_scan"
 
 
 async def test_sweep_continues_past_download_failure(store):

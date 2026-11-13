@@ -3,6 +3,7 @@ import pytest
 
 from papra_suite.llm_client import LLMClient
 from papra_suite.titles import (
+    EXCERPT_CHARS,
     TITLE_MAX_LENGTH,
     build_title_messages,
     generate_title,
@@ -20,9 +21,17 @@ def test_build_title_messages_shape():
 
 
 def test_build_title_messages_truncates_excerpt():
-    long = "x" * 5000
+    """Excerpt-BUDGET pin (was a length-only pin, satisfied by any stub slice):
+    kills `trimmed = excerpt[:EXCERPT_CHARS]` -> `excerpt[:20]` / `[:0]`, which
+    would generate every title of a long document from a sliver of page 1 while
+    the suite stayed green. The tail marker sits just inside the budget, so a
+    shorter slice cannot produce it; the filler proves the budget still cuts."""
+    long = "A" * (EXCERPT_CHARS - 60) + "TAILMARKER" + "B" * 3000
     messages = build_title_messages(filename="f.pdf", excerpt=long)
-    assert len(messages[1]["content"]) < 2600
+    content = messages[1]["content"]
+    assert len(content) < 2600  # the excerpt is truncated (the old assertion)
+    assert "TAILMARKER" in content  # ... at EXCERPT_CHARS, not after 20 chars
+    assert "B" * 60 not in content  # the tail beyond the budget is gone
 
 
 def test_sanitize_title_strips_quotes_and_caps():
