@@ -35,6 +35,7 @@ class FakeSession:
     seen: list = field(default_factory=list)
     deleted: list = field(default_factory=list)
     fail_on_connect: Exception | None = None
+    closed: bool = False
 
     def connect(self):
         if self.fail_on_connect:
@@ -55,7 +56,7 @@ class FakeSession:
         self.deleted.extend(uids)
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class StubClient:
@@ -235,6 +236,50 @@ async def test_poll_updates_persisted_mailbox_state(store, monkeypatch):
     assert updated.last_error is None
     assert updated.consecutive_failures == 0
     assert updated.enabled is True
+
+
+async def test_upload_failure_freezes_last_seen_prefix(store, monkeypatch):
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    session = FakeSession(raws=[
+        (1, build_raw(message_id="<m1@x>", attachments=[("bad.pdf", b"%PDF-1")])),
+        (2, build_raw(message_id="<m2@x>", attachments=[("good.pdf", b"%PDF-2")])),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient(fail_for={"bad.pdf"})
+
+    org = store.get_org(org_id)
+    mailbox = store.get_mailbox(mailbox_id)
+    result = await poll_mailbox_once(store, client, mailbox, org)
+
+    # uid 1 failed: last_seen must not advance past it (uid 2's success must
+    # not strand uid 1) — the empty-poll default 0 keeps uid 1 re-fetchable
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 0
+    assert result.documents_uploaded == 1
+
+    # a follow-up poll re-fetches uid 1 (and retries its upload)
+    second = await poll_mailbox_once(
+        store, client, store.get_mailbox(mailbox_id), org
+    )
+    assert second.messages_scanned == 2
+    assert second.messages_failed == 1
+    assert second.documents_uploaded == 0  # good.pdf dedup-skipped
+
+
+async def test_poll_never_raises_on_internal_error(store, monkeypatch):
+    def _boom(raw):
+        raise RuntimeError("boom")
+
+    session = FakeSession(raws=[(1, build_raw())])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    monkeypatch.setattr("papra_suite.mail.parse_message", _boom)
+
+    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+
+    assert result.error is not None and "boom" in result.error
+    assert session.closed is True
 
 
 async def test_poll_connection_failure_disables_after_three(store, monkeypatch):

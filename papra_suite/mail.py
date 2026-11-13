@@ -229,51 +229,63 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
     seen_uids: list[int] = []
     delete_uids: list[int] = []
     candidate_last_seen = mailbox.last_seen_uid if not rescan else None
+    prefix_failed = False
 
-    for uid, raw in raw_messages:
-        result.messages_scanned += 1
-        parsed = parse_message(raw)
-        if not subject_matches(parsed.subject, mailbox.subject_filter):
-            logger.info("message uid=%s skipped by subject filter", uid)
-            seen_uids.append(uid)
-            candidate_last_seen = uid
-            continue
-        uploads_ok = True
-        had_pdfs = False
-        for attachment in parsed.pdf_attachments:
-            had_pdfs = True
-            attachment_hash = dedup_hash(
-                mailbox.id, parsed.message_id, attachment.filename, len(attachment.content)
-            )
-            if store.dedup_exists(attachment_hash):
-                logger.info("attachment %s already ingested (dedup)", attachment.filename)
+    try:
+        for uid, raw in raw_messages:
+            result.messages_scanned += 1
+            parsed = parse_message(raw)
+            if not subject_matches(parsed.subject, mailbox.subject_filter):
+                logger.info("message uid=%s skipped by subject filter", uid)
+                seen_uids.append(uid)
+                if not prefix_failed:
+                    candidate_last_seen = uid
                 continue
-            try:
-                document = await client.create_document(
-                    org.papra_org_id, attachment.filename, attachment.content
+            uploads_ok = True
+            had_pdfs = False
+            for attachment in parsed.pdf_attachments:
+                had_pdfs = True
+                attachment_hash = dedup_hash(
+                    mailbox.id, parsed.message_id, attachment.filename, len(attachment.content)
                 )
-            except PapraError as error:
-                uploads_ok = False
-                result.messages_failed += 1
-                logger.error("upload failed for %s: %s", attachment.filename, error)
-                continue
-            file_hash = compute_file_hash(attachment.content)
-            enqueue_ocr_job(
-                store, papra_org_id=org.papra_org_id, document_id=document["id"],
-                file_hash=file_hash, name=document["name"],
-                mime="application/pdf", ingested_via="mail",
-            )
-            store.add_dedup(attachment_hash)
-            result.documents_uploaded += 1
-        for name in parsed.skipped_attachments:
-            result.attachments_skipped += 1
-            logger.info("skipped non-pdf attachment %s", name)
-        if uploads_ok:
-            seen_uids.append(uid)
-            if mailbox.delete_after_download and had_pdfs:
-                delete_uids.append(uid)
-            candidate_last_seen = uid
-        # on failure: leave the message unread and do not advance last_seen
+                if store.dedup_exists(attachment_hash):
+                    logger.info("attachment %s already ingested (dedup)", attachment.filename)
+                    continue
+                try:
+                    document = await client.create_document(
+                        org.papra_org_id, attachment.filename, attachment.content
+                    )
+                except PapraError as error:
+                    uploads_ok = False
+                    result.messages_failed += 1
+                    logger.error("upload failed for %s: %s", attachment.filename, error)
+                    continue
+                file_hash = compute_file_hash(attachment.content)
+                enqueue_ocr_job(
+                    store, papra_org_id=org.papra_org_id, document_id=document["id"],
+                    file_hash=file_hash, name=document["name"],
+                    mime="application/pdf", ingested_via="mail",
+                )
+                store.add_dedup(attachment_hash)
+                result.documents_uploaded += 1
+            for name in parsed.skipped_attachments:
+                result.attachments_skipped += 1
+                logger.info("skipped non-pdf attachment %s", name)
+            if uploads_ok:
+                seen_uids.append(uid)
+                if mailbox.delete_after_download and had_pdfs:
+                    delete_uids.append(uid)
+                if not prefix_failed:
+                    candidate_last_seen = uid
+            else:
+                # freeze last_seen: a failed message must stay re-fetchable;
+                # later messages are still processed best-effort (dedup-safe)
+                prefix_failed = True
+    except Exception as error:  # noqa: BLE001 - the poller never raises
+        result.error = str(error)
+        await asyncio.to_thread(session.close)
+        _record_failure_quietly(store, mailbox.id, result.error)
+        return result
 
     try:
         await asyncio.to_thread(session.mark_seen, seen_uids)
