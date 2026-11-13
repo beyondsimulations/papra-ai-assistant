@@ -51,12 +51,71 @@ def _papra_is_up(*, readiness_timeout_s: float = 0.0) -> bool:
     return _probe_readiness(PAPRA_TEST_URL, readiness_timeout_s=readiness_timeout_s)
 
 
+GREENMAIL_HOST = "127.0.0.1"
+GREENMAIL_SMTP_PORT = 3025
+GREENMAIL_IMAP_PORT = 3143
+GREENMAIL_USER = "ingest@localhost"
+GREENMAIL_PASSWORD = "ingest-pass-123"
+
+
+def _greenmail_is_up() -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((GREENMAIL_HOST, GREENMAIL_IMAP_PORT), timeout=2.0):
+            return True
+    except OSError:
+        return False
+
+
 @pytest.fixture(scope="session")
+def greenmail():
+    if not _greenmail_is_up():
+        _skip_or_fail("scratch GreenMail not running; use `make test`")
+    yield (GREENMAIL_HOST, GREENMAIL_IMAP_PORT, GREENMAIL_SMTP_PORT,
+           GREENMAIL_USER, GREENMAIL_PASSWORD)
+
+
+def purge_greenmail_inbox():
+    """Empty the shared GreenMail INBOX so each test starts from a clean mailbox."""
+    import imaplib
+
+    imap = imaplib.IMAP4(GREENMAIL_HOST, GREENMAIL_IMAP_PORT)
+    try:
+        imap.login(GREENMAIL_USER, GREENMAIL_PASSWORD)
+        imap.select("INBOX")
+        imap.store("1:*", "+FLAGS", "\\Deleted")
+        imap.expunge()
+    finally:
+        imap.logout()
+
+
+def inject_message(*, to, subject, attachments=()):
+    """Send a MIME message with (filename, bytes, mime-tuple) attachments via GreenMail SMTP."""
+    import smtplib
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["From"] = "sender@example.com"
+    message["To"] = to
+    message["Subject"] = subject
+    message["Message-ID"] = f"<{uuid.uuid4().hex}@test>"
+    for filename, content, mime in attachments:
+        message.add_attachment(content, maintype=mime[0], subtype=mime[1], filename=filename)
+    with smtplib.SMTP(GREENMAIL_HOST, GREENMAIL_SMTP_PORT, timeout=10) as smtp:
+        smtp.send_message(message)
+
+
+# Function-scoped on purpose: each integration test gets a fresh Papra
+# user/org/api key. A session-scoped org leaks documents between tests (the
+# M2 ingestion suite asserts on org-emptiness and Papra 409-dedups identical
+# file content), so per-test isolation is required.
+@pytest.fixture
 def papra_stack():
     if not _papra_is_up(readiness_timeout_s=15.0):
         _skip_or_fail("scratch Papra not running; use `make test`")
 
-    # unique per session so a reused container cannot collide
+    # unique per test so a reused container cannot collide
     suffix = uuid.uuid4().hex[:8]
     with httpx.Client(base_url=PAPRA_TEST_URL) as http:
         sign_up = http.post(
