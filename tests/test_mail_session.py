@@ -21,17 +21,24 @@ def make_session(ssl_mode="plain"):
 class FakeImap:
     """Minimal imaplib double: canned SEARCH result, per-uid FETCH responses."""
 
-    def __init__(self, search_uids=(1, 2, 3), bodies=None, fetch_responses=None):
+    def __init__(self, search_uids=(1, 2, 3), bodies=None, fetch_responses=None,
+                 sizes=None):
         self.search_uids = list(search_uids)
         self.bodies = bodies or {}                    # uid -> raw bytes (well-formed)
-        self.fetch_responses = fetch_responses or {}  # uid -> raw fetch_data list
-        self.fetch_calls = []
+        self.fetch_responses = fetch_responses or {}  # uid -> raw body-fetch_data list
+        self.sizes = sizes or {}                       # uid -> explicit RFC822.SIZE
+        self.size_probes = []   # uids probed with (RFC822.SIZE)
+        self.fetch_calls = []    # uids whose BODY.PEEK[] was actually fetched
 
     def uid(self, command, *args):
         if command == "SEARCH":
             payload = " ".join(str(u) for u in self.search_uids).encode()
             return ("OK", [payload])
         uid = int(args[0])
+        if args[1] == "(RFC822.SIZE)":
+            self.size_probes.append(uid)
+            size = self.sizes.get(uid, len(self.bodies.get(uid, b"")))
+            return ("OK", [f"{uid} (RFC822.SIZE {size} UID {uid})".encode()])
         self.fetch_calls.append(uid)
         if uid in self.fetch_responses:
             return ("OK", self.fetch_responses[uid])
@@ -74,29 +81,35 @@ def test_fetch_since_filters_uid_edge():
 
 def test_fetch_since_skips_oversized_message():
     session = make_session()
-    big = b"x" * (MAX_MESSAGE_BYTES + 1)
-    session._imap = FakeImap(search_uids=(1,), bodies={1: big})
+    # size probe reports an oversized message; no body is ever stored (a body
+    # fetch would KeyError), so the skip must happen on metadata alone
+    session._imap = FakeImap(
+        search_uids=(1,), sizes={1: MAX_MESSAGE_BYTES + 1}
+    )
 
     batch = session.fetch_since(None)
 
     assert batch.messages == []
     assert batch.oversized_uids == [1]   # still counts: the poller advances past it
+    assert session._imap.size_probes == [1]
+    assert session._imap.fetch_calls == []  # the BODY fetch is never issued
 
 
 def test_fetch_since_stops_at_aggregate_cap():
     session = make_session()
-    big = b"x" * (30 * 1024 * 1024)      # 30MB each: five would be 150MB
+    big = 30 * 1024 * 1024               # 30MB each: five would be 150MB
     session._imap = FakeImap(
-        search_uids=(1, 2, 3, 4, 5), bodies={uid: big for uid in (1, 2, 3, 4, 5)}
+        search_uids=(1, 2, 3, 4, 5), sizes={uid: big for uid in (1, 2, 3, 4, 5)}
     )
 
     batch = session.fetch_since(None)
 
     # fetching stops once accumulated bytes exceed MAX_POLL_BYTES (4 x 30MB):
-    # the returned batch is bounded and uid 5 is never fetched
+    # the returned batch is bounded and uid 5 is never even probed
     assert batch.messages == []
     assert batch.oversized_uids == [1, 2, 3, 4]
-    assert session._imap.fetch_calls == [1, 2, 3, 4]
+    assert session._imap.size_probes == [1, 2, 3, 4]
+    assert session._imap.fetch_calls == []   # all four are oversized: no body reads
     assert 4 * 30 * 1024 * 1024 > MAX_POLL_BYTES
 
 

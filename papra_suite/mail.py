@@ -227,6 +227,24 @@ class MailboxSession:
                     total_bytes, MAX_POLL_BYTES, remaining,
                 )
                 break
+            # Pre-check the message size via a cheap metadata-only fetch
+            # (RFC822.SIZE) before requesting the body: a hostile oversized
+            # message must not be fully read into RAM just to be skipped.
+            size = self._rfc822_size(uid)
+            if size is None:
+                logger.warning("message uid=%s vanished before fetch; skipping", uid)
+                continue
+            total_bytes += size
+            if size > MAX_MESSAGE_BYTES:
+                # Oversized messages still count toward the aggregate cap,
+                # exactly as when the bytes crossed the wire into this process.
+                logger.warning(
+                    "message uid=%s exceeds the per-message cap (%d bytes); "
+                    "skipping without fetching the body",
+                    uid, MAX_MESSAGE_BYTES,
+                )
+                batch.oversized_uids.append(uid)
+                continue
             status, fetch_data = self._imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
             if status != "OK":
                 raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
@@ -239,20 +257,19 @@ class MailboxSession:
                     and isinstance(entry[1], bytes)):
                 logger.warning("message uid=%s vanished before fetch; skipping", uid)
                 continue
-            raw = entry[1]
-            total_bytes += len(raw)
-            if len(raw) > MAX_MESSAGE_BYTES:
-                # Oversized messages still count toward the aggregate cap: the
-                # bytes already crossed the wire into this process.
-                logger.warning(
-                    "message uid=%s exceeds the per-message cap (%d bytes); "
-                    "skipping without parsing",
-                    uid, MAX_MESSAGE_BYTES,
-                )
-                batch.oversized_uids.append(uid)
-                continue
-            batch.messages.append((uid, raw))
+            batch.messages.append((uid, entry[1]))
         return batch
+
+    def _rfc822_size(self, uid: int) -> int | None:
+        """Return the message's RFC822.SIZE, or None if it vanished/parse failed."""
+        status, fetch_data = self._imap.uid("FETCH", str(uid), "(RFC822.SIZE)")
+        if status != "OK":
+            raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
+        entry = fetch_data[0] if fetch_data else None
+        if not isinstance(entry, bytes):
+            return None
+        match = re.search(rb"RFC822\.SIZE\s+(\d+)", entry)
+        return int(match.group(1)) if match else None
 
     def mark_seen(self, uids: list[int]) -> None:
         for uid in uids:
