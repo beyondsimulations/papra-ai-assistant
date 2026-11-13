@@ -47,21 +47,27 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
     value = _require(env, name).rstrip("/")
     if not value:
         raise ConfigError(f"{name} must not be empty")
-    parsed = urlparse(value)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ConfigError(f"{name} must be an http(s) URL, got: {value!r}")
-    # A netloc like ":1221" passes the netloc check but has no host; httpx
-    # would fail on every request. Likewise a bad port ("papra:abc",
-    # "papra:99999", "host:1221:extra") only blows up inside httpx at
-    # request time — the check command must reject it up front instead.
-    if not parsed.hostname:
-        raise ConfigError(f"{name} must include a host, got: {value!r}")
     try:
+        # A malformed IPv6 literal (e.g. "http://[::1") makes urlparse itself
+        # raise ValueError("Invalid IPv6 URL") at parse time, not only on the
+        # .port access — mirror the DASHBOARD_BIND handling in _parse_bind.
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ConfigError(f"{name} must be an http(s) URL, got: {value!r}")
+        # A netloc like ":1221" passes the netloc check but has no host; httpx
+        # would fail on every request. Likewise a bad port ("papra:abc",
+        # "papra:99999", "host:1221:extra") only blows up inside httpx at
+        # request time — the check command must reject it up front instead.
+        if not parsed.hostname:
+            raise ConfigError(f"{name} must include a host, got: {value!r}")
         parsed.port  # noqa: B018 — property access validates the port
     except ValueError:
         # Covers non-numeric, out-of-range (0-65535) and trailing-garbage
-        # ports; urlparse raises on .port access, not on parse.
-        raise ConfigError(f"{name} must have a valid port, got: {value!r}") from None
+        # ports, plus malformed IPv6 literals; urlparse raises on .port
+        # access, not on parse.
+        raise ConfigError(
+            f"{name} must have a valid port and IPv6 literal, got: {value!r}"
+        ) from None
     # "http://papra:" (empty port) is indistinguishable from "http://papra"
     # via parsed attributes (netloc "papra:" but hostname/port identical to
     # the no-port form), and httpx normalizes both to the scheme default

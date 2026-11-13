@@ -131,3 +131,22 @@ def test_trailing_garbage_after_port_base_url_rejected():
 def test_valid_base_urls_still_pass():
     config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "https://host.example"})
     assert config.papra_base_url == "https://host.example"
+
+
+def test_malformed_ipv6_papra_base_url_raises_config_error():
+    # "http://[::1" (unclosed bracket) makes urlparse itself raise
+    # ValueError("Invalid IPv6 URL") at parse time — this must surface as a
+    # ConfigError naming the variable, not a raw traceback.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://[::1"})
+
+
+def test_malformed_ipv6_llm_base_url_raises_config_error():
+    # "http://[invalid]:80" also fails at urlparse parse time.
+    with pytest.raises(ConfigError, match="LLM_BASE_URL"):
+        load_config({**BASE_ENV, "LLM_BASE_URL": "http://[invalid]:80"})
+
+
+def test_valid_bracketed_ipv6_base_url_passes():
+    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://[::1]:1221"})
+    assert config.papra_base_url == "http://[::1]:1221"
