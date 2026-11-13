@@ -165,7 +165,7 @@ async def test_serve_logs_designed_task_exit_as_info(tmp_path, monkeypatch, capl
     mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
                                        username="u", password="p", poll_interval_s=0)
 
-    async def failing_poll(store_arg, papra, mailbox, org):
+    async def failing_poll(store_arg, papra, mailbox, org, *, matcher=None):
         # one poll failure with disable_after=1 disables the mailbox row;
         # the REAL _poll_loop then re-fetches the row and stops by design
         store_arg.record_poll_failure(mailbox.id, "boom", disable_after=1)
@@ -392,7 +392,7 @@ async def test_poll_loop_polls_with_fresh_mailbox_row(tmp_path, monkeypatch):
     class _StopLoop(BaseException):
         pass
 
-    async def fake_poll(store_arg, papra, mailbox, org):
+    async def fake_poll(store_arg, papra, mailbox, org, *, matcher=None):
         captured.append(mailbox.last_seen_uid)
         # simulate a successful poll persisting a new UID cursor
         store_arg.record_poll_success(
@@ -427,7 +427,7 @@ async def test_poll_loop_stops_when_mailbox_disabled_mid_loop(tmp_path, monkeypa
                                       username="u", password="p", poll_interval_s=0)
     polls = []
 
-    async def failing_poll(store_arg, papra, mailbox, org):
+    async def failing_poll(store_arg, papra, mailbox, org, *, matcher=None):
         polls.append(mailbox.id)
         store_arg.record_poll_failure(mailbox.id, "boom", disable_after=1)
 
@@ -455,7 +455,7 @@ async def test_poll_loop_stops_when_mailbox_deleted_mid_loop(tmp_path, monkeypat
                                       username="u", password="p", poll_interval_s=0)
     polls = []
 
-    async def deleting_poll(store_arg, papra, mailbox, org):
+    async def deleting_poll(store_arg, papra, mailbox, org, *, matcher=None):
         polls.append(mailbox.id)
         store_arg.delete_mailbox(mailbox.id)
 
@@ -492,7 +492,7 @@ async def test_poll_loop_survives_missing_org_without_disable_storm(
 
     poll_calls = []
 
-    async def ghost_org_poll(store_arg, papra, mailbox, org):
+    async def ghost_org_poll(store_arg, papra, mailbox, org, *, matcher=None):
         poll_calls.append(org)  # must NEVER run: org is None
 
     monkeypatch.setattr(mail_mod, "poll_mailbox_once", ghost_org_poll)
@@ -516,6 +516,115 @@ async def test_poll_loop_survives_missing_org_without_disable_storm(
     assert mailbox.consecutive_failures == 0
     assert mailbox.last_error is None
     assert any("not found" in record.getMessage() for record in caplog.records)
+    store.close()
+
+
+async def test_poll_loop_owns_one_regex_matcher_and_closes_it_on_normal_exit(
+        tmp_path, monkeypatch):
+    """Lifecycle seam pin: one killable-matcher child per poll TASK (reused
+    across polls and across every message of a poll), and aclose() runs when
+    the loop exits by design (mailbox disabled). A matcher that outlives its
+    task is an orphan regex_worker process per poll loop.
+    """
+    import papra_suite.mail as mail_mod
+    import papra_suite.safematch as safematch_mod
+    from papra_suite.pipeline import _poll_loop
+    from papra_suite.safematch import KillableMatcher, MatchOutcome
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_1", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
+                                      username="u", password="p", poll_interval_s=0)
+    started, closed = [], []
+
+    class SpyMatcher(KillableMatcher):
+        async def aclose(self):
+            closed.append(self)
+            await super().aclose()
+
+    monkeypatch.setattr(safematch_mod, "KillableMatcher", SpyMatcher)
+
+    async def recording_poll(store_arg, papra, mailbox, org, *, matcher=None):
+        started.append(matcher)
+        # stop the loop after this iteration FIRST: a poll fake that raises
+        # must not leave _poll_loop spinning on a caught exception
+        store_arg.record_poll_failure(mailbox.id, "boom", disable_after=1)
+        assert matcher is not None, "the poll loop handed the poll no matcher"
+        assert await matcher.search(".*x.*", "x", timeout_s=10.0) is MatchOutcome.MATCH
+
+    monkeypatch.setattr(mail_mod, "poll_mailbox_once", recording_poll)
+    await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+
+    assert len(started) == 1                     # one matcher, handed to the poll
+    assert closed == started                     # and it was closed on exit
+    assert started[0].pid is None                # no live child left over
+    assert started[0].child_returncode is not None  # killed AND reaped, not abandoned
+    store.close()
+
+
+async def test_poll_loop_closes_its_regex_matcher_when_cancelled(tmp_path, monkeypatch):
+    """Shutdown pin: serve cancels its poll tasks, so teardown must also run
+    through CancelledError — otherwise every serve shutdown (SIGTERM of the
+    container is a cancellation, not a return) leaks a child process, and a
+    child stuck in a catastrophic match keeps burning CPU after its parent
+    is gone.
+    """
+    import os
+
+    import papra_suite.mail as mail_mod
+    import papra_suite.safematch as safematch_mod
+    from papra_suite.pipeline import _poll_loop
+    from papra_suite.safematch import KillableMatcher, MatchOutcome
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_1", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
+                                      username="u", password="p", poll_interval_s=0)
+    started, closed = [], []
+
+    class SpyMatcher(KillableMatcher):
+        async def aclose(self):
+            closed.append(self)
+            await super().aclose()
+
+    monkeypatch.setattr(safematch_mod, "KillableMatcher", SpyMatcher)
+
+    async def hanging_poll(store_arg, papra, mailbox, org, *, matcher=None):
+        started.append(matcher)
+        assert matcher is not None, "the poll loop handed the poll no matcher"
+        assert await matcher.search(".*x.*", "x", timeout_s=10.0) is MatchOutcome.MATCH
+        await asyncio.sleep(3600)                # where serve's shutdown catches it
+
+    monkeypatch.setattr(mail_mod, "poll_mailbox_once", hanging_poll)
+    task = asyncio.create_task(
+        _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+    )
+    try:
+        # bounded wait (20s): a poll loop that never hands out a live matcher
+        # must FAIL this test, not hang it
+        for _ in range(2000):
+            if started and getattr(started[0], "pid", None) is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert started and getattr(started[0], "pid", None) is not None, \
+            "the poll loop never gave the poll a running regex child"
+        child_pid = started[0].pid
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert closed == started                     # cancellation still tore down
+    assert started[0].child_returncode is not None
+    # the OS-level proof that no orphan survived the cancellation
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
     store.close()
 
 

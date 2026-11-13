@@ -20,6 +20,7 @@ from email.message import Message
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.papra_client import PapraClient, PapraError
 from papra_suite.pipeline import enqueue_ocr_job
+from papra_suite.safematch import KillableMatcher, MatchOutcome
 from papra_suite.store import Mailbox, Org, Store
 
 logger = logging.getLogger(__name__)
@@ -41,21 +42,49 @@ PDF_MAGIC = b"%PDF-"
 MAX_MESSAGE_BYTES = 25 * 1024 * 1024
 MAX_POLL_BYTES = 100 * 1024 * 1024
 # Subject cap for the regex filter: RFC 5322 sets no hard subject limit, and
-# legitimately useful subjects beyond this length are vanishingly rare, but
-# unbounded input feeds the common super-linear regex backtracking class.
-# The cap bounds the LINEAR and QUADRATIC classes; the high-base exponential
-# class is rejected up front by validate_subject_filter (once per poll).
+# legitimately useful subjects beyond this length are vanishingly rare, so
+# the cap shrinks what a hostile subject can hand the engine. It is NOT the
+# bound that protects the process: cutting a subject from 5000 to 1000 chars
+# still leaves a catastrophic pattern running for longer than any timeout,
+# which is why the match itself is killable (SUBJECT_FILTER_TIMEOUT_S).
 MAX_SUBJECT_CHARS = 1000
-# Honest semantics: the per-message wait_for around subject_matches bounds
-# NOTHING for GIL-holding regexes — re.search keeps the GIL for its whole
-# runtime, so the timeout callback cannot run until the search finishes.
-# It is defense in depth for the residual low-base exponential class only,
-# and fires (late) after the search drains.
+# Per-message budget for the operator's subject regex. The match runs in the
+# disposable child of papra_suite/regex_worker.py, and a child can be killed:
+# SIGTERM/SIGKILL are delivered by the kernel, so this budget interrupts a
+# catastrophic backtracking search mid-flight. A wait_for around a search in
+# THIS process could not (re.search holds the GIL until it drains, so the
+# callback only fires after the freeze is over). A killed match counts as a
+# NON-MATCH and the poll continues, so \Seen and the UID cursor still advance
+# and a poisoned subject cannot re-freeze the process on the next poll.
 SUBJECT_FILTER_TIMEOUT_S = 2.0
-# Pre-validation growth ratio: t("a"*30) / t("a"*20) above this means the
-# pattern's backtracking grows super-linearly with input length (linear
-# ~1.5x, quadratic ~2.3x, exponential classes >> 10x).
+# Budget for the pre-validation probes, which run in the same killable child.
+# Validation used to be the unbounded part: (a+)+\d+$ never returns from its
+# own "a"*30 probe, which froze the loop before a single mail was read. 10s
+# is generous — a pattern that cannot finish a 30-byte probe in that time is
+# definitionally unusable against a 1000-byte subject, so it is rejected.
+SUBJECT_VALIDATION_TIMEOUT_S = 10.0
+# Pre-validation growth ratio: t(long near-miss) / t(short near-miss) above
+# this rejects the pattern. HONEST SCOPE — a probe can only measure the
+# backtracking its INPUT reaches, so the gate catches patterns whose ambiguous
+# group is reachable from the probe alphabet ((a|aa)+b ~120x, (a+)+$ ~15x,
+# ^(\w+\s?)*$ ~15x) and MISSES patterns whose blowup sits behind an anchor
+# plus a literal the operator typed: (Rechnung|Invoice)\s*(\d+\s*)+$ scores
+# ~1x on every probe here and is ACCEPTED while still costing ~2x per added
+# digit. The bound that protects the process is killable execution, not this
+# gate; passing it must never be read as "this pattern is safe".
 SUBJECT_FILTER_MAX_GROWTH_RATIO = 10
+# Probe pairs for the gate, each a NEAR-MISS at two lengths (a trailing byte
+# that breaks the match, so backtracking actually runs — an input the pattern
+# MATCHES is O(n) and measures nothing). The original all-"a" pair stays:
+# it is what catches (a|aa)+b. The two near-miss pairs add the classes that
+# need a non-matching tail to blow up ((a+)+$, ^(\w+\s?)*$) at lengths small
+# enough to stay milliseconds — the gate is a cheap first filter now that the
+# killable child is the actual bound.
+SUBJECT_FILTER_PROBE_PAIRS = (
+    ("a" * 20, "a" * 30),
+    ("a" * 12 + "!", "a" * 16 + "!"),
+    ("1" * 12 + "!", "1" * 16 + "!"),
+)
 
 
 @dataclass
@@ -170,19 +199,29 @@ def _decode_header_value(raw: str | None) -> str | None:
 
 
 def validate_subject_filter(pattern: str | None) -> None:
-    """Pre-validate a mailbox subject filter once per poll, before any
+    r"""Pre-validate a mailbox subject filter once per poll, before any
     message processing. Raises ValueError on an invalid or unsafe pattern.
 
-    Honest semantics: the poller's per-message wait_for bounds nothing for
-    GIL-holding regexes (re.search keeps the GIL, so the timeout callback
-    cannot run mid-search) — one crafted subject would freeze the WHOLE
-    process for an attacker-choosable duration and crash-loop after restart.
-    This check rejects that high-base exponential class cheaply: time the
-    compiled pattern against "a"*20 and "a"*30 and refuse when the growth
-    ratio exceeds SUBJECT_FILTER_MAX_GROWTH_RATIO. The MAX_SUBJECT_CHARS cap
-    bounds the linear and quadratic classes; low-base exponential patterns
-    that slip under the ratio remain a documented residual (mitigated only
-    coarsely, by the cap and the late-firing wait_for).
+    WHAT THIS GATE ACTUALLY DETECTS: it times the compiled pattern against a
+    few short probe pairs (SUBJECT_FILTER_PROBE_PAIRS) and refuses when the
+    growth ratio passes SUBJECT_FILTER_MAX_GROWTH_RATIO. A probe can only
+    measure the backtracking its INPUT reaches, so it catches patterns whose
+    ambiguous group is reachable from the probe alphabet ((a|aa)+b, (a+)+$,
+    ^(\w+\s?)*$) and does NOT catch patterns whose ambiguity sits behind an
+    anchor plus a literal the operator typed:
+    (Rechnung|Invoice)\s*(\d+\s*)+$ scores ~1x on every probe here and is
+    accepted, while still costing ~2x per added digit on "Rechnung 111...!".
+    Passing this function does NOT mean a pattern is safe.
+
+    What protects the process is that the filter is EXECUTED KILLABLY: the
+    poller runs both this gate and every per-message match in the child
+    process of papra_suite/regex_worker.py (see papra_suite.safematch), so a
+    probe that never terminates — (a+)+\d+$ never returns from its own
+    "a"*30 probe — is killed at SUBJECT_VALIDATION_TIMEOUT_S and surfaces as
+    this same ValueError, and a subject that blows up at match time is killed
+    at SUBJECT_FILTER_TIMEOUT_S and counted as a non-match. The function
+    itself stays sync and cheap so it can be called directly; only there is
+    its runtime bounded by nothing.
     """
     if not pattern:
         return
@@ -190,14 +229,18 @@ def validate_subject_filter(pattern: str | None) -> None:
         compiled = re.compile(pattern)
     except re.error as error:
         raise ValueError(f"invalid subject filter: {error}") from error
-    start = time.perf_counter()
-    compiled.search("a" * 20)
-    t20 = time.perf_counter() - start
-    start = time.perf_counter()
-    compiled.search("a" * 30)
-    t30 = time.perf_counter() - start
-    if t30 / max(t20, 1e-6) > SUBJECT_FILTER_MAX_GROWTH_RATIO:
-        raise ValueError("subject filter is unsafe: super-linear backtracking")
+    for short_input, long_input in SUBJECT_FILTER_PROBE_PAIRS:
+        start = time.perf_counter()
+        compiled.search(short_input)
+        t_short = time.perf_counter() - start
+        start = time.perf_counter()
+        compiled.search(long_input)
+        t_long = time.perf_counter() - start
+        if t_long / max(t_short, 1e-6) > SUBJECT_FILTER_MAX_GROWTH_RATIO:
+            raise ValueError(
+                "subject filter is unsafe: super-linear backtracking "
+                f"(probe growth ratio over {SUBJECT_FILTER_MAX_GROWTH_RATIO})"
+            )
 
 
 def subject_matches(subject: str | None, pattern: str | None) -> bool:
@@ -205,12 +248,16 @@ def subject_matches(subject: str | None, pattern: str | None) -> bool:
 
     The subject is truncated to MAX_SUBJECT_CHARS before matching: RFC 5322
     has no hard subject limit, legit subjects over the cap are vanishingly
-    rare, and the cap bounds the input for the linear and quadratic
-    backtracking classes. The exponential class is rejected up front by
-    validate_subject_filter (once per poll); the caller's wait_for around
-    this call bounds nothing for GIL-holding regexes — it fires only after
-    a catastrophic search finishes (defense in depth for the residual
-    low-base class).
+    rare, and the cap shrinks what the engine has to chew on.
+
+    This is the SYNC reference for filter semantics (case-insensitivity, the
+    empty-pattern and None-subject branches, the cap) — and running the regex
+    in the calling thread is exactly why it is no longer the production path:
+    a catastrophic pattern here is uninterruptible, because re.search holds
+    the GIL until it drains and no timeout inside this process can fire.
+    The poller asks papra_suite.safematch.KillableMatcher the same question
+    instead: same answer, but of a child process that is killed when it runs
+    out of budget.
     """
     if not pattern:
         return True
@@ -413,9 +460,65 @@ class PollResult:
 
 
 async def poll_mailbox_once(store: Store, client: PapraClient,
-                            mailbox: Mailbox, org: Org) -> PollResult:
+                            mailbox: Mailbox, org: Org, *,
+                            matcher: KillableMatcher | None = None) -> PollResult:
     """Poll one mailbox once. Never raises: failures land in the result and
-    the mailbox's persisted error state (3 consecutive -> disabled)."""
+    the mailbox's persisted error state (3 consecutive -> disabled).
+
+    `matcher` is the killable regex child that runs the subject filter (see
+    papra_suite.safematch). The LIFECYCLE SEAM is the poll task:
+    papra_suite.pipeline._poll_loop builds one matcher for its whole life and
+    hands it to every poll, so the child is reused across polls and across
+    all messages of a poll and is killed together with the task (serve
+    shutdown, mailbox deleted/disabled, task death). A caller that injects
+    nothing gets a private matcher, closed on the way out of here — so the
+    killable filter cannot be forgotten by a caller, and no path leaves an
+    orphan regex_worker behind.
+    """
+    if matcher is not None:
+        return await _poll_mailbox_once(store, client, mailbox, org, matcher)
+    own_matcher = KillableMatcher()
+    try:
+        return await _poll_mailbox_once(store, client, mailbox, org, own_matcher)
+    finally:
+        await own_matcher.aclose()
+
+
+async def _subject_filter_match(matcher: KillableMatcher, subject: str | None,
+                                pattern: str | None, *, uid: int) -> bool:
+    r"""Ask the killable child whether this subject passes the filter.
+
+    Mirrors subject_matches' cheap branches (no pattern matches everything,
+    a missing subject matches nothing) so the sync helper and the production
+    path keep answering the same question, then runs the actual regex in the
+    child. A killed match (TIMEOUT) and a child that cannot run at all
+    (UNAVAILABLE) are both NON-MATCHES plus a WARNING: the poll continues,
+    \Seen and the cursor advance, and the next poll is not poisoned again.
+    Degrading to a non-match rather than to a match is deliberate — an
+    unanswered filter must never ingest mail on its own.
+    """
+    if not pattern:
+        return True
+    if subject is None:
+        return False
+    outcome = await matcher.search(pattern, subject[:MAX_SUBJECT_CHARS],
+                                   timeout_s=SUBJECT_FILTER_TIMEOUT_S)
+    if outcome is MatchOutcome.TIMEOUT:
+        logger.warning(
+            "subject filter timed out after %.1fs on uid=%s and the match was "
+            "killed; treating the message as a non-match",
+            SUBJECT_FILTER_TIMEOUT_S, uid,
+        )
+    elif outcome is MatchOutcome.UNAVAILABLE:
+        logger.warning(
+            "subject filter could not be evaluated on uid=%s (no regex child "
+            "available); treating the message as a non-match", uid
+        )
+    return outcome is MatchOutcome.MATCH
+
+
+async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox,
+                             org: Org, matcher: KillableMatcher) -> PollResult:
     SECRET_REGISTRY.add(mailbox.password)
     session = MailboxSession(
         host=mailbox.host, port=mailbox.port, username=mailbox.username,
@@ -423,11 +526,15 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
     )
     result = PollResult()
     try:
-        # Reject unsafe subject filters BEFORE connecting and before ANY
-        # message processing: a ValueError here flows into the poll-failure
-        # path (3-strike disable, visible in the dashboard) instead of the
-        # process freezing on the first crafted subject.
-        validate_subject_filter(mailbox.subject_filter)
+        # Reject unsafe or uncompilable subject filters BEFORE connecting and
+        # before ANY message processing: a ValueError here flows into the
+        # poll-failure path (3-strike disable, visible in the dashboard)
+        # instead of the process paying for the pattern one message at a time.
+        # It runs in the killable child, so a pattern whose probe never
+        # terminates ((a+)+\d+$) is killed and rejected here rather than
+        # freezing the loop before a single mail is read.
+        await matcher.validate(mailbox.subject_filter,
+                               timeout_s=SUBJECT_VALIDATION_TIMEOUT_S)
         await asyncio.to_thread(session.connect)
         uidvalidity = await asyncio.to_thread(session.select_inbox)
         rescan = mailbox.uidvalidity is not None and mailbox.uidvalidity != uidvalidity
@@ -468,24 +575,17 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
             # event-loop block: MIME parsing must run off the loop like every
             # other blocking call in this poller (decisions doc §3)
             parsed = await asyncio.to_thread(parse_message, raw)
-            # Run the admin-supplied regex off the event loop under a timeout.
-            # Honest semantics: re.search holds the GIL, so for a catastrophic
-            # pattern the timeout fires only AFTER the search finishes (the
-            # loop is frozen meanwhile) — this bounds the residual low-base
-            # class coarsely, never inline. The high-base exponential class
-            # never reaches here (rejected by validate_subject_filter), and
-            # the subject cap bounds the linear/quadratic classes.
-            try:
-                matched = await asyncio.wait_for(
-                    asyncio.to_thread(subject_matches, parsed.subject,
-                                      mailbox.subject_filter),
-                    timeout=SUBJECT_FILTER_TIMEOUT_S,
-                )
-            except TimeoutError:
-                logger.warning(
-                    "subject filter timed out on uid=%s; treating as non-match", uid
-                )
-                matched = False
+            # The admin-supplied regex runs in the killable child, off this
+            # process entirely. A pattern that passes pre-validation but
+            # blows up behind its own literal ((Rechnung|Invoice)\s*(\d+\s*)+$
+            # on "Rechnung 111...!") is killed at SUBJECT_FILTER_TIMEOUT_S:
+            # the kernel delivers the signal, so unlike a wait_for around a
+            # search here (which cannot fire while re.search holds the GIL)
+            # the budget actually ends the match, the event loop stays free
+            # for the whole run, and the cursor still advances below.
+            matched = await _subject_filter_match(
+                matcher, parsed.subject, mailbox.subject_filter, uid=uid
+            )
             if not matched:
                 logger.info("message uid=%s skipped by subject filter", uid)
                 seen_uids.append(uid)

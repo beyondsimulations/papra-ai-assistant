@@ -650,19 +650,22 @@ async def test_poll_oversized_skipped_defaults_to_zero(store, monkeypatch):
 
 
 async def test_subject_filter_redos_is_bounded(store, monkeypatch, caplog):
-    # wait_for pin for the IN-CAP class: an admin regex that PASSES the
-    # per-poll pre-validation (probe growth ratio ~4x, under the 10x
-    # threshold) but is still super-linearly slow against a crafted
-    # subject within the 1000-char cap. The poll must stay bounded and
-    # treat the message as a non-match. The a-run is sized so the capped
-    # regex alone runs several seconds — far past the 2s wait_for budget —
-    # so the timeout path fires deterministically (warning logged,
-    # non-match, message seen). Without the wait_for offload the regex
-    # would run inline on the event loop: no timeout warning, and the
-    # poll only returns after the full inline runtime. (The high-base
-    # exponential class, e.g. (a|aa)+b with a ~100x probe ratio, never
-    # reaches here: validate_subject_filter fails the poll up front —
-    # see test_poll_with_unsafe_subject_filter_records_failure.)
+    # Killable-child pin for the IN-CAP class: an admin regex that PASSES the
+    # per-poll pre-validation (probe growth ratios ~4.4x and ~2.5x, under the
+    # 10x threshold) but is still super-linearly slow against a crafted
+    # subject within the 1000-char cap. The match runs in the killable child,
+    # so the 2s budget ENDS it — SIGTERM is kernel-delivered, so it lands
+    # mid-search and the event loop stays free — and the message is treated
+    # as a non-match: warning logged, non-match, message seen.
+    # What this pin does NOT claim: that validation rejected this pattern.
+    # The ratio gate only detects patterns whose PROBE INPUTS are near-misses;
+    # patterns whose ambiguity sits behind an anchor plus a literal
+    # ((Rechnung|Invoice)\s*(\d+\s*)+$) pass validation untouched and are
+    # bounded here by the kill alone — see
+    # test_poll_kills_a_catastrophic_filter_match_and_still_advances.
+    # (a|aa)+b, whose probes do reach its ambiguity, is still refused before
+    # any message is read — see
+    # test_poll_with_unsafe_subject_filter_records_failure.)
     crafted = "a" * 180 + "!" * (5000 - 180)
     session = FakeSession(raws=[(1, build_raw(subject=crafted, message_id="<redos@x>"))])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
@@ -677,21 +680,182 @@ async def test_subject_filter_redos_is_bounded(store, monkeypatch, caplog):
     assert result.error is None
     assert result.documents_uploaded == 0      # non-match: no upload attempted
     assert session.seen == [1]                 # intentionally skipped like a filter miss
-    # the wait_for timeout fired: the message was treated as a non-match
+    # the child was killed at the budget: the message became a non-match
     assert any("subject filter timed out" in record.message for record in caplog.records)
-    # bounded: the timeout decided the match; the (uninterruptible, GIL-
-    # holding) regex thread drains in its own time, coarse-bounded far
-    # below the un-hung un-bounded inline case
+    # bounded by the kill, not by the search draining: a quartic search over
+    # a 1000-char subject is still running long after this poll returned,
+    # and it now burns a child's CPU rather than the service's event loop
     assert elapsed < 30.0
 
 
+# The anchored-literal catastrophic class: its ambiguous group sits behind a
+# literal the operator typed, so validate_subject_filter's probes ("a"*n and
+# "1"*n near-misses) never reach the ambiguity, the growth ratio measures
+# ~1x, and the pattern PASSES pre-validation. Measured on this machine the
+# match costs ~2x per added digit: 20 digits 0.04s, 24 digits 0.69s,
+# 26 digits 2.4s, 40 digits effectively forever — and MAX_SUBJECT_CHARS=1000
+# bounds nothing of that. This is the pattern class the killable child exists
+# for, and the reason "validation passed" must never be read as "safe".
+ANCHORED_CATASTROPHIC = r"(Rechnung|Invoice)\s*(\d+\s*)+$"
+POISON_SUBJECT = "Rechnung " + "1" * 40 + "!"
+
+
+async def test_poll_kills_a_catastrophic_filter_match_and_still_advances(
+    store, monkeypatch, caplog
+):
+    r"""C1: a subject filter that passes pre-validation but blows up on the
+    operator's own literal must be bounded AT MATCH TIME by killing the
+    match — and the poll must then behave like a filter miss.
+
+    Before the killable child this froze the entire serve process: the
+    search held the GIL, so wait_for could not fire until it drained, and
+    \Seen plus the DB cursor are written AFTER the message loop — so the
+    restart re-fetched the same mail and re-froze, forever, with the
+    3-strike disable never engaging (a frozen poll never raises).
+    """
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=ANCHORED_CATASTROPHIC,
+    )
+    session = FakeSession(
+        raws=[(7, build_raw(subject=POISON_SUBJECT, message_id="<poison@x>"))]
+    )
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    # proof that the event loop stayed responsive for the whole poll: a 10ms
+    # ticker must get roughly its share of the wall clock. Frozen loop -> a
+    # handful of ticks over ~2s of elapsed time; healthy -> ~100 per second.
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker_task = asyncio.create_task(ticker())
+    start = time.monotonic()
+    with caplog.at_level("WARNING", logger="papra_suite.mail"):
+        result = await poll_mailbox_once(
+            store, client, store.get_mailbox(mailbox_id), store.get_org(org_id)
+        )
+    elapsed = time.monotonic() - start
+    ticker_task.cancel()
+    await asyncio.gather(ticker_task, return_exceptions=True)
+
+    # the killed match is a NON-MATCH, not a poll failure: nothing uploaded,
+    # no error recorded, the mailbox stays enabled
+    assert result.error is None
+    assert result.messages_scanned == 1
+    assert result.documents_uploaded == 0
+    assert client.uploads == []
+    # ...and the poll still finished its bookkeeping, which is what stops the
+    # next poll from re-fetching the poison message
+    assert session.seen == [7]
+    updated = store.get_mailbox(mailbox_id)
+    assert updated.last_seen_uid == 7
+    assert updated.enabled is True
+    assert updated.consecutive_failures == 0
+    assert updated.last_error is None
+    # decided by the kill, not by the search draining (2**40 steps)
+    assert elapsed < 15.0
+    assert any("subject filter timed out" in record.getMessage() for record in caplog.records)
+    # the loop was never frozen: the ticker got at least 60% of its share
+    # (loose on purpose: child startup is ~15ms of loop work, and macOS
+    # timer granularity eats a few ticks per second)
+    assert ticks >= 0.6 * (elapsed / 0.01)
+
+
+async def test_poll_kills_an_unbounded_validation_probe(store, monkeypatch):
+    """The gate itself used to be unbounded: (a+)+\\d+$ against the "a"*30
+    probe never returns (measured: still running after 15s), so the poll
+    loop froze BEFORE a single mail was read. Validation now runs in the
+    killable child: it comes back as a rejection on the existing
+    poll-failure/3-strike path instead of a frozen process.
+    """
+    monkeypatch.setattr("papra_suite.mail.SUBJECT_VALIDATION_TIMEOUT_S", 1.0)
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=r"(a+)+\d+$",
+    )
+    session = FakeSession(raws=[(1, build_raw(subject="Rechnung 1", message_id="<x@x>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    start = time.monotonic()
+    result = await poll_mailbox_once(
+        store, StubClient(), store.get_mailbox(mailbox_id), store.get_org(org_id)
+    )
+    elapsed = time.monotonic() - start
+
+    assert result.error is not None and "unsafe" in result.error
+    mailbox = store.get_mailbox(mailbox_id)
+    assert mailbox.consecutive_failures == 1
+    assert "unsafe" in (mailbox.last_error or "")
+    # bounded by the kill: the sync gate hung indefinitely
+    assert elapsed < 20.0
+    # rejected before connect/processing, exactly like the ratio-gate class
+    assert result.messages_scanned == 0
+    assert session.seen == []
+    assert session.closed is True
+
+
+async def test_poll_degrades_when_the_regex_child_cannot_run(store, monkeypatch, caplog):
+    """A child that cannot be started must degrade like a timeout — non-match
+    plus a WARNING, poll continues, cursor advances — never crash the poll
+    loop or freeze it (there is always a next poll to try again on).
+    """
+    import sys
+
+    import papra_suite.mail as mail_mod
+    from papra_suite.safematch import KillableMatcher
+
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=".*rechnung.*",
+    )
+    # every child attempt dies instantly: no match can ever be answered
+    monkeypatch.setattr(
+        mail_mod, "KillableMatcher",
+        lambda: KillableMatcher(command=[sys.executable, "-c", "import sys; sys.exit(3)"]),
+    )
+    session = FakeSession(raws=[(4, build_raw(subject="Rechnung 42", message_id="<m4@x>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    with caplog.at_level("WARNING", logger="papra_suite.mail"):
+        result = await asyncio.wait_for(
+            poll_mailbox_once(
+                store, client, store.get_mailbox(mailbox_id), store.get_org(org_id)
+            ),
+            timeout=60,
+        )
+
+    assert result.error is None                  # degradation, not a poll failure
+    assert result.documents_uploaded == 0        # an unanswered match never ingests
+    assert session.seen == [4]                   # the message is still retired
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 4
+    assert store.get_mailbox(mailbox_id).enabled is True
+    assert any("subject filter" in record.getMessage() for record in caplog.records)
+
+
 async def test_poll_with_unsafe_subject_filter_records_failure(store, monkeypatch):
-    """Unsafe-filter pin: a catastrophic subject filter (exponential
-    backtracking class) must fail the poll VISIBLY — result.error set and a
-    poll failure recorded toward the 3-strike disable — BEFORE connecting or
-    processing any message, with no process freeze. Removing the
-    validate_subject_filter call from the poll re-freezes it on the first
-    crafted subject and fails this test."""
+    """Unsafe-filter pin: a subject filter whose probe inputs reach its own
+    ambiguity (exponential backtracking class) must fail the poll VISIBLY —
+    result.error set and a poll failure recorded toward the 3-strike disable
+    — BEFORE connecting or processing any message.
+
+    Removing the matcher.validate call from the poll does not re-freeze the
+    process any more (the killable child already guarantees that); it makes
+    the failure INVISIBLE instead — the mailbox would keep polling forever,
+    every message burning its full match budget in a child before being
+    counted as a non-match, and a permanently unusable filter would never
+    reach the dashboard or the 3-strike disable. That is why the gate still
+    runs up front, in the same killable child.
+    """
     org_id = store.create_org(papra_org_id="org_papra", name="Test")
     mailbox_id = store.create_mailbox(
         org_id=org_id, host="imap.test", port=993, username="u", password="p",
