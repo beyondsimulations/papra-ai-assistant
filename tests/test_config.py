@@ -358,3 +358,42 @@ def test_control_chars_in_bind_rejected():
     # Same for DASHBOARD_BIND: a DEL byte in the host must not pass.
     with pytest.raises(ConfigError, match="DASHBOARD_BIND"):
         load_config({**BASE_ENV, "DASHBOARD_BIND": f"127.0.0.1{chr(0x7f)}:8080"})
+
+
+def test_scheme_error_does_not_echo_password():
+    # The scheme check runs before the credentials check, so its echo must
+    # be sanitized: the password must not reach stderr, but the scheme must
+    # remain for diagnosability.
+    with pytest.raises(ConfigError) as excinfo:
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "ftp://svc:secretpw@papra:1221"})
+
+    assert "secretpw" not in str(excinfo.value)
+    assert "ftp" in str(excinfo.value)
+
+
+def test_host_error_does_not_echo_password():
+    # "http://svc:secretpw@" has no host; the host-check echo must not leak
+    # the password.
+    with pytest.raises(ConfigError) as excinfo:
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://svc:secretpw@"})
+
+    assert "secretpw" not in str(excinfo.value)
+
+
+def test_ipv6_error_does_not_echo_password():
+    # A malformed IPv6 literal makes urlparse itself raise; the ValueError
+    # handler echoes the value and must not leak the password.
+    with pytest.raises(ConfigError) as excinfo:
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://[svc:secretpw@papra:1221"})
+
+    assert "secretpw" not in str(excinfo.value)
+
+
+def test_query_stripped_from_echo():
+    # The query check itself does not echo, but earlier checks (e.g. scheme)
+    # might; the sanitizing helper must also strip query strings, which can
+    # carry tokens.
+    with pytest.raises(ConfigError) as excinfo:
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "ftp://papra:1221?tok=xyz"})
+
+    assert "xyz" not in str(excinfo.value)

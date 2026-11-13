@@ -1,4 +1,5 @@
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,16 @@ class AppConfig:
 
 
 DEFAULT_BIND = "127.0.0.1:8080"
+
+
+def _safe_echo(value: str) -> str:
+    # Strip userinfo ("user:pass@" between "//" and the host) and the query
+    # component ("?..." onward) before echoing a value in an error message:
+    # __main__ prints ConfigError to stderr unredacted, and both can carry
+    # secrets even when a later check (credentials/query) would have rejected
+    # the value without echoing it.
+    redacted = re.sub(r"//[^/@]*@", "//", value)
+    return re.sub(r"\?.*", "", redacted)
 
 
 def _has_nondisplay_chars(text: str) -> bool:
@@ -74,13 +85,17 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
         # .port access — mirror the DASHBOARD_BIND handling in _parse_bind.
         parsed = urlparse(value)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ConfigError(f"{name} must be an http(s) URL, got: {value!r}")
+            raise ConfigError(
+                f"{name} must be an http(s) URL, got: {_safe_echo(value)!r}"
+            )
         # A netloc like ":1221" passes the netloc check but has no host; httpx
         # would fail on every request. Likewise a bad port ("papra:abc",
         # "papra:99999", "host:1221:extra") only blows up inside httpx at
         # request time — the check command must reject it up front instead.
         if not parsed.hostname:
-            raise ConfigError(f"{name} must include a host, got: {value!r}")
+            raise ConfigError(
+                f"{name} must include a host, got: {_safe_echo(value)!r}"
+            )
         # httpx derives Basic auth credentials from URL userinfo, OVERRIDING
         # the Bearer API key header on every request (guaranteed 401s), and
         # it logs the credentialed URL at INFO — leaking the password to
@@ -96,7 +111,7 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
         # "/" is already gone, so any remaining path is a real path.
         if parsed.path not in ("",):
             raise ConfigError(
-                f"{name} must not include a path, got: {value!r}"
+                f"{name} must not include a path, got: {_safe_echo(value)!r}"
             )
         # httpx merges a base URL's query string into every request path
         # (e.g. "http://papra:1221?token=abc" + "/api/..." -> garbage), so
@@ -112,20 +127,24 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
             raise ConfigError(f"{name} must not contain a query string")
         if _has_nondisplay_chars(parsed.hostname) or _has_nondisplay_chars(value):
             raise ConfigError(
-                f"{name} must not contain whitespace or control characters, got: {value!r}"
+                f"{name} must not contain whitespace or control characters,"
+                f" got: {_safe_echo(value)!r}"
             )
         parsed.port  # noqa: B018 — property access validates the port
         # "http://papra:0": urlparse returns port 0 without raising, but httpx
         # keeps it and every request fails with ConnectError — same class as
         # the papra:99999/papra:abc cases. Port None is fine (scheme default).
         if parsed.port == 0:
-            raise ConfigError(f"{name} must not use port 0, got: {value!r}")
+            raise ConfigError(
+                f"{name} must not use port 0, got: {_safe_echo(value)!r}"
+            )
     except ValueError:
         # Covers non-numeric, out-of-range (0-65535) and trailing-garbage
         # ports, plus malformed IPv6 literals; urlparse raises on .port
         # access, not on parse.
         raise ConfigError(
-            f"{name} must have a valid port and IPv6 literal, got: {value!r}"
+            f"{name} must have a valid port and IPv6 literal,"
+            f" got: {_safe_echo(value)!r}"
         ) from None
     # "http://papra:" (empty port) is indistinguishable from "http://papra"
     # via parsed attributes (netloc "papra:" but hostname/port identical to
@@ -154,13 +173,17 @@ def _parse_bind(raw: str) -> tuple[str, int]:
     except ValueError:
         # Covers both a malformed IPv6 literal and an out-of-range port.
         raise ConfigError(
-            f"DASHBOARD_BIND must be 'host:port' with a valid port, got: {raw!r}"
+            f"DASHBOARD_BIND must be 'host:port' with a valid port,"
+            f" got: {_safe_echo(raw)!r}"
         ) from None
     if not parsed.hostname or port is None:
-        raise ConfigError(f"DASHBOARD_BIND must be 'host:port', got: {raw!r}")
+        raise ConfigError(
+            f"DASHBOARD_BIND must be 'host:port', got: {_safe_echo(raw)!r}"
+        )
     if _has_nondisplay_chars(parsed.hostname) or _has_nondisplay_chars(raw):
         raise ConfigError(
-            f"DASHBOARD_BIND must not contain whitespace or control characters, got: {raw!r}"
+            "DASHBOARD_BIND must not contain whitespace or control characters,"
+            f" got: {_safe_echo(raw)!r}"
         )
     return parsed.hostname, port
 
