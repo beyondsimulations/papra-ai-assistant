@@ -1,3 +1,7 @@
+import sqlite3
+import threading
+import time
+
 import pytest
 
 import papra_suite.store as store_module
@@ -54,6 +58,48 @@ def test_claim_next_job_transitions_to_running(store):
     assert job is not None and job.status == "running"
     # claimed job is not claimable again
     assert store.claim_next_job("ocr") is None
+
+
+def test_concurrent_constructor_waits_for_wal(tmp_path):
+    """A racing constructor must not crash on the WAL pragma while another
+    connection holds a write lock on a fresh (delete-journal) database: the
+    pragma does not honor busy_timeout, so __init__ retries within a bounded
+    window until the lock is released."""
+    db_path = tmp_path / "state.db"
+    # Fresh db file in default delete-journal mode (no Store constructed yet).
+    holder = sqlite3.connect(db_path, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("CREATE TABLE lock_holder (id INTEGER PRIMARY KEY)")
+
+    def release_later():
+        time.sleep(1.0)
+        holder.commit()
+        holder.close()
+
+    releaser = threading.Thread(target=release_later)
+    releaser.start()
+    try:
+        store = Store(db_path)  # must wait for the lock, not raise
+    finally:
+        releaser.join(timeout=35.0)
+    mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
+    store.close()
+    assert mode == "wal"
+
+
+def test_claim_next_job_is_fifo(store):
+    """The oldest pending job must be claimed first (ORDER BY created_at ASC);
+    a DESC ordering would starve the oldest job."""
+    store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                      content_hash="h1", payload={})
+    time.sleep(0.01)
+    store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_2",
+                      content_hash="h2", payload={})
+
+    first = store.claim_next_job("ocr")
+    assert first is not None and first.document_id == "doc_1"
+    second = store.claim_next_job("ocr")
+    assert second is not None and second.document_id == "doc_2"
 
 
 def test_concurrent_migrate_no_double_apply(tmp_path):

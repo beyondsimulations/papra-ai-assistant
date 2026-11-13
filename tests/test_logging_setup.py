@@ -7,6 +7,20 @@ from papra_suite.logging_setup import SECRET_REGISTRY, setup_logging
 from papra_suite.store import Store
 
 
+@pytest.fixture(autouse=True)
+def _isolate_root_logger_and_secrets():
+    """Snapshot the root logger's handlers and the secret registry before each
+    test and restore them after, so setup_logging's handlers (especially the
+    RingBufferHandler holding a closed store) cannot leak into later tests."""
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_secrets = set(SECRET_REGISTRY._secrets)
+    yield
+    root.handlers[:] = saved_handlers
+    SECRET_REGISTRY._secrets.clear()
+    SECRET_REGISTRY._secrets.update(saved_secrets)
+
+
 @pytest.fixture
 def store(tmp_path):
     store = Store(tmp_path / "state.db")
@@ -58,6 +72,21 @@ def test_ring_buffer_lines_are_redacted(store):
     logging.getLogger("test").error("auth error, password=hunter2-hunter2")
     lines = store.recent_log_lines(limit=10)
     assert all("hunter2-hunter2" not in line for _, _, line in lines)
+
+
+def test_ring_buffer_never_raises_after_store_close(store, capsys):
+    """After the store is closed, the RingBufferHandler's emit must swallow
+    the ProgrammingError via its except/handleError guard — logging must
+    never crash the app — while the stdout sink keeps emitting."""
+    setup_logging(store)
+    logging.getLogger("test").info("before close")
+    store.close()
+
+    logging.getLogger("test").info("after close")  # must not raise
+
+    out = capsys.readouterr().out
+    assert "before close" in out
+    assert "after close" in out
 
 
 def test_exception_text_is_redacted_in_both_sinks(store, capsys):

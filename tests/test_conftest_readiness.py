@@ -1,5 +1,6 @@
 """Unit tests for the integration readiness probe (no Docker required)."""
 
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -35,3 +36,54 @@ def test_probe_retries_on_503_until_200():
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_probe_accepts_401_as_up():
+    """A healthy Papra stack may answer 401 (no API key sent); the probe must
+    treat 401 as up, not keep retrying (mutating the acceptance set to (200,)
+    would make this test fail)."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(401)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        start = time.monotonic()
+        url = f"http://127.0.0.1:{port}"
+        assert _probe_readiness(url, readiness_timeout_s=10.0, poll_interval_s=0.1)
+        assert time.monotonic() - start < 2.0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_probe_returns_false_after_deadline():
+    """When nothing ever answers 200/401 within the window, the probe must
+    return False (not True) after roughly the deadline — the deadline-expiry
+    branch must stay covered (mutating it to return True fails this test)."""
+    # Verify the port is closed right before probing: bind to an ephemeral
+    # port and close it, then immediately probe it. Connection-refused fails
+    # fast, so the elapsed time is dominated by the deadline window.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    start = time.monotonic()
+    result = _probe_readiness(
+        f"http://127.0.0.1:{port}",
+        readiness_timeout_s=1.0,
+        poll_interval_s=0.1,
+    )
+    elapsed = time.monotonic() - start
+    assert result is False
+    assert elapsed >= 1.0

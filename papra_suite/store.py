@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -162,7 +163,25 @@ class Store:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # Journal-mode changes do NOT honor busy_timeout: on a fresh (non-WAL)
+        # database, if another process holds a write lock, the WAL pragma
+        # fails immediately with "database is locked". Retry within a bounded
+        # window so racing constructors converge on WAL instead of dying
+        # with a raw traceback before migrate()'s race guard can run.
+        deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.25)
+        # Ordinary (non-journal-mode) contention honors busy_timeout.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
 
     def close(self) -> None:
