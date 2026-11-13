@@ -97,3 +97,28 @@ async def test_serve_recovers_stale_jobs_at_startup(tmp_path):
     await serve(config, stop=stop, store=store)
     assert not _dangling_serve_tasks()  # clean shutdown, no dangling tasks
     store.close()
+
+
+async def test_poll_loop_survives_get_org_failure():
+    """A get_org failure (inside the defensive try) must not kill the loop."""
+    from types import SimpleNamespace
+
+    from papra_suite.pipeline import _poll_loop
+
+    class FailingOrgStore:
+        def __init__(self):
+            self.calls = 0
+
+        def get_org(self, org_id):
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("sqlite: database is locked")
+            raise KeyboardInterrupt()  # stop seam (BaseException passes the guard)
+
+    store = FailingOrgStore()
+    mailbox = SimpleNamespace(id="mb_1", org_id="org_1", poll_interval_s=0)
+
+    with pytest.raises(KeyboardInterrupt):
+        await _poll_loop(store, papra=None, mailbox=mailbox)
+
+    assert store.calls == 3  # the loop survived BOTH get_org failures

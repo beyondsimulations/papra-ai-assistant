@@ -6,6 +6,7 @@ import pytest
 
 from papra_suite.config import load_config
 from papra_suite.pipeline import (
+    SWEEP_PAGE_SIZE,
     SweepResult,
     on_job_done,
     run_ocr_job,
@@ -43,10 +44,12 @@ class StubPapra:
         if name:
             self.documents[org_id][document_id]["name"] = name
 
-    async def list_documents(self, org_id, *, page_size=100, search_query=None,
-                             sort_field="createdAt", sort_order="desc"):
+    async def list_documents(self, org_id, *, page_index=0, page_size=100,
+                             search_query=None, sort_field="createdAt",
+                             sort_order="desc"):
         docs = list(self.documents[org_id].values())
-        return docs, len(docs)
+        page = docs[page_index * page_size:(page_index + 1) * page_size]
+        return page, len(docs)
 
 
 def make_llm(responses: list[str]):
@@ -107,6 +110,25 @@ async def test_run_ocr_job_writes_back_assembled_markdown(store, config):
     assert papra.content_updates == [("doc_1", None, "# Seite eins\n\n# Seite zwei")]
 
 
+async def test_run_ocr_job_raises_on_zero_page_pdf(store, config):
+    # a zero-page PDF must fail visibly, not write empty content back
+    # (handcrafted: this PyMuPDF cannot save a zero-page document)
+    data = (
+        b"%PDF-1.4\n"
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n"
+        b"trailer\n<< /Root 1 0 R /Size 3 >>\n"
+    )
+    papra = StubPapra(data)
+    llm, calls = make_llm(["# md"])
+
+    with pytest.raises(ValueError, match="no pages to transcribe"):
+        await run_ocr_job(papra, llm, make_job(store), config=config)
+
+    assert calls["n"] == 0  # no LLM calls for a pageless document
+    assert papra.content_updates == []  # nothing written back
+
+
 def test_on_job_done_enqueues_title_job(store):
     job = make_job(store)
     on_job_done(store, job, ocr_result="# Rechnung\n\nInhalt")
@@ -117,6 +139,13 @@ def test_on_job_done_enqueues_title_job(store):
     assert title_job.content_hash == hashlib.sha256(b"# Rechnung\n\nInhalt").hexdigest()
     assert title_job.payload["name"] == "rechnung.pdf"
     assert title_job.payload["excerpt"] == "# Rechnung\n\nInhalt"
+
+
+def test_on_job_done_name_defaults_to_document_pdf(store):
+    job = make_job(store, payload={"file_hash": "h1"})  # no name in payload
+    on_job_done(store, job, ocr_result="Inhalt")
+    title_job = [j for j in store.list_jobs() if j.kind == "title"][0]
+    assert title_job.payload["name"] == "document.pdf"  # matches run_title_job's default
 
 
 def test_on_job_done_ignores_title_kind(store):
@@ -147,11 +176,12 @@ async def test_worker_loop_processes_and_transitions(store, config):
     llm, _ = make_llm(["# md"])
     make_job(store)  # enqueue one ocr job (doc_1)
 
-    # run the loop until the queue drains, then stop it via a failing claim patch
+    # run the loop until the queue drains, then stop it via a failing claim
+    # patch (BaseException: the claim guard must not swallow the stop seam)
     original_claim = store.claim_next_job
     state = {"claims": 0}
 
-    class _StopLoop(Exception):
+    class _StopLoop(BaseException):
         pass
 
     def claim(kind):
@@ -166,6 +196,73 @@ async def test_worker_loop_processes_and_transitions(store, config):
                           handler=lambda job: run_ocr_job(papra, llm, job, config=config))
 
     jobs = store.list_jobs()
+    assert [j.kind for j in jobs if j.status == "done"] == ["ocr"]
+    assert [j.kind for j in jobs if j.status == "pending"] == ["title"]
+
+
+async def test_worker_loop_transitions_before_marking_done(store, config):
+    """Order pin: on_job_done runs BEFORE mark_job_done.
+
+    A crash at mark_job_done must leave the title job already enqueued
+    (and the OCR job not done) — the crash-safe ordering the startup
+    recovery relies on to re-run the OCR job without losing the title.
+    """
+    import fitz
+
+    pdf = fitz.open()
+    pdf.new_page()
+    papra = StubPapra(pdf.tobytes())
+    pdf.close()
+    llm, _ = make_llm(["# md"])
+    make_job(store)
+
+    class _Crash(BaseException):
+        pass
+
+    def mark_job_done(job_id):
+        raise _Crash()  # simulate a crash between transition and done-marking
+
+    store.mark_job_done = mark_job_done
+    with pytest.raises(_Crash):
+        await worker_loop(store, kind="ocr",
+                          handler=lambda job: run_ocr_job(papra, llm, job, config=config))
+
+    jobs = store.list_jobs()
+    title_jobs = [j for j in jobs if j.kind == "title"]
+    assert [j.status for j in title_jobs] == ["pending"]  # transition ran first
+    ocr_job = [j for j in jobs if j.kind == "ocr"][0]
+    assert ocr_job.status != "done"  # crash before done-marking
+
+
+async def test_worker_loop_survives_claim_failure(store, config):
+    """A claim that raises is logged and the loop continues — not dies."""
+    import fitz
+
+    pdf = fitz.open()
+    pdf.new_page()
+    papra = StubPapra(pdf.tobytes())
+    pdf.close()
+    llm, _ = make_llm(["# md"])
+    make_job(store)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] == 1:
+            raise RuntimeError("sqlite: database disk image is malformed")
+        if state["claims"] > 2:
+            raise KeyboardInterrupt()  # stop seam after the job was processed
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0,
+                          handler=lambda job: run_ocr_job(papra, llm, job, config=config))
+
+    jobs = store.list_jobs()
+    # the job was processed despite the failed claim
     assert [j.kind for j in jobs if j.status == "done"] == ["ocr"]
     assert [j.kind for j in jobs if j.status == "pending"] == ["title"]
 
@@ -259,12 +356,14 @@ async def test_sweep_continues_past_org_listing_failure(store):
                 },
             }
 
-        async def list_documents(self, org_id, *, page_size=100, search_query=None,
-                                 sort_field="createdAt", sort_order="desc"):
+        async def list_documents(self, org_id, *, page_index=0, page_size=100,
+                                 search_query=None, sort_field="createdAt",
+                                 sort_order="desc"):
             if org_id == "org_1":
                 raise RuntimeError("500 internal error")
             docs = list(self.documents[org_id].values())
-            return docs, len(docs)
+            page = docs[page_index * page_size:(page_index + 1) * page_size]
+            return page, len(docs)
 
     result = await sweep_once(store, OrgListingFailsPapra())
 
@@ -272,6 +371,48 @@ async def test_sweep_continues_past_org_listing_failure(store):
     assert result.jobs_enqueued == 1  # org_2's PDF enrolled despite org_1 failing
     job = store.claim_next_job("ocr")
     assert job.papra_org_id == "org_2" and job.document_id == "doc_3"
+
+
+class ManyDocsPapra(StubPapra):
+    """N PDFs in org_1; records which page indexes the sweep requested."""
+
+    def __init__(self, count: int):
+        super().__init__()
+        self.documents = {"org_1": {
+            f"doc_{i}": {"id": f"doc_{i}", "name": f"doc_{i}.pdf",
+                         "mimeType": "application/pdf"}
+            for i in range(count)
+        }}
+        self.pages_requested: list[int] = []
+
+    async def list_documents(self, org_id, *, page_index=0, page_size=100,
+                             search_query=None, sort_field="createdAt",
+                             sort_order="desc"):
+        self.pages_requested.append(page_index)
+        return await super().list_documents(
+            org_id, page_index=page_index, page_size=page_size,
+            sort_field=sort_field, sort_order=sort_order)
+
+
+async def test_sweep_once_paginates_past_first_page(store):
+    papra = ManyDocsPapra(75)  # 50 + 25: needs both pages
+
+    result = await sweep_once(store, papra)
+
+    assert result.documents_checked == 75
+    assert result.jobs_enqueued == 75  # every PDF across BOTH pages
+    assert papra.pages_requested == [0, 1]  # stopped at the short page
+
+
+async def test_sweep_once_stops_at_page_boundary(store):
+    papra = ManyDocsPapra(SWEEP_PAGE_SIZE)  # exactly one full page
+
+    result = await sweep_once(store, papra)
+
+    assert result.documents_checked == SWEEP_PAGE_SIZE
+    assert result.jobs_enqueued == SWEEP_PAGE_SIZE
+    # page 0 is full -> one confirming fetch of page 1 (empty) -> stop
+    assert papra.pages_requested == [0, 1]
 
 
 async def test_sweep_once_is_idempotent(store):

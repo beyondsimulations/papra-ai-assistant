@@ -18,6 +18,7 @@ from papra_suite.titles import generate_title
 logger = logging.getLogger(__name__)
 
 SWEEP_PAGE_SIZE = 50
+DEFAULT_DOCUMENT_NAME = "document.pdf"
 
 
 @dataclass
@@ -36,6 +37,8 @@ async def run_ocr_job(papra: PapraClient, ocr_llm: LLMClient, job: Job, *,
         pdf_bytes, dpi=config.ocr_dpi, max_pages=config.ocr_max_pages,
         pixel_budget=config.ocr_page_pixel_budget,
     )
+    if not pages:
+        raise ValueError("document has no pages to transcribe")
     page_markdowns = []
     for index, png in enumerate(pages):
         logger.info("ocr: document %s page %d/%d", job.document_id, index + 1, len(pages))
@@ -63,13 +66,14 @@ def on_job_done(store: Store, job: Job, *, ocr_result: str) -> None:
         papra_org_id=job.papra_org_id,
         document_id=job.document_id,
         content_hash=content_hash,
-        payload={"name": job.payload.get("name", ""), "excerpt": ocr_result[:2000]},
+        payload={"name": job.payload.get("name", DEFAULT_DOCUMENT_NAME),
+                 "excerpt": ocr_result[:2000]},
     )
 
 
 async def run_title_job(papra: PapraClient, title_llm: LLMClient, job: Job) -> None:
     title = await generate_title(
-        title_llm, filename=job.payload.get("name", "document.pdf"),
+        title_llm, filename=job.payload.get("name", DEFAULT_DOCUMENT_NAME),
         excerpt=job.payload.get("excerpt", ""),
     )
     await papra.update_document(job.papra_org_id, job.document_id, name=title)
@@ -127,6 +131,21 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         tasks.append(asyncio.create_task(
             _sweep_loop(store, papra, config.sweep_interval_s)))
 
+    def _supervise(task: asyncio.Task, name: str) -> None:
+        """Log loudly if a long-lived task exits without cancellation."""
+        def _on_done(done: asyncio.Task) -> None:
+            if done.cancelled():
+                return  # expected shutdown path
+            error = done.exception()
+            if error is not None:
+                logger.error("task %s exited unexpectedly: %s", name, error)
+            else:
+                logger.error("task %s exited unexpectedly", name)
+        task.add_done_callback(_on_done)
+
+    for task in tasks:
+        _supervise(task, task.get_name())
+
     stop_waiter = asyncio.create_task(stop.wait())
     try:
         await stop_waiter
@@ -134,7 +153,7 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         stop_waiter.cancel()
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(stop_waiter, *tasks, return_exceptions=True)
         for client in built_clients:
             try:
                 await client.aclose()
@@ -151,12 +170,12 @@ async def _poll_loop(store: Store, papra: PapraClient, mailbox) -> None:
     from papra_suite.mail import poll_mailbox_once
 
     while True:
-        org = store.get_org(mailbox.org_id)
-        if org is not None:
-            try:
+        try:
+            org = store.get_org(mailbox.org_id)
+            if org is not None:
                 await poll_mailbox_once(store, papra, mailbox, org)
-            except Exception:  # noqa: BLE001 - defense in depth (M2 carry-over)
-                logger.exception("poll loop error for mailbox %s", mailbox.id)
+        except Exception:  # noqa: BLE001 - an org lookup or poll failure must not kill the loop
+            logger.exception("poll loop error for mailbox %s", mailbox.id)
         await asyncio.sleep(mailbox.poll_interval_s)
 
 
@@ -175,17 +194,31 @@ async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int) -> None
 
 async def worker_loop(store: Store, *, kind: str, handler,
                       idle_sleep_s: float = 1.0) -> None:
-    """Claim-and-run loop for one job kind. Never raises."""
+    """Claim-and-run loop for one job kind. Never raises.
+
+    Transition ordering is crash-safety critical: on_job_done (enqueue the
+    title job) runs BEFORE mark_job_done. A crash between the two leaves the
+    OCR job 'running' (not done) — startup recovery rewinds it to pending,
+    the re-run's idempotent title enqueue is an INSERT OR IGNORE no-op, and
+    the job then completes. The reverse order would permanently drop title
+    generation: done jobs are not recovered, and the seen-table blocks the
+    sweep from re-discovering the document.
+    """
     while True:
-        job = store.claim_next_job(kind)
+        try:
+            job = store.claim_next_job(kind)
+        except Exception as error:  # noqa: BLE001 - a corrupt row or sqlite error must not kill the worker
+            logger.error("claiming next %s job failed: %s", kind, error)
+            await asyncio.sleep(idle_sleep_s)
+            continue
         if job is None:
             await asyncio.sleep(idle_sleep_s)
             continue
         try:
             result = await handler(job)
-            store.mark_job_done(job.id)
             if isinstance(result, str):
                 on_job_done(store, job, ocr_result=result)
+            store.mark_job_done(job.id)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - the loop must survive
@@ -204,46 +237,59 @@ def _is_pdf(document: dict) -> bool:
 
 
 async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
-    """Record and enqueue OCR for externally-ingested documents (decisions §4)."""
+    """Record and enqueue OCR for externally-ingested documents (decisions §4).
+
+    documents_checked counts every document the sweep LISTED (including
+    already-seen and non-PDF ones): it means "listed and examined", not
+    "newly enqueued". Documents are paginated SWEEP_PAGE_SIZE at a time;
+    a page returning fewer than SWEEP_PAGE_SIZE documents ends the org.
+    Enqueuing never creates new Papra documents, so pagination is stable
+    while iterating.
+    """
     result = SweepResult()
     for org in store.list_orgs():
-        try:
-            documents, _count = await papra.list_documents(
-                org.papra_org_id, page_size=SWEEP_PAGE_SIZE,
-                sort_field="createdAt", sort_order="desc",
-            )
-        except Exception as error:  # noqa: BLE001 - one org must not wedge the sweep
-            logger.error("sweep: listing documents for org %s failed: %s",
-                         org.papra_org_id, error)
-            result.errors += 1
-            continue
-        for document in documents:
-            result.documents_checked += 1
-            document_id = document["id"]
-            if store.document_seen(org.papra_org_id, document_id):
-                continue
+        page_index = 0
+        while True:
             try:
-                if _is_pdf(document):
-                    file_bytes = await papra.download_file(org.papra_org_id, document_id)
-                    file_hash = hashlib.sha256(file_bytes).hexdigest()
-                    enqueue_ocr_job(
-                        store, papra_org_id=org.papra_org_id, document_id=document_id,
-                        file_hash=file_hash, name=document.get("name", "document.pdf"),
-                        mime="application/pdf", ingested_via="sweep",
-                    )
-                    result.jobs_enqueued += 1
-                else:
-                    store.record_document_seen(
-                        papra_org_id=org.papra_org_id, papra_document_id=document_id,
-                        name=document.get("name", ""), mime=document.get("mimeType", ""),
-                        ingested_via="sweep",
-                    )
-                    result.non_pdf_skipped += 1
-            except Exception as error:  # noqa: BLE001 - one document must not wedge the sweep
-                logger.error("sweep: processing document %s in org %s failed: %s",
-                             document_id, org.papra_org_id, error)
+                documents, _count = await papra.list_documents(
+                    org.papra_org_id, page_index=page_index,
+                    page_size=SWEEP_PAGE_SIZE,
+                    sort_field="createdAt", sort_order="desc",
+                )
+            except Exception as error:  # noqa: BLE001 - one org must not wedge the sweep
+                logger.error("sweep: listing documents for org %s failed: %s",
+                             org.papra_org_id, error)
                 result.errors += 1
-                continue
+                break
+            for document in documents:
+                result.documents_checked += 1
+                document_id = document["id"]
+                if store.document_seen(org.papra_org_id, document_id):
+                    continue
+                try:
+                    if _is_pdf(document):
+                        file_bytes = await papra.download_file(org.papra_org_id, document_id)
+                        file_hash = hashlib.sha256(file_bytes).hexdigest()
+                        enqueue_ocr_job(
+                            store, papra_org_id=org.papra_org_id, document_id=document_id,
+                            file_hash=file_hash, name=document.get("name", "document.pdf"),
+                            mime="application/pdf", ingested_via="sweep",
+                        )
+                        result.jobs_enqueued += 1
+                    else:
+                        store.record_document_seen(
+                            papra_org_id=org.papra_org_id, papra_document_id=document_id,
+                            name=document.get("name", ""), mime=document.get("mimeType", ""),
+                            ingested_via="sweep",
+                        )
+                        result.non_pdf_skipped += 1
+                except Exception as error:  # noqa: BLE001 - one document must not wedge the sweep
+                    logger.error("sweep: processing document %s in org %s failed: %s",
+                                 document_id, org.papra_org_id, error)
+                    result.errors += 1
+            if len(documents) < SWEEP_PAGE_SIZE:
+                break
+            page_index += 1
     return result
 
 
