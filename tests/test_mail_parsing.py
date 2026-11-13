@@ -54,6 +54,15 @@ def test_parse_message_extracts_metadata_and_attachments():
     assert "photo.jpg" in parsed.skipped_attachments[0]
 
 
+def test_parse_message_decodes_rfc2047_subject():
+    # non-ASCII subjects are RFC 2047 encoded on the wire; the subject filter
+    # must see the decoded string or it false-negatives every German subject
+    raw = build_raw(subject="Rechnung über Möbel")
+    parsed = parse_message(raw)
+    assert parsed.subject == "Rechnung über Möbel"
+    assert subject_matches(parsed.subject, ".*über.*") is True
+
+
 def test_parse_message_without_message_id():
     raw = build_raw(message_id=None)
     parsed = parse_message(raw)

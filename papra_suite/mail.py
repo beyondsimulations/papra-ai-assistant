@@ -4,11 +4,22 @@ This module owns the only imaplib usage in the service; every IMAP call is
 executed via asyncio.to_thread by the poller (decisions doc §3).
 """
 
+import asyncio
 import hashlib
+import imaplib
+import logging
 import re
 from dataclasses import dataclass, field
 from email import message_from_bytes
+from email.header import decode_header, make_header
 from email.message import Message
+
+from papra_suite.logging_setup import SECRET_REGISTRY
+from papra_suite.papra_client import PapraClient, PapraError
+from papra_suite.pipeline import enqueue_ocr_job
+from papra_suite.store import Mailbox, Org, Store
+
+logger = logging.getLogger(__name__)
 
 MAX_FILENAME_LENGTH = 120
 PDF_MAGIC = b"%PDF-"
@@ -66,7 +77,7 @@ def parse_message(raw: bytes) -> ParsedMessage:
     message = message_from_bytes(raw)
     parsed = ParsedMessage(
         message_id=message.get("Message-ID"),
-        subject=message.get("Subject"),
+        subject=_decode_header_value(message.get("Subject")),
     )
     for part in message.walk():
         if part.get_content_maintype() == "multipart":
@@ -82,6 +93,17 @@ def parse_message(raw: bytes) -> ParsedMessage:
         else:
             parsed.skipped_attachments.append(sanitize_filename(filename))
     return parsed
+
+
+def _decode_header_value(raw: str | None) -> str | None:
+    """Decode RFC 2047 encoded words (e.g. =?utf-8?Q?...?=) so the subject
+    filter matches German mail; fall back to the raw string on any error."""
+    if raw is None:
+        return None
+    try:
+        return str(make_header(decode_header(raw)))
+    except Exception:  # noqa: BLE001 - decoding must never break parsing
+        return raw
 
 
 def subject_matches(subject: str | None, pattern: str | None) -> bool:
@@ -100,3 +122,189 @@ def dedup_hash(mailbox_id: str, message_id: str | None, filename: str, size: int
 
 def compute_file_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+class MailboxSession:
+    """Sync imaplib wrapper — every method runs inside asyncio.to_thread."""
+
+    def __init__(self, *, host: str, port: int, username: str, password: str,
+                 ssl_mode: str) -> None:
+        self._host = host
+        self._port = port
+        self._username = username
+        self._password = password
+        self._ssl_mode = ssl_mode
+        self._imap: imaplib.IMAP4 | None = None
+
+    def connect(self) -> None:
+        if self._ssl_mode == "ssl":
+            self._imap = imaplib.IMAP4_SSL(self._host, self._port)
+        elif self._ssl_mode == "starttls":
+            self._imap = imaplib.IMAP4(self._host, self._port)
+            self._imap.starttls()
+        else:
+            self._imap = imaplib.IMAP4(self._host, self._port)
+        self._imap.login(self._username, self._password)
+
+    def select_inbox(self) -> str:
+        status, _ = self._imap.select("INBOX")
+        if status != "OK":
+            raise imaplib.IMAP4.error("select INBOX failed")
+        _, data = self._imap.response("UIDVALIDITY")
+        # data is [b'UIDVALIDITY <n>'] after select; be defensive: some servers
+        # (and imaplib versions) return None/empty — fall back to "0" rather
+        # than crash (Task 5's integration tests exercise the real path).
+        if not data or not data[0]:
+            return "0"
+        return data[0].decode().split()[-1]
+
+    def fetch_since(self, last_seen_uid: int | None) -> list[tuple[int, bytes]]:
+        if last_seen_uid is None:
+            status, data = self._imap.uid("SEARCH", None, "ALL")
+        else:
+            status, data = self._imap.uid("SEARCH", None, f"UID {last_seen_uid + 1}:*")
+        if status != "OK":
+            raise imaplib.IMAP4.error("UID SEARCH failed")
+        uids = [int(u) for u in data[0].split()]
+        uids = [u for u in uids if last_seen_uid is None or u > last_seen_uid]
+        uids.sort()
+        messages = []
+        for uid in uids:
+            status, fetch_data = self._imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
+            if status != "OK":
+                raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
+            raw = fetch_data[0][1]
+            messages.append((uid, raw))
+        return messages
+
+    def mark_seen(self, uids: list[int]) -> None:
+        for uid in uids:
+            self._imap.uid("STORE", str(uid), "+FLAGS", "(\\Seen)")
+
+    def delete_and_expunge(self, uids: list[int]) -> None:
+        for uid in uids:
+            self._imap.uid("STORE", str(uid), "+FLAGS", "(\\Deleted)")
+        self._imap.expunge()
+
+    def close(self) -> None:
+        if self._imap is not None:
+            try:
+                self._imap.logout()
+            except Exception:  # noqa: BLE001 - closing must never raise
+                pass
+            self._imap = None
+
+
+@dataclass
+class PollResult:
+    messages_scanned: int = 0
+    documents_uploaded: int = 0
+    attachments_skipped: int = 0
+    messages_failed: int = 0
+    error: str | None = None
+
+
+async def poll_mailbox_once(store: Store, client: PapraClient,
+                            mailbox: Mailbox, org: Org) -> PollResult:
+    """Poll one mailbox once. Never raises: failures land in the result and
+    the mailbox's persisted error state (3 consecutive -> disabled)."""
+    SECRET_REGISTRY.add(mailbox.password)
+    session = MailboxSession(
+        host=mailbox.host, port=mailbox.port, username=mailbox.username,
+        password=mailbox.password, ssl_mode=mailbox.ssl_mode,
+    )
+    result = PollResult()
+    try:
+        await asyncio.to_thread(session.connect)
+        uidvalidity = await asyncio.to_thread(session.select_inbox)
+        rescan = mailbox.uidvalidity is not None and mailbox.uidvalidity != uidvalidity
+        last_seen = None if (mailbox.last_seen_uid is None or rescan) else mailbox.last_seen_uid
+        raw_messages = await asyncio.to_thread(session.fetch_since, last_seen)
+    except Exception as error:  # noqa: BLE001 - the poller never crashes the loop
+        result.error = str(error)
+        await asyncio.to_thread(session.close)
+        _record_failure_quietly(store, mailbox.id, result.error)
+        return result
+
+    seen_uids: list[int] = []
+    delete_uids: list[int] = []
+    candidate_last_seen = mailbox.last_seen_uid if not rescan else None
+
+    for uid, raw in raw_messages:
+        result.messages_scanned += 1
+        parsed = parse_message(raw)
+        if not subject_matches(parsed.subject, mailbox.subject_filter):
+            logger.info("message uid=%s skipped by subject filter", uid)
+            seen_uids.append(uid)
+            candidate_last_seen = uid
+            continue
+        uploads_ok = True
+        had_pdfs = False
+        for attachment in parsed.pdf_attachments:
+            had_pdfs = True
+            attachment_hash = dedup_hash(
+                mailbox.id, parsed.message_id, attachment.filename, len(attachment.content)
+            )
+            if store.dedup_exists(attachment_hash):
+                logger.info("attachment %s already ingested (dedup)", attachment.filename)
+                continue
+            try:
+                document = await client.create_document(
+                    org.papra_org_id, attachment.filename, attachment.content
+                )
+            except PapraError as error:
+                uploads_ok = False
+                result.messages_failed += 1
+                logger.error("upload failed for %s: %s", attachment.filename, error)
+                continue
+            file_hash = compute_file_hash(attachment.content)
+            enqueue_ocr_job(
+                store, papra_org_id=org.papra_org_id, document_id=document["id"],
+                file_hash=file_hash, name=document["name"],
+                mime="application/pdf", ingested_via="mail",
+            )
+            store.add_dedup(attachment_hash)
+            result.documents_uploaded += 1
+        for name in parsed.skipped_attachments:
+            result.attachments_skipped += 1
+            logger.info("skipped non-pdf attachment %s", name)
+        if uploads_ok:
+            seen_uids.append(uid)
+            if mailbox.delete_after_download and had_pdfs:
+                delete_uids.append(uid)
+            candidate_last_seen = uid
+        # on failure: leave the message unread and do not advance last_seen
+
+    try:
+        await asyncio.to_thread(session.mark_seen, seen_uids)
+        if delete_uids:
+            await asyncio.to_thread(session.delete_and_expunge, delete_uids)
+    except Exception as error:  # noqa: BLE001
+        result.error = str(error)
+        await asyncio.to_thread(session.close)
+        _record_failure_quietly(store, mailbox.id, result.error)
+        return result
+    finally:
+        await asyncio.to_thread(session.close)
+
+    # record success even for an empty poll: last_poll_at must refresh and
+    # a previous error must clear; uid 0 means "nothing seen yet"
+    last_seen = candidate_last_seen if candidate_last_seen is not None \
+        else (mailbox.last_seen_uid or 0)
+    _record_success_quietly(store, mailbox.id, last_seen_uid=last_seen, uidvalidity=uidvalidity)
+    return result
+
+
+def _record_success_quietly(store: Store, mailbox_id: str, *, last_seen_uid: int,
+                            uidvalidity: str | None) -> None:
+    try:
+        store.record_poll_success(mailbox_id, last_seen_uid=last_seen_uid, uidvalidity=uidvalidity)
+    except ValueError:
+        pass  # mailbox not persisted (unit fixtures): nothing to record
+
+
+def _record_failure_quietly(store: Store, mailbox_id: str, error: str) -> None:
+    try:
+        store.record_poll_failure(mailbox_id, error)
+    except ValueError:
+        pass  # mailbox not persisted (unit fixtures): nothing to record
