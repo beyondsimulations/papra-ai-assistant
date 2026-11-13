@@ -82,6 +82,37 @@ def test_parse_message_decodes_rfc2047_filenames():
         assert "=?utf-8" not in name
 
 
+def test_parse_message_survives_malformed_encoded_words():
+    # a malformed encoded word must never raise out of parse_message: a
+    # poison message would fail EVERY poll on the same uid (mailbox disabled
+    # after 3 consecutive failures). Unknown charset -> LookupError, broken
+    # base64 -> HeaderParseError: both must land in the raw-string fallback.
+    raw = (
+        b"From: sender@example.com\r\n"
+        b"To: box@example.com\r\n"
+        b"Message-ID: <poison@example.com>\r\n"
+        b"Subject: =?unknown-charset-x?Q?hello?=\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: multipart/mixed; boundary=\"pin-bound\"\r\n"
+        b"\r\n"
+        b"--pin-bound\r\n"
+        b"Content-Type: application/pdf\r\n"
+        b"Content-Disposition: attachment;\r\n"
+        b" filename=\"=?utf-8?B?not-base64!!?=\"\r\n"
+        b"Content-Transfer-Encoding: 7bit\r\n"
+        b"\r\n"
+        + PDF_BYTES +
+        b"\r\n--pin-bound--\r\n"
+    )
+
+    parsed = parse_message(raw)
+
+    # the fallback returns the RAW string in each position, no exception
+    assert parsed.subject == "=?unknown-charset-x?Q?hello?="
+    assert [a.filename for a in parsed.pdf_attachments] == ["=?utf-8?B?not-base64!!?="]
+    assert parsed.pdf_attachments[0].content == PDF_BYTES
+
+
 def test_parse_message_without_message_id():
     raw = build_raw(message_id=None)
     parsed = parse_message(raw)

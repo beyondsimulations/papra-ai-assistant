@@ -80,7 +80,8 @@ def purge_greenmail_inbox():
     """Empty the shared GreenMail INBOX so each test starts from a clean mailbox."""
     import imaplib
 
-    imap = imaplib.IMAP4(GREENMAIL_HOST, GREENMAIL_IMAP_PORT)
+    # timeout: a stalled GreenMail must fail loudly, never wedge the suite
+    imap = imaplib.IMAP4(GREENMAIL_HOST, GREENMAIL_IMAP_PORT, timeout=5)
     try:
         imap.login(GREENMAIL_USER, GREENMAIL_PASSWORD)
         imap.select("INBOX")

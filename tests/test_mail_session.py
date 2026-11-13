@@ -129,6 +129,27 @@ def test_fetch_since_filters_uid_edge():
     assert [uid for uid, _raw in batch.messages] == [7]
 
 
+def test_fetch_since_skips_size_probe_without_size_pattern():
+    # the size probe can also answer with a bare bytes status line that has
+    # NO RFC822.SIZE at all (message vanished; server reports FLAGS only):
+    # the no-match arm must return None -> the uid is skipped, never an
+    # AttributeError from a guardless int(match.group(1))
+    session = make_session()
+    good = b"Subject: ok\r\n\r\nbody"
+    session._imap = FakeImap(
+        search_uids=(1, 2),
+        bodies={2: good},
+        size_responses={1: [b"1 (FLAGS (\\Deleted) UID 1)"]},  # no size pattern
+    )
+
+    batch = session.fetch_since(None)
+
+    assert batch.messages == [(2, good)]
+    assert batch.oversized_uids == []
+    assert session._imap.size_probes == [1, 2]
+    assert session._imap.fetch_calls == [2]   # uid 1 is never fetched
+
+
 def test_fetch_since_skips_oversized_message():
     session = make_session()
     # size probe reports an oversized message; no body is ever stored (a body

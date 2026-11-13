@@ -450,6 +450,25 @@ async def test_poll_survives_store_errors_in_recording(store, monkeypatch):
     assert result.documents_uploaded == 0
 
 
+async def test_poll_survives_store_errors_on_success_recording(store, monkeypatch):
+    import sqlite3
+
+    def _locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "record_poll_success", _locked)
+    session = FakeSession(raws=[(1, build_raw())])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    # the success-recording twin: a locked store must not escape
+    # poll_mailbox_once on a SUCCESSFUL poll either (the failure twin above
+    # pins record_poll_failure); the result still reports the upload
+    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+
+    assert isinstance(result, PollResult)
+    assert result.documents_uploaded == 1 and result.error is None
+
+
 async def test_poll_connection_failure_disables_after_three(store, monkeypatch):
     org_id = store.create_org(papra_org_id="org_papra", name="Test")
     mailbox_id = store.create_mailbox(

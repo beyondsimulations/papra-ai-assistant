@@ -89,7 +89,7 @@ async def test_delete_after_download_removes_message(ingestion_stack):
     assert result.documents_uploaded == 1 and result.error is None
     import imaplib
 
-    imap = imaplib.IMAP4(mailbox.host, mailbox.port)
+    imap = imaplib.IMAP4(mailbox.host, mailbox.port, timeout=5)
     imap.login(mailbox.username, mailbox.password)
     imap.select("INBOX")
     status, data = imap.search(None, "ALL")
@@ -122,7 +122,7 @@ async def test_expunge_does_not_destroy_operator_deleted_mail(ingestion_stack):
 
     import imaplib
 
-    imap = imaplib.IMAP4(mailbox.host, mailbox.port)
+    imap = imaplib.IMAP4(mailbox.host, mailbox.port, timeout=5)
     imap.login(mailbox.username, mailbox.password)
     imap.select("INBOX")
     _status, data = imap.uid("SEARCH", None, "ALL")
@@ -136,7 +136,7 @@ async def test_expunge_does_not_destroy_operator_deleted_mail(ingestion_stack):
 
     assert result.error is None and result.documents_uploaded == 1
 
-    imap = imaplib.IMAP4(mailbox.host, mailbox.port)
+    imap = imaplib.IMAP4(mailbox.host, mailbox.port, timeout=5)
     imap.login(mailbox.username, mailbox.password)
     imap.select("INBOX")
     _status, data = imap.uid("SEARCH", None, "ALL")
