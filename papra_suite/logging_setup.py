@@ -29,6 +29,13 @@ class SecretRegistry:
 SECRET_REGISTRY = SecretRegistry()
 
 
+def register_config_secrets(config) -> None:
+    """Register all env-carried secrets so the shared filter can redact them."""
+    SECRET_REGISTRY.add(config.papra_api_key)
+    SECRET_REGISTRY.add(config.llm_api_key)
+    SECRET_REGISTRY.add(config.admin_password)
+
+
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()

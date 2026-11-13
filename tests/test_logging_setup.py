@@ -144,6 +144,26 @@ def test_setup_logging_is_idempotent(store, capsys):
     assert sum("idempotency sentinel line" in line for _, _, line in lines) == 1
 
 
+def test_register_config_secrets_adds_all_env_secrets(store, capsys):
+    from papra_suite.config import load_config
+    from papra_suite.logging_setup import register_config_secrets
+
+    env = {
+        "PAPRA_BASE_URL": "http://papra:1221", "PAPRA_API_KEY": "ppapi_env_key_1",
+        "LLM_BASE_URL": "http://llm:8000", "LLM_API_KEY": "llm_env_key_2",
+        "TITLE_MODEL": "t", "OCR_MODEL": "o", "ADMIN_PASSWORD": "admin_env_pw_3",
+    }
+    config = load_config(env)
+    register_config_secrets(config)
+    setup_logging(store)
+    logging.getLogger("test").info("keys: ppapi_env_key_1 llm_env_key_2 admin_env_pw_3")
+    line = capsys.readouterr().out.strip().splitlines()[-1]
+    assert "ppapi_env_key_1" not in line
+    assert "llm_env_key_2" not in line
+    assert "admin_env_pw_3" not in line
+    assert line.count("[REDACTED]") == 3
+
+
 def test_prefix_secrets_redact_longest_first(store, capsys):
     """Pins the longest-first iteration in SecretRegistry.redact: replacing a
     secret that is a strict prefix of another first leaks the longer secret's
