@@ -1,10 +1,12 @@
 import asyncio
 import imaplib
+import re
 import time
 from dataclasses import dataclass, field
 
 import pytest
 
+from papra_suite import mail, safematch
 from papra_suite.mail import FetchBatch, PollResult, poll_mailbox_once
 from papra_suite.store import Mailbox, Org, Store
 
@@ -947,7 +949,9 @@ async def test_poll_stops_without_retiring_mail_when_a_match_cannot_be_decided(
     assert result.error is not None and "uid=5" in result.error
     assert result.documents_uploaded == 0        # undecided: nothing ingested
     assert session.seen == []                    # neither message was \Seen
-    assert mailbox.last_seen_uid is None         # cursor frozen -> re-fetch next poll
+    # the cursor never got the undecidable message's uid, so the next poll
+    # re-fetches it (a uid decided before the failure keeps its progress)
+    assert mailbox.last_seen_uid is None
     assert mailbox.consecutive_failures == 1
 
 
@@ -1095,3 +1099,117 @@ async def test_poll_with_unsafe_subject_filter_records_failure(store, monkeypatc
     assert result.documents_uploaded == 0
     assert session.seen == []
     assert session.closed is True  # the failure path still closed the session
+
+
+# --- what the child is actually handed -------------------------------------
+
+class RecordingMatcher(safematch.KillableMatcher):
+    """The real killable child, with every request it was asked to make kept
+    for inspection — the only way to pin what the CHILD path receives, as
+    opposed to what the sync `subject_matches` helper would have done."""
+
+    instances: list = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.validated: list[tuple[str, float]] = []
+        self.searches: list[tuple[str, str, float]] = []
+        RecordingMatcher.instances.append(self)
+
+    async def validate(self, pattern, *, timeout_s):
+        self.validated.append((pattern, timeout_s))
+        outcome = await super().validate(pattern, timeout_s=timeout_s)
+        assert self.pid is not None, "validation did not run in a child"
+        return outcome
+
+    async def search(self, pattern, subject, *, timeout_s,
+                     flags=re.IGNORECASE):
+        # the whole point: a real child is already running when the poll site
+        # asks, so this is the child path and not the sync helper
+        assert self.pid is not None, "the search ran without a child"
+        self.searches.append((pattern, subject, timeout_s))
+        return await super().search(pattern, subject, timeout_s=timeout_s, flags=flags)
+
+
+async def test_the_child_is_handed_a_capped_subject_and_never_a_missing_one(
+    store, monkeypatch
+):
+    """The child-path half of the subject gate, which no other test reaches:
+
+    * subject[:MAX_SUBJECT_CHARS] — dropping the cap SURVIVES every other test,
+      because the sync `subject_matches` caps too and is what the
+      sync-only tests exercise. Here the cap is the only thing keeping a
+      hostile 4000-character subject from being handed to the child whole.
+    * `subject is None -> non-match` — both ways of losing that guard were
+      mutation survivors before this test: deleted outright, the slice raises
+      TypeError and the message is counted as a poll failure; relaxed to
+      `subject or ""` (or `str(subject)`), the child is asked to match an empty
+      or a "None" subject, and an operator filter like `^$|Rechnung` then
+      decides a message that has no subject at all. Either way the wrong thing
+      is decided; a missing subject has to be settled in the parent, without a
+      request.
+    """
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=r"^Rechnung",
+    )
+    monkeypatch.setattr(mail, "KillableMatcher", RecordingMatcher)
+    RecordingMatcher.instances.clear()
+    long_subject = "Rechnung " + "1" * 4000
+    # a genuinely missing Subject header (build_raw(subject=None) would put the
+    # four-character string "None" in it, which is a different question)
+    no_subject = re.sub(rb"^Subject:.*\r?\n", b"",
+                       build_raw(message_id="<none@x>"), count=1, flags=re.M)
+    session = FakeSession(raws=[
+        (1, build_raw(subject=long_subject, message_id="<long@x>")),
+        (2, no_subject),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_mailbox_once(
+        store, StubClient(), store.get_mailbox(mailbox_id), store.get_org(org_id)
+    )
+
+    assert result.error is None
+    matcher = RecordingMatcher.instances[0]
+    # one request for the long subject, NONE for the missing one, and the
+    # missing-subject message was not uploaded (non-match, not "None")
+    assert [subject for _pattern, subject, _t in matcher.searches] == \
+        [long_subject[:mail.MAX_SUBJECT_CHARS]]
+    assert len(matcher.searches[0][1]) == mail.MAX_SUBJECT_CHARS
+    assert result.documents_uploaded == 1
+    assert session.seen == [1, 2]           # both retired, cursor moves on
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 2
+
+
+def test_the_regex_budgets_are_pinned():
+    """Constant pin: both shipped timeout defaults survive any change to their
+    value (2.0 -> 0.001 and 10 -> 3600 were both mutation-survivors), and the
+    two numbers are load-bearing in opposite directions.
+
+    SUBJECT_FILTER_TIMEOUT_S is the per-message budget for the operator's
+    regex in the killable child: raise it and a poison subject delays a whole
+    poll for every message in the batch (2 s x 50 messages is already 100 s of
+    a mailbox's poll); lower it and legitimate long subjects on a loaded box
+    start timing out into silent non-matches.
+    SUBJECT_VALIDATION_TIMEOUT_S bounds the pre-validation probes, which must
+    stay far BELOW the 300 s poll interval while remaining generous enough that
+    a pattern which cannot finish a 30-byte probe is rejected rather than
+    installed; at 3600 s a single stuck probe would outlive the poll loop's own
+    interval and the mailbox would never report anything at all.
+
+    Asserted as constants on purpose — a test that slept 10 s to observe the
+    validation budget would slow the suite to measure a number that the kill
+    path already proves is enforced (see
+    test_poll_kills_an_unbounded_validation_probe).
+    """
+    assert mail.MAX_SUBJECT_CHARS == 1000          # the cap the child receives
+    assert mail.SUBJECT_FILTER_TIMEOUT_S == 2.0    # per-message match budget
+    assert mail.SUBJECT_VALIDATION_TIMEOUT_S == 10.0   # whole pre-validation
+    # each request's self-deadline is ITS OWN budget plus this grace (so 4s for
+    # a per-message search and 12s for pre-validation, independently): positive
+    # grace is what keeps the parent's own kill the thing that normally ends a
+    # child, and a grace of 0 would have the child shoot itself in the foot
+    # every time the parent is one tick late
+    assert safematch.SELF_DEADLINE_GRACE_S > 0

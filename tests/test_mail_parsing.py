@@ -1,3 +1,4 @@
+import time
 from email.message import EmailMessage
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -6,6 +7,7 @@ from email.mime.text import MIMEText
 import pytest
 
 from papra_suite.mail import (
+    SUBJECT_FILTER_TIMEOUT_S,
     Attachment,
     compute_file_hash,
     dedup_hash,
@@ -244,3 +246,49 @@ def test_compute_file_hash():
     assert compute_file_hash(b"abc") == compute_file_hash(b"abc")
     assert compute_file_hash(b"abc") != compute_file_hash(b"abd")
     assert len(compute_file_hash(b"abc")) == 64
+
+
+# --- the gate's probe pairs -------------------------------------------------
+
+@pytest.mark.parametrize("pattern", [
+    r"(a+)+$",          # ambiguous group, non-matching tail: ~15x growth
+    r"^(\w+\s?)*$",     # same class over \w, the shape an operator really types
+], ids=["nested-plus", "word-space-star"])
+def test_validate_subject_filter_refuses_the_near_miss_probe_classes(pattern):
+    """The pairs AFTER ("a"*20, "a"*30) exist for exactly these patterns.
+
+    A pair only measures the backtracking its INPUT reaches, and an input the
+    pattern MATCHES is O(n) and measures nothing: (a+)+$ on "a"*30 is instant
+    because it matches. The blowup needs a near miss — a trailing byte that
+    breaks the match — so SUBJECT_FILTER_PROBE_PAIRS carries pairs like
+    ("a"*12+"!", "a"*16+"!"). Reduce the list back to the single original pair
+    and this test fails: both patterns then walk into the per-message match,
+    where only the killable child's 2 s budget ends them.
+
+    The timing half is the point: each is refused in milliseconds, far inside
+    SUBJECT_FILTER_TIMEOUT_S, because the pairs are short by design (the gate
+    runs at the head of every poll, and it is the cheap first filter now that
+    the killable child is the real bound). Growing a pair until it actually
+    terminates catastrophically turns that millisecond refusal into a
+    minute-long one (on this machine (1+)+$ takes 2.4 s to fail one
+    "1"*26+"!" probe, and a 32-digit probe never returns); shortening one until
+    both lengths run in microseconds instead lets the ratio compare timing
+    noise, which refuses patterns that are perfectly usable.
+    """
+    start = time.perf_counter()
+    with pytest.raises(ValueError, match="unsafe"):
+        validate_subject_filter(pattern)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.5, (
+        f"{pattern!r} took {elapsed:.3f}s to refuse: the gate is meant to be "
+        f"milliseconds, not a share of the {SUBJECT_FILTER_TIMEOUT_S}s the "
+        "per-message match gets"
+    )
+
+
+def test_the_gate_probes_a_digit_near_miss_too():
+    """The digit pair ("1"*12+"!", "1"*16+"!") is the third class: the gate's
+    probes must span both alphabets an operator's \\d or [0-9] can reach, not
+    only the "a" alphabet the original ("a"*20, "a"*30) pair covered."""
+    with pytest.raises(ValueError, match="unsafe"):
+        validate_subject_filter(r"(\d+\s*)+$")

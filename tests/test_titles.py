@@ -106,3 +106,36 @@ async def test_generate_title_falls_back_on_malformed_2xx(response):
     title = await generate_title(llm, filename="rechnung-42.pdf", excerpt="inhalt")
     assert title == "rechnung-42.pdf"
     assert responses["n"] == 1  # a 2xx parse failure is permanent, not retried
+
+
+async def test_generate_title_falls_back_on_a_permanent_completion():
+    """C2's designed outcome, and the one class of LLMError the fallback used
+    not to survive for: a completion the server cut off (finish_reason
+    "length", content null or half a title) arrives as
+    LLMError(permanent=True), which SKIPS LLMClient's own retry loop — so
+    generate_title's `except LLMError` is the only thing between it and the
+    worker's retry ladder.
+
+    Narrowing that clause to the retryable half (the mutant this round found
+    SURVIVING: `if error.permanent: raise`, on the reasonable-looking grounds
+    that a permanent error should fail the job) sends the title job to
+    mark_title_failed with a document that gets no title at all, instead of the
+    filename it arrived with — and the suite stayed green, because every other
+    fallback test drives a 500 or a malformed body, which are permanent=False.
+    The fallback is the product decision: a titleless document is still a
+    document.
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"choices": [
+            {"message": {"content": "Rechnung über die Miete 2026"},
+             "finish_reason": "length"}]})
+
+    llm = LLMClient("http://llm.test", "k", "m", backoff_base_s=0.0,
+                    transport=httpx.MockTransport(handler))
+    title = await generate_title(llm, filename="rechnung-42.pdf", excerpt="inhalt")
+
+    assert title == "rechnung-42.pdf"   # the filename, not the truncated title
+    assert calls["n"] == 1              # and asked exactly once: permanent

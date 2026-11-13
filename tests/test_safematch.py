@@ -623,3 +623,27 @@ async def test_the_child_ignores_a_shadowing_package_in_its_cwd(tmp_path, monkey
             await matcher.validate(GATED_PATTERN, timeout_s=30.0)
     finally:
         await matcher.aclose()
+
+
+async def test_the_child_resolves_the_package_from_the_env_pin_in_a_foreign_cwd(
+    tmp_path, monkeypatch
+):
+    """The PYTHONPATH pin, tested where it actually matters.
+
+    A test run from the repo root cannot tell the pin from luck: `-m` puts the
+    cwd on sys.path, so papra_suite/ would be importable even with no pin at
+    all — dropping the package root from _child_env() there survives the whole
+    suite. Started from a directory that holds nothing, with PYTHONPATH absent
+    from the inherited environment, the pin is the only thing that can resolve
+    the worker module, which is the installed/console-script launch the
+    docstring says it exists for.
+    """
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.chdir(tmp_path)          # no papra_suite anywhere near the child
+
+    matcher = KillableMatcher()
+    try:
+        assert await matcher.search("needle", "the needle", timeout_s=10.0) \
+            is MatchOutcome.MATCH       # a child that could not import answers nothing
+    finally:
+        await matcher.aclose()
