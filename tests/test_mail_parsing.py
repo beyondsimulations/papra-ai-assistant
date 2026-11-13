@@ -159,6 +159,15 @@ def test_sanitize_filename_strips_paths_and_control_chars():
     assert sanitize_filename("   .pdf") == "document.pdf"
 
 
+def test_sanitize_filename_caps_length_without_short_suffix():
+    # >120 chars with NO extension: the else branch truncates to the cap —
+    # dropping it would keep the full (300-char) name
+    assert len(sanitize_filename("x" * 300)) == 120
+    # an extension LONGER than 10 chars also takes the else arm (the short-
+    # suffix branch would produce a 120+20+1-char name)
+    assert len(sanitize_filename("x" * 200 + "." + "y" * 20)) == 120
+
+
 def test_subject_matches():
     assert subject_matches("Rechnung 42", None) is True
     assert subject_matches("Rechnung 42", "") is True

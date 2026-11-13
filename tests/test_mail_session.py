@@ -116,9 +116,13 @@ def test_fetch_since_skips_vanished_size_probe():
 def test_fetch_since_filters_uid_edge():
     # RFC 3501: "UID n:*" must include the mailbox's last message even when
     # its uid is below n — the client-side filter must drop it or the last
-    # message is perpetually re-fetched
+    # message is perpetually re-fetched. The boundary uid == last_seen must be
+    # dropped too (strictly greater): it was already fetched last poll, so a
+    # >= filter would re-fetch it forever on RFC-compliant servers.
     session = make_session()
-    session._imap = FakeImap(search_uids=(1, 2, 7), bodies={7: b"raw-7"})
+    session._imap = FakeImap(
+        search_uids=(1, 2, 5, 7), bodies={5: b"raw-5", 7: b"raw-7"}
+    )
 
     batch = session.fetch_since(5)
 
@@ -345,6 +349,62 @@ def test_delete_and_expunge_skips_expunge_on_foreign_deleted_mail(caplog):
     # every registered secret substring in log records, and earlier unit
     # fixtures register "p" as a mailbox password secret
     assert any("foreign \\Deleted" in record.message for record in caplog.records)
+
+
+def test_select_inbox_parses_uidvalidity_from_both_response_shapes():
+    # after SELECT, imaplib's response("UIDVALIDITY") data is the prefixed
+    # shape [b'UIDVALIDITY <n>'] on most servers, but some return the bare
+    # [b'<n>']. Splitting off the LAST token handles both; a [0] mutant would
+    # turn the prefixed shape into the constant "UIDVALIDITY" — the rescan
+    # trigger would never fire and mail after a reissued-lower-UID UIDVALIDITY
+    # would silently never be fetched.
+    class _SelectImap:
+        def __init__(self, uidvalidity_data):
+            self.select_calls = []
+            self._uidvalidity_data = uidvalidity_data
+
+        def select(self, mailbox):
+            self.select_calls.append(mailbox)
+            return ("OK", [b"1"])
+
+        def response(self, key):
+            assert key == "UIDVALIDITY"
+            return ("OK", self._uidvalidity_data)
+
+    session = make_session()
+
+    session._imap = _SelectImap([b"UIDVALIDITY 12345"])
+    assert session.select_inbox() == "12345"
+    assert session._imap.select_calls == ["INBOX"]
+
+    session._imap = _SelectImap([b"12345"])
+    assert session.select_inbox() == "12345"
+
+
+def test_close_swallows_logout_failure_and_is_idempotent():
+    # a server RST before LOGOUT must never propagate out of the poller's
+    # finally block: close() swallows the error AND still clears _imap, so a
+    # second close() is a no-op (and _record_success_quietly still runs,
+    # persisting last_seen on successful polls).
+    class _RstImap:
+        def __init__(self):
+            self.logout_calls = 0
+
+        def logout(self):
+            self.logout_calls += 1
+            raise imaplib.IMAP4.error("connection reset by peer")
+
+    session = make_session()
+    rude = _RstImap()
+    session._imap = rude
+
+    session.close()  # must not raise
+
+    assert rude.logout_calls == 1
+    assert session._imap is None
+
+    session.close()  # idempotent: no imap, no second logout, no raise
+    assert rude.logout_calls == 1
 
 
 def test_subject_matches_truncates_beyond_cap():

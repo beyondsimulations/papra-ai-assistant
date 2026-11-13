@@ -8,17 +8,15 @@ from papra_suite.store import Store
 
 
 @pytest.fixture(autouse=True)
-def _isolate_root_logger_and_secrets():
-    """Snapshot the root logger's handlers and the secret registry before each
-    test and restore them after, so setup_logging's handlers (especially the
-    RingBufferHandler holding a closed store) cannot leak into later tests."""
+def _isolate_root_logger():
+    """Snapshot the root logger's handlers before each test and restore them
+    after, so setup_logging's handlers (especially the RingBufferHandler
+    holding a closed store) cannot leak into later tests. Secret-registry
+    isolation is hoisted to the root conftest.py (one mechanism, one place)."""
     root = logging.getLogger()
     saved_handlers = list(root.handlers)
-    saved_secrets = set(SECRET_REGISTRY._secrets)
     yield
     root.handlers[:] = saved_handlers
-    SECRET_REGISTRY._secrets.clear()
-    SECRET_REGISTRY._secrets.update(saved_secrets)
 
 
 @pytest.fixture
