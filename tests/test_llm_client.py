@@ -39,7 +39,7 @@ async def test_bearer_auth_and_model_sent():
 
     body = json.loads(seen["body"])
     assert seen["auth"] == "Bearer llm-key"
-    assert seen["path"] == "/chat/completions"
+    assert seen["path"] == "/v1/chat/completions"
     assert body["model"] == "qwen3-vl"
     assert body["messages"] == [{"role": "user", "content": "hi"}]
 

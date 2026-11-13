@@ -70,7 +70,11 @@ class LLMClient:
         last_error = ""
         for attempt in range(MAX_ATTEMPTS):
             try:
-                response = await self._client.post("/chat/completions", json=body)
+                # The standard OpenAI-compatible route, /v1-namespaced: vLLM,
+                # Ollama and LM Studio document only this path (mlx_lm.server
+                # maps both). Kept as a literal so the test fake cannot be
+                # wrong together with the client via a shared constant.
+                response = await self._client.post("/v1/chat/completions", json=body)
             except httpx.TransportError as error:
                 last_error = str(error)
                 if attempt == MAX_ATTEMPTS - 1:
