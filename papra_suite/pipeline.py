@@ -75,6 +75,98 @@ async def run_title_job(papra: PapraClient, title_llm: LLMClient, job: Job) -> N
     await papra.update_document(job.papra_org_id, job.document_id, name=title)
 
 
+async def serve(config, *, stop: asyncio.Event | None = None,
+                store: Store | None = None, papra: PapraClient | None = None,
+                ocr_llm: LLMClient | None = None,
+                title_llm: LLMClient | None = None) -> None:
+    """The process runtime: pollers, OCR/title workers, sweep.
+
+    Runs until the stop event is set (or the surrounding task is cancelled),
+    then cancels its tasks and closes ONLY the clients and store it
+    constructed — injected ones belong to the caller (owns_* pattern).
+    """
+    from papra_suite.logging_setup import register_config_secrets, setup_logging
+
+    stop = stop or asyncio.Event()
+    owns_store = store is None
+    if store is None:
+        store = Store(config.data_dir / "state.db")
+    store.migrate()
+    recovered = store.recover_running_jobs()
+    if recovered:
+        logger.info("recovered %d stale running job(s) at startup", recovered)
+    setup_logging(store)
+    register_config_secrets(config)
+
+    built_clients: list = []
+    if papra is None:
+        papra = PapraClient(config.papra_base_url, config.papra_api_key)
+        built_clients.append(papra)
+    if ocr_llm is None:
+        ocr_llm = LLMClient(config.llm_base_url, config.llm_api_key,
+                            config.ocr_model, timeout_s=300.0)
+        built_clients.append(ocr_llm)
+    if title_llm is None:
+        title_llm = LLMClient(config.llm_base_url, config.llm_api_key,
+                              config.title_model, timeout_s=300.0)
+        built_clients.append(title_llm)
+
+    tasks = []
+    for mailbox in store.list_mailboxes(enabled_only=True):
+        tasks.append(asyncio.create_task(_poll_loop(store, papra, mailbox)))
+    for _ in range(config.ocr_concurrency):
+        tasks.append(asyncio.create_task(worker_loop(
+            store, kind="ocr",
+            handler=lambda job: run_ocr_job(papra, ocr_llm, job, config=config),
+        )))
+    tasks.append(asyncio.create_task(worker_loop(
+        store, kind="title",
+        handler=lambda job: run_title_job(papra, title_llm, job),
+    )))
+    if config.sweep_interval_s > 0:
+        tasks.append(asyncio.create_task(
+            _sweep_loop(store, papra, config.sweep_interval_s)))
+
+    stop_waiter = asyncio.create_task(stop.wait())
+    try:
+        await stop_waiter
+    finally:
+        stop_waiter.cancel()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for client in built_clients:
+            await client.aclose()
+        if owns_store:
+            store.close()
+
+
+async def _poll_loop(store: Store, papra: PapraClient, mailbox) -> None:
+    from papra_suite.mail import poll_mailbox_once
+
+    while True:
+        org = store.get_org(mailbox.org_id)
+        if org is not None:
+            try:
+                await poll_mailbox_once(store, papra, mailbox, org)
+            except Exception:  # noqa: BLE001 - defense in depth (M2 carry-over)
+                logger.exception("poll loop error for mailbox %s", mailbox.id)
+        await asyncio.sleep(mailbox.poll_interval_s)
+
+
+async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int) -> None:
+    while True:
+        try:
+            result = await sweep_once(store, papra)
+            if result.jobs_enqueued or result.non_pdf_skipped:
+                logger.info("sweep: %d checked, %d enqueued, %d non-pdf",
+                            result.documents_checked, result.jobs_enqueued,
+                            result.non_pdf_skipped)
+        except Exception:  # noqa: BLE001
+            logger.exception("sweep loop error")
+        await asyncio.sleep(interval_s)
+
+
 async def worker_loop(store: Store, *, kind: str, handler,
                       idle_sleep_s: float = 1.0) -> None:
     """Claim-and-run loop for one job kind. Never raises."""

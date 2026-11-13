@@ -10,6 +10,7 @@ def main() -> int:
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check", help="validate config, open and migrate the store, exit")
+    sub.add_parser("serve", help="run the pipeline: pollers, OCR/title workers, sweep")
 
     args = parser.parse_args()
 
@@ -29,6 +30,14 @@ def main() -> int:
         finally:
             store.close()
         print(f"config ok; store migrated; data dir: {config.data_dir}")
+        return 0
+
+    if args.command == "serve":
+        import asyncio
+
+        from papra_suite.pipeline import serve
+
+        asyncio.run(serve(config))
         return 0
 
     return 1
