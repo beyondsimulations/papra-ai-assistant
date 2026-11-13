@@ -1,6 +1,7 @@
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -287,6 +288,56 @@ def test_job_payload_roundtrip(store):
     fetched = store.get_job(job_id)
     assert fetched is not None
     assert fetched.payload == payload
+
+
+def test_list_jobs_respects_limit(store):
+    """list_jobs(limit=2) must return exactly 2 jobs; dropping the LIMIT
+    clause (or ignoring the limit argument) must fail this test."""
+    for i in range(3):
+        store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id=f"doc_{i}",
+                          content_hash=f"h{i}", payload={})
+        time.sleep(0.01)
+
+    assert len(store.list_jobs(limit=2)) == 2
+
+
+def test_backoff_schedule_is_exponential(store):
+    """next_attempt_at must follow backoff_base_s * 4 ** (attempts - 1):
+    ~30s after the first failure, ~120s after the second. A constant
+    (non-exponential) backoff must fail this test."""
+    store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                      content_hash="abc", payload={})
+    job = store.claim_next_job("ocr")
+
+    store.mark_job_failed(job.id, "boom")  # default backoff_base_s=30
+    next_at = datetime.fromisoformat(store.get_job(job.id).next_attempt_at)
+    delta = (next_at - datetime.now(UTC)).total_seconds()
+    assert 29 <= delta <= 32, f"first backoff should be ~30s, got {delta}s"
+
+    # The job is now in backoff (next_attempt_at ~ now+30s) and not
+    # claimable; age it artificially without touching attempts so the
+    # second claim/fail cycle can run.
+    with store._lock, store._conn:
+        store._conn.execute(
+            "UPDATE jobs SET next_attempt_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), job.id),
+        )
+
+    store.claim_next_job("ocr")
+    store.mark_job_failed(job.id, "boom")  # attempts=2 -> 30 * 4 = 120s
+    next_at = datetime.fromisoformat(store.get_job(job.id).next_attempt_at)
+    delta = (next_at - datetime.now(UTC)).total_seconds()
+    assert 119 <= delta <= 122, f"second backoff should be ~120s, got {delta}s"
+
+
+def test_log_ring_buffer_tuple_order(store):
+    """Each entry must be (ts, level, line) in that order; swapping the
+    INSERT bind order (level, ts, line) must fail this test."""
+    ts = "2026-11-13T00:00:00+00:00"
+    store.append_log_line(ts=ts, level="WARNING", line="disk almost full")
+    entries = store.recent_log_lines()
+    assert len(entries) == 1
+    assert entries[0] == (ts, "WARNING", "disk almost full")
 
 
 def test_list_jobs_newest_first(store):

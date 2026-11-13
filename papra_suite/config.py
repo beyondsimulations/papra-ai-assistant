@@ -31,6 +31,14 @@ class AppConfig:
 DEFAULT_BIND = "127.0.0.1:8080"
 
 
+def _has_nondisplay_chars(text: str) -> bool:
+    # httpx percent-encodes spaces ("http://my host" -> a different host) and
+    # raises InvalidURL on tabs/control chars, but Python's urlparse silently
+    # strips \t/\r/\n before parsing — so both the parsed hostname and the
+    # raw value must be screened.
+    return any(ch.isspace() or not ch.isprintable() for ch in text)
+
+
 def _require(env: Mapping[str, str], name: str) -> str:
     value = env.get(name, "").strip()
     if not value:
@@ -60,6 +68,10 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
         # request time — the check command must reject it up front instead.
         if not parsed.hostname:
             raise ConfigError(f"{name} must include a host, got: {value!r}")
+        if _has_nondisplay_chars(parsed.hostname) or _has_nondisplay_chars(value):
+            raise ConfigError(
+                f"{name} must not contain whitespace or control characters, got: {value!r}"
+            )
         parsed.port  # noqa: B018 — property access validates the port
     except ValueError:
         # Covers non-numeric, out-of-range (0-65535) and trailing-garbage
@@ -99,6 +111,10 @@ def _parse_bind(raw: str) -> tuple[str, int]:
         ) from None
     if not parsed.hostname or port is None:
         raise ConfigError(f"DASHBOARD_BIND must be 'host:port', got: {raw!r}")
+    if _has_nondisplay_chars(parsed.hostname) or _has_nondisplay_chars(raw):
+        raise ConfigError(
+            f"DASHBOARD_BIND must not contain whitespace or control characters, got: {raw!r}"
+        )
     return parsed.hostname, port
 
 

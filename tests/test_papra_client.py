@@ -160,7 +160,15 @@ async def test_list_documents_passes_search_query():
     # count is the server-reported total (7), not len(documents) (1) —
     # pinning the documentsCount contract against a len() fallback mutation.
     assert documents == [DOC] and count == 7
-    assert seen["params"]["searchQuery"] == "invoice"
+    # Pin the full pagination contract: dropping the params dict entirely
+    # (or any of the five keys) must fail the suite.
+    assert seen["params"] == {
+        "pageIndex": "0",
+        "pageSize": "100",
+        "sortField": "createdAt",
+        "sortOrder": "desc",
+        "searchQuery": "invoice",
+    }
 
 
 async def test_list_documents_falls_back_when_count_missing():
@@ -217,9 +225,13 @@ async def test_create_document_sends_multipart_file():
 
 async def test_whoami_returns_api_key():
     api_key = {"id": "ak_1", "permissions": []}
+    seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
         return httpx.Response(200, json={"apiKey": api_key})
 
     async with make_client(handler) as client:
         assert await client.whoami() == api_key
+    # Pin the whoami endpoint path against a mutated URL.
+    assert seen["path"] == "/api/api-keys/current"

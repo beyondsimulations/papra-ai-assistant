@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from papra_suite.config import ConfigError, load_config
@@ -150,3 +152,42 @@ def test_malformed_ipv6_llm_base_url_raises_config_error():
 def test_valid_bracketed_ipv6_base_url_passes():
     config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://[::1]:1221"})
     assert config.papra_base_url == "http://[::1]:1221"
+
+
+def test_base_url_with_space_in_host_rejected():
+    # "http://my host:1221" parses fine, but httpx percent-encodes the space
+    # and connects to a different host — every request would fail.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://my host:1221"})
+
+
+def test_base_url_with_tab_rejected():
+    # urlparse silently strips \t, but the httpx constructor raises
+    # InvalidURL ("Invalid non-printable ASCII character in URL").
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": f"http://host{chr(9)}:1221"})
+
+
+def test_dashboard_bind_with_space_in_host_rejected():
+    # "12 7.0.0.1:8080" is not a bindable address; urlparse happily parses
+    # it as hostname "12 7.0.0.1".
+    with pytest.raises(ConfigError, match="DASHBOARD_BIND"):
+        load_config({**BASE_ENV, "DASHBOARD_BIND": "12 7.0.0.1:8080"})
+
+
+def test_whitespace_only_api_key_rejected():
+    # _require must strip before the emptiness check, otherwise "   " is
+    # blessed as a non-empty key and every request 401s.
+    with pytest.raises(ConfigError, match="PAPRA_API_KEY"):
+        load_config({**BASE_ENV, "PAPRA_API_KEY": "   "})
+
+
+def test_required_values_are_stripped():
+    config = load_config({**BASE_ENV, "PAPRA_API_KEY": "  ppapi_x  "})
+    assert config.papra_api_key == "ppapi_x"
+
+
+def test_data_dir_default():
+    # The documented default data dir when DATA_DIR is unset.
+    config = load_config(BASE_ENV)
+    assert config.data_dir == Path("/app/data")
