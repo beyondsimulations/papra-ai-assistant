@@ -268,6 +268,32 @@ async def test_upload_failure_freezes_last_seen_prefix(store, monkeypatch):
     assert second.documents_uploaded == 0  # good.pdf dedup-skipped
 
 
+async def test_rescan_failure_persists_zero_last_seen(store, monkeypatch):
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    store.record_poll_success(
+        mailbox_id, last_seen_uid=5, uidvalidity="111"
+    )
+    session = FakeSession(
+        uidvalidity="222",
+        raws=[(1, build_raw(message_id="<m1@x>", attachments=[("bad.pdf", b"%PDF-1")]))],
+    )
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient(fail_for={"bad.pdf"})
+
+    org = store.get_org(org_id)
+    mailbox = store.get_mailbox(mailbox_id)
+    await poll_mailbox_once(store, client, mailbox, org)
+
+    # rescan saw nothing succeed: stale pre-rescan uid 5 must NOT be
+    # restored — persist 0 so the failed message stays re-fetchable
+    updated = store.get_mailbox(mailbox_id)
+    assert updated.last_seen_uid == 0
+    assert updated.uidvalidity == "222"
+
+
 async def test_poll_never_raises_on_internal_error(store, monkeypatch):
     def _boom(raw):
         raise RuntimeError("boom")

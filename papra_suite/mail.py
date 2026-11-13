@@ -302,7 +302,7 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
     # record success even for an empty poll: last_poll_at must refresh and
     # a previous error must clear; uid 0 means "nothing seen yet"
     last_seen = candidate_last_seen if candidate_last_seen is not None \
-        else (mailbox.last_seen_uid or 0)
+        else (0 if rescan else (mailbox.last_seen_uid or 0))
     _record_success_quietly(store, mailbox.id, last_seen_uid=last_seen, uidvalidity=uidvalidity)
     return result
 
