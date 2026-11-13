@@ -1,4 +1,6 @@
+import os
 import sqlite3
+import stat
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -407,3 +409,68 @@ def test_migrate_holds_write_lock_from_begin(tmp_path, monkeypatch):
     store = Store(db_path)
     store.migrate()
     store.close()
+
+
+def test_wal_retry_deadline_raises(tmp_path, monkeypatch):
+    """A wedged database (lock never released) must make the constructor
+    raise after the 30s deadline — not hang forever. The deadline check is
+    pinned by faking the clock: the deadline computation sees t=0 and every
+    subsequent monotonic() read is far past it, while time.sleep is a no-op
+    so the test itself cannot stall on real sleeps."""
+    db_path = tmp_path / "state.db"
+    holder = sqlite3.connect(db_path, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("CREATE TABLE lock_holder (id INTEGER PRIMARY KEY)")
+
+    calls = 0
+
+    def fake_monotonic():
+        nonlocal calls
+        calls += 1
+        if calls > 10_000:
+            raise AssertionError("WAL retry clock spun unboundedly")
+        return 0.0 if calls == 1 else 1e12  # deadline = 30.0, then far past it
+
+    sleeps = 0
+
+    def fake_sleep(_seconds):
+        # A no-op sleep, but bounded: a regression that deletes the deadline
+        # raise (and with it every remaining monotonic() call) spins here —
+        # fail the test instead of hanging the suite forever.
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 10_000:
+            raise AssertionError("WAL retry looped past its deadline without raising")
+
+    monkeypatch.setattr(store_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(store_module.time, "sleep", fake_sleep)
+
+    start = time.perf_counter()  # real clock for the wall-time bound
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            Store(db_path)
+    finally:
+        holder.rollback()
+        holder.close()
+    assert time.perf_counter() - start < 5.0
+
+
+def test_wal_retry_raises_fast_on_fatal_error(tmp_path):
+    """A non-lock OperationalError at WAL-pragma time (e.g. an unwritable
+    data dir: the pre-created db opens read-only, so PRAGMA journal_mode=WAL
+    fails with 'attempt to write a readonly database') must fail fast via
+    the non-contention screen — not spin through the full 30s retry window.
+    (The db file must be pre-created while the dir is still writable so the
+    failure lands on the PRAGMA, not on sqlite3.connect.)"""
+    db_path = tmp_path / "state.db"
+    seed = sqlite3.connect(db_path)  # create a valid, openable db file
+    seed.close()
+    os.chmod(tmp_path, stat.S_IRUSR | stat.S_IXUSR)  # read-only data dir
+    try:
+        start = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            Store(db_path)
+        elapsed = time.monotonic() - start
+    finally:
+        os.chmod(tmp_path, stat.S_IRWXU)  # let tmp_path cleanup succeed
+    assert elapsed < 5.0, f"fatal error should fail fast, took {elapsed:.1f}s"

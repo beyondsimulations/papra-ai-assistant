@@ -130,6 +130,25 @@ def test_trailing_garbage_after_port_base_url_rejected():
         load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://host:1221:extra"})
 
 
+def test_base_url_with_user_and_password_rejected():
+    # httpx would derive Basic auth from the userinfo, overriding the Bearer
+    # API key header (every request 401s), and log the credentialed URL.
+    with pytest.raises(ConfigError, match="credentials"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://user:pass@papra:1221"})
+
+
+def test_base_url_with_username_only_rejected():
+    # A bare username (no password) is equally fatal: httpx still builds
+    # Basic auth credentials from it, overriding the Bearer header.
+    with pytest.raises(ConfigError, match="credentials"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://user@papra:1221"})
+
+
+def test_base_url_without_credentials_still_passes():
+    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221"})
+    assert config.papra_base_url == "http://papra:1221"
+
+
 def test_valid_base_urls_still_pass():
     config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "https://host.example"})
     assert config.papra_base_url == "https://host.example"

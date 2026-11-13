@@ -68,6 +68,12 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
         # request time — the check command must reject it up front instead.
         if not parsed.hostname:
             raise ConfigError(f"{name} must include a host, got: {value!r}")
+        # httpx derives Basic auth credentials from URL userinfo, OVERRIDING
+        # the Bearer API key header on every request (guaranteed 401s), and
+        # it logs the credentialed URL at INFO — leaking the password to
+        # stdout logs the redaction filter cannot catch. Reject up front.
+        if parsed.username is not None or parsed.password is not None:
+            raise ConfigError(f"{name} must not contain credentials, got: {value!r}")
         # httpx concatenates a base URL's path with every request path
         # ("http://papra:1221/api" + "/api/api-keys/current" ->
         # "/api/api-keys/current" 404s on every call), so no input can make a
