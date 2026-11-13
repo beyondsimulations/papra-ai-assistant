@@ -237,6 +237,22 @@ def test_reset_job_revives_failed_job(store):
     assert revived.status == "pending" and revived.attempts == 0 and revived.error is None
 
 
+def test_reset_job_makes_job_claimable(store):
+    job_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_1",
+                               content_hash="abc", payload={})
+    for _ in range(3):
+        job = store.claim_next_job("ocr")
+        store.mark_job_failed(job.id, "boom", backoff_base_s=0)
+    assert store.get_job(job_id).status == "failed"
+
+    store.reset_job(job_id)
+
+    claimed = store.claim_next_job("ocr")
+    assert claimed is not None
+    assert claimed.id == job_id
+    assert claimed.status == "running"
+
+
 def test_document_seen_roundtrip(store):
     assert not store.document_seen("org_1", "doc_1")
     store.record_document_seen(papra_org_id="org_1", papra_document_id="doc_1",

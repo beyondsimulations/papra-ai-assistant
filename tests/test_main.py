@@ -7,8 +7,20 @@ store.migrate() call fail a test.
 import sqlite3
 import sys
 
+import pytest
+
 from papra_suite.__main__ import main
 from tests.test_config import BASE_ENV
+
+
+def test_version_flag_prints_version_and_exits_zero(monkeypatch, capsys):
+    from papra_suite import __version__
+
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "--version"])
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 0
+    assert __version__ in capsys.readouterr().out
 
 
 def test_check_success_migrates_and_exits_zero(monkeypatch, tmp_path):

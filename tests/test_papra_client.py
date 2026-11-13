@@ -5,6 +5,22 @@ import pytest
 
 from papra_suite.papra_client import PapraClient, PapraError
 
+
+async def test_timeout_is_passed_to_underlying_client():
+    client = PapraClient("http://papra.test", "ppapi_test", timeout_s=12.5)
+    try:
+        assert client._client.timeout.connect == 12.5
+    finally:
+        await client.aclose()
+
+
+async def test_backoff_default_is_not_zero():
+    client = PapraClient("http://papra.test", "ppapi_test")
+    try:
+        assert client._backoff_base_s == 0.5
+    finally:
+        await client.aclose()
+
 ORG = "org_123"
 DOC = {"id": "doc_1", "name": "bill.pdf", "mimeType": "application/pdf"}
 
