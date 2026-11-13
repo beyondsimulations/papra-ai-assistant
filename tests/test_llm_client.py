@@ -128,3 +128,53 @@ async def test_backoff_sleeps_between_attempts():
         start = time.monotonic()
         await client.chat([{"role": "user", "content": "x"}])
         assert time.monotonic() - start >= 0.24  # 0.05 + 0.20
+
+
+# --- Pins required by the Task 1 review: previously unpinned branches ---
+
+
+async def test_429_is_retried():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    async with make_client(handler) as client:
+        assert await client.chat([{"role": "user", "content": "x"}]) == "ok"
+    assert calls["n"] == 2
+
+
+async def test_http_exhaustion_raises_with_status():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503)
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError) as excinfo:
+            await client.chat([{"role": "user", "content": "x"}])
+    assert excinfo.value.status == 503
+    assert calls["n"] == 3
+
+
+async def test_timeout_is_passed_to_underlying_client():
+    # httpx 0.28: a scalar timeout populates all four Timeout attributes,
+    # so timeout.connect pins the pass-through
+    client = LLMClient("http://llm.test", "k", "m", timeout_s=12.5)
+    try:
+        assert client._client.timeout.connect == 12.5
+    finally:
+        await client.aclose()
+
+
+async def test_image_without_user_message_raises():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    async with make_client(handler) as client:
+        with pytest.raises(LLMError):
+            await client.chat([{"role": "system", "content": "sys"}], image=b"x")
