@@ -616,3 +616,25 @@ def test_wal_retry_raises_fast_on_fatal_error(tmp_path):
     finally:
         os.chmod(tmp_path, stat.S_IRWXU)  # let tmp_path cleanup succeed
     assert elapsed < 5.0, f"fatal error should fail fast, took {elapsed:.1f}s"
+
+
+def test_create_mailbox_rejects_unknown_ssl_mode(store):
+    # fail-closed: an unrecognized ssl_mode must never be persisted — the
+    # session would otherwise fail-open to plaintext IMAP (cleartext credentials)
+    org_id = store.create_org(papra_org_id="org_abc", name="Org")
+    for mode in ("TLS", "tls", "SSL", "STARTTLS", "", "secure"):
+        with pytest.raises(ValueError, match="ssl_mode"):
+            store.create_mailbox(
+                org_id=org_id, host="h", port=993, username="u", password="p",
+                ssl_mode=mode,
+            )
+
+
+def test_create_mailbox_accepts_valid_ssl_modes(store):
+    org_id = store.create_org(papra_org_id="org_abc", name="Org")
+    for mode in ("ssl", "starttls", "plain"):
+        mailbox_id = store.create_mailbox(
+            org_id=org_id, host="h", port=993, username="u", password="p",
+            ssl_mode=mode,
+        )
+        assert store.get_mailbox(mailbox_id).ssl_mode == mode

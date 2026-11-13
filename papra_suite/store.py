@@ -18,6 +18,8 @@ def _iso(dt: datetime) -> str:
 
 LOG_RING_BUFFER_SIZE = 1000
 
+VALID_SSL_MODES = ("ssl", "starttls", "plain")
+
 
 def _migration_001_initial(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -400,6 +402,13 @@ class Store:
                        password: str, ssl_mode: str = "ssl", poll_interval_s: int = 300,
                        subject_filter: str | None = None,
                        delete_after_download: bool = False) -> str:
+        # Fail-closed validation: an unrecognized ssl_mode must never be
+        # persisted — MailboxSession.connect would otherwise fail-open to
+        # plaintext IMAP and leak the credentials in cleartext.
+        if ssl_mode not in VALID_SSL_MODES:
+            raise ValueError(
+                f"ssl_mode must be one of {', '.join(VALID_SSL_MODES)}; got {ssl_mode!r}"
+            )
         mailbox_id = uuid.uuid4().hex
         with self._lock, self._conn:
             self._conn.execute(

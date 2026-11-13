@@ -1,8 +1,9 @@
+import time
 from dataclasses import dataclass, field
 
 import pytest
 
-from papra_suite.mail import PollResult, poll_mailbox_once
+from papra_suite.mail import FetchBatch, PollResult, poll_mailbox_once
 from papra_suite.store import Mailbox, Org, Store
 
 
@@ -32,6 +33,7 @@ def build_raw(subject="Invoice", message_id="<m1@x>", attachments=(("a.pdf", b"%
 class FakeSession:
     uidvalidity: str = "111"
     raws: list = field(default_factory=list)     # [(uid, raw)]
+    oversized: list = field(default_factory=list)  # uids above the per-message cap
     seen: list = field(default_factory=list)
     deleted: list = field(default_factory=list)
     fail_on_connect: Exception | None = None
@@ -45,9 +47,11 @@ class FakeSession:
         return self.uidvalidity
 
     def fetch_since(self, last_seen_uid):
-        if last_seen_uid is None:
-            return list(self.raws)
-        return [(uid, raw) for uid, raw in self.raws if uid > last_seen_uid]
+        messages = self.raws if last_seen_uid is None \
+            else [(uid, raw) for uid, raw in self.raws if uid > last_seen_uid]
+        oversized = self.oversized if last_seen_uid is None \
+            else [uid for uid in self.oversized if uid > last_seen_uid]
+        return FetchBatch(messages=list(messages), oversized_uids=list(oversized))
 
     def mark_seen(self, uids):
         self.seen.extend(uids)
@@ -381,3 +385,96 @@ async def test_poll_connection_failure_disables_after_three(store, monkeypatch):
     assert updated.enabled is False
     assert updated.consecutive_failures == 3
     assert "refused" in updated.last_error
+
+
+async def test_delete_not_triggered_for_non_pdf_only_message(store, monkeypatch):
+    # pin the had_pdfs guard: a jpg-only message under delete_after_download
+    # must be marked seen but NEVER expunged (silent data loss otherwise)
+    raw = build_raw(attachments=[("photo.jpg", b"\xff\xd8jpeg")])
+    session = FakeSession(raws=[(1, raw)])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_mailbox_once(
+        store, StubClient(), make_mailbox(delete_after_download=True), ORG
+    )
+
+    assert result.documents_uploaded == 0 and result.error is None
+    assert session.deleted == []
+    assert session.seen == [1]
+
+
+async def test_filtered_message_does_not_advance_past_failure(store, monkeypatch):
+    # pin the freeze on the subject-filtered branch: a filtered message after
+    # a failed one must not advance last_seen past the failure (silent loss)
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=".*invoice.*",
+    )
+    session = FakeSession(raws=[
+        (1, build_raw(message_id="<m1@x>", attachments=[("bad.pdf", b"%PDF-1")])),
+        (2, build_raw(subject="Newsletter", message_id="<m2@x>")),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient(fail_for={"bad.pdf"})
+
+    org = store.get_org(org_id)
+    mailbox = store.get_mailbox(mailbox_id)
+    result = await poll_mailbox_once(store, client, mailbox, org)
+
+    # uid 1 (matches filter, upload failed) stays re-fetchable: last_seen frozen
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 0
+    # uid 2 was processed (subject-filtered -> seen), just not counted for advance
+    assert session.seen == [2]
+    assert result.messages_failed == 1 and result.error is None
+
+
+async def test_poll_advances_past_oversized_message(store, monkeypatch):
+    # per-message cap at the poller level: an oversized uid is skipped without
+    # parsing but still counts as processed — the poll advances past it
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    session = FakeSession(raws=[(2, build_raw(message_id="<m2@x>"))], oversized=[1])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    org = store.get_org(org_id)
+    mailbox = store.get_mailbox(mailbox_id)
+    result = await poll_mailbox_once(store, client, mailbox, org)
+
+    assert result.documents_uploaded == 1          # only the small message parsed
+    assert len(client.uploads) == 1
+    assert session.seen == [1, 2]                  # oversized still marked seen
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 2
+
+
+async def test_subject_filter_redos_is_bounded(store, monkeypatch, caplog):
+    # catastrophic admin regex against a crafted 5000-char subject: the poll
+    # must stay bounded and treat the message as a non-match. The a-run is
+    # sized so the capped regex alone runs ~10s — far past the 2s wait_for
+    # budget — so the timeout path fires deterministically (warning logged,
+    # non-match, message seen). Without the wait_for offload the regex would
+    # run inline on the event loop: no timeout warning, and the poll only
+    # returns after the full inline runtime.
+    crafted = "a" * 38 + "!" * (5000 - 38)
+    session = FakeSession(raws=[(1, build_raw(subject=crafted, message_id="<redos@x>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    start = time.monotonic()
+    with caplog.at_level("WARNING", logger="papra_suite.mail"):
+        result = await poll_mailbox_once(
+            store, StubClient(), make_mailbox(subject_filter=r"(a|aa)+b"), ORG
+        )
+    elapsed = time.monotonic() - start
+
+    assert result.error is None
+    assert result.documents_uploaded == 0      # non-match: no upload attempted
+    assert session.seen == [1]                 # intentionally skipped like a filter miss
+    # the wait_for timeout fired: the message was treated as a non-match
+    assert any("subject filter timed out" in record.message for record in caplog.records)
+    # bounded: the timeout decided the match at 2s; the remaining drain of the
+    # (uninterruptible, GIL-holding) regex thread is coarse-bounded far below
+    # the un-hung un-bounded inline case
+    assert elapsed < 30.0

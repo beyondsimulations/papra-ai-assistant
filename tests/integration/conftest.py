@@ -90,8 +90,45 @@ def purge_greenmail_inbox():
         imap.logout()
 
 
+def _wait_for_greenmail_delivery(message_id: str, *, timeout_s: float = 5.0) -> None:
+    """Block until GreenMail has delivered the message to the IMAP INBOX.
+
+    GreenMail's SMTP->IMAP delivery is asynchronous (~185ms measured): without
+    this wait, tests race it (machine-dependent flakiness, cross-test
+    pollution). Search for the injected Message-ID, retrying every 50ms up
+    to a 5s window; raise on timeout so a broken GreenMail fails loudly.
+    """
+    import imaplib
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            imap = imaplib.IMAP4(GREENMAIL_HOST, GREENMAIL_IMAP_PORT)
+            try:
+                imap.login(GREENMAIL_USER, GREENMAIL_PASSWORD)
+                imap.select("INBOX")
+                status, data = imap.uid(
+                    "SEARCH", None, f'HEADER Message-ID "{message_id}"'
+                )
+                if status == "OK" and data and data[0] and data[0].split():
+                    return
+            finally:
+                try:
+                    imap.logout()
+                except Exception:  # noqa: BLE001 - cleanup must not mask the result
+                    pass
+        except OSError:
+            pass  # GreenMail briefly refused the connection: retry within the window
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"GreenMail did not deliver message {message_id} within {timeout_s}s"
+            )
+        time.sleep(0.05)
+
+
 def inject_message(*, to, subject, attachments=()):
-    """Send a MIME message with (filename, bytes, mime-tuple) attachments via GreenMail SMTP."""
+    """Send a MIME message with (filename, bytes, mime-tuple) attachments via
+    GreenMail SMTP, then wait until it is visible in the IMAP INBOX."""
     import smtplib
     from email.message import EmailMessage
 
@@ -102,8 +139,10 @@ def inject_message(*, to, subject, attachments=()):
     message["Message-ID"] = f"<{uuid.uuid4().hex}@test>"
     for filename, content, mime in attachments:
         message.add_attachment(content, maintype=mime[0], subtype=mime[1], filename=filename)
+    message_id = message["Message-ID"]
     with smtplib.SMTP(GREENMAIL_HOST, GREENMAIL_SMTP_PORT, timeout=10) as smtp:
         smtp.send_message(message)
+    _wait_for_greenmail_delivery(message_id)
 
 
 # Function-scoped on purpose: each integration test gets a fresh Papra

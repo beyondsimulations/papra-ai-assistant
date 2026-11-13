@@ -25,11 +25,35 @@ logger = logging.getLogger(__name__)
 MAX_FILENAME_LENGTH = 120
 PDF_MAGIC = b"%PDF-"
 
+# Memory hardening for fetch_since: a single fetched message larger than
+# MAX_MESSAGE_BYTES is skipped (counted as processed so the poll advances);
+# a poll stops fetching once accumulated bytes exceed MAX_POLL_BYTES — the
+# remaining messages stay for the next poll (correct re-fetch semantics).
+MAX_MESSAGE_BYTES = 25 * 1024 * 1024
+MAX_POLL_BYTES = 100 * 1024 * 1024
+# Subject cap for the regex filter: RFC 5322 sets no hard subject limit, and
+# legitimately useful subjects beyond this length are vanishingly rare, but
+# unbounded input feeds the common super-linear regex backtracking class.
+MAX_SUBJECT_CHARS = 1000
+SUBJECT_FILTER_TIMEOUT_S = 2.0
+
 
 @dataclass
 class Attachment:
     filename: str
     content: bytes
+
+
+@dataclass
+class FetchBatch:
+    """Result of one fetch_since pass.
+
+    messages: (uid, raw) pairs below the per-message cap, in uid order.
+    oversized_uids: messages above MAX_MESSAGE_BYTES — the poller skips
+    them without parsing but still advances last_seen past them.
+    """
+    messages: list[tuple[int, bytes]] = field(default_factory=list)
+    oversized_uids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -112,11 +136,20 @@ def _decode_header_value(raw: str | None) -> str | None:
 
 
 def subject_matches(subject: str | None, pattern: str | None) -> bool:
-    """Optional per-mailbox subject regex filter; no pattern means match all."""
+    """Optional per-mailbox subject regex filter; no pattern means match all.
+
+    The subject is truncated to MAX_SUBJECT_CHARS before matching: RFC 5322
+    has no hard subject limit, legit subjects over the cap are vanishingly
+    rare, and the cap bounds the input for the common super-linear regex
+    backtracking class (the poller additionally runs this off the event loop
+    under a timeout — defense in depth against a frozen loop).
+    """
     if not pattern:
         return True
     if subject is None:
         return False
+    if len(subject) > MAX_SUBJECT_CHARS:
+        subject = subject[:MAX_SUBJECT_CHARS]
     return re.search(pattern, subject, re.IGNORECASE) is not None
 
 
@@ -142,13 +175,21 @@ class MailboxSession:
         self._imap: imaplib.IMAP4 | None = None
 
     def connect(self) -> None:
+        # Fail-closed on an unrecognized ssl_mode (legacy/hand-edited rows):
+        # an unknown value must never silently fall through to plaintext
+        # IMAP, which would send the credentials in cleartext.
         if self._ssl_mode == "ssl":
             self._imap = imaplib.IMAP4_SSL(self._host, self._port)
         elif self._ssl_mode == "starttls":
             self._imap = imaplib.IMAP4(self._host, self._port)
             self._imap.starttls()
-        else:
+        elif self._ssl_mode == "plain":
             self._imap = imaplib.IMAP4(self._host, self._port)
+        else:
+            raise ValueError(
+                f"unknown ssl_mode {self._ssl_mode!r}; refusing to connect "
+                "(valid: ssl, starttls, plain)"
+            )
         self._imap.login(self._username, self._password)
 
     def select_inbox(self) -> str:
@@ -163,7 +204,7 @@ class MailboxSession:
             return "0"
         return data[0].decode().split()[-1]
 
-    def fetch_since(self, last_seen_uid: int | None) -> list[tuple[int, bytes]]:
+    def fetch_since(self, last_seen_uid: int | None) -> FetchBatch:
         if last_seen_uid is None:
             status, data = self._imap.uid("SEARCH", None, "ALL")
         else:
@@ -171,16 +212,47 @@ class MailboxSession:
         if status != "OK":
             raise imaplib.IMAP4.error("UID SEARCH failed")
         uids = [int(u) for u in data[0].split()]
+        # RFC 3501 edge: "UID n:*" must include the mailbox's last message even
+        # when its uid is below n — without this filter such servers would cause
+        # a perpetual re-fetch of the last message (benign but wasteful).
         uids = [u for u in uids if last_seen_uid is None or u > last_seen_uid]
         uids.sort()
-        messages = []
+        batch = FetchBatch()
+        total_bytes = 0
         for uid in uids:
+            if total_bytes > MAX_POLL_BYTES:
+                remaining = len(uids) - len(batch.messages) - len(batch.oversized_uids)
+                logger.info(
+                    "poll byte cap reached (%d > %d); %d message(s) left for the next poll",
+                    total_bytes, MAX_POLL_BYTES, remaining,
+                )
+                break
             status, fetch_data = self._imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
             if status != "OK":
                 raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
-            raw = fetch_data[0][1]
-            messages.append((uid, raw))
-        return messages
+            # A message can vanish between SEARCH and FETCH (another client
+            # expunged it): the response is then a bare bytes status line or
+            # [None]. Validate the shape instead of indexing blindly — an
+            # int/TypeError here would fail the whole poll.
+            entry = fetch_data[0] if fetch_data else None
+            if not (isinstance(entry, tuple) and len(entry) >= 2
+                    and isinstance(entry[1], bytes)):
+                logger.warning("message uid=%s vanished before fetch; skipping", uid)
+                continue
+            raw = entry[1]
+            total_bytes += len(raw)
+            if len(raw) > MAX_MESSAGE_BYTES:
+                # Oversized messages still count toward the aggregate cap: the
+                # bytes already crossed the wire into this process.
+                logger.warning(
+                    "message uid=%s exceeds the per-message cap (%d bytes); "
+                    "skipping without parsing",
+                    uid, MAX_MESSAGE_BYTES,
+                )
+                batch.oversized_uids.append(uid)
+                continue
+            batch.messages.append((uid, raw))
+        return batch
 
     def mark_seen(self, uids: list[int]) -> None:
         for uid in uids:
@@ -224,7 +296,7 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
         uidvalidity = await asyncio.to_thread(session.select_inbox)
         rescan = mailbox.uidvalidity is not None and mailbox.uidvalidity != uidvalidity
         last_seen = None if (mailbox.last_seen_uid is None or rescan) else mailbox.last_seen_uid
-        raw_messages = await asyncio.to_thread(session.fetch_since, last_seen)
+        batch = await asyncio.to_thread(session.fetch_since, last_seen)
     except Exception as error:  # noqa: BLE001 - the poller never crashes the loop
         result.error = str(error)
         await asyncio.to_thread(session.close)
@@ -237,10 +309,38 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
     prefix_failed = False
 
     try:
-        for uid, raw in raw_messages:
+        # merge messages and oversized uids back into uid order so the
+        # freeze-on-failure semantics stay position-correct
+        entries = sorted(
+            [(uid, raw) for uid, raw in batch.messages]
+            + [(uid, None) for uid in batch.oversized_uids]
+        )
+        for uid, raw in entries:
             result.messages_scanned += 1
+            if raw is None:
+                logger.warning(
+                    "message uid=%s skipped: exceeds the per-message size cap", uid
+                )
+                seen_uids.append(uid)
+                if not prefix_failed:
+                    candidate_last_seen = uid
+                continue
             parsed = parse_message(raw)
-            if not subject_matches(parsed.subject, mailbox.subject_filter):
+            # Run the admin-supplied regex off the event loop under a timeout:
+            # a super-linear pattern against a crafted subject must degrade
+            # to a bounded non-match, never a frozen loop.
+            try:
+                matched = await asyncio.wait_for(
+                    asyncio.to_thread(subject_matches, parsed.subject,
+                                      mailbox.subject_filter),
+                    timeout=SUBJECT_FILTER_TIMEOUT_S,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "subject filter timed out on uid=%s; treating as non-match", uid
+                )
+                matched = False
+            if not matched:
                 logger.info("message uid=%s skipped by subject filter", uid)
                 seen_uids.append(uid)
                 if not prefix_failed:
