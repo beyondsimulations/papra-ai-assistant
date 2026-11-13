@@ -288,6 +288,36 @@ async def test_poll_loop_survives_get_org_failure():
     assert store.calls == 3  # the loop survived BOTH get_org failures
 
 
+async def test_poll_loop_survives_get_mailbox_failure():
+    """A get_mailbox failure (inside the defensive try) must not kill the loop."""
+    from types import SimpleNamespace
+
+    from papra_suite.pipeline import _poll_loop
+
+    class FailingMailboxStore:
+        def __init__(self, mailbox):
+            self.mailbox = mailbox
+            self.calls = 0
+
+        def get_mailbox(self, mailbox_id):
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("sqlite: database is locked")
+            raise KeyboardInterrupt()  # stop seam (BaseException passes the guard)
+
+        def get_org(self, org_id):
+            raise AssertionError("must not be reached while get_mailbox fails")
+
+    mailbox = SimpleNamespace(id="mb_1", org_id="org_1", poll_interval_s=0,
+                              enabled=True)
+    store = FailingMailboxStore(mailbox)
+
+    with pytest.raises(KeyboardInterrupt):
+        await _poll_loop(store, papra=None, mailbox=mailbox)
+
+    assert store.calls == 3  # the loop survived BOTH get_mailbox failures
+
+
 async def test_poll_loop_polls_with_fresh_mailbox_row(tmp_path, monkeypatch):
     """Fresh-row pin: each iteration must re-fetch the mailbox from the
     store. Polling the startup snapshot forever would ignore the persisted

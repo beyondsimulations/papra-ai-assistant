@@ -214,19 +214,19 @@ async def _poll_loop(store: Store, papra: PapraClient, mailbox) -> None:
         # persisted UID cursor (re-fetching the whole mailbox each poll) and
         # the enabled flag (a mailbox disabled at runtime must stop the loop).
         mailbox_id = mailbox.id
-        mailbox = store.get_mailbox(mailbox_id)
-        if mailbox is None or not mailbox.enabled:
-            logger.info("poll loop stopping: mailbox %s deleted or disabled", mailbox_id)
-            break
         try:
+            mailbox = store.get_mailbox(mailbox_id)
+            if mailbox is None or not mailbox.enabled:
+                logger.info("poll loop stopping: mailbox %s deleted or disabled", mailbox_id)
+                break
             org = store.get_org(mailbox.org_id)
             if org is not None:
                 await poll_mailbox_once(store, papra, mailbox, org)
             else:
                 logger.info("poll loop: org %s for mailbox %s not found; skipping",
                             mailbox.org_id, mailbox.id)
-        except Exception:  # noqa: BLE001 - an org lookup or poll failure must not kill the loop
-            logger.exception("poll loop error for mailbox %s", mailbox.id)
+        except Exception:  # noqa: BLE001 - a re-fetch, org lookup, or poll failure must not kill the loop
+            logger.exception("poll loop error for mailbox %s", mailbox_id)
         await asyncio.sleep(mailbox.poll_interval_s)
 
 
@@ -275,10 +275,6 @@ async def worker_loop(store: Store, *, kind: str, handler,
         except Exception as error:  # noqa: BLE001 - the loop must survive
             logger.error("job %s (%s) failed: %s", job.id, kind, error)
             try:
-                # Papra 4xx (except 429) never auto-retries (decisions §6):
-                # a deleted document (404) riding the 3-attempt backoff is
-                # ~2.5 minutes of futile retries. Fail such jobs permanently
-                # on the first attempt; 5xx/429/other errors keep the backoff.
                 # 4xx (except 429) never auto-retries (decisions §6), from
                 # ANY client: a deleted document (PapraError 404) or a bad
                 # model name (LLMError 404) riding the 3-attempt backoff is
