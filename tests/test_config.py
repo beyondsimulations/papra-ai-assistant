@@ -194,10 +194,13 @@ def test_query_bearing_base_url_rejected():
         load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221?token=abc"})
 
 
-def test_empty_query_base_url_still_passes():
-    # "http://papra:1221?" has an empty query — harmless, must pass.
-    config = load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221?"})
-    assert config.papra_base_url == "http://papra:1221?"
+def test_bare_question_mark_base_url_rejected():
+    # "http://papra:1221?" has an empty query per urlparse, but httpx
+    # build_request mangles it into garbage (path "/", query b"/api/...")
+    # — the same 404-everything failure mode as a non-empty query.
+    # Must be rejected.
+    with pytest.raises(ConfigError, match="PAPRA_BASE_URL"):
+        load_config({**BASE_ENV, "PAPRA_BASE_URL": "http://papra:1221?"})
 
 
 def test_fragment_only_base_url_still_passes():

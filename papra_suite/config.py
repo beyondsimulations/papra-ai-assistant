@@ -70,9 +70,13 @@ def _require_base_url(env: Mapping[str, str], name: str) -> str:
             raise ConfigError(f"{name} must include a host, got: {value!r}")
         # httpx merges a base URL's query string into every request path
         # (e.g. "http://papra:1221?token=abc" + "/api/..." -> garbage), so
-        # every call would 404. A non-empty query must be rejected. An empty
-        # query ("http://papra:1221?") or a fragment ("...#frag") is harmless.
-        if parsed.query:
+        # every call would 404. A bare trailing "?" ("http://papra:1221?")
+        # is equally fatal — urlparse reports an empty query, but httpx
+        # build_request turns it into garbage (path "/", query b"/api/...")
+        # — so reject any "?" before the fragment, empty or not. A fragment
+        # ("...#frag") without a query is harmless.
+        before_fragment = value.split("#", 1)[0]
+        if "?" in before_fragment:
             raise ConfigError(
                 f"{name} must not contain a query string, got: {value!r}"
             )
