@@ -36,6 +36,35 @@ def test_wait_for_greenmail_delivery_raises_on_timeout(monkeypatch):
     assert time.monotonic() - start < 2.0
 
 
+def test_wait_for_greenmail_delivery_pins_socket_timeout(monkeypatch):
+    """Implementation-coupled pin: the T6 fake swallows kwargs, so a lost
+    timeout=5 would go unnoticed. The delivery wait's per-attempt IMAP
+    connection must pass an explicit timeout — an unpinned constructor would
+    wedge the suite on a stalled socket read."""
+    captured = {}
+
+    class _Delivered:
+        def login(self, user, password):
+            pass
+
+        def select(self, mailbox):
+            return ("OK", [b"1"])
+
+        def uid(self, command, *args):
+            return ("OK", [b"1"])   # SEARCH: the message is found
+
+        def logout(self):
+            pass
+
+    def _fake_ctor(host, port, **kwargs):
+        captured.update(kwargs)
+        return _Delivered()
+
+    monkeypatch.setattr(imaplib, "IMAP4", _fake_ctor)
+    _wait_for_greenmail_delivery("<found@test>")
+    assert captured.get("timeout") == 5
+
+
 def test_probe_retries_on_503_until_200():
     """A server answering 503 while booting must not fail the probe outright;
     the probe retries on any response until the window expires."""

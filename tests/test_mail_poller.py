@@ -534,6 +534,44 @@ async def test_poll_advances_past_oversized_message(store, monkeypatch):
     assert store.get_mailbox(mailbox_id).last_seen_uid == 2
 
 
+async def test_poll_counts_oversized_messages(store, monkeypatch):
+    # oversized_skipped: every uid the fetch batch reports as oversized is
+    # counted once — the parsing-free skip is visible in the result, and the
+    # parseable messages in the same batch must not inflate the counter
+    session = FakeSession(
+        raws=[(1, build_raw(message_id="<m1@x>")), (4, build_raw(message_id="<m4@x>"))],
+        oversized=[2, 3, 5],
+    )
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    result = await poll_mailbox_once(store, client, make_mailbox(), ORG)
+
+    assert result.error is None
+    assert result.oversized_skipped == 3
+    assert result.messages_scanned == 5            # oversized still scanned
+    assert result.documents_uploaded == 2          # only the fetched bodies
+
+
+async def test_poll_oversized_skipped_defaults_to_zero(store, monkeypatch):
+    # a poll without oversized mail reports 0 (the dataclass default), and the
+    # new field is appended last so positional construction of the pre-existing
+    # fields — including `error` — keeps working
+    legacy = PollResult(1, 2, 3, 4, "boom")
+    assert (legacy.messages_scanned, legacy.documents_uploaded,
+            legacy.attachments_skipped, legacy.messages_failed, legacy.error) == \
+        (1, 2, 3, 4, "boom")
+    assert PollResult().oversized_skipped == 0 and legacy.oversized_skipped == 0
+
+    session = FakeSession(raws=[(1, build_raw())])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+
+    assert result.error is None
+    assert result.oversized_skipped == 0
+
+
 async def test_subject_filter_redos_is_bounded(store, monkeypatch, caplog):
     # catastrophic admin regex against a crafted 5000-char subject: the poll
     # must stay bounded and treat the message as a non-match. The a-run is

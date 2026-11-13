@@ -322,6 +322,8 @@ class PollResult:
     attachments_skipped: int = 0
     messages_failed: int = 0
     error: str | None = None
+    # appended last: the pre-existing fields keep their positional order
+    oversized_skipped: int = 0
 
 
 async def poll_mailbox_once(store: Store, client: PapraClient,
@@ -364,6 +366,9 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
                 logger.warning(
                     "message uid=%s skipped: exceeds the per-message size cap", uid
                 )
+                # counted per processed message, exactly like messages_scanned:
+                # a mid-batch exception leaves the later uids uncounted
+                result.oversized_skipped += 1
                 seen_uids.append(uid)
                 if not prefix_failed:
                     candidate_last_seen = uid
@@ -464,8 +469,9 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
 
     # record success even for an empty poll: last_poll_at must refresh and
     # a previous error must clear; uid 0 means "nothing seen yet"
-    last_seen = candidate_last_seen if candidate_last_seen is not None \
-        else (0 if rescan else (mailbox.last_seen_uid or 0))
+    # the fallback is always 0: this arm runs only when candidate_last_seen is
+    # None, i.e. on a rescan or when last_seen_uid was None — nothing to carry forward
+    last_seen = candidate_last_seen if candidate_last_seen is not None else 0
     _record_success_quietly(store, mailbox.id, last_seen_uid=last_seen, uidvalidity=uidvalidity)
     return result
 
