@@ -340,6 +340,43 @@ async def test_worker_loop_survives_claim_failure(store, config):
     assert [j.kind for j in jobs if j.status == "pending"] == ["title"]
 
 
+async def test_worker_loop_survives_empty_queue(store):
+    """Idle-exit pin: an empty claim (None) must IDLE the loop, not exit it.
+
+    A `if job is None: break` regression silently kills every worker as soon
+    as the queue drains once. Claim sequence [job1, None, job2, stop]: BOTH
+    jobs must be processed and the stop exception must surface — a
+    break-on-None would return before job2 and never raise the stop seam.
+    """
+    make_job(store, doc="doc_1")
+    make_job(store, doc="doc_2")
+    processed = []
+
+    async def handler(job):
+        processed.append(job.document_id)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    class _StopLoop(BaseException):
+        pass
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] == 2:
+            return None  # empty queue: the loop must idle, not exit
+        if state["claims"] > 3:
+            raise _StopLoop()  # stop seam AFTER the second job was claimed
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(_StopLoop):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    assert processed == ["doc_1", "doc_2"]  # job2 ran AFTER the empty claim
+    assert [j.status for j in store.list_jobs() if j.kind == "ocr"] == ["done", "done"]
+
+
 async def test_worker_loop_marks_failures(store, config):
     llm, _ = make_llm(["# md"])
     make_job(store)
@@ -394,6 +431,36 @@ async def test_worker_loop_survives_mark_job_failed_error(store, caplog):
     # the job stays 'running' (the failure could not be recorded) — recovery
     # at startup is the backstop, but the WORKER loop itself survived
     assert store.list_jobs()[0].status == "running"
+
+
+async def test_worker_loop_survives_vanished_job_on_failure_record(store, caplog):
+    """The vanished-job guard must also hold for ValueError specifically
+    (mark_job_failed raises it when the job row disappeared mid-run): the
+    loop survives and logs, instead of dying on the recording failure."""
+    make_job(store)
+
+    async def handler(job):
+        raise RuntimeError("boom")
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 2:
+            raise KeyboardInterrupt()  # stop seam: the loop SURVIVED claim 2
+        return original_claim(kind)
+
+    def mark_job_failed(job_id, error, **kwargs):
+        raise ValueError(f"unknown job: {job_id}")  # job vanished mid-run
+
+    store.claim_next_job = claim
+    store.mark_job_failed = mark_job_failed
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    assert state["claims"] == 3  # loop kept going after the vanished job
+    assert any("vanished" in record.getMessage() for record in caplog.records)
 
 
 async def test_worker_loop_fails_papra_4xx_immediately(store):
@@ -461,6 +528,30 @@ async def test_sweep_once_enqueues_for_unseen_pdfs_only(store):
     assert job.document_id == "doc_1"
     assert job.content_hash == hashlib.sha256(papra.pdf).hexdigest()
     assert job.payload.get("name") == "rechnung.pdf"
+
+
+async def test_sweep_is_pdf_falls_back_to_pdf_name(store):
+    """Extension-fallback pin: a listing entry with NO mimeType at all must
+    be classified by its name — scan.pdf enqueued, notes.txt skipped. A
+    mime-only _is_pdf mutant fails here."""
+
+    class NoMimePapra(StubPapra):
+        def __init__(self):
+            super().__init__()
+            self.documents = {"org_1": {
+                "doc_scan": {"id": "doc_scan", "name": "scan.pdf"},
+                "doc_notes": {"id": "doc_notes", "name": "notes.txt"},
+            }}
+
+    papra = NoMimePapra()
+
+    result = await sweep_once(store, papra)
+
+    assert result.jobs_enqueued == 1  # scan.pdf made it in via the .pdf name
+    assert result.non_pdf_skipped == 1  # notes.txt skipped
+    job = store.claim_next_job("ocr")
+    assert job is not None and job.document_id == "doc_scan"
+    assert store.document_seen("org_1", "doc_notes")  # skip is permanent
 
 
 async def test_sweep_continues_past_download_failure(store):

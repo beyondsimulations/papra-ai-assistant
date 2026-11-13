@@ -102,6 +102,162 @@ async def test_serve_recovers_stale_jobs_at_startup(tmp_path):
     store.close()
 
 
+async def test_serve_logs_unexpected_task_exit(tmp_path, monkeypatch, caplog):
+    """Supervision pin: a long-lived task dying mid-run must be logged
+    loudly ("exited unexpectedly") — deleting the done-callback supervision
+    fails this test."""
+    import logging
+
+    import papra_suite.pipeline as pipeline_mod
+    from papra_suite import logging_setup
+
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_1", name="Org")
+    store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
+                         username="u", password="p", poll_interval_s=3600)
+
+    async def dying_poll_loop(store, papra, mailbox):
+        raise RuntimeError("died fast")  # the long-lived task dies immediately
+
+    monkeypatch.setattr(pipeline_mod, "_poll_loop", dying_poll_loop)
+    # serve's setup_logging clears root handlers (including pytest's capture
+    # handler) and register_config_secrets feeds the redaction filter left on
+    # the root logger by earlier serve tests (it mutates the SHARED record,
+    # so caplog would see redacted text). Neutralize both so caplog observes
+    # the supervision log verbatim.
+    monkeypatch.setattr(logging_setup, "setup_logging", lambda store=None: None)
+    monkeypatch.setattr(logging_setup, "register_config_secrets", lambda config: None)
+
+    stop = asyncio.Event()
+
+    async def set_stop_later():
+        await asyncio.sleep(0.3)  # the task dies long before this
+        stop.set()
+
+    asyncio.get_running_loop().create_task(set_stop_later())
+    with caplog.at_level(logging.ERROR):
+        await serve(config, stop=stop, store=store)
+
+    assert any("exited unexpectedly" in record.getMessage()
+               and "died fast" in record.getMessage()
+               for record in caplog.records)
+    assert not _dangling_serve_tasks()
+    store.close()
+
+
+async def test_serve_spawns_sweep_loop(tmp_path, monkeypatch):
+    """Sweep-spawn pin: serve must actually spawn the sweep loop. With
+    SWEEP_INTERVAL_S=1 and a sweep_once that records and stops serve, the
+    recording proves the spawn — and that exactly one sweep ran."""
+    import papra_suite.pipeline as pipeline_mod
+    from papra_suite.pipeline import SweepResult
+
+    config = load_config({**BASE_ENV, "SWEEP_INTERVAL_S": "1",
+                          "DATA_DIR": str(tmp_path)})
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.create_org(papra_org_id="org_1", name="Org")  # no mailboxes
+
+    stop = asyncio.Event()
+    sweeps = []
+
+    async def sweep_once_and_stop(store_arg, papra):
+        sweeps.append(store_arg)
+        stop.set()  # end serve from within the FIRST sweep
+        return SweepResult()
+
+    monkeypatch.setattr(pipeline_mod, "sweep_once", sweep_once_and_stop)
+
+    async def watchdog_stop():
+        # only ever reached if the sweep never spawned (mutant guard: the
+        # test then FAILS on the assertion instead of hanging forever)
+        await asyncio.sleep(5.0)
+        stop.set()
+
+    watchdog = asyncio.get_running_loop().create_task(watchdog_stop())
+    await serve(config, stop=stop, store=store)
+    watchdog.cancel()  # untriggered in the passing case — do not linger
+
+    assert len(sweeps) == 1  # the sweep ran once, then serve stopped
+    assert not _dangling_serve_tasks()
+    store.close()
+
+
+async def test_serve_closes_remaining_clients_when_one_close_fails(
+        tmp_path, monkeypatch):
+    """Close-guard pin: one built client's aclose raising must not skip the
+    other closes — both LLM clients still close and serve's own store still
+    closes. Reverting the per-close try wrappers fails this test."""
+    import papra_suite.pipeline as pipeline_mod
+
+    class FailingClosePapra:
+        def __init__(self, base_url, api_key):
+            pass
+
+        async def aclose(self):
+            raise RuntimeError("close blew up")
+
+    llm_closes = []
+
+    class RecordingLLM:
+        def __init__(self, base_url, api_key, model, timeout_s=300.0):
+            pass
+
+        async def aclose(self):
+            llm_closes.append(True)
+
+    store_closes = []
+
+    def recording_close(self):
+        store_closes.append(True)
+
+    monkeypatch.setattr(pipeline_mod, "PapraClient", FailingClosePapra)
+    monkeypatch.setattr(pipeline_mod, "LLMClient", RecordingLLM)
+    monkeypatch.setattr(Store, "close", recording_close)
+
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})
+    stop = asyncio.Event()
+
+    async def set_stop_later():
+        await asyncio.sleep(0.2)
+        stop.set()
+
+    asyncio.get_running_loop().create_task(set_stop_later())
+    await serve(config, stop=stop)  # NO injected store: serve owns it
+
+    assert len(llm_closes) == 2  # ocr + title clients closed despite the raise
+    assert store_closes == [True]  # the owned store closed too
+    assert not _dangling_serve_tasks()
+
+
+async def test_serve_closes_own_store_on_shutdown(tmp_path, monkeypatch):
+    """owns_store pin: serve WITHOUT an injected store constructs its own
+    store and closes it on shutdown."""
+    store_closes = []
+    original_close = Store.close
+
+    def recording_close(self):
+        store_closes.append(True)
+        original_close(self)
+
+    monkeypatch.setattr(Store, "close", recording_close)
+
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})
+    stop = asyncio.Event()
+
+    async def set_stop_later():
+        await asyncio.sleep(0.2)
+        stop.set()
+
+    asyncio.get_running_loop().create_task(set_stop_later())
+    await serve(config, stop=stop)  # serve builds AND owns the store
+
+    assert store_closes == [True]  # constructed and closed its own
+    assert not _dangling_serve_tasks()
+
+
 async def test_poll_loop_survives_get_org_failure():
     """A get_org failure (inside the defensive try) must not kill the loop."""
     from types import SimpleNamespace

@@ -48,6 +48,21 @@ async def test_generate_title_returns_sanitized_llm_output():
     assert title == "Rechnung 42 – Möbel"
 
 
+async def test_generate_title_empty_llm_response_uses_filename_fallback():
+    """Empty-response pin: a 2xx with EMPTY content is not an error, but the
+    sanitize chain must still yield the (sanitized) filename fallback —
+    breaking the fallback chain (e.g. sanitize_title(raw) with no fallback,
+    which yields "Untitled") fails this test."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": ""}}]})
+
+    llm = LLMClient("http://llm.test", "k", "m", transport=httpx.MockTransport(handler))
+    # quotes/whitespace make the chain observable: the fallback must be the
+    # SANITIZED filename, not the raw one
+    title = await generate_title(llm, filename='  "Rechnung 42.pdf"  ', excerpt="inhalt")
+    assert title == "Rechnung 42.pdf"
+
+
 async def test_generate_title_falls_back_on_llm_failure(caplog):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)

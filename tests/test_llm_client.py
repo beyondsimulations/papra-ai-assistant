@@ -57,6 +57,40 @@ async def test_image_becomes_data_url_content_part():
     assert json.loads(bodies[0])["messages"][0] == {"role": "system", "content": "sys"}
 
 
+async def test_image_attaches_to_last_user_message():
+    """With TWO user messages, the image part must land on the LAST one —
+    dropping reversed() (first-user-message mutant) fails this test."""
+    import json
+
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.read())
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    async with make_client(handler) as client:
+        await client.chat(
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "an answer"},
+                {"role": "user", "content": "and this one"},
+            ],
+            image=b"\x89PNG fake",
+        )
+
+    sent = json.loads(bodies[0])["messages"]
+    expected = "data:image/png;base64," + base64.b64encode(b"\x89PNG fake").decode()
+    # the SECOND user message carries the image part...
+    assert sent[3]["content"] == [
+        {"type": "text", "text": "and this one"},
+        {"type": "image_url", "image_url": {"url": expected}},
+    ]
+    # ...and the first user message (and system) are untouched
+    assert sent[1] == {"role": "user", "content": "first question"}
+    assert sent[0] == {"role": "system", "content": "sys"}
+
+
 async def test_returns_stripped_content():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"choices": [{"message": {"content": "  markdown\n"}}]})
