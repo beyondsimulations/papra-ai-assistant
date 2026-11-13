@@ -149,3 +149,18 @@ idempotent enqueue make a webhook receiver a drop-in addition later.
   `GET .../documents/:documentId/file`, tags list/add. Verified against
   docs.papra.app on 2026-11-12; re-verify against the running
   instance's OpenAPI document at build time per `spec.md` §5.2.
+
+## 13. Dashboard aesthetic (recorded 2026-11-13, for M4 planning)
+
+The dashboard (M4) should feel at home next to Papra: a clean **light mode** with a
+similar general aesthetic — sidebar/content layout archetypes, calm neutral
+palette, generous whitespace, restrained typography.
+
+Legal line (consistent with §10 of spec.md): layout concepts and general look
+and feel are not copyrightable and are safe to emulate; Papra's *expression* is
+not — never copy its CSS, design tokens, components, HTML structure, SVG icons,
+logo, or assets (AGPL-3.0; substantial copying would make this service a
+derivative). We write our own minimal CSS from scratch, honoring the spec's
+server-rendered/no-JS-framework constraint. At M4 planning time, use the
+web tooling to extract factual design notes only (layout archetypes, palette
+feel) from papra.app and docs.papra.app — facts, not files.
