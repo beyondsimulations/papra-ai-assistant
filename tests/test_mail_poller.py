@@ -650,21 +650,27 @@ async def test_poll_oversized_skipped_defaults_to_zero(store, monkeypatch):
 
 
 async def test_subject_filter_redos_is_bounded(store, monkeypatch, caplog):
-    # catastrophic admin regex against a crafted 5000-char subject: the poll
-    # must stay bounded and treat the message as a non-match. The a-run is
-    # sized so the capped regex alone runs ~10s — far past the 2s wait_for
-    # budget — so the timeout path fires deterministically (warning logged,
-    # non-match, message seen). Without the wait_for offload the regex would
-    # run inline on the event loop: no timeout warning, and the poll only
-    # returns after the full inline runtime.
-    crafted = "a" * 38 + "!" * (5000 - 38)
+    # wait_for pin for the IN-CAP class: an admin regex that PASSES the
+    # per-poll pre-validation (probe growth ratio ~4x, under the 10x
+    # threshold) but is still super-linearly slow against a crafted
+    # subject within the 1000-char cap. The poll must stay bounded and
+    # treat the message as a non-match. The a-run is sized so the capped
+    # regex alone runs several seconds — far past the 2s wait_for budget —
+    # so the timeout path fires deterministically (warning logged,
+    # non-match, message seen). Without the wait_for offload the regex
+    # would run inline on the event loop: no timeout warning, and the
+    # poll only returns after the full inline runtime. (The high-base
+    # exponential class, e.g. (a|aa)+b with a ~100x probe ratio, never
+    # reaches here: validate_subject_filter fails the poll up front —
+    # see test_poll_with_unsafe_subject_filter_records_failure.)
+    crafted = "a" * 180 + "!" * (5000 - 180)
     session = FakeSession(raws=[(1, build_raw(subject=crafted, message_id="<redos@x>"))])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
     start = time.monotonic()
     with caplog.at_level("WARNING", logger="papra_suite.mail"):
         result = await poll_mailbox_once(
-            store, StubClient(), make_mailbox(subject_filter=r"(a|aa)+b"), ORG
+            store, StubClient(), make_mailbox(subject_filter=r"a*a*a*a*b"), ORG
         )
     elapsed = time.monotonic() - start
 
@@ -673,7 +679,43 @@ async def test_subject_filter_redos_is_bounded(store, monkeypatch, caplog):
     assert session.seen == [1]                 # intentionally skipped like a filter miss
     # the wait_for timeout fired: the message was treated as a non-match
     assert any("subject filter timed out" in record.message for record in caplog.records)
-    # bounded: the timeout decided the match at 2s; the remaining drain of the
-    # (uninterruptible, GIL-holding) regex thread is coarse-bounded far below
-    # the un-hung un-bounded inline case
+    # bounded: the timeout decided the match; the (uninterruptible, GIL-
+    # holding) regex thread drains in its own time, coarse-bounded far
+    # below the un-hung un-bounded inline case
     assert elapsed < 30.0
+
+
+async def test_poll_with_unsafe_subject_filter_records_failure(store, monkeypatch):
+    """Unsafe-filter pin: a catastrophic subject filter (exponential
+    backtracking class) must fail the poll VISIBLY — result.error set and a
+    poll failure recorded toward the 3-strike disable — BEFORE connecting or
+    processing any message, with no process freeze. Removing the
+    validate_subject_filter call from the poll re-freezes it on the first
+    crafted subject and fails this test."""
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p",
+        subject_filter=r"(a|aa)+b",
+    )
+    session = FakeSession(raws=[(1, build_raw(subject="a" * 5000, message_id="<x@x>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    start = time.monotonic()
+    result = await poll_mailbox_once(
+        store, StubClient(), store.get_mailbox(mailbox_id), store.get_org(org_id)
+    )
+    elapsed = time.monotonic() - start
+
+    # the failure is visible in the result and the persisted mailbox state
+    assert result.error is not None and "unsafe" in result.error
+    mailbox = store.get_mailbox(mailbox_id)
+    assert mailbox.consecutive_failures == 1
+    assert "unsafe" in (mailbox.last_error or "")
+    # no freeze: the pre-validation probes are milliseconds, not the ~10s
+    # the pattern would burn against the crafted subject
+    assert elapsed < 5.0
+    # nothing was processed: no connect, no fetch handling, no uploads
+    assert result.messages_scanned == 0
+    assert result.documents_uploaded == 0
+    assert session.seen == []
+    assert session.closed is True  # the failure path still closed the session

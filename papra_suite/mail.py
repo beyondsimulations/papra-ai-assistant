@@ -11,6 +11,7 @@ import logging
 import re
 import sqlite3
 import ssl
+import time
 from dataclasses import dataclass, field
 from email import message_from_bytes
 from email.header import decode_header, make_header
@@ -42,8 +43,19 @@ MAX_POLL_BYTES = 100 * 1024 * 1024
 # Subject cap for the regex filter: RFC 5322 sets no hard subject limit, and
 # legitimately useful subjects beyond this length are vanishingly rare, but
 # unbounded input feeds the common super-linear regex backtracking class.
+# The cap bounds the LINEAR and QUADRATIC classes; the high-base exponential
+# class is rejected up front by validate_subject_filter (once per poll).
 MAX_SUBJECT_CHARS = 1000
+# Honest semantics: the per-message wait_for around subject_matches bounds
+# NOTHING for GIL-holding regexes — re.search keeps the GIL for its whole
+# runtime, so the timeout callback cannot run until the search finishes.
+# It is defense in depth for the residual low-base exponential class only,
+# and fires (late) after the search drains.
 SUBJECT_FILTER_TIMEOUT_S = 2.0
+# Pre-validation growth ratio: t("a"*30) / t("a"*20) above this means the
+# pattern's backtracking grows super-linearly with input length (linear
+# ~1.5x, quadratic ~2.3x, exponential classes >> 10x).
+SUBJECT_FILTER_MAX_GROWTH_RATIO = 10
 
 
 @dataclass
@@ -157,14 +169,48 @@ def _decode_header_value(raw: str | None) -> str | None:
         return raw
 
 
+def validate_subject_filter(pattern: str | None) -> None:
+    """Pre-validate a mailbox subject filter once per poll, before any
+    message processing. Raises ValueError on an invalid or unsafe pattern.
+
+    Honest semantics: the poller's per-message wait_for bounds nothing for
+    GIL-holding regexes (re.search keeps the GIL, so the timeout callback
+    cannot run mid-search) — one crafted subject would freeze the WHOLE
+    process for an attacker-choosable duration and crash-loop after restart.
+    This check rejects that high-base exponential class cheaply: time the
+    compiled pattern against "a"*20 and "a"*30 and refuse when the growth
+    ratio exceeds SUBJECT_FILTER_MAX_GROWTH_RATIO. The MAX_SUBJECT_CHARS cap
+    bounds the linear and quadratic classes; low-base exponential patterns
+    that slip under the ratio remain a documented residual (mitigated only
+    coarsely, by the cap and the late-firing wait_for).
+    """
+    if not pattern:
+        return
+    try:
+        compiled = re.compile(pattern)
+    except re.error as error:
+        raise ValueError(f"invalid subject filter: {error}") from error
+    start = time.perf_counter()
+    compiled.search("a" * 20)
+    t20 = time.perf_counter() - start
+    start = time.perf_counter()
+    compiled.search("a" * 30)
+    t30 = time.perf_counter() - start
+    if t30 / max(t20, 1e-6) > SUBJECT_FILTER_MAX_GROWTH_RATIO:
+        raise ValueError("subject filter is unsafe: super-linear backtracking")
+
+
 def subject_matches(subject: str | None, pattern: str | None) -> bool:
     """Optional per-mailbox subject regex filter; no pattern means match all.
 
     The subject is truncated to MAX_SUBJECT_CHARS before matching: RFC 5322
     has no hard subject limit, legit subjects over the cap are vanishingly
-    rare, and the cap bounds the input for the common super-linear regex
-    backtracking class (the poller additionally runs this off the event loop
-    under a timeout — defense in depth against a frozen loop).
+    rare, and the cap bounds the input for the linear and quadratic
+    backtracking classes. The exponential class is rejected up front by
+    validate_subject_filter (once per poll); the caller's wait_for around
+    this call bounds nothing for GIL-holding regexes — it fires only after
+    a catastrophic search finishes (defense in depth for the residual
+    low-base class).
     """
     if not pattern:
         return True
@@ -377,6 +423,11 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
     )
     result = PollResult()
     try:
+        # Reject unsafe subject filters BEFORE connecting and before ANY
+        # message processing: a ValueError here flows into the poll-failure
+        # path (3-strike disable, visible in the dashboard) instead of the
+        # process freezing on the first crafted subject.
+        validate_subject_filter(mailbox.subject_filter)
         await asyncio.to_thread(session.connect)
         uidvalidity = await asyncio.to_thread(session.select_inbox)
         rescan = mailbox.uidvalidity is not None and mailbox.uidvalidity != uidvalidity
@@ -417,9 +468,13 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
             # event-loop block: MIME parsing must run off the loop like every
             # other blocking call in this poller (decisions doc §3)
             parsed = await asyncio.to_thread(parse_message, raw)
-            # Run the admin-supplied regex off the event loop under a timeout:
-            # a super-linear pattern against a crafted subject must degrade
-            # to a bounded non-match, never a frozen loop.
+            # Run the admin-supplied regex off the event loop under a timeout.
+            # Honest semantics: re.search holds the GIL, so for a catastrophic
+            # pattern the timeout fires only AFTER the search finishes (the
+            # loop is frozen meanwhile) — this bounds the residual low-base
+            # class coarsely, never inline. The high-base exponential class
+            # never reaches here (rejected by validate_subject_filter), and
+            # the subject cap bounds the linear/quadratic classes.
             try:
                 matched = await asyncio.wait_for(
                     asyncio.to_thread(subject_matches, parsed.subject,

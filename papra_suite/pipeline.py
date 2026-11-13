@@ -171,7 +171,13 @@ async def serve(config, *, stop: asyncio.Event | None = None,
             _sweep_loop(store, papra, config.sweep_interval_s), name="sweep"))
 
     def _supervise(task: asyncio.Task, name: str) -> None:
-        """Log loudly if a long-lived task exits without cancellation."""
+        """Log a long-lived task's exit, loudly only when it is NOT designed.
+
+        A task that RAISED is a real crash: ERROR "exited unexpectedly".
+        A task that returned CLEANLY exited by design (a 3-strike-disabled
+        or runtime-deleted mailbox stops its poll loop normally): INFO,
+        not a false crash alarm in the log stream.
+        """
         def _on_done(done: asyncio.Task) -> None:
             if done.cancelled():
                 return  # expected shutdown path
@@ -179,7 +185,7 @@ async def serve(config, *, stop: asyncio.Event | None = None,
             if error is not None:
                 logger.error("task %s exited unexpectedly: %s", name, error)
             else:
-                logger.error("task %s exited unexpectedly", name)
+                logger.info("task %s exited", name)
         task.add_done_callback(_on_done)
 
     for task in tasks:
@@ -362,8 +368,21 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
                             )
                             result.oversized_skipped += 1
                             continue
-                        file_bytes = await papra.download_file(org.papra_org_id, document_id)
-                        file_hash = hashlib.sha256(file_bytes).hexdigest()
+                        # The listing already carries the content hash for
+                        # compliant servers: use it and never download the
+                        # body. The download+hash leg doubled the transfer and
+                        # pulled the FULL document into RAM solely to recompute
+                        # a value the listing already had.
+                        file_hash = document.get("originalSha256Hash")
+                        if not file_hash:
+                            logger.info(
+                                "sweep: document %s in org %s carries no "
+                                "originalSha256Hash in the listing; downloading "
+                                "to compute the content hash",
+                                document_id, org.papra_org_id,
+                            )
+                            file_bytes = await papra.download_file(org.papra_org_id, document_id)
+                            file_hash = hashlib.sha256(file_bytes).hexdigest()
                         enqueue_ocr_job(
                             store, papra_org_id=org.papra_org_id, document_id=document_id,
                             file_hash=file_hash, name=document.get("name", "document.pdf"),

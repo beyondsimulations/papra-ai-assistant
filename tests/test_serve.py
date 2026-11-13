@@ -147,6 +147,59 @@ async def test_serve_logs_unexpected_task_exit(tmp_path, monkeypatch, caplog):
     store.close()
 
 
+async def test_serve_logs_designed_task_exit_as_info(tmp_path, monkeypatch, caplog):
+    """Clean-exit pin: a poll loop that stops BY DESIGN (the mailbox is
+    disabled at runtime by the 3-strike failure accounting) exits normally,
+    and the supervisor must log INFO "task X exited" — NOT a false ERROR
+    "exited unexpectedly" crash alarm. Reverting the supervisor to
+    ERROR-always fails this test."""
+    import logging
+
+    import papra_suite.mail as mail_mod
+    from papra_suite import logging_setup
+
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_1", name="Org")
+    mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
+                                       username="u", password="p", poll_interval_s=0)
+
+    async def failing_poll(store_arg, papra, mailbox, org):
+        # one poll failure with disable_after=1 disables the mailbox row;
+        # the REAL _poll_loop then re-fetches the row and stops by design
+        store_arg.record_poll_failure(mailbox.id, "boom", disable_after=1)
+
+    monkeypatch.setattr(mail_mod, "poll_mailbox_once", failing_poll)
+    # same neutralization as the ERROR-arm pin: keep pytest's caplog handler
+    # and bypass the redaction filter so the supervision log is observed
+    # verbatim
+    monkeypatch.setattr(logging_setup, "setup_logging", lambda store=None: None)
+    monkeypatch.setattr(logging_setup, "register_config_secrets", lambda config: None)
+
+    stop = asyncio.Event()
+
+    async def set_stop_later():
+        await asyncio.sleep(0.3)  # the designed exit happens long before this
+        stop.set()
+
+    asyncio.get_running_loop().create_task(set_stop_later())
+    with caplog.at_level(logging.INFO):
+        await serve(config, stop=stop, store=store)
+
+    task_name = f"poll:{mailbox_id}"
+    # the designed exit is INFO "task X exited" (no "unexpectedly")
+    assert any(record.levelno == logging.INFO
+               and record.getMessage() == f"task {task_name} exited"
+               for record in caplog.records)
+    # no false crash alarm anywhere in the stream
+    assert not any("exited unexpectedly" in record.getMessage()
+                   for record in caplog.records)
+    assert not any(record.levelno == logging.ERROR for record in caplog.records)
+    assert not _dangling_serve_tasks()
+    store.close()
+
+
 async def test_serve_spawns_sweep_loop(tmp_path, monkeypatch):
     """Sweep-spawn pin: serve must actually spawn the sweep loop. With
     SWEEP_INTERVAL_S=1 and a sweep_once that records and stops serve, the

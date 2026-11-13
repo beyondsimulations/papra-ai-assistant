@@ -3,6 +3,8 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import pytest
+
 from papra_suite.mail import (
     Attachment,
     compute_file_hash,
@@ -11,6 +13,7 @@ from papra_suite.mail import (
     sanitize_filename,
     sniff_is_pdf,
     subject_matches,
+    validate_subject_filter,
 )
 
 PDF_BYTES = b"%PDF-1.4 fake pdf body"
@@ -205,6 +208,26 @@ def test_subject_matches():
     assert subject_matches("Rechnung 42", ".*rechnung.*") is True
     assert subject_matches("Spam", ".*rechnung.*") is False
     assert subject_matches(None, ".*rechnung.*") is False
+
+
+def test_validate_subject_filter_rejects_catastrophic_pattern():
+    # the classic exponential-backtracking class: the t("a"*30)/t("a"*20)
+    # growth ratio is ~100x, far past the 10x threshold
+    with pytest.raises(ValueError, match="unsafe"):
+        validate_subject_filter(r"(a|aa)+b")
+
+
+def test_validate_subject_filter_accepts_linear_and_empty():
+    validate_subject_filter(None)  # no filter at all
+    validate_subject_filter("")  # empty filter: match-all
+    validate_subject_filter(r".*rechnung.*")  # linear scan: ratio ~1x
+
+
+def test_validate_subject_filter_rejects_invalid_regex():
+    # an uncompilable pattern must surface as ValueError (the poll-failure
+    # path), not as a raw re.error mid-poll
+    with pytest.raises(ValueError, match="invalid subject filter"):
+        validate_subject_filter("(")
 
 
 def test_dedup_hash_is_stable_and_discriminating():

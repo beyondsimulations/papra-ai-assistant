@@ -545,6 +545,91 @@ async def test_worker_loop_fails_llm_4xx_immediately(store):
     assert "model not found" in job.error
 
 
+async def test_worker_loop_backs_off_llm_429(store):
+    """429-exclusion pin: rate limiting (429) is a TRANSIENT condition — the
+    job stays pending with backoff, NOT permanent, even though 429 sits in
+    the 4xx range. Dropping the `!= 429` exclusion from the 4xx permanence
+    check fails this test."""
+    from papra_suite.llm_client import LLMError
+
+    make_job(store)
+
+    async def handler(job):
+        raise LLMError("rate limited", 429)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 1:
+            raise KeyboardInterrupt()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    job = store.list_jobs()[0]
+    assert job.status == "pending" and job.attempts == 1  # backoff, NOT permanent
+    assert "rate limited" in job.error
+
+
+async def test_worker_loop_fails_status_400_immediately(store):
+    """Range-boundary pin (lower edge): status 400 is a permanent client
+    error — first-attempt failure, no backoff. Mutating the range to
+    `401 <= status` fails this test."""
+    from papra_suite.llm_client import LLMError
+
+    make_job(store)
+
+    async def handler(job):
+        raise LLMError("bad request", 400)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 1:
+            raise KeyboardInterrupt()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    job = store.list_jobs()[0]
+    assert job.status == "failed" and job.attempts == 1  # permanent
+
+
+async def test_worker_loop_backs_off_status_500(store):
+    """Range-boundary pin (upper edge): status 500 is a server error — backoff,
+    not permanent. Mutating the range to `status <= 500` fails this test."""
+    from papra_suite.llm_client import LLMError
+
+    make_job(store)
+
+    async def handler(job):
+        raise LLMError("internal error", 500)
+
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > 1:
+            raise KeyboardInterrupt()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind="ocr", idle_sleep_s=0, handler=handler)
+
+    job = store.list_jobs()[0]
+    assert job.status == "pending" and job.attempts == 1  # backoff, NOT permanent
+
+
 async def test_worker_loop_backs_off_llm_5xx(store):
     """LLM 5xx keeps the normal retry policy: pending with backoff."""
     from papra_suite.llm_client import LLMError
@@ -827,6 +912,87 @@ async def test_sweep_covers_large_orgs_across_passes(store, caplog):
     assert store.get_setting("sweep_offset:org_1") == "0"  # reset on the short page
     # every one of the 6000 documents made it into the seen table eventually
     assert all(store.document_seen("org_1", f"doc_{i}") for i in range(6000))
+
+
+async def test_sweep_uses_listing_hash_without_download(store):
+    """Listing-hash pin: a document whose listing entry carries
+    originalSha256Hash must be enqueued with THAT hash and NEVER downloaded —
+    the download+hash leg doubled the transfer and pulled the full document
+    into RAM solely to recompute a value the listing already had. Reverting
+    to download-always fails the zero-download spy."""
+
+    class HashListingPapra(StubPapra):
+        def __init__(self):
+            super().__init__()
+            self.download_calls = 0
+            self.documents = {"org_1": {
+                "doc_h": {"id": "doc_h", "name": "rechnung.pdf",
+                          "mimeType": "application/pdf",
+                          "originalSha256Hash": "listing-hash-abc123"},
+            }}
+
+        async def download_file(self, org_id, document_id):
+            self.download_calls += 1
+            return self.pdf
+
+    papra = HashListingPapra()
+
+    result = await sweep_once(store, papra)
+
+    assert result.jobs_enqueued == 1
+    job = store.claim_next_job("ocr")
+    assert job is not None and job.document_id == "doc_h"
+    # the LISTING's hash, not a recompute of the downloaded body
+    assert job.content_hash == "listing-hash-abc123"
+    assert papra.download_calls == 0  # ZERO downloads: hash came from the listing
+
+
+async def test_sweep_falls_back_to_download_hash_when_listing_hash_absent(store, caplog):
+    """Fallback pin: a listing entry WITHOUT originalSha256Hash (older or
+    non-compliant server) still gets enqueued via the download+hash path,
+    with the fallback logged."""
+
+    class NoHashListingPapra(StubPapra):
+        def __init__(self):
+            super().__init__()
+            self.download_calls = 0
+            self.documents = {"org_1": {
+                "doc_f": {"id": "doc_f", "name": "rechnung.pdf",
+                          "mimeType": "application/pdf"},
+            }}
+
+        async def download_file(self, org_id, document_id):
+            self.download_calls += 1
+            return self.pdf
+
+    papra = NoHashListingPapra()
+
+    with caplog.at_level(logging.INFO):
+        result = await sweep_once(store, papra)
+
+    assert result.jobs_enqueued == 1
+    assert papra.download_calls == 1  # fallback path did download
+    job = store.claim_next_job("ocr")
+    assert job.content_hash == hashlib.sha256(papra.pdf).hexdigest()
+    assert any("originalSha256Hash" in record.getMessage()
+               and "doc_f" in record.getMessage()
+               for record in caplog.records)  # the fallback is visible in logs
+
+
+async def test_sweep_self_heals_corrupt_offset(store):
+    """Corrupt-offset pin: a settings row sweep_offset:<org> holding garbage
+    (hand-edited or legacy data) must self-heal to offset 0 — the sweep
+    completes and enqueues normally. Mutating the guard to raise fails this
+    test with the propagated ValueError."""
+    store.set_setting("sweep_offset:org_1", "garbage")
+
+    result = await sweep_once(store, StubPapra())
+
+    assert result.errors == 0
+    assert result.jobs_enqueued == 1  # swept from healed offset 0
+    assert store.document_seen("org_1", "doc_1")
+    # healed and then reset to 0 by the short page
+    assert store.get_setting("sweep_offset:org_1") == "0"
 
 
 async def test_sweep_once_is_idempotent(store):

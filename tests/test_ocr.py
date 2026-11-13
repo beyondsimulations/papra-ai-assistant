@@ -39,11 +39,15 @@ def test_render_pages_caps_and_warns(caplog):
 
 def test_render_pages_downscales_over_pixel_budget():
     pdf = make_pdf(["dense"])  # A4 at 150 dpi is ~1.75M pixels; use a tiny budget
-    pages = render_pages(pdf, dpi=150, max_pages=1, pixel_budget=50_000)
+    budget = 50_000
+    pages = render_pages(pdf, dpi=150, max_pages=1, pixel_budget=budget)
     assert len(pages) == 1
-    image = fitz.open(stream=pages[0], filetype="png")
-    width, height = image[0].rect.width, image[0].rect.height
-    assert width * height <= 50_000 * 1.05  # small tolerance for rounding
+    pixmap = fitz.Pixmap(pages[0])  # PIXEL dims (page.rect would re-scale by dpi)
+    # pin the sqrt downscale FACTOR: the render must land ON the budget
+    # (within rounding), not merely under it. Linear scaling would render
+    # budget^2/base_pixels (~1.1k) pixels — far below the lower bound.
+    # Mutation: `** 0.5` -> linear -> this lower bound fails.
+    assert budget * 0.85 <= pixmap.width * pixmap.height <= budget * 1.05
 
 
 def test_render_pages_empty_pdf():
