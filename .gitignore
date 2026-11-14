@@ -5,3 +5,6 @@ __pycache__/
 .venv/
 data/
 *.db
+
+# pi agent profile (local-only: model routing, agent personas, loop skill)
+.pi/
