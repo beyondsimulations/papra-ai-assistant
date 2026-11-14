@@ -23,7 +23,8 @@ design deliberately replaces that wording with a **layered heuristic**, because
 the rules below do not bound matching *complexity*:
 
 > Accepted patterns may still match in superlinear time. What the contract
-> guarantees is **bounded work per message**, not bounded complexity.
+> guarantees is **bounded work per matching attempt**, with at most one
+> budget-consuming attempt per message (§2) — not bounded complexity.
 
 The rejected alternative was a grammar with a provable complexity bound. It was
 rejected as unverifiable without automata machinery we would be inventing, and
@@ -401,7 +402,8 @@ Probes and the ratio gate stay where they are, re-described per §6.
 
 - **From the M3 gate wording** ("conservative accepted subset"): replaced by the
   layered heuristic of §1, with the guarantee restated as bounded work per
-  message. This is the deliberate substitution §1 asks to be read as.
+  attempt rather than bounded complexity. This is the deliberate substitution §1
+  asks to be read as.
 - **From `spec.md` §5.6 / §5.7**: the spec describes validation as "reject
   patterns that show super-linear backtracking on sample input", i.e. probe
   based. §6 forbids probes as acceptance evidence, so the spec's wording is
