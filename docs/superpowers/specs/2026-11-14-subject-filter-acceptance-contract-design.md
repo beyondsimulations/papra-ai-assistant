@@ -2,7 +2,7 @@
 
 Companion to `spec.md` and to
 `docs/superpowers/specs/2026-11-12-papra-suite-implementation-decisions-design.md`.
-Status: **proposal under review — not yet approved, not yet a plan input.** This
+Status: **approved 2026-11-14 — ready for implementation planning.** This
 document is a prerequisite gate for the M4 dashboard: an operator must not be
 given a text box that writes a regex into the poll loop until the rules below
 decide what that box accepts.
