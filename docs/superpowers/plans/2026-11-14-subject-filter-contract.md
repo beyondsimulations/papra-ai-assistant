@@ -155,10 +155,41 @@ class TestNodeModel:
         class Opaque:
             def __len__(self): return 1
             def __getitem__(self, i): return (None,)
+
         node = (_parser.LITERAL, Opaque())
-        assert regexlint._unconsumed(node)
+        # _children refuses this payload outright, so the refusal surfaces through
+        # whichever entry point is used; both must refuse, neither may shrug.
+        with pytest.raises(regexlint._Reject):
+            regexlint._unconsumed(node)
         with pytest.raises(regexlint._Reject):
             regexlint._walk([node], 0, regexlint._Guard(time.monotonic() + 5))
+
+    def test_a_payload_element_that_is_not_an_instruction_is_rejected_not_dropped(self):
+        # The fail-open hole a filter would open: if _children() returned only
+        # what _is_node accepts, a malformed element inside a repetition body
+        # would never be seen and the pattern would be reported as understood.
+        junk = ("junk", 1, 2, 3)          # 4 elements: not an instruction
+        fake = _parser.SubPattern(None)
+        fake.data = [(_parser.MAX_REPEAT, (0, _parser.MAXREPEAT,
+                                           [junk, (_parser.LITERAL, 97)]))]
+        with pytest.raises(regexlint._Reject):
+            regexlint._walk(regexlint._nodes(fake), 0, regexlint._Guard(time.monotonic() + 5))
+
+    def test_a_junk_element_outside_a_repetition_is_rejected_too(self):
+        with pytest.raises(regexlint._Reject):
+            regexlint._walk([("junk", 1, 2, 3)], 0, regexlint._Guard(time.monotonic() + 5))
+
+    def test_a_leaf_payload_of_scalars_is_not_mistaken_for_a_sequence(self):
+        # RANGE carries (97, 122) and LITERAL an int: values, not instructions.
+        # Treating them as instructions would reject every character range in the
+        # accepted corpus; the first version of the fail-closed children guard
+        # did exactly that, so this is a regression pin, not a style preference.
+        assert analyze("^A-[0-9/\\-]{4,12}$", re.IGNORECASE).ok
+        in_node = regexlint._seq(_parser.parse("[a-z]", 0))[0]
+        assert regexlint._name(in_node) == "IN"
+        range_node = regexlint._children(in_node)[0][0]
+        assert regexlint._name(range_node) == "RANGE"
+        assert regexlint._children(range_node)[0] == []     # the ints are not children
 
     def test_unknown_opcode_rejects_instead_of_being_skipped(self, monkeypatch):
         monkeypatch.setattr(regexlint, "_KNOWN_OPS", frozenset())
@@ -345,6 +376,10 @@ def _payload(node):
 
 
 def _nodes(x) -> list:
+    """The instruction elements of a sequence. INSPECTION ONLY — traversal never
+    filters through here, because filtering is how a malformed element disappears
+    instead of being rejected. `analyze`, `_width` and `_children` all walk raw
+    sequences and let `_walk` reject what is not an instruction."""
     return [c for c in _seq(x) if _is_node(c)]
 
 
@@ -374,35 +409,60 @@ def _repeat_bounds(node):
 
 
 def _children(node) -> tuple[list, set]:
-    """(nested nodes, ids of the payload elements that were read).
+    """(nested items, ids of the payload elements that were read).
 
-    The second value is what makes this fail closed: _unconsumed() asks whether
-    anything container-shaped was left unread.
+    Elements are returned UNFILTERED **in sequence positions** (repetition body,
+    group body, branch arms, assertion bodies). Filtering those to `_is_node`
+    would drop a malformed element silently — an instruction the analyzer never
+    looked at — and `_walk` would report the pattern as understood; `_walk`
+    rejects them instead, and `_width` returns unknown while `_contains_branch`
+    refuses, so no path can read a clean verdict out of an unread element.
+
+    Leaf payloads are a different thing: `RANGE` carries `(97, 122)` and `LITERAL`
+    an int. Those are values, not instructions, and treating them as instructions
+    would reject every character range in the accepted corpus — the first version
+    of this guard did exactly that. So the fallback path tolerates inert values
+    and rejects only an unexpected *container*.
+
+    The second return value records which payload elements were read at all,
+    which is what _unconsumed() asks about.
     """
     name = _name(node)
     payload = _payload(node)
     if name in _REPEAT_OPS:
         _repeat_bounds(node)                      # proves the shape before [2]
-        return _nodes(payload[2]), {id(payload[2])}
+        return _seq(payload[2]), {id(payload[2])}
     if name == "SUBPATTERN":
         if len(payload) < 4:
             raise _Reject("group payload is not (group, add, name, body)")
-        return _nodes(payload[3]), {id(payload[3])}
+        return _seq(payload[3]), {id(payload[3])}
     if name == "BRANCH":
         arms = payload[1] if len(payload) > 1 else []
         out: list = []
         for arm in _seq(arms):
-            out += _nodes(arm)
+            out += _seq(arm)
         return out, {id(arms)}
     if name in _ASSERT_OPS:
         out, consumed = [], set()
         for part in _seq(payload):
             if _is_node(part) or (hasattr(part, "__len__")
                                   and not isinstance(part, (str, bytes))):
-                out += _nodes(part)
+                out += _seq(part)
                 consumed.add(id(part))
         return out, consumed
-    return _nodes(payload), {id(c) for c in _seq(payload) if _is_node(c)}
+    # fallback: member lists (IN) and scalar payloads (RANGE, LITERAL, AT, MARK)
+    out, consumed = [], set()
+    for element in _seq(payload):
+        if _is_node(element):
+            out.append(element)
+            consumed.add(id(element))
+        elif element is None or isinstance(element, (str, bytes, int, float, complex, bool)):
+            continue                              # an inert payload value
+        elif hasattr(element, "__len__") and hasattr(element, "__getitem__"):
+            raise _Reject("pattern nests a payload shape this analyzer does not understand")
+        else:
+            raise _Reject("pattern nests a payload value this analyzer does not understand")
+    return out, consumed
 
 
 def _unconsumed(node) -> bool:
@@ -451,7 +511,9 @@ def analyze(pattern: str, flags: int = 0, *, deadline_s: float = 0.25) -> Analys
         # poller, and an analysis that parsed with different flags would not be
         # analysing the filter that runs. (re._parser.FLAGS is the flag-letter
         # dict, not process-global state, so there is nothing to reset.)
-        forest = _nodes(_parser.parse(pattern, flags))
+        # The root sequence is read UNFILTERED so a malformed top-level element
+        # is rejected by _walk rather than dropped by a comprehension.
+        forest = _seq(_parser.parse(pattern, flags))
         _walk(forest, 0, _Guard(time.monotonic() + deadline_s))
     except AnalysisTimeout:
         raise
@@ -529,7 +591,7 @@ tests/data/subject_filter_must_accept.txt
 
 ```python
 # tests/test_filter_contract.py
-"""The accepted language is a contract with consequences, so it is a file (spec §9).
+r"""The accepted language is a contract with consequences, so it is a file (spec §9).
 
 M2 shipped `(\w+\s?)*` as a README example, which is what "the accepted set is
 whatever the probe happened not to catch" bought. These two files are read by the
@@ -572,23 +634,30 @@ class TestWidthModel:
         assert accidents == []
 
     def test_branch_width_is_per_branch_not_summed_across_alternatives(self):
-        # A previous draft summed across alternatives, which made (a|aa) look
-        # fixed-width and let R1 pass the class it existed for. This asserts the
-        # numbers on a real parse rather than on a hand-built node.
+        # A previous draft summed across alternatives. The numbers come from a
+        # real parse, including one factoring surprise: CPython turns `(a|aa)`
+        # into a literal `a` plus a branch over (empty | `a`), so the BRANCH node
+        # itself is width (0,1) while the repetition body R1 reads is (1,2).
         def branch(pattern):
             for node in regexlint._nodes(_parser.parse(pattern, 0)):
                 if regexlint._name(node) == "BRANCH":
                     return regexlint._width(node)
-            for node in regexlint._nodes(_parser.parse(pattern, 0)):
                 for child in regexlint._children(node)[0]:
                     if regexlint._name(child) == "BRANCH":
                         return regexlint._width(child)
             raise AssertionError(f"no BRANCH in {pattern!r}")
 
-        assert branch("(Rechnung|Invoice)") == (8, 9)
-        assert branch("(a|aa)") == (1, 2)
+        assert branch("(Rechnung|Invoice)") == (7, 8)      # per-branch min/max
+        assert branch("(?:abc|de)") == (2, 3)              # not (5, 5), not (2+3)
+        assert branch("(?:(a)|(b))") == (1, 1)
+        assert branch("(a|aa)") == (0, 1)                  # factored: '' | 'a'
+        # and what R1 actually sees for `(a|aa)+` is the body width (1, 2)
+        repeat = regexlint._nodes(_parser.parse("(a|aa)+", 0))[0]
+        assert regexlint._sum_widths(
+            [regexlint._width(c) for c in regexlint._children(repeat)[0]]
+        ) == (1, 2)
 
-    def test_unknown_width_propagates_as_none(self):
+    def test_unknown_shape_is_unknown_width_not_an_exception(self):
         assert regexlint._width((_parser.LITERAL, 97)) == (1, 1)   # sanity
         assert regexlint._width(("NOPE", ())) is None
 
@@ -651,6 +720,8 @@ def _width(node, depth: int = 0):
     """
     if depth > MAX_DEPTH:
         return None
+    if not _is_node(node):
+        return None                       # unknown shape: callers must reject
     name = _name(node)
     if name in _FIXED_ONE:
         return (1, 1)
@@ -662,7 +733,7 @@ def _width(node, depth: int = 0):
     if name == "BRANCH":
         arms = []
         for arm in _seq(payload[1] if len(payload) > 1 else []):
-            summed = _sum_widths([_width(c, depth + 1) for c in _nodes(arm)])
+            summed = _sum_widths([_width(c, depth + 1) for c in _seq(arm)])
             if summed is None:
                 return None
             arms.append(summed)
@@ -760,19 +831,27 @@ An unknown width is a rejection, never a default."
 class TestR2AlternationInsideRepetition:
     @pytest.mark.parametrize("pattern", [
         "(a|aa)+b", "(a|aa)+$", "(a|ab)*c", "(a|aa)*b", "^(a|a?){50}b$",
-        "(Re: |WG: )+", "(yes|no)*!", "^(foo|bar){2}$",      # documented costs, A.1
-        "(?:(a)|a)+x", "(?:(a)|a)+b",                        # the R2-necessity witnesses
+        "(Re: |WG: )+", "(yes|no)*!", "^(foo|bar){2}$",       # documented costs, A.1
+        "(?:(a)|a)+x", "(?:(a)|a)+b",                          # R2-necessity witnesses
         "a(?:xx|(?:b|bb)+c)+d",
     ])
-    def test_rejects(self, pattern):
+    def test_rejected_by_a_named_rule(self, pattern):
+        # NOT asserted as "R2": most of these trip R1 on the way in, because a
+        # variable-width branch body fails R1 before the walk looks for the
+        # alternation. Demanding one specific reason would pin the traversal
+        # order rather than the policy; the reason-specific assertions live in
+        # the isolation witnesses below.
         got = analyze(pattern, re.IGNORECASE)
-        assert not got.ok and "R2" in got.reason, f"{pattern!r}: {got.reason}"
+        assert not got.ok, f"{pattern!r} accepted: {got.reason}"
+        assert any(tag in got.reason for tag in ("R1", "R2", "R3", "R4")), got.reason
 
-    def test_r1_cannot_see_the_r2_witness(self):
-        # Independence: (?:(a)|a)+b has single-width branches, so only R2 catches
-        # it. If this ever becomes redundant, the redundancy is the bug.
-        assert not analyze("(?:(a)|a)+b", re.IGNORECASE).ok
-        assert "R2" in analyze("(?:(a)|a)+b", re.IGNORECASE).reason
+    @pytest.mark.parametrize("pattern", ["(?:(a)|a)+x", "(?:(a)|a)+b", "(Re: |WG: )+",
+                                         "^(foo|bar){2}$"])
+    def test_r2_is_the_rule_that_fires_when_r1_cannot_see_it(self, pattern):
+        # R1 and R2 are independent, and these are the shapes that prove it:
+        # single-width branches (or a body R1's width test passes) with an
+        # alternation that is nonetheless exponential.
+        assert "R2" in analyze(pattern, re.IGNORECASE).reason
 
     @pytest.mark.parametrize("pattern", [
         "^(Rechnung|Invoice|Rechnungsnummer)\\s*\\d{4,10}$",
@@ -829,6 +908,8 @@ def _contains_branch(node, depth: int = 0) -> bool:
     """Is there an alternation anywhere inside this node (R2)?"""
     if depth > MAX_DEPTH:
         return True                      # too deep to prove: refuse
+    if not _is_node(node):
+        return True                       # unreadable shape: refuse
     if _name(node) == "BRANCH":
         return True
     return any(_contains_branch(c, depth + 1) for c in _children(node)[0])
@@ -842,26 +923,65 @@ extend `_check_repetition` inside the `high is None or high >= 2` guard, after t
             raise _Reject("alternation inside a repetition (R2)")
 ```
 
-and add R3 in **two** places. First, at the top of the per-item block in `_walk`, before the unknown-opcode check:
+and add R3 as a **pre-pass over the whole forest**, run in `analyze` before `_walk`, plus a fast-path check on each item inside `_walk`:
 
 ```python
-        if name in ("GROUPREF", "REF", "GROUPREF_EXISTS"):
+_BACKREF_OPS = frozenset({"GROUPREF", "REF", "GROUPREF_EXISTS"})
+
+
+def _contains_backref(items, depth: int = 0) -> bool:
+    """Is a backreference anywhere in this forest? Checked before any other rule.
+
+    A backreference's width is not statically derivable, and its position is
+    unpredictable: `(a)\\1+` puts a GROUPREF inside a repetition, so the width
+    question is asked before the walk reaches the node, and the pattern gets
+    refused as "empty-matching body (R1)" — a reason that has nothing to do with
+    why it was refused. Checking the property before the rules run keeps the
+    reason honest no matter which rule fires first.
+
+    When this scan cannot continue it answers **no**, which looks backwards for a
+    fail-closed module and is still correct: a pattern too deep or too large to
+    scan is also too deep or too large for `_walk`, which rejects it with the true
+    reason, and an unknown opcode whose payload cannot be read is rejected by
+    `_walk` as "not understood". Returning yes here would mislabel all of those as
+    backreferences — a wrong reason is not fail-closed, it is just wrong.
+    """
+    if depth > MAX_DEPTH:
+        return False          # beyond this _walk's own bound refuses, with the true reason
+    for item in items:
+        if not _is_node(item):
+            continue                    # _walk rejects malformed elements
+        try:
+            nested = _children(item)[0]
+        except _Reject:
+            continue                    # unreadable payload: _walk names that shape
+        if _name(item) in _BACKREF_OPS:
+            return True
+        if _contains_backref(nested, depth + 1):
+            return True
+    return False
+```
+
+```python
+# in analyze, between building the forest and calling _walk:
+        if _contains_backref(forest):
+            return Analysis(False, "backreferences are refused (R3)")
+```
+
+```python
+# in _walk, the fast path, before the unknown-opcode check:
+        if name in _BACKREF_OPS:
             raise _Reject("backreferences are refused (R3)")
 ```
 
-Second, at the top of `_width`, right after `name = _name(node)`:
+An earlier draft put the R3 rejection inside `_width` instead, at the point the width is asked for. That works but it is order-sensitive and easy to omit — a reviewer reading only `_width` cannot tell it carries a policy decision, and my own extractor of this plan's code missed the insertion, which is how the ordering dependence got caught. A property that is true of the pattern should be checked once, over the whole pattern.
 
-```python
-    if name in ("GROUPREF", "REF", "GROUPREF_EXISTS"):
-        raise _Reject("backreferences are refused (R3)")
-```
-
-The second one is not belt-and-braces. `(a)\1+` reaches `_check_repetition` before the walk ever descends to the `GROUPREF` node, and `GROUPREF`'s children are empty, so its width comes out `(0, 0)` and the pattern is refused as "empty-matching body (R1)" — refused for a reason it has nothing to do with. A backreference is precisely the construct whose width cannot be derived, so it must refuse **at the point the width is asked for**; without this, six of the corpus's backreference fixtures report R1 and the reason the operator sees is a lie. This is the same failure mode as the `TypeError` in Task 2, and Task 9's "no rejection may come from an accident" test is what keeps it from creeping back.
+The pre-pass must not be cleverer than it looks: when it cannot scan, it answers "no backreference here" and lets `_walk` refuse on the real bound. A first version answered "yes, probably a backreference" for anything deeper than the scan limit, which turned three unrelated tests into backreference rejections — a wrong reason dressed up as caution.
 
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/pytest -q tests/test_regexlint.py -k "TestR2 or TestR3 or TestTraversal"`
-Expected: all pass, and every backreference fixture's reason says `backreference` — if any says `R1`, the `_width` insertion is missing. Then run the whole file: the A.2 accepts must stay accepted, which is what the `?`-exemption in `_check_repetition` protects — moving the R2 loop outside that guard rejects five realistic optional-alternation filters.
+Expected: all pass, and every backreference fixture's reason says `backreference` — if any says `R1`, the pre-pass in `analyze` is missing. Then run the whole file: the A.2 accepts must stay accepted, which is what the `?`-exemption in `_check_repetition` protects — moving the R2 loop outside that guard rejects five realistic optional-alternation filters.
 
 - [ ] **Step 5: Confirm green, then commit**
 
@@ -938,18 +1058,16 @@ class TestR4AdjacentOverlappingRepetitions:
         assert analyze(pattern, re.IGNORECASE).ok, analyze(pattern, re.IGNORECASE).reason
 
     def test_the_ordering_the_threshold_was_chosen_on(self):
-        # Measured at 80 characters so the suite stays fast; the same ordering
-        # holds at the cap, where 4 unbounded repetitions exceed 10 s.
-        def cost(pattern: str) -> float:
-            subject = "a" * 80
-            start = time.perf_counter()
-            re.search(pattern, subject)          # no trailing b: the match must FAIL
-            return time.perf_counter() - start
-
-        two, three, four = cost("^a*a*b$"), cost("^a*a*a*b$"), cost("^a*a*a*a*b$")
-        assert three > two * 1.5
-        assert four > two * 10
-
+        # Structural, not timed: the CI suite must not depend on how loaded the
+        # machine is. The measured cap-length numbers live in the table above and
+        # are re-measured by `filter_contract_check.py --bench`, which runs each
+        # shape in its own process under a hard timeout.
+        assert analyze("^a*a*b$", re.IGNORECASE).ok              # run of 2
+        assert not analyze("^a*a*a*b$", re.IGNORECASE).ok        # run of 3
+        assert not analyze("^a*a*#?a*a*a*x$", re.IGNORECASE).ok  # bounded member inside
+        # the run is per sequence, not per pattern: the same three repetitions
+        # separated by a non-nullable item are legal
+        assert analyze("^a*a*#a*a*$", re.IGNORECASE).ok
     def test_r4_does_not_double_as_a_complexity_bound(self):
         # R4 counts a syntactic run; it is not a budget. This stays accepted and
         # is cheap at the cap, which is the honest face of the policy.
@@ -1007,6 +1125,8 @@ another.
 
 Run: `.venv/bin/pytest -q tests/test_regexlint.py -k TestR4`
 Expected: all pass. If `^\\s*\\s*x$`-shaped accepts fail, `_unbounded_in_run` is counting bounded repetitions; if `^a*a*#?a*$` is accepted, the counter is resetting on the `#?`.
+
+**What the analysis clock does and does not cover.** `deadline_s` starts after `re.compile` and after `re._parser.parse`, and some `_width` work happens before the next `guard.tick`. That is accepted rather than hidden: the child's SIGALRM self-deadline (Task 5) bounds the whole request including compile and parse, so the analyzer's own clock is a fast path out of a slow walk while the parent's kill remains the real bound. Task 5 sets the child's alarm below the parent's remaining budget for exactly this reason.
 
 - [ ] **Step 5: Re-verify the corpora of record against the finished rules**
 
@@ -2106,6 +2226,12 @@ import re
 import sys
 from pathlib import Path
 
+# A script run as `python scripts/filter_contract_check.py` gets scripts/ on
+# sys.path, not the repo root, so the import below fails from a clean checkout
+# unless the script locates its own package. This is not hypothetical: the test
+# that runs this file as a subprocess is exactly the case that fails without it.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from papra_suite import regexlint
 
 DATA = Path(__file__).resolve().parent.parent / "tests" / "data"
@@ -2189,15 +2315,20 @@ def test_blinding_r2_accepts_the_r2_only_witness(monkeypatch):
     assert regexlint.analyze("(?:(a)|a)+b", re.IGNORECASE).ok        # was: R2
 
 
-def test_reading_a_repetition_payload_as_a_body_blinds_everything(monkeypatch):
-    # The original shape bug: payload[0] is the int `min`, so a naive walk finds
-    # no children and (a+)+ walks away clean.
+def test_the_naive_children_mistake_needs_two_guards_to_slip(monkeypatch):
+    # Two guards cover reading a repeat payload's element 0 as the body:
+    # _children returns the real body, and _unconsumed refuses an unread
+    # container. Removing the first must NOT yield acceptance — the second
+    # catches it. Removing both does, which is what this pins.
     def naive(node):
         from papra_suite.regexlint import _is_node, _payload, _seq
         return [c for c in _seq(_payload(node)) if _is_node(c)], set()
 
     monkeypatch.setattr(regexlint, "_children", naive)
-    assert regexlint.analyze("(a+)+$", re.IGNORECASE).ok             # was: R1
+    got = regexlint.analyze("(a+)+$", re.IGNORECASE)
+    assert not got.ok and "payload shape" in got.reason              # guard 2 holds
+    monkeypatch.setattr(regexlint, "_unconsumed", lambda node: False)
+    assert regexlint.analyze("(a+)+$", re.IGNORECASE).ok             # now it slips
 
 
 def test_restoring_the_width_sum_bug_produces_an_accidental_rejection(monkeypatch):
@@ -2213,7 +2344,7 @@ def test_restoring_the_width_sum_bug_produces_an_accidental_rejection(monkeypatc
                for p in ["(a+)+$", "(?=^(a+)+$)", "(a*)*"])
 
 
-def test_disabling_r4_accepts_the_adjacent_repetition_class(monkeypatch):
+def test_blinding_the_unbounded_run_check_accepts_the_adjacent_class(monkeypatch):
     monkeypatch.setattr(regexlint, "_unbounded_in_run", lambda items: 0)
     assert regexlint.analyze("^a*a*a*a*b$", re.IGNORECASE).ok        # was: R4
 ```
