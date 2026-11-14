@@ -2,29 +2,33 @@
 
 Companion to `spec.md` and to
 `docs/superpowers/specs/2026-11-12-papra-suite-implementation-decisions-design.md`.
-Status: **agreed design, awaiting implementation plan.** This document is a
-prerequisite gate for the M4 dashboard: an operator must not be given a text
-box that writes a regex into the poll loop until the rules below decide what
-that box accepts.
+Status: **proposal under review — not yet approved, not yet a plan input.** This
+document is a prerequisite gate for the M4 dashboard: an operator must not be
+given a text box that writes a regex into the poll loop until the rules below
+decide what that box accepts.
 
-Where this document disagrees with `spec.md` §5.6 or with the M3
-residual-risk wording in `.superpowers/m3-review-loop-state.md`, this document
-wins; each disagreement is flagged in §12.
+Where this document disagrees with `spec.md` §5.6 or with the M3 residual-risk
+wording in `.superpowers/m3-review-loop-state.md`, this document wins once
+approved; each disagreement is flagged in §12.
+
+Every number below is labelled either **measured** (reproducible on CPython 3.12
+on the orchestrator's machine, prototype in §9) or **policy** (a choice). No
+number is offered as proof of a property the prototype does not implement.
 
 ## 1. Scope, and an explicit change to the agreed gate
 
 Operators type regular expressions into a subject filter. Those expressions run
 against strings an outsider controls. M3 shipped the *runtime* half of this
-(killable child, `papra_suite/safematch.py`), and its review left the
-save-time half as "M4 blocker: save-time filter validation".
+(killable child, `papra_suite/safematch.py`), and its review left the save-time
+half as "M4 blocker: save-time filter validation".
 
 The gate was originally worded as a **conservative accepted subset**. This
 design deliberately replaces that wording with a **layered heuristic**, because
 the rules below do not bound matching *complexity*:
 
 > Accepted patterns may still match in superlinear time. What the contract
-> guarantees is **bounded work per matching attempt**, with at most one
-> budget-consuming attempt per message (§2) — not bounded complexity.
+> guarantees is **bounded work per attempt**, inside a bounded number of
+> attempts per message (§2) — not bounded complexity.
 
 The rejected alternative was a grammar with a provable complexity bound. It was
 rejected as unverifiable without automata machinery we would be inventing, and
@@ -34,210 +38,214 @@ the record rather than a gap discovered later.
 
 ## 2. The guarantee, stated to its limit
 
-Three controls, measured on CPython 3.12. Each covers a class the others do
-not; none covers the others' classes.
+Three controls. They **overlap**: the deadline contains work that the structural
+rules reject preventively and that the cap restricts preventively. Treating them
+as disjoint coverage classes was an error in an earlier draft.
 
-| class | example | measured | covered by |
-| --- | --- | --- | --- |
-| exponential backtracking | `(a+)+$` | **26 characters** → 2.50 s | the structural rules only — the length cap cannot help, a subject is longer than 26 chars |
-| polynomial, sequential repeats | `^a*a*a*b$` | 1 000 chars → 0.074 s; 10 000 → >8 s | length cap only — no structural rule rejects it |
-| polynomial, search restarts | `a+b` (unanchored) | 60 000 → 0.77 s; 250 000 → >8 s | length cap only |
-| anything unforeseen | — | — | child deadline, §5 |
+| cost class | example | measured | prevented by | contained by |
+| --- | --- | --- | --- | --- |
+| exponential backtracking | `(a+)+$` | 26 characters → 2.50 s | structural rules (§3) — the cap cannot help, subjects are longer than 26 chars | child deadline |
+| combinatorial bounded repetition | `^(a?){100}a{100}$` | **>10 s at a 100-character subject** | structural rules — every size bound is satisfied, and the cap cannot help | child deadline |
+| polynomial, sequential repeats | `^a*a*a*b$` | 1 000 chars → 0.074 s; 10 000 → >8 s | cap only | child deadline |
+| polynomial, search restarts | `a+b`, `(a|b)+x` (unanchored) | 1 000 → 0.006 s; 16 000 → 1.39 s; 60 000 → >10 s | cap only | child deadline |
+| decoder work before matching | 2 M raw chars of encoded words | **6.8 s to decode** | raw limit (§4) | **nothing** — see residual 7 |
+| anything unforeseen | — | — | — | child deadline |
 
-Stated positively: **each matching attempt is bounded by the parent's reply
-budget and by the child's own self-deadline, and a match cannot outlive its
-child.** The per-message accounting, read out of `safematch.py` rather than
-assumed:
+**Attempts per message — corrected, and this was wrong in an earlier draft.**
+`_request` (`safematch.py:269-321`) retries on `EOFError`, `OSError`,
+unparseable replies and write failures **without regard to how long the child
+ran**. A child that consumes nearly the whole budget and then dies therefore
+lands in a retried path, and a child killed by its own `SIGALRM` can present as
+EOF rather than as the parent's `TimeoutError`. The honest bound:
 
-- A `TIMEOUT` ends the message's filter evaluation. It is deliberately **not
-  retried** (`safematch.py:271-273`): retrying a catastrophic pattern buys
-  nothing but a second burned budget.
-- The respawn loop (`MAX_CHILD_RETRIES = 2`) is reached only on *fast* failures
-  — child died between check and write, reply unparseable — because the
-  budget-exceeded path raises immediately instead of looping. So at most one
-  attempt per message consumes a full budget.
-- The child's self-deadline is rounded up to whole seconds and can therefore
-  exceed the parent's patience by less than a second. The parent's kill is the
-  authoritative bound; the self-deadline is for the case where there is no
-  parent left to do the killing.
+- a **parent-detected** timeout raises `MatchTimeout` and is **not** retried
+  (`safematch.py:271-273`);
+- everything else retries until `MAX_CHILD_RETRIES = 2`, so the worst case is
+  **`MAX_CHILD_RETRIES + 1 = 3` attempts**, i.e. up to ~3 × 2 s ≈ **6 s** of
+  child CPU per message per mailbox;
+- the parent's 2.0 s deadline and the child's self-deadline of
+  `ceil(2.0) = 2` s **race**, and either can win, so which path a given message
+  takes is not predictable.
+
+Closing that gap is work, not prose: either a deadline shared across retries or
+reliable classification of a child-alarm death as a timeout. Until one exists,
+§11 records 6 s as the bound rather than 2 s.
+
+**Aggregate bound — corrected.** One `KillableMatcher` is created per mailbox
+poll task (`mail.py:485`), plus one in the pipeline (`pipeline.py:227`), so
+concurrent regex children are bounded by **enabled mailboxes + 1**.
+`OCR_CONCURRENCY` bounds OCR jobs and has **no** relationship to regex children;
+citing it as an aggregate matcher bound was wrong.
 
 Stated negatively, and this is load-bearing prose:
 
-- `SUBJECT_FILTER_TIMEOUT_S` bounds **one match attempt inside one child**. It
-  is not a bound on poll latency, which also contains IMAP round-trips, Papra
-  uploads, retries, IPC and process cleanup.
-- It is not a service-availability guarantee, and the controls below are not one
-  either. N children at 2 s each are N busy cores; sustained hostile traffic can
-  saturate a home server while every individual deadline is honoured. The
-  concurrency limits that already exist (`OCR_CONCURRENCY` and the poll
-  structure) stay operative and are the only aggregate bound there is; see §13.
-- A length cap of 1000 and a structural rule set neither establish that an
-  accepted pattern is cheap. More sequential repetitions exhaust the budget on
-  short inputs. The deadline stays necessary because of what the other two do
-  not prove.
+- `SUBJECT_FILTER_TIMEOUT_S` bounds **one attempt inside one child**. It is not
+  a bound on poll latency, which also contains header decoding, IMAP
+  round-trips, Papra uploads, retries, IPC and process cleanup.
+- It is not a service-availability guarantee. Enabled mailboxes times 2 s of
+  concurrent child CPU is a real load on a home server, and sustained hostile
+  traffic can saturate it while every individual deadline is honoured.
+- Neither the cap nor the structural rules establish that an accepted pattern is
+  cheap: `(a|b)+x` is accepted and is quadratic, measured above.
 
 ## 3. Control 1 — structural acceptance
 
-Two rejection rules and one refusal rule, evaluated over the **parse tree** and
-never over source text — because CPython rewrites the expression before the
-engine sees it. Measured directly: `(a|b)+x` contains **no `BRANCH` node at
-all** (the single-character alternation is factored into a character class, and
-the result really is linear), while `(a|aa)+b` **keeps** its `BRANCH` (unequal
-branches cannot be factored) and really is catastrophic. A source-level rule
-would treat the two identically and be wrong in both directions.
+Three rules over the **parse tree**, never over source text, plus the analysis
+bounds. Rules are stated so an operator can be told why their pattern was
+refused in one sentence.
 
-**R1 — an unbounded repetition whose body contains a repetition or an
-alternation is rejected.** `*`, `+` and `{m,}` over an ambiguous body.
+**R1 — inside a repetition of two or more (or an unbounded repetition), the
+repeated body must have a fixed width and must not be able to match the empty
+string.** This is the rule that catches the class an earlier draft of this
+document accepted: `^(a?){1000}a{1000}$` and `^(a?){100}a{100}$` are 17–19
+characters, two repetition nodes, depth 4, 2 repetitions — inside every size
+bound — and measured **>10 s at a 100-character subject**, which is a normal
+subject length, so the length cap does not contain them. A variable-width or
+empty-matching body under repetition is what lets one input be split many ways.
 
-**R2 — a bounded repetition of two or more whose body contains an unbounded
-repetition is rejected.** This is what catches `(\s*\w+\s*){1,10}rechnung` and
-`^(a*){20}b$`: a finite outer count multiplied by an ambiguous interior is
-still a combinatorial distribution of the same input.
+**R2 — no alternation inside a repetition.** Catches what R1's width arithmetic
+structurally cannot see, because CPython rewrites alternations: `(?:(a)|a)+x`,
+`(a|aa)+b`. Appendix A.1 records which rule fired for which fixture, and without
+R2 those fixtures are accepted.
 
-**A bounded repetition over a fully bounded body is accepted**, and that
-distinction is the whole reason the rules are split this way. A first draft said
-"a repetition whose body contains an alternation" and was measured rejecting
-`^(Rechnung|Invoice)?$`, `^Rechnung[- ]?(1|II)?$` and
-`^(?:Rechnung|Invoice)?\s*\d+$` — ordinary optional prefixes whose cost is a
-constant factor, because `?` can only repeat once. The unbounded/bounded split
-separates the shapes that multiply ambiguity from the shapes that merely
-multiply work by a constant.
+**R3 — constructs the analyser does not reason about are refused.**
+Backreferences (`(a)\1+`) are rejected: no rule here says anything about them. So
+is any opcode the traversal does not recognise.
 
-**R3 — constructs the analyser does not reason about are refused.** Backreferences (`(a)\1+`) are rejected outright: no rule here says anything about them, and R1's reasoning does not cover them. So is any opcode the traversal does not recognise.
+**A bounded repetition of exactly one (`?`) is exempt**, which is what keeps
+`^Rechnung[- ]?(1|II)?$`, `^(Rechnung|Invoice)?$` and `(R|I)?N\d{6}` acceptable:
+one repetition of an alternation cannot multiply.
 
-Measured against the corpus in §9: **14 of 14 catastrophic and unsupported
-patterns rejected** — including `(Rechnung|Invoice)\s*(\d+\s*)+$`, which scored
-**1.0** on M3's growth-ratio probe and was therefore accepted by it — and **28
-of 28 realistic operator patterns accepted**, zero false rejections. The
-accepted patterns include the harmless bounded alternations above and both
-normalised `(a|b)*x` / `(a|b)+x`.
+Measured against the corpora in Appendix A: **21 of 21 rejected, 31 of 31
+accepted**. The rejected set includes `(Rechnung|Invoice)\s*(\d+\s*)+$`, which
+scored **1.0** on M3's growth-ratio probe and was therefore accepted by it.
+These numbers come from the **prototype** in `/tmp/finalrule4.py`, which
+implements R1–R3 and the four size bounds but **not** the fail-closed opcode
+adapter, and the validator that ships must re-run them before they are quoted as
+evidence about the product (§9).
 
-**The known cost of the policy is named, not hidden.** `(Re: |WG: )+` and
-`(yes|no)*!` are rejected and are **not** catastrophic: their branches have
-distinct first characters and fixed lengths. The rules cannot see that, because
-seeing it means comparing branch languages, and the sharper test
-(reject-only-when-branches-overlap) was rejected as the beginning of an
-automata checker we could not verify. The operator gets a message naming the rule
-and a restructuring hint; the rejected pattern is a bug report away from being
-re-examined. The margin numbers in the bounds table below are **policy choices**
-about what an operator plausibly writes, not evidence about real mailboxes.
+**What the policy costs, measured rather than glossed.** Rejected and *not*
+catastrophic: `(Re: |WG: )+`, `(yes|no)*!`, `^(foo|bar){2}$`, and
+`^(?:\d{1,3}\.){3}\d{1,3}$` (variable-width body). Measured cost of the first
+two at the cap: `(Re: |WG: )+x` on 1 000 characters is **0.009 s**, on 10 000 it
+is 0.221 s — the same profile as `(a|b)+x`, which is **accepted** (0.006 s /
+0.135 s), because CPython happens to normalise `(a|b)` into a character class
+and not `(Re: |WG: )` into anything. So the boundary here is drawn by
+normalisation, not by a cost difference, and an operator who reads "no
+alternation in a repetition" as a claim about danger is being told something
+that measurement does not support. It is a claim about what the analyser can
+prove cheaply. R2 is kept anyway: it is two lines, fails closed, and `(a|b)+`
+survives only because normalisation collapsed it — a trivially written variant
+does not.
 
-**Analysis bounds.** A hostile pattern can also be hostile to the analyser, so
-the contract additionally rejects patterns above four bounds. The busiest
-filter in the realistic corpus (an alternation of invoice words, optional
-prefixes, two numeric groups and a trailing year) measures 97 characters, 69
-parse nodes, depth 5 and 10 repetitions, so the bounds sit roughly 5x above
-anything a real mailbox needs:
-
-| bound | limit | margin over busiest measured filter |
-| --- | --- | --- |
-| pattern length | 512 characters | 5.3x |
-| parse nodes | 512 | 7.4x |
-| tree depth | 24 | 4.8x |
-| repetition nodes | 64 | 6.4x |
-
-The subject is bounded by §4, and the frame handed to the child is bounded by
-the pattern-length bound plus the subject cap — **not** by `MAX_MESSAGE_BYTES`,
-which bounds the fetched message and says nothing about IPC. These bounds
-protect the analyser; they are not what bounds matching cost.
+**Analysis bounds.** Protect the analyser from hostile patterns: pattern length
+≤ 512 characters, ≤ 512 parse nodes, depth ≤ 24, ≤ 64 repetition nodes.
+Measured over the accepted corpus: longest 32 characters, busiest 31 nodes,
+depth ≤ 4, ≤ 4 repetitions; a hand-written busy invoice filter reached 97
+characters, 69 nodes, depth 5, 10 repetitions. The limits sit several times
+above those samples; that is a **policy** choice about what operators plausibly
+write, not evidence about real mailboxes, and **no bound here limits expanded
+work** — which is exactly why R1 exists.
 
 **Fail closed, and distinguish two kinds of "no".** The traversal is
-opcode-specific: it recognises the nodes it reasons about and treats anything
-unfamiliar — an unexpected opcode, an unrecognised child shape, a parse error,
-an analysis that runs out of its own budget — as a **rejection of that
-pattern**, never as acceptance. `re._parser` is a private module and the
-project declares `>=3.12` rather than one interpreter, so it sits behind a thin
-adapter whose only job is to make the shape assumptions explicit and to fail
-closed when they stop holding.
+opcode-specific: anything unfamiliar — an unexpected opcode, an unrecognised
+child shape, a parse error, an analysis that runs out of its own budget — is a
+**rejection of that pattern**, never acceptance. `re._parser` is private and the
+project declares `>=3.12`, so it sits behind an adapter that makes the shape
+assumptions explicit and fails closed when they stop holding. Two traps were
+hit while prototyping and both belong in pins (§9): repetition and group bodies
+are `re._parser.SubPattern`, which is **not** a `list` subclass, and CPython
+stores some nodes as **two-element lists** rather than tuples — a traversal that
+checks `isinstance(x, tuple)` silently skips branch bodies and reports a
+catastrophic pattern as safe.
 
-A **pattern-level** rejection (invalid, or refused by R1/R2/R3/bounds) means:
-the filter is not saved, the operator is told which rule fired and how to
-restructure. An **infrastructure-level** failure (child will not start, IPC
-broke) is `UNAVAILABLE` and keeps M3's disposition: poll error, cursor frozen,
-failure counted. Those two must never share a code path — the same confusion
-cost a round of the M3 review.
+A **pattern-level** rejection means the filter is not saved and the operator is
+told which rule fired and how to restructure. An **infrastructure-level** failure
+(child will not start, IPC broke) is `UNAVAILABLE` and keeps M3's disposition:
+poll error, cursor frozen, failure counted. Those two must never share a code
+path — the same confusion cost a round of the M3 review.
 
-## 4. Control 2 — subject length bound
+## 4. Control 2 — subject length: two limits with two justifications
 
-`MAX_SUBJECT_CHARS = 1000` already exists and already applies on both paths
-(`papra_suite/mail.py:266`, `:519`). What changes is the **disposition**: over
-the cap, we stop pretending to have evaluated the subject.
+`MAX_SUBJECT_CHARS = 1000` already exists and applies on both paths
+(`papra_suite/mail.py:266`, `:519`). What changes is the **disposition**.
 
-**The shipped truncation is wrong in both directions.** `re.search(pattern,
-subject[:1000])` manufactures an end-of-string that the operator's `$` did not
+**4.1 The decoded cap is a correctness rule.** `re.search(pattern,
+subject[:1000])` manufactures an end-of-string the operator's `$` did not
 approve, and destroys the tail a `$` needed. Reproduced with
-`^Rechnung.*\d{3}$`, a plausible operator filter:
+`^Rechnung.*\d{3}$`:
 
-- subject 1050 chars, digits landing on char 1000 → truncated **matches**, full
-  subject does not. Mail is ingested that the filter rejected.
-- subject 1109 chars, digits beyond char 1000 → truncated **does not match**,
+- 1050 characters, digits landing on character 1000 → truncated **matches**,
+  full subject does not. Mail is ingested that the filter rejected.
+- 1109 characters, digits beyond character 1000 → truncated **does not match**,
   full subject does. Mail the filter wanted is silently never ingested.
 
 Neither appeared in M3 review because the cap predates it and its comment
-records only the resource benefit. Truncation is therefore rejected outright,
-not merely superseded: it is not the safe direction, it fails both ways.
+records only the resource benefit. So: over the cap, do not truncate and do not
+evaluate.
 
-**Rule (T2).** When a mailbox **has** a subject filter configured and the
-subject exceeds the cap:
+**Rule (T2).** When a mailbox **has** a subject filter configured and the decoded
+subject exceeds 1000 code points:
 
-- Do not truncate. Do not evaluate.
 - Return `SUBJECT_TOO_LONG` — a distinct outcome, **not** `NOMATCH`.
 - Disposition follows `TIMEOUT`'s: warning, skip ingestion, mark `\Seen`,
-  advance the cursor. Documented consequence: **this retires the message from
-  automatic processing. Nothing retries it.**
+  advance the cursor. Consequence stated plainly: **this retires the message
+  from automatic processing; nothing retries it.** Deliberate operator recovery
+  may still exist; the automatic path does not.
 - One redacted WARNING carrying mailbox id, UID, measured length and the cap —
-  never the subject text, which is untrusted content and would land in the
-  dashboard's log page.
-- A per-mailbox counter, monotone and restart-surviving, shown on the M4
-  status page. It counts **retired messages, not evaluation attempts**, and is
-  incremented **in the same transaction as the cursor advance**, so a crash
-  between the two cannot double-count. Storage is M4's choice; the requirement
-  is that skipping is countable rather than log-scrapable.
-- **No filter configured → rule does not apply.** No filter means ingest;
-  there is nothing to refuse.
+  never the subject text, which is untrusted content bound for the dashboard's
+  log page.
+- A per-mailbox counter (semantics in §8).
+- **No filter configured → rule does not apply.** No filter means ingest.
 
-`SUBJECT_TOO_LONG` is **not** evidence that the subject failed the regex. It is
-a processing-domain restriction, and no dashboard badge may imply "did not
-match".
+Measured on the **decoded** value: what `_decode_header_value` returns after
+`decode_header`/`make_header`, before any whitespace collapsing; the matching
+path receives that same string with no truncation anywhere.
 
-**Measurement point.** The cap is measured on the **decoded** value, in Unicode
-code points: what `_decode_header_value` returns after
-`decode_header`/`make_header`, before any whitespace collapsing — and the
-matching path receives that same string with no truncation anywhere.
+**4.2 A raw-header limit returns, honestly labelled as an ingestion
+restriction.** An earlier draft justified a raw limit as *implying* decoded
+length. That is false, and the arithmetic is worth recording because it is the
+reason the two limits cannot be merged: `decode_header` **discards whitespace
+between adjacent encoded words**, so a 73-character raw header — two 16-character
+encoded words and **41** characters of filler — decodes to `ab`. Inflation is
+unbounded; no raw threshold can prove anything about decoded length.
 
-There is deliberately **no raw-header shortcut**. A first draft of this section
-refused any raw `Subject` longer than 32 768 characters without decoding it,
-justified by a worst-case inflation of 27 raw characters per decoded code point.
-That justification is false: `decode_header` **discards whitespace between
-adjacent encoded words**, so a 73-character raw header of two encoded words and
-65 filler characters decodes to `ab`. Inflation is unbounded, which means a raw
-limit can reject a subject whose decoded value fits the cap — a second silent
-ingestion restriction wearing an optimisation's clothes. Decoding is also not
-the cost the shortcut existed to prevent: `decode_header` plus `make_header`
-over an **8-million-character** subject measured **1.3 ms**, and the whole
-message is already bounded by `MAX_MESSAGE_BYTES` (25 MiB) and
-`MAX_POLL_BYTES` (100 MiB), checked on `RFC822.SIZE` before the fetch. The
-decoded length is the only length this contract recognises.
+The raw limit is nevertheless required, for a different reason: decoding happens
+in the poller, **before** the child deadline exists. Measured, `decode_header`
+plus `make_header` over 2 000 000 raw characters of encoded words costs **6.8 s**
+(200 000 raw → ~155 ms), against a message buffer already capped at
+`MAX_MESSAGE_BYTES` = 25 MiB (`RFC822.SIZE` checked before the fetch). A plain
+ASCII subject of 8 M characters costs 1.3 ms — that number is a
+*plain-header* observation and must not be quoted as a cost bound for hostile
+headers.
 
-The cap is one fixed named constant, 1000 decoded code points. It is a product
-policy choice, not an RFC-derived safety threshold — RFC 5322 sets no subject
-limit at all. Making it configurable would multiply the corpus and let the
-operator widen the very thing the control exists to narrow. Any future
-header-level restriction inherits this section's precondition: **only when a
-subject filter is configured.**
+So: **a raw `Subject` header value longer than 32 768 characters is
+`SUBJECT_TOO_LONG` without decoding**, and the document states plainly that this
+**can reject a subject whose decoded value would fit** — it is a bound on decoder
+work, and it is a second ingestion restriction, not an optimisation. Both limits
+apply only when a subject filter is configured.
+
+`SUBJECT_TOO_LONG` is **not** evidence that the subject failed the regex. It is a
+processing-domain restriction and no dashboard badge may imply "did not match".
+
+Both caps are fixed named constants, not configuration: 1000 decoded code points
+(product policy; RFC 5322 sets no subject limit at all) and 32 768 raw
+characters. Making either configurable would multiply the corpus and let an
+operator widen the thing the control exists to narrow.
 
 ## 5. Control 3 — the child deadline (shipped, re-described)
 
-`SUBJECT_FILTER_TIMEOUT_S = 2.0`, enforced by a request-owned `SIGALRM`
-self-deadline in the child with no Python handler installed (the default
-disposition kills mid-`re.search`, where nothing running in that interpreter
-could), plus a parent-side kill and the M3 orphan bound. A killed match is
-`TIMEOUT` → decided non-match, `\Seen` set, cursor advances, which is what
-stops poison mail from being re-fetched and re-killed every poll.
+`SUBJECT_FILTER_TIMEOUT_S = 2.0`, a request-owned `SIGALRM` self-deadline in the
+child with no Python handler installed (the default disposition kills
+mid-`re.search`, where nothing running in that interpreter could), plus a
+parent-side kill and the M3 orphan bound. A killed match is `TIMEOUT` → decided
+non-match, `\Seen` set, cursor advances, which is what stops poison mail being
+re-fetched and re-killed every poll.
 
-This section exists to record what it is **not**: not a poll-latency bound, not
-a capacity bound, and not the reason the other two controls are unnecessary —
-it is the control that covers the two controls' blind spots.
+What it is **not**: not a poll-latency bound; not an aggregate bound; not one
+attempt per message (§2, up to three); not sufficient — the structural rules and
+the caps exist because the deadline alone means paying 2 s per hostile message
+forever.
 
 ## 6. Probes refute, they never accept
 
@@ -248,185 +256,261 @@ The growth-ratio probes stay, with their role narrowed to one direction:
 
 M3 measured why: `(Rechnung|Invoice)\s*(\d+\s*)+$` blows up only on input
 containing the pattern author's own literal prefix, so generic probes score it
-1.0 — perfectly linear — while it kills a 26-character subject-class blowup.
+1.0 — perfectly linear — while it needs 26 characters to exceed the deadline.
 Probe inputs derived from literals extracted out of the pattern itself are
-permitted as additional **rejection** evidence, and are still not acceptance
+permitted as further **rejection** evidence, and are still not acceptance
 evidence for a pattern the structural rules reject.
 
 ## 7. No escape hatch
 
-There is no "I understand the risk" checkbox, no env var that disables
-R1/R2/R3 or the length cap, and no per-mailbox override. A single-operator system has the
-same person as author, attacker and victim; an escape hatch converts a stated
-bound into a preference, and the person who flips it is the one who gets the
-2 s CPU slice. An operator who genuinely needs a rejected pattern files it as a
-bug and restructures in the meantime.
+No "I understand the risk" checkbox, no env var that disables R1/R2/R3 or either
+cap, no per-mailbox override. A single-operator system has the same person as
+author, attacker and victim; an escape hatch converts a stated bound into a
+preference, and the person who flips it is the one who pays the child CPU.
 
-## 8. Outcome vocabulary and dispositions
+## 8. Outcome vocabulary, dispositions, and their bookkeeping
 
-`MatchOutcome` keeps `MATCH`, `NOMATCH`, `TIMEOUT`, `UNAVAILABLE`. The subject
-length decision is made in the poller **before** the matcher is called, so the
-child protocol is unchanged and gains no length outcome.
+`MatchOutcome` keeps `MATCH`, `NOMATCH`, `TIMEOUT`, `UNAVAILABLE`. The child
+protocol gains **one** operation, `analyze` (§10); **no new length outcome is
+added to it**, because both length decisions are made in the poller before the
+matcher is called.
 
 | outcome | decided by | ingestion | `\Seen` | cursor | visible as |
 | --- | --- | --- | --- | --- | --- |
-| `MATCH` | filter | yes | set | advances | normal path |
+| `MATCH` | filter | permitted | set | advances | normal path |
 | `NOMATCH` | filter | no | set | advances | normal path |
-| `TIMEOUT` | child deadline | no | set | advances | warning + counted |
-| `SUBJECT_TOO_LONG` | length cap | no | set | advances | warning + counter |
+| `TIMEOUT` | child deadline | no | set | advances | warning + `filter_timeouts` counter |
+| `SUBJECT_TOO_LONG` | length cap | no | set | advances | warning + `subject_too_long` counter |
 | `INVALID_PATTERN` at save time | R1/R2/R3/bounds | n/a | untouched | untouched | dashboard error naming the rule |
-| `INVALID_PATTERN` at startup (row edited by hand) | R1/R2/R3/bounds | undecided | **not set** | **frozen** | poll error, `record_poll_failure`, 3-strike path |
+| `INVALID_PATTERN` at startup (hand-edited row) | R1/R2/R3/bounds | undecided | **not set** | **frozen** | poll error, `record_poll_failure`, 3-strike path |
 | `UNAVAILABLE` | child cannot run | undecided | **not set** | **frozen** | poll error, `record_poll_failure`, 3-strike path |
 
-A stored filter that fails the contract at startup takes `UNAVAILABLE`'s
-disposition rather than a silent one: the poll errors and the cursor freezes,
-because the alternative is deciding mail with a rule the system has already
-refused to reason about.
+`MATCH` **permits** ingestion; it does not cause it. Parsing, size limits,
+dedup, the Papra upload and the OCR job can all still refuse the message, and
+the `\Seen`/cursor semantics for those failures are M2/M3 behaviour that this
+document does not change.
 
-**Invariants that the table does not carry.**
+**Bookkeeping invariants.**
 
-- `SUBJECT_TOO_LONG` **never calls `record_poll_failure`**. It is a disposition,
-  not a fault: it must not bump `consecutive_failures` and must not be able to
-  drive a mailbox into the 3-strike disable. A hostile sender must not be able
-  to switch a mailbox off by sending long subjects.
-- It creates **no job** and records **nothing** in `dedup_hashes`: nothing was
-  ingested, so nothing may be marked as seen-and-handled by the dedup path.
-- `\Seen` and the cursor advance together, exactly as `TIMEOUT` does them
-  today.
+- `SUBJECT_TOO_LONG` and `TIMEOUT` are **dispositions, not faults**: neither may
+  call `record_poll_failure`, so neither can raise `consecutive_failures` or
+  drive a mailbox into the 3-strike disable. A hostile sender must not be able to
+  switch a mailbox off by sending long subjects. The qualification matters: a
+  failure to *persist* one of these dispositions, or an IMAP error while
+  applying it, is still a poll failure and still counts.
+- Neither creates a job nor writes a `dedup_hashes` row.
+- **Counters are approximate, and must be labelled that way.** Today
+  `mark_seen()` (IMAP) runs at `mail.py:675` and the cursor write at `:691`, in
+  separate steps; a crash in between leaves the message `\Seen` with the cursor
+  behind, and because `fetch_since()` does not filter on `\Seen` the message is
+  re-fetched and re-evaluated. So a counter counts **retired evaluations**, is
+  monotone, and **can over-count** after a crash, a replay, a deliberate cursor
+  reset or a UIDVALIDITY change. Exact-once would require an identity key
+  (mailbox, UIDVALIDITY, UID) and an idempotency table; that is explicitly out of
+  scope (§13), and the M4 status page must not present the number as exact.
+- Counters are written in the same transaction as the cursor advance, so the
+  over-count window is the IMAP/database gap and not a second one.
 
-**Recovery from a disabled mailbox, stated because the code does not do it
-automatically.** `record_poll_failure` sets `enabled = 0` at the third
-consecutive failure (`store.py:470-476`) and `record_poll_success` resets
+**Recovery from a disabled mailbox.** `record_poll_failure` sets `enabled = 0` at
+the third consecutive failure (`store.py:470-476`); `record_poll_success` resets
 `consecutive_failures` and `last_error` but **never restores `enabled`**
-(`store.py:455-459`). So after an operator corrects a rejected filter the
-mailbox stays disabled until they re-enable it through the M4 toggle. Saving a
-corrected filter clears `last_error` and `consecutive_failures` — the cause is
-provably gone — but does not flip `enabled`: that flag is operator-controlled
-and the dashboard must not quietly start polling something the operator turned
-off.
+(`store.py:455-459`). So a mailbox disabled by a bad filter stays disabled until
+the operator re-enables it, and saving a corrected filter **does not clear
+`last_error` or `consecutive_failures`** — those fields also describe IMAP,
+authentication and matcher-infrastructure failures, and validating a regex proves
+nothing about them. The next genuinely successful poll clears them. Saving does
+not flip `enabled` either: that flag is operator-controlled.
 
-**Parity, honestly scoped.** `subject_matches` returns a bool and therefore
-cannot represent `UNAVAILABLE` or `SUBJECT_TOO_LONG` at all, so a promise that
-it "mirrors every row" would be false. Instead: the *semantics* — case-insensitivity,
-the empty-pattern and `None`-subject branches, the cap and its disposition —
-live in one shared helper that both paths call, and the poller/child path
-returns an outcome-bearing type. Pins assert the shared helper's decisions and
-both §4 reproducers rewritten to expect `SUBJECT_TOO_LONG`; they do not assert a
-Boolean parity that cannot exist.
+**Parity, honestly scoped.** `subject_matches` returns a bool and cannot
+represent `UNAVAILABLE` or `SUBJECT_TOO_LONG`, so a promise that it "mirrors
+every row" would be false. Instead the *semantics* — case-insensitivity, the
+empty-pattern and `None`-subject branches, both caps and their dispositions —
+live in one shared helper both paths call, and the poller/child path returns an
+outcome-bearing type. Pins assert the helper's decisions, including both §4.1
+reproducers rewritten to expect `SUBJECT_TOO_LONG`.
 
 ## 9. Corpora, pins, and the release gate
 
-- **Must-reject corpus — 14 fixtures, expected outcome recorded per fixture
-  under the combined R1+R2+R3 policy.** The catastrophic set
-  (`(a+)+$`, `(a|aa)+b`, `^(\w+\s?)*$`, `(Rechnung|Invoice)\s*(\d+\s*)+$`,
-  `^(Rechnung|Invoice)[ ]*(\d+)+$`, `(a+)+\d+$`, `(x+x+)+y`,
-  `(\s*\w+\s*){1,10}rechnung`, `^(a*){20}b$`, `(a?)*b`, `(?:(a)|a)+x`), the
-  unsupported construct `(a)\1+rechnung`, and the two **documented costs**
-  `(Re: |WG: )+` and `(yes|no)*!` — which are in this corpus on purpose, so
-  that if the policy is ever relaxed the relaxation is a decision somebody had
-  to make loudly rather than a silent drift.
-- **Must-accept corpus — 28 fixtures.** The realistic operator patterns, each
-  with `accept` recorded explicitly (no blanket statement that "the corpus
-  passes"): includes `^Rechnung[- ]?(1|II)?$`, `^(Rechnung|Invoice)?$`,
-  `^(?:Rechnung|Invoice)?\s*\d+$`, `^(Rechnung|Invoice){1,3}\d+$`,
-  `(a|b)*x`, `(a|b)+x`, `(a?){10}b`, `(a|aa){0,1}b`. Retained as a
-  **compatibility** corpus whose purpose is to make over-tightening fail
-  loudly; it is not a safety corpus and must not be described as one.
-- **Invalid-input fixtures.** Patterns CPython itself refuses, including `(?i)`
+- **Canonical fixture artefact.** Appendix A is the corpus of record: every
+  fixture with its expected verdict and rule name, committed alongside the
+  implementation as a test fixture file so the numbers in this document are
+  reproducible rather than remembered. The prototypes used to produce them are
+  labelled as prototypes.
+- **Must-reject: 21 fixtures** (Appendix A.1).
+- **Must-accept: 31 fixtures** (Appendix A.2), each with `accept` recorded
+  explicitly. A **compatibility** corpus: its purpose is to make
+  over-tightening fail loudly, and it is not a safety corpus.
+- **Accepted-but-slow corpus:** `^a*a*a*b$`, `a+b`, `(a|b)+x`, `.*x.*`. Pinned
+  **behaviourally**, never by timing: over-cap subjects never reach the matcher;
+  exactly-at-cap subjects reach it unchanged; an expensive accepted pattern is
+  evaluated in the child and killed there. A test asserting "~75 ms" would fail
+  on a slower laptop while the guard is intact.
+- **Invalid-input fixtures:** patterns CPython itself refuses, including `(?i)`
   anywhere but the start (measured: `re.error: global flags not at the start`),
-  saved as a rejection carrying CPython's own message.
-- **Accepted-but-slow corpus.** `^a*a*a*b$` and the unanchored-restart cases
-  like `a+b` live here, **not** in the must-reject corpus: the structural rules
-  accept them, and their cost is held by the length cap and the deadline.
-  Pinned **behaviourally**, never by timing: a subject over the cap never
-  reaches the matcher; a subject exactly at the cap reaches it unchanged;
-  an expensive accepted pattern is evaluated in the child and is killed there.
-  The §2 numbers are illustrative observations about one machine, not
-  acceptance criteria, and a test that asserts "~75 ms" would fail on a slower
-  laptop while passing on a machine where the guard is broken.
-- **Mutation pins.** Each rule (R1, R2, R3, each analysis bound, the length
-  cap) gets a pin that breaks when the rule is weakened, so deleting a rule
-  turns a test red rather than silently widening the accepted set.
-- **Shape pins.** Two of them. One asserting the parse-tree shapes the adapter
-  reasons about (a repetition node's body is reachable; repetition and group
-  bodies come back as the expected container type). One asserting the
-  normalisation from §3: `(a|b)+x` produces **no** `BRANCH` node and
-  `(a|aa)+b **does**. A CPython refactor must surface as a failing test, never
-  as silent acceptance.
-- **Shared-semantics pins** for the helper behind both paths, covering every row
-  of the §8 table — including that `SUBJECT_TOO_LONG` leaves
-  `consecutive_failures` untouched and writes no dedup row.
-- **Per-interpreter gate.** The corpora run on **3.12 and 3.13**, which is the
-  supported-runtime set for this contract even though `pyproject` declares the
-  broader floor `>=3.12`; adopting a further interpreter requires re-running the
-  corpora before that build ever polls mail.
+  rejected with CPython's own message.
+- **Mutation pins:** R1, R2, R3, each size bound, the decoded cap and the raw
+  limit each get a pin that fails when the rule is weakened.
+- **Shape pins**, three of them, because the representation has already bitten
+  twice: (i) a repetition node's body is reachable and `SubPattern` is not a
+  `list`; (ii) node detection accepts **both** tuples and two-element lists, so a
+  CPython change to either cannot silently hide branch bodies; (iii) `(a|b)+x`
+  produces **no** `BRANCH` node while `(a|aa)+b` **does**.
+- **Interface pins** for §10: analysis-timeout is distinguishable from
+  infrastructure-unavailable; a validator that cannot run never yields
+  acceptance.
+- **Per-interpreter gate.** The corpora run on **3.12 and 3.13**, the supported
+  set for this contract even though `pyproject` declares `>=3.12`; no further
+  interpreter may poll mail before they have been run on it.
 
-## 10. Where it runs
+## 10. Where it runs, and the validation boundary
 
-One module owns the contract. It is called from three places, all of which must
-use the same code:
+One module owns the contract, and **all** pattern work — parsing, the traversal,
+compilation, and any probe — is delegated to the killable child through a single
+`analyze` operation, so a pathological pattern cannot hang validation the way
+`(a+)+\d+$` once hung the pre-validation probe. Nothing in the dashboard process
+parses an operator-supplied pattern.
 
-1. **Dashboard save path** (M4) — refuses the write, names the rule.
-2. **The killable child**, as a new `analyze` op — so the analysis itself runs
-   inside the deadline, and a pathological pattern cannot hang validation the
-   way `(a+)+\d+$` once hung the pre-validation probe.
-3. **Startup pre-validation** of filters already in the database, for rows
-   edited by hand or written by an older version; a refused stored filter
-   behaves as `INVALID_PATTERN` for that mailbox rather than starting a poll
-   loop that will misbehave.
+The parent-side interface returns a typed result, never a bool:
+
+| result | meaning | caller's action |
+| --- | --- | --- |
+| `VALID` | accepted by R1/R2/R3 and inside all bounds | save / poll |
+| `REJECTED` with rule name | structural rule or bound fired | save refused, rule shown |
+| `UNSUPPORTED` | backreference or unknown opcode | save refused |
+| `ANALYSIS_TIMEOUT` | the analysis itself blew its budget | save refused; **not** `UNAVAILABLE` |
+| `UNAVAILABLE` | child could not run | nothing is decided; never treated as acceptance |
+
+Analysis compiles with the **same flags as matching** (`re.IGNORECASE`), so
+validator and matcher cannot disagree about the expression they were both handed.
+
+Three call sites, all through that interface:
+
+1. **Dashboard save path** — the primary gate: nothing is persisted that the
+   contract rejects.
+2. **The child**, as the `analyze` op that performs the work above.
+3. **Startup pre-validation** of rows already in the database (hand-edited, or
+   written by an older version), behaving as `INVALID_PATTERN` for that mailbox.
+
+Startup validation alone is insufficient, because the dashboard makes filters
+mutable at runtime. So a pattern is only ever used for matching if it was
+validated **in this process run against that exact pattern string**: the poller
+compares the stored pattern's hash against the validated one and re-validates on
+any difference, including edits made while polling is running.
 
 Probes and the ratio gate stay where they are, re-described per §6.
 
 ## 11. Residual risk register (accepted, dated 2026-11-14)
 
-1. Accepted patterns may be superlinear. The worst cost measured after the
-   length cap was ~75 ms per message for `^a*a*a*b$`-class at the cap, on one
-   machine — an **observation, not a bound**: more sequential repetitions can
-   exhaust the deadline on shorter inputs, which is why §5 stays necessary.
-2. Sustained hostile traffic can still burn `deadline × concurrent children` of
-   CPU. The controls bound work per attempt, not aggregate capacity; the only
-   aggregate bound that exists is the concurrency already in the system (§2).
-3. The 2 s figure is a child-attempt bound; end-to-end poll latency under a
-   stalled IMAP server is separately known to exceed Docker's stop grace and is
-   tracked as M4 work.
-4. `re._parser` is private; the mitigation is fail-closed traversal plus the
+1. Accepted patterns may be superlinear: `(a|b)+x` measured 0.006 s at the cap
+   and 1.39 s at 16 000 characters. Inside the cap this is cheap; the cap is
+   what makes it cheap.
+2. Worst case per hostile message per mailbox is **~6 s of child CPU** (three
+   attempts, §2), not 2 s. Closing it to one attempt is named work.
+3. Sustained hostile traffic can burn `enabled mailboxes × deadline` of CPU;
+   there is no aggregate admission control and §13 keeps it that way.
+4. Poll latency is not bounded by 2 s or 6 s: stalled IMAP is separately known
+   to exceed Docker's stop grace and is tracked as M4 work.
+5. `re._parser` is private and its representation is already irregular (tuple
+   nodes and list nodes coexist). Mitigation is fail-closed traversal plus three
    shape pins, not API stability.
-5. R1 rejects some non-catastrophic patterns — `(Re: |WG: )+` and `(yes|no)*!`
-   are the named examples, both in the must-reject corpus so a relaxation has to
-   be deliberate. Their operators lose a construct and gain a precise message.
-6. Mail with subjects over 1000 code points is never auto-ingested. On this
-   deployment that is an accepted ingestion limit, made countable rather than
-   silent.
+6. R1/R2 reject patterns that are not dangerous — `(Re: |WG: )+` measured 0.009 s
+   at the cap — and the accepted/rejected boundary in that corner is decided by
+   CPython's normalisation rather than by cost. Operators lose a construct and
+   gain a rule name.
+7. **Header decoding runs before any deadline.** Bounded by the 32 768-character
+   raw limit; measured 155 ms at 200 000 raw characters, so the residual is
+   roughly 150 ms per mail with a maximal subject header, once per message,
+   unkillable.
+8. Mail with subjects over the decoded cap, or raw headers over the raw limit, is
+   never auto-ingested **when a subject filter is configured**. Accepted
+   ingestion limit; countable, but the count is approximate (§8).
 
 ## 12. Deviations
 
 - **From the M3 gate wording** ("conservative accepted subset"): replaced by the
-  layered heuristic of §1, with the guarantee restated as bounded work per
-  attempt rather than bounded complexity. This is the deliberate substitution §1
-  asks to be read as.
+  layered heuristic of §1, guarantee restated as bounded work per attempt within
+  a bounded attempt count.
 - **From `spec.md` §5.6 / §5.7**: the spec describes validation as "reject
   patterns that show super-linear backtracking on sample input", i.e. probe
-  based. §6 forbids probes as acceptance evidence, so the spec's wording is
-  superseded: probes refuse, structure accepts, and the length cap plus the
-  child deadline bound the cost.
+  based. §6 forbids probes as acceptance evidence: probes refuse, structure
+  accepts, caps restrict input, the deadline contains the rest.
 - **From shipped M3 behaviour**: `MAX_SUBJECT_CHARS` changes from truncation to
-  `SUBJECT_TOO_LONG` (§4), on the evidence that truncation is wrong in both
+  `SUBJECT_TOO_LONG` (§4.1), on the evidence that truncation is wrong in both
   directions.
-- **Supported runtimes**: this contract tests 3.12 and 3.13, which is narrower
-  than `pyproject`'s declared `>=3.12`. The declared floor is not raised here,
-  but no interpreter outside the tested pair may poll mail before the corpora
-  have been run on it (§9).
+- **From the first draft of this document**: the raw-header limit returns with a
+  different justification (decoder work, explicitly able to over-reject); the
+  "one budget-consuming attempt per message" claim is withdrawn; `MATCH`, the
+  counters and the OCR_CONCURRENCY citation are corrected; status changes from
+  "agreed design" to proposal.
+- **Supported runtimes**: tested on 3.12 and 3.13, narrower than `pyproject`'s
+  `>=3.12`. The floor is not raised, but no other interpreter polls mail before
+  the corpora pass on it.
 
 ## 13. Out of scope
 
 **New** aggregate admission control, rate limiting, a token bucket over filter
-evaluation, or a global matcher concurrency cap — the concurrency limits already
-in the system remain operative and are deliberately left alone, so nothing here
-should be read as a service-availability guarantee. Also out of scope: a
-load-dependent second, shorter deadline tier for oversized subjects (it would
-still skip mail, and its outcomes would depend on load); a complexity-guaranteed
-regex grammar; making the length cap configurable; a raw-header length shortcut
-(rejected in §4 because encoded-word whitespace makes inflation unbounded);
-branch-overlap analysis (§3); `regex`-module timeouts (a new dependency, and
-`spec.md` §7 pins `regex` for a different reason); changing `\Seen`/cursor
-semantics for `TIMEOUT`.
+evaluation, or a global matcher concurrency cap; exact-once retirement counting
+(an identity key plus an idempotency table); a load-dependent second, shorter
+deadline tier for oversized subjects; a complexity-guaranteed regex grammar;
+branch-overlap or branch-language analysis, which is where "reject only when the
+alternatives overlap" leads; making either cap configurable; a
+shared-across-retries deadline (named in §2 as the fix for residual 2, but not
+delivered here); `regex`-module timeouts; changing `\Seen`/cursor semantics for
+`TIMEOUT`.
+
+## Appendix A — corpora of record
+
+### A.1 Must-reject (21)
+
+| fixture | rule |
+| --- | --- |
+| `(a+)+$` | R1 |
+| `(a|aa)+b` | R2 |
+| `(a|aa)+$` | R2 |
+| `^(\w+\s?)*$` | R1 |
+| `(Rechnung|Invoice)\s*(\d+\s*)+$` | R1 |
+| `^(Rechnung|Invoice)[ ]*(\d+)+$` | R1 |
+| `(a+)+\d+$` | R1 |
+| `(x+x+)+y` | R1 |
+| `(\s*\w+\s*){1,10}rechnung` | R1 |
+| `(a)\1+rechnung` | R1, R3 (backreference) |
+| `^(a*){20}b$` | R1 |
+| `(a?)*b` | R1 |
+| `(?:(a)|a)+x` | R2 |
+| `^(a?){1000}a{1000}$` | R1 |
+| `^(a?){100}a{100}$` | R1 |
+| `(a?){10}b` | R1 |
+| `^(a|a?){50}b$` | R1, R2 |
+| `(a{1,3}){40}x` | R1 |
+| `^(a|ab){40}x` | R2 |
+| `(Re: |WG: )+` | R2 — **documented cost**, measured 0.009 s at the cap |
+| `(yes|no)*!` | R2 — **documented cost** |
+
+**R2 is load-bearing, not decoration.** The attributions above are the
+prototype's own output, and R1 alone misses every pure-alternation case:
+CPython factors the common prefix out of `(a|aa)` into `a(?:|a)`, whose width
+looks fixed to a width computation that sums a branch's alternatives. A correct
+per-branch width analysis would recover some of them, and is deliberately not
+written, because R2 rejects the whole class outright for two lines of code. A
+pin should assert this division of labour — R1 alone does **not** reject
+`(a|aa)+b` — so that nobody deletes R2 on the assumption that R1 subsumes it.
+
+`^(?:\d{1,3}\.){3}\d{1,3}$`, `^\d{1,3}(\.\d{1,3}){3}$` and `^(foo|bar){2}$` are
+also rejected (R1 / R2) and are recorded here as additional costs so a future
+relaxation has to be deliberate.
+
+### A.2 Must-accept (31)
+
+`.*rechnung.*` · `Rechnung` · `^Rechnung[- ]?\d{3,6}$` · `\b(Rechnung|Invoice)\b`
+· `^(?:Rechnung|Invoice|Re)\b.*` · `IN[0-9/\-]{4,12}` · `\d{4}-\d{4}` ·
+`^\S+@\S+\.\S+$` · `^(Rechnung|Rechnungen)\s*#?\d*` · `(?i)rechnung` ·
+`[^@]*@[^@]*` · `^\s*(Rechnung|Invoice)\s+\d+\s*$` · `^.*\bMahnung\b.*$` ·
+`(?<!\w)#\d+` · `^Q-?\d{5}$` · `\b(19|20)\d{2}\b` · `^(?!Abmeldung).*Rechnung.*` ·
+`invoice[-_ ]?\d+` · `^(R|I)N-\d{6}$` · `^Rechnung[- ]?(1|II)?$` ·
+`^(Rechnung|Invoice)?$` · `^(?:Rechnung|Invoice)?\s*\d+$` · `(R|I)?N\d{6}` ·
+`(a|b)*x` · `(a|b)+x` · `(a|aa){0,1}b` · `^\d{4}-\d{2}-\d{2}$` ·
+`^IN-\d{6}( / \d{4})?$` · `(?i)^(re:|wg:)? ?rechnung\b` · `^\d{4}-\d{4}$` ·
+`^Q-?\d{5}$`
+
+None of these is a safety claim. `(a|b)+x` and `.*rechnung.*` are accepted and
+are superlinear; they are cheap only because of the decoded cap.
