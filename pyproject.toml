@@ -7,6 +7,13 @@ requires-python = ">=3.12"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = ["integration: requires the scratch Papra compose stack"]
+# Every test must terminate: two guard pins (the mailbox-enabled loop break and
+# the subject-filter pre-validation) detect a regression by HANGING, which with
+# no timeout means a stalled suite and no failing test to point at. 120 s is
+# ~30x the slowest test today (4.1 s, the SIGKILL-orphan pin) and generous for
+# the stack-backed integration tests. Signal method (the POSIX default) raises
+# inside the test so a test's own finally blocks still reap its regex children.
+timeout = 120
 
 [tool.ruff]
 line-length = 100
