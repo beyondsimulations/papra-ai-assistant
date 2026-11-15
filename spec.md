@@ -73,7 +73,16 @@ Tables: `orgs` (id, papra_org_id, name), `mailboxes` (id, org_id, host, port, us
 ### 5.3 Mail poller
 
 - Per mailbox: connect (IMAP with SSL or STARTTLS per config), fetch unread messages since last seen UID, process only attachments with mime type `application/pdf` (sniff by magic bytes `%PDF-`, not only the declared mime type: mail clients frequently mislabel). Non-PDF attachments are logged and skipped; a message containing only non-PDF attachments is not counted as processed.
-- Apply optional subject regex filter per mailbox.
+- Admission is by SENDER, not by subject (changed 2026-11-15; the per-mailbox
+  subject regex was removed — see
+  `docs/superpowers/specs/2026-11-15-ingest-simplification-and-sender-allowlist-design.md`).
+  The deployment is one dedicated inbox that only the operator forwards into: a
+  human decides what belongs in Papra, so nothing reads the subject to decide.
+  Admission is decided on the fetched HEADERS, before a body is requested.
+  An allow-list entry is an exact address or a whole domain; an empty or absent
+  `PAPRA_ALLOWED_SENDERS` PAUSES ingestion rather than retiring mail; a
+  malformed `From:` is refused as ambiguous rather than interpreted. It filters
+  mail CLAIMING an admitted identity — it does not defeat spoofing.
 - Dedup: hash (mailbox, message-id, attachment filename, attachment size); skip known hashes.
 - Filename handling: sanitize; keep original name as the Papra document name initially (title generation replaces it later).
 - Optional delete-after-download per mailbox, default false, only mark as read otherwise. If enabled: a message is deleted only after every PDF attachment in it was uploaded successfully; a message with failed uploads stays in the mailbox for the next poll (dedup prevents double uploads).
@@ -107,7 +116,9 @@ Tables: `orgs` (id, papra_org_id, name), `mailboxes` (id, org_id, host, port, us
 
 ## 6. Configuration
 
-Env vars (all required unless marked optional): `PAPRA_BASE_URL` (internal, e.g. `http://papra:1221`), `PAPRA_API_KEY`, `LLM_BASE_URL`, `LLM_API_KEY`, `TITLE_MODEL`, `OCR_MODEL`, `ADMIN_PASSWORD`, `DASHBOARD_BIND` (default `127.0.0.1:8080`), `DATA_DIR` (default `/app/data`), `OCR_MAX_PAGES` (default 50), `OCR_PAGE_PIXEL_BUDGET` (default 2000000), `OCR_DPI` (default 150). Mailbox config lives in the dashboard/DB, not env.
+Env vars (all required unless marked optional): `PAPRA_BASE_URL` (internal, e.g. `http://papra:1221`), `PAPRA_API_KEY`, `LLM_BASE_URL`, `LLM_API_KEY`, `TITLE_MODEL`, `OCR_MODEL`, `ADMIN_PASSWORD`, `DASHBOARD_BIND` (default `127.0.0.1:8080`), `DATA_DIR` (default `/app/data`), `OCR_MAX_PAGES` (default 50), `OCR_PAGE_PIXEL_BUDGET` (default 2000000), `OCR_DPI` (default 150), `PAPRA_ALLOWED_SENDERS` (comma-separated addresses and
+domains; **required in practice**: with no usable entry the poller pauses instead
+of ingesting). Mailbox config lives in the dashboard/DB, not env.
 
 ## 7. Deployment
 
