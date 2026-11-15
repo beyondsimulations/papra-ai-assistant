@@ -112,6 +112,22 @@ size-cap logic requires, so batching them is a later optimization, not a claim h
 Mutants killed: removing the header gate (the body-request test fails), dropping
 `batch.denied` from the poll loop (counters and the cursor fail).
 
+## Task 3b — open, found in review, NOT yet fixed
+
+1. **An unrecognised FETCH response can lose mail.** Both the header fetch and the
+   body fetch treat a response whose literal cannot be matched as "the message
+   vanished" and skip it. If a later uid succeeds in the same poll, `last_seen_uid`
+   advances past the skipped one and it is never searched again — silent loss, not a
+   retry. Skipping is only safe when disappearance is *confirmed*; an unexpected
+   response shape (PARTIAL, untagged-only, a literal for a different uid) must abort
+   the batch so the cursor cannot pass it, and must never be recorded as a sender
+   refusal. Needs a response-shape check that verifies the returned uid/section, plus
+   a test that a low skipped uid cannot be bypassed by a higher successful one.
+2. **A test does not test its name.** `test_a_refusal_before_a_failed_upload_still_advances_the_cursor`
+   uses the ordinary StubClient, so it asserts the success path while claiming to
+   assert a failed upload. Needs a failing client and cursor == 1.
+3. No tested replay path for refused mail after the operator edits the allow-list.
+
 ## Task 4: authentication evidence — blocked, by design
 
 No `Authentication-Results` parsing until the chosen provider is verified to strip or

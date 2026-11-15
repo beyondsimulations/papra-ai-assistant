@@ -181,6 +181,20 @@ class TestHeaderFieldExtraction:
             assert isinstance(extract_from_field(raw), str)
             assert al.admit_headers(raw) != PERMISSION
 
+    def test_the_address_must_be_literally_inside_the_brackets(self):
+        # parseaddr removes spaces inside an angle-addr, so it can return an
+        # address the header never contained. Both of these were admitted as
+        # valid addresses before the bracket contents were checked directly.
+        assert parse_from_header("<a@x.com more>") is None
+        assert parse_from_header("<a @x.com>") is None
+        # whitespace INSIDE the brackets is folding, not a different
+        # address — this one is legitimately a@x.com
+        assert parse_from_header("< a@x.com >") == "a@x.com"
+        assert parse_from_header("Name <a@x.com> <b@evil.net>") is None
+        # and the honest shapes still work
+        assert parse_from_header("Name <a@x.com>") == "a@x.com"
+        assert parse_from_header('"a@x.com" <b@x.com>') == "b@x.com"
+
     def test_a_mangled_display_name_does_not_void_a_clean_address(self):
         # Display names carry no authorization weight: undecodable bytes in one
         # are cosmetic, and refusing here would deny ordinary mail.

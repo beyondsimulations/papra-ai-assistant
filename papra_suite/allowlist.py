@@ -86,6 +86,15 @@ def parse_from_header(value: str | None) -> str | None:
         # An angle-addr must end the value; anything after it is a second claim.
         if not text.endswith(">"):
             return None
+        # And the brackets must CONTAIN the address, unmodified. parseaddr is
+        # the same lenient machine as getaddresses: From: "<a @x.com>" parses to
+        # a@x.com and "<a@x.com more>" to a@x.commore, neither of which appears
+        # in the header the sender wrote. Requiring the literal bracketed
+        # content to be the address is what makes "we checked the header's own
+        # text" mean something.
+        bracketed = text[text.index("<") + 1: -1].strip()
+        if bracketed.lower() != addr or not _STRICT_ADDRESS.match(bracketed.lower()):
+            return None
     else:
         # Without angle brackets the value must be the address and nothing else.
         # Legacy "Display Name a@x.com" is refused with it: ambiguous, and not
