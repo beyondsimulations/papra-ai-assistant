@@ -2,7 +2,7 @@
 
 Companion to `spec.md` and to
 `docs/superpowers/specs/2026-11-12-papra-suite-implementation-decisions-design.md`.
-Status: **approved 2026-11-14 — ready for implementation planning.** This
+Status: **WITHDRAWN 2026-11-15 — subject filters are removed from the product; see 2026-11-15-ingest-simplification-and-sender-allowlist-design.md. Do not implement.** This
 document is a prerequisite gate for the M4 dashboard: an operator must not be
 given a text box that writes a regex into the poll loop until the rules below
 decide what that box accepts.
