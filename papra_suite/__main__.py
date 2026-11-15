@@ -110,10 +110,20 @@ def main() -> int:
             if args.dry_run:
                 print("dry run: nothing changed")
                 return 0
-            previous = store.reset_mailbox_cursor(args.mailbox_id,
-                                                  from_uid=args.from_uid)
+            try:
+                previous = store.reset_mailbox_cursor(args.mailbox_id,
+                                                      from_uid=args.from_uid)
+            except ValueError as error:
+                print(f"replay refused: {error}", file=sys.stderr)
+                return 2
             print(f"cursor rewound from {previous} to {args.from_uid}; "
                   "already-ingested documents are protected by content dedup")
+            if not mailbox.enabled:
+                print("mailbox was disabled by repeated poll failures and has been "
+                      "re-enabled; the poll loop restarts on its next interval")
+            if mailbox.last_seen_uid is not None:
+                print("note: run this while `serve` is stopped, or expect the poll "
+                      "in flight to write its own cursor when it finishes")
         finally:
             store.close()
         return 0

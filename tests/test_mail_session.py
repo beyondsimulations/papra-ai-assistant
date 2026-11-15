@@ -56,6 +56,17 @@ class FakeImap:
         self.no_search_deleted = no_search_deleted
         self.no_expunge = no_expunge
 
+    def select(self, mailbox="INBOX"):
+        # enough of a SELECT response for the real select_inbox to parse
+        return ("OK", [b"111"])
+
+    def response(self, name):
+        # SELECT-side untagged data (UIDVALIDITY) as the real parser expects it
+        return ("OK", [b"111"])
+
+    def capability(self):
+        return ("OK", [b" ".join(self.capabilities)])
+
     def expunge(self):
         self.expunge_calls += 1
         if self.no_expunge:
@@ -169,11 +180,10 @@ def test_fetch_since_filters_uid_edge():
     assert [uid for uid, _raw in batch.messages] == [7]
 
 
-def test_fetch_since_skips_size_probe_without_size_pattern():
-    # the size probe can also answer with a bare bytes status line that has
-    # NO RFC822.SIZE at all (message vanished; server reports FLAGS only):
-    # the no-match arm must return None -> the uid is skipped, never an
-    # AttributeError from a guardless int(match.group(1))
+def test_a_size_response_without_a_size_is_refused_not_read_as_absent():
+    # A FLAGS-only answer used to be read as "the message vanished" and skipped.
+    # That is the same silent-loss bug one layer down: absence has to be
+    # validated, not inferred from a response this client cannot read.
     session = make_session()
     good = b"Subject: ok\r\n\r\nbody"
     session._imap = FakeImap(
@@ -182,12 +192,23 @@ def test_fetch_since_skips_size_probe_without_size_pattern():
         size_responses={1: [b"1 (FLAGS (\\Deleted) UID 1)"]},  # no size pattern
     )
 
-    batch = session.fetch_since(None)
+    with pytest.raises(Exception) as excinfo:
+        session.fetch_since(None)
 
-    assert batch.messages == [(2, good)]
-    assert batch.oversized_uids == []
-    assert session._imap.size_probes == [1, 2]
-    assert session._imap.fetch_calls == [2]   # uid 1 is never fetched
+    assert "no RFC822.SIZE" in str(excinfo.value)
+    assert session._imap.fetch_calls == []    # batch aborted before any body
+
+
+def test_metadata_describing_another_uid_is_refused():
+    session = make_session()
+    good = b"Subject: ok\r\n\r\nbody"
+    session._imap = FakeImap(search_uids=(1,), bodies={1: good},
+                             size_responses={1: [b"9 (RFC822.SIZE 5 UID 9)"]})
+
+    with pytest.raises(Exception) as excinfo:
+        session.fetch_since(None)
+
+    assert "another message" in str(excinfo.value)
 
 
 def test_fetch_since_skips_oversized_message():

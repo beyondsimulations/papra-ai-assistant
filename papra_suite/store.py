@@ -460,7 +460,8 @@ class Store:
             )
 
     def reset_mailbox_cursor(self, mailbox_id: str, *,
-                             from_uid: int | None = None) -> int | None:
+                             from_uid: int | None = None,
+                             reenable: bool = True) -> int | None:
         """Rewind the poll cursor so mail is read again; returns the old cursor.
 
         This is the recovery path for a corrected sender allow-list: refused
@@ -471,16 +472,32 @@ class Store:
         """
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT last_seen_uid FROM mailboxes WHERE id = ?", (mailbox_id,)
+                "SELECT last_seen_uid, enabled FROM mailboxes WHERE id = ?",
+                (mailbox_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"unknown mailbox: {mailbox_id}")
+            previous, was_enabled = row[0], bool(row[1])
+            if from_uid is not None and from_uid < 0:
+                raise ValueError(f"from_uid must not be negative, got {from_uid}")
+            if previous is not None and from_uid is not None and from_uid > previous:
+                # This is a rewind. Moving the cursor forward would retire mail
+                # the operator never asked to skip — the mistake here is exactly
+                # the silent loss the fetch code spent this milestone removing.
+                raise ValueError(
+                    f"refusing to move the cursor forward ({previous} -> {from_uid}); "
+                    "replay only rewinds")
             self._conn.execute(
                 "UPDATE mailboxes SET last_seen_uid = ?, last_error = NULL, "
-                "consecutive_failures = 0 WHERE id = ?",
-                (from_uid, mailbox_id),
+                "consecutive_failures = 0, enabled = ? WHERE id = ?",
+                (from_uid, int(reenable), mailbox_id),
             )
-            return row[0]
+            # A mailbox disabled by three failed polls would otherwise stay
+            # disabled after a successful replay: the counters were cleared but
+            # the poll loop exits when the row says enabled = 0, so the operator
+            # would rewind and still see nothing happen.
+            self._replayed = (previous, was_enabled)
+            return previous
 
     def record_poll_failure(self, mailbox_id: str, error: str, *,
                             disable_after: int = 3) -> None:

@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 import pytest
 
 from papra_suite.allowlist import PERMISSION, parse_allowlist
-from papra_suite.mail import FetchBatch, PollResult, poll_mailbox_once
+from papra_suite.mail import FetchBatch, MailboxSession, PollResult, poll_mailbox_once
 from papra_suite.store import Mailbox, Org, Store
+from tests.test_mail_session import FakeImap
 
 
 def make_mailbox(**overrides):
@@ -938,3 +939,130 @@ async def test_an_oversized_message_is_still_counted_alongside_refusals(
 
     assert result.oversized_skipped == 1 and result.senders_denied == 1
     assert result.messages_scanned == 2
+
+
+async def test_malformed_metadata_on_a_low_uid_cannot_be_bypassed_by_a_good_one(
+    store, monkeypatch
+):
+    """Through the REAL MailboxSession, not a fake that volunteers an exception:
+    uid 1 answers its metadata unreadably, uid 2 is fine. If the unreadable
+    answer were read as "gone", the cursor would reach 2 and uid 1 would be lost
+    without an error, a refusal or a log line."""
+
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    org = store.get_org(org_id)
+    good = build_raw(message_id="<m2@x>", attachments=[("b.pdf", b"%PDF-2")])
+    imap = FakeImap(
+        search_uids=(1, 2),
+        bodies={1: build_raw(message_id="<m1@x>", attachments=[("a.pdf", b"%PDF-1")]),
+                2: good},
+        size_responses={1: [b"1 (FLAGS (\\Seen) UID 1)"]},  # no size at all
+    )
+    monkeypatch.setattr("papra_suite.mail.MailboxSession",
+                        lambda **kw: ScriptedSession(imap))
+    client = StubClient()
+
+    result = await poll_with_allow_list(store, client, store.get_mailbox(mailbox_id), org)
+
+    # assert the CAUSE, not merely that something failed: a test that passes
+    # because the fake lacked a method would guard nothing
+    assert "RFC822.SIZE" in (result.error or "")
+    assert client.uploads == []
+    assert result.senders_denied == 0 and result.malformed_senders == 0
+    assert store.get_mailbox(mailbox_id).last_seen_uid is None
+
+
+class ScriptedSession(MailboxSession):
+    """A real MailboxSession over a scripted IMAP double: only the socket is
+    faked, so fetch_since, select_inbox and the metadata rules under test are
+    the production ones."""
+
+    def __init__(self, imap):
+        super().__init__(host="imap.test", port=993, username="u", password="p",
+                         ssl_mode="plain")
+        self._imap = imap
+
+    def connect(self):
+        pass
+
+
+async def test_replay_after_fixing_the_allow_list_ingests_once_and_never_twice(
+    store, monkeypatch
+):
+    """The recovery story end to end, because "refused mail can come back" is a
+    claim about three steps, not one.
+
+    refused → operator fixes the list → rewind → ingested → rewind again →
+    content dedup stops a second copy. A replay that double-ingested would be
+    worse than no replay at all.
+    """
+    from papra_suite.store import Store
+
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    org = store.get_org(org_id)
+    raws = [(1, build_raw(message_id="<m1@x>", sender="Accounting <books@other.net>",
+                         attachments=[("inv.pdf", b"%PDF-1")]))]
+
+    async def poll(allow):
+        session = FakeSession(raws=list(raws))
+        monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+        client = StubClient()
+        result = await poll_mailbox_once(store, client, store.get_mailbox(mailbox_id),
+                                         org, allowlist=parse_allowlist(allow))
+        return session, client, result
+
+    # 1. refused: nothing uploaded, cursor moved past it
+    _session, client, first = await poll("x.com")
+    assert client.uploads == [] and first.senders_denied == 1
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 1
+
+    # 2. the operator adds the sender and rewinds
+    store.reset_mailbox_cursor(mailbox_id)
+
+    # 3. ingested
+    _session, client, second = await poll("x.com, other.net")
+    assert [name for _org, name, _b in client.uploads] == ["inv.pdf"]
+    assert second.senders_denied == 0
+
+    # 4. a second replay must not create a second copy
+    store.reset_mailbox_cursor(mailbox_id)
+    _session, client, third = await poll("x.com, other.net")
+    assert client.uploads == []
+    assert third.documents_uploaded == 0
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 1
+
+
+async def test_replay_refuses_to_move_the_cursor_forward(store):
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    store.record_poll_success(mailbox_id, last_seen_uid=50, uidvalidity="111")
+
+    with pytest.raises(ValueError) as excinfo:
+        store.reset_mailbox_cursor(mailbox_id, from_uid=60)
+
+    assert "forward" in str(excinfo.value)
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 50
+
+
+async def test_replay_re_enables_a_mailbox_disabled_by_repeated_failures(store):
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    for _ in range(3):
+        store.record_poll_failure(mailbox_id, "unreadable fetch response")
+    assert store.get_mailbox(mailbox_id).enabled is False
+
+    store.reset_mailbox_cursor(mailbox_id)
+
+    revived = store.get_mailbox(mailbox_id)
+    assert revived.enabled is True
+    assert revived.consecutive_failures == 0 and revived.last_error is None

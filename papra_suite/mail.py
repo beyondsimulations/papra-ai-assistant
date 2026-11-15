@@ -176,6 +176,9 @@ def compute_file_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+VANISHED = object()  # validated absence, not "could not read"
+
+
 class MailboxSession:
     """Sync imaplib wrapper — every method runs inside asyncio.to_thread."""
 
@@ -249,7 +252,7 @@ class MailboxSession:
             # (RFC822.SIZE) before requesting the body: a hostile oversized
             # message must not be fully read into RAM just to be skipped.
             size = self._rfc822_size(uid)
-            if size is None:
+            if size is VANISHED:
                 logger.warning("message uid=%s vanished before fetch; skipping", uid)
                 continue
             total_bytes += size
@@ -320,7 +323,7 @@ class MailboxSession:
         # metadata probe is the cheapest way to ask. Anything else — PARTIAL,
         # untagged-only, a shape this client does not understand — means the
         # message is still there and we did not read it.
-        if self._rfc822_size(uid) is None:
+        if self._rfc822_size(uid) is VANISHED:
             return None
         raise imaplib.IMAP4.error(
             f"UID FETCH for {uid} returned no message data while the message is "
@@ -328,16 +331,34 @@ class MailboxSession:
             "read"
         )
 
-    def _rfc822_size(self, uid: int) -> int | None:
-        """Return the message's RFC822.SIZE, or None if it vanished/parse failed."""
+    def _rfc822_size(self, uid: int) -> int | object:
+        """The message's RFC822.SIZE, or VANISHED — never both meanings at once.
+
+        Returning None for "gone" and also for "I could not read that" was the
+        same bug one layer down: every caller read None as "skip it", so a
+        malformed metadata response let the cursor walk past a message that was
+        never decided. Absence has to be VALIDATED, not inferred from confusion.
+        """
         status, fetch_data = self._imap.uid("FETCH", str(uid), "(RFC822.SIZE)")
         if status != "OK":
             raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
         entry = fetch_data[0] if fetch_data else None
+        if entry is None or entry == [None] or entry == b"":
+            return VANISHED
         if not isinstance(entry, bytes):
-            return None
+            raise imaplib.IMAP4.error(
+                f"UID FETCH for {uid} returned unreadable metadata "
+                f"({entry!r:.60}); not treating that as a deleted message")
+        if not re.search(rf"\bUID {uid}\b", entry.decode("ascii", errors="replace")):
+            raise imaplib.IMAP4.error(
+                f"UID FETCH for {uid} returned metadata describing another message "
+                f"({entry!r:.60})")
         match = re.search(rb"RFC822\.SIZE\s+(\d+)", entry)
-        return int(match.group(1)) if match else None
+        if match is None:
+            raise imaplib.IMAP4.error(
+                f"UID FETCH for {uid} carried no RFC822.SIZE; refusing to guess "
+                "whether the message exists")
+        return int(match.group(1))
 
     def mark_seen(self, uids: list[int]) -> None:
         for uid in uids:
