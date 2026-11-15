@@ -2,7 +2,11 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:  # annotation only: allowlist imports ConfigError from here
+    from papra_suite.allowlist import AllowList
 
 
 class ConfigError(Exception):
@@ -26,6 +30,7 @@ class AppConfig:
     ocr_dpi: int
     ocr_concurrency: int
     sweep_interval_s: int
+    allowed_senders: "AllowList"
 
 
 DEFAULT_BIND = "127.0.0.1:8080"
@@ -211,6 +216,15 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
 
     host, port = _parse_bind(env.get("DASHBOARD_BIND", "").strip() or DEFAULT_BIND)
 
+    # Local import on purpose: allowlist raises ConfigError from this module, so
+    # a module-level import here would be a cycle. Parsing at load time is the
+    # point — a nonsense entry must stop `check` and `serve` at startup rather
+    # than quietly vanish and leave the operator believing an entry that grants
+    # nothing.
+    from papra_suite.allowlist import parse_allowlist
+
+    allowed_senders = parse_allowlist(env.get("PAPRA_ALLOWED_SENDERS", ""))
+
     return AppConfig(
         papra_base_url=_require_base_url(env, "PAPRA_BASE_URL"),
         papra_api_key=_require(env, "PAPRA_API_KEY"),
@@ -227,4 +241,5 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
         ocr_dpi=_int_env(env, "OCR_DPI", 150),
         ocr_concurrency=min(_int_env(env, "OCR_CONCURRENCY", 3), 3),
         sweep_interval_s=_int_env(env, "SWEEP_INTERVAL_S", 300),
+        allowed_senders=allowed_senders,
     )

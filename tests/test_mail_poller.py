@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from papra_suite.allowlist import parse_allowlist
 from papra_suite.mail import FetchBatch, PollResult, poll_mailbox_once
 from papra_suite.store import Mailbox, Org, Store
 
@@ -23,9 +24,21 @@ def make_mailbox(**overrides):
 ORG = Org(id="org_local", papra_org_id="org_papra", name="Test")
 
 
-def build_raw(subject="Invoice", message_id="<m1@x>", attachments=(("a.pdf", b"%PDF-1"),)):
+# x.com covers the fixture's sender. Tests that care about admission build their
+# own list; everything else just needs to get past the gate to reach the mail
+# pipeline under test.
+ALLOW = parse_allowlist("x.com")
+
+
+async def poll_with_allow_list(store, client, mailbox, org):
+    return await poll_mailbox_once(store, client, mailbox, org, allowlist=ALLOW)
+
+
+def build_raw(subject="Invoice", message_id="<m1@x>",
+              sender="Sender <sender@x.com>",
+              attachments=(("a.pdf", b"%PDF-1"),)):
     from tests.test_mail_parsing import build_raw as _build
-    return _build(subject=subject, message_id=message_id, attachments=[
+    return _build(subject=subject, message_id=message_id, sender=sender, attachments=[
         (name, content, ("application", "pdf")) for name, content in attachments
     ])
 
@@ -95,7 +108,7 @@ async def test_poll_uploads_pdf_and_enqueues_ocr(store, monkeypatch):
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
     client = StubClient()
 
-    result = await poll_mailbox_once(store, client, make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, client, make_mailbox(), ORG)
 
     assert result.documents_uploaded == 1 and result.error is None
     assert client.uploads == [("org_papra", "a.pdf", b"%PDF-1")]
@@ -114,7 +127,7 @@ async def test_poll_skips_non_pdf_and_marks_seen(store, monkeypatch, caplog):
     session = FakeSession(raws=[(1, raw)])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
 
     assert result.documents_uploaded == 0
     assert result.attachments_skipped == 1
@@ -126,9 +139,9 @@ async def test_poll_dedup_prevents_double_upload(store, monkeypatch):
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
     client = StubClient()
 
-    await poll_mailbox_once(store, client, make_mailbox(), ORG)
+    await poll_with_allow_list(store, client, make_mailbox(), ORG)
     # same message again (e.g. failed upload of a LATER message kept it fetchable)
-    result = await poll_mailbox_once(store, client, make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, client, make_mailbox(), ORG)
 
     assert result.documents_uploaded == 0
     assert len(client.uploads) == 1
@@ -142,7 +155,7 @@ async def test_poll_upload_failure_does_not_advance_last_seen(store, monkeypatch
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
     client = StubClient(fail_for={"bad.pdf"})
 
-    result = await poll_mailbox_once(store, client, make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, client, make_mailbox(), ORG)
 
     assert result.documents_uploaded == 1 and result.messages_failed == 1
     assert session.seen == [2]             # only the successful message is read
@@ -156,7 +169,7 @@ async def test_poll_delete_after_download(store, monkeypatch):
     session = FakeSession(raws=[(1, build_raw())])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    await poll_mailbox_once(store, StubClient(), make_mailbox(delete_after_download=True), ORG)
+    await poll_with_allow_list(store, StubClient(), make_mailbox(delete_after_download=True), ORG)
 
     assert session.seen == [1] and session.deleted == [1]
 
@@ -166,7 +179,7 @@ async def test_poll_delete_not_triggered_on_upload_failure(store, monkeypatch):
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
     client = StubClient(fail_for={"bad.pdf"})
 
-    await poll_mailbox_once(store, client, make_mailbox(delete_after_download=True), ORG)
+    await poll_with_allow_list(store, client, make_mailbox(delete_after_download=True), ORG)
 
     assert session.deleted == []           # stays in the mailbox for the next poll
     assert session.seen == []
@@ -177,7 +190,7 @@ async def test_poll_uidvalidity_change_rescans(store, monkeypatch):
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
     # mailbox claims uid 5 already seen under the OLD validity 111
-    result = await poll_mailbox_once(
+    result = await poll_with_allow_list(
         store, StubClient(), make_mailbox(last_seen_uid=5, uidvalidity="111"), ORG
     )
 
@@ -188,7 +201,7 @@ async def test_poll_connection_failure_records_error_not_crash(store, monkeypatc
     session = FakeSession(fail_on_connect=ConnectionRefusedError("refused"))
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
 
     assert result.error is not None and "refused" in result.error
     assert result.documents_uploaded == 0
@@ -202,7 +215,7 @@ async def test_poll_registers_mailbox_password_for_redaction(store, monkeypatch,
 
     import logging
     setup_logging(store)
-    await poll_mailbox_once(store, StubClient(), make_mailbox(password="box-secret-pw"), ORG)
+    await poll_with_allow_list(store, StubClient(), make_mailbox(password="box-secret-pw"), ORG)
     logging.getLogger("test").info("connection used password box-secret-pw")
     line = capsys.readouterr().out.strip().splitlines()[-1]
     assert "box-secret-pw" not in line
@@ -218,7 +231,7 @@ async def test_poll_updates_persisted_mailbox_state(store, monkeypatch):
 
     org = store.get_org(org_id)
     mailbox = store.get_mailbox(mailbox_id)
-    await poll_mailbox_once(store, StubClient(), mailbox, org)
+    await poll_with_allow_list(store, StubClient(), mailbox, org)
 
     updated = store.get_mailbox(mailbox_id)
     assert updated.last_seen_uid == 7
@@ -242,7 +255,7 @@ async def test_upload_failure_freezes_last_seen_prefix(store, monkeypatch):
 
     org = store.get_org(org_id)
     mailbox = store.get_mailbox(mailbox_id)
-    result = await poll_mailbox_once(store, client, mailbox, org)
+    result = await poll_with_allow_list(store, client, mailbox, org)
 
     # uid 1 failed: last_seen must not advance past it (uid 2's success must
     # not strand uid 1) — the empty-poll default 0 keeps uid 1 re-fetchable
@@ -250,7 +263,7 @@ async def test_upload_failure_freezes_last_seen_prefix(store, monkeypatch):
     assert result.documents_uploaded == 1
 
     # a follow-up poll re-fetches uid 1 (and retries its upload)
-    second = await poll_mailbox_once(
+    second = await poll_with_allow_list(
         store, client, store.get_mailbox(mailbox_id), org
     )
     assert second.messages_scanned == 2
@@ -275,7 +288,7 @@ async def test_rescan_failure_persists_zero_last_seen(store, monkeypatch):
 
     org = store.get_org(org_id)
     mailbox = store.get_mailbox(mailbox_id)
-    await poll_mailbox_once(store, client, mailbox, org)
+    await poll_with_allow_list(store, client, mailbox, org)
 
     # rescan saw nothing succeed: stale pre-rescan uid 5 must NOT be
     # restored — persist 0 so the failed message stays re-fetchable
@@ -299,7 +312,7 @@ async def test_poll_parses_messages_off_the_event_loop(store, monkeypatch):
     session = FakeSession(raws=[(1, build_raw())])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
 
     assert result.error is None and result.documents_uploaded == 1
     assert "parse_message" in threaded_calls
@@ -322,7 +335,7 @@ async def test_empty_non_rescan_poll_carries_last_seen_forward(store, monkeypatc
     mailbox = store.get_mailbox(mailbox_id)
     assert mailbox.last_seen_uid == 42
 
-    result = await poll_mailbox_once(store, StubClient(), mailbox, org)
+    result = await poll_with_allow_list(store, StubClient(), mailbox, org)
 
     assert result.error is None and result.messages_scanned == 0
     assert store.get_mailbox(mailbox_id).last_seen_uid == 42
@@ -355,12 +368,12 @@ async def test_poll_resumes_after_cap_truncated_batch(store, monkeypatch):
 
     org = store.get_org(org_id)
     mailbox = store.get_mailbox(mailbox_id)
-    result = await poll_mailbox_once(store, client, mailbox, org)
+    result = await poll_with_allow_list(store, client, mailbox, org)
 
     assert result.documents_uploaded == 3
     assert store.get_mailbox(mailbox_id).last_seen_uid == 3
 
-    second = await poll_mailbox_once(store, client, store.get_mailbox(mailbox_id), org)
+    second = await poll_with_allow_list(store, client, store.get_mailbox(mailbox_id), org)
 
     assert second.documents_uploaded == 2
     assert len(client.uploads) == 5
@@ -375,7 +388,7 @@ async def test_poll_never_raises_on_internal_error(store, monkeypatch):
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
     monkeypatch.setattr("papra_suite.mail.parse_message", _boom)
 
-    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
 
     assert result.error is not None and "boom" in result.error
     assert session.closed is True
@@ -394,7 +407,7 @@ async def test_upload_409_counts_as_already_ingested(store, monkeypatch):
 
     org = store.get_org(org_id)
     mailbox = store.get_mailbox(mailbox_id)
-    result = await poll_mailbox_once(store, client, mailbox, org)
+    result = await poll_with_allow_list(store, client, mailbox, org)
 
     # 409 = already ingested in papra: success, not a per-message failure
     assert result.messages_failed == 0 and result.error is None
@@ -406,7 +419,7 @@ async def test_upload_409_counts_as_already_ingested(store, monkeypatch):
     assert updated.last_error is None and updated.consecutive_failures == 0
 
     # dedup hash recorded: a re-poll uploads nothing and still succeeds
-    second = await poll_mailbox_once(store, client, updated, org)
+    second = await poll_with_allow_list(store, client, updated, org)
     assert second.messages_failed == 0 and second.error is None
     assert second.documents_uploaded == 0 and client.uploads == []
 
@@ -423,7 +436,7 @@ async def test_poll_survives_store_errors_in_recording(store, monkeypatch):
 
     # the store error must not escape poll_mailbox_once (never-raises):
     # the result still reports the connection failure
-    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
 
     assert isinstance(result, PollResult)
     assert result.error is not None and "refused" in result.error
@@ -443,7 +456,7 @@ async def test_poll_survives_store_errors_on_success_recording(store, monkeypatc
     # the success-recording twin: a locked store must not escape
     # poll_mailbox_once on a SUCCESSFUL poll either (the failure twin above
     # pins record_poll_failure); the result still reports the upload
-    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
 
     assert isinstance(result, PollResult)
     assert result.documents_uploaded == 1 and result.error is None
@@ -462,7 +475,7 @@ async def test_poll_connection_failure_disables_after_three(store, monkeypatch):
         monkeypatch.setattr(
             "papra_suite.mail.MailboxSession", lambda _s=session, **kw: _s
         )
-        result = await poll_mailbox_once(store, StubClient(), mailbox, org)
+        result = await poll_with_allow_list(store, StubClient(), mailbox, org)
 
     assert result.error is not None
     updated = store.get_mailbox(mailbox_id)
@@ -478,7 +491,7 @@ async def test_delete_not_triggered_for_non_pdf_only_message(store, monkeypatch)
     session = FakeSession(raws=[(1, raw)])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    result = await poll_mailbox_once(
+    result = await poll_with_allow_list(
         store, StubClient(), make_mailbox(delete_after_download=True), ORG
     )
 
@@ -503,7 +516,7 @@ async def test_oversized_message_does_not_advance_past_failure(store, monkeypatc
 
     org = store.get_org(org_id)
     mailbox = store.get_mailbox(mailbox_id)
-    result = await poll_mailbox_once(store, client, mailbox, org)
+    result = await poll_with_allow_list(store, client, mailbox, org)
 
     # uid 1 failed: last_seen stays 0 so it stays re-fetchable
     assert store.get_mailbox(mailbox_id).last_seen_uid == 0
@@ -532,7 +545,7 @@ async def test_store_stage_imap_error_never_raises(store, monkeypatch):
 
     org = store.get_org(org_id)
     mailbox = store.get_mailbox(mailbox_id)
-    result = await poll_mailbox_once(store, StubClient(), mailbox, org)
+    result = await poll_with_allow_list(store, StubClient(), mailbox, org)
 
     assert isinstance(result, PollResult)          # never raises
     assert result.error is not None and "STORE failed" in result.error
@@ -555,7 +568,7 @@ async def test_poll_advances_past_oversized_message(store, monkeypatch):
 
     org = store.get_org(org_id)
     mailbox = store.get_mailbox(mailbox_id)
-    result = await poll_mailbox_once(store, client, mailbox, org)
+    result = await poll_with_allow_list(store, client, mailbox, org)
 
     assert result.documents_uploaded == 1          # only the small message parsed
     assert len(client.uploads) == 1
@@ -574,7 +587,7 @@ async def test_poll_counts_oversized_messages(store, monkeypatch):
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
     client = StubClient()
 
-    result = await poll_mailbox_once(store, client, make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, client, make_mailbox(), ORG)
 
     assert result.error is None
     assert result.oversized_skipped == 3
@@ -595,7 +608,7 @@ async def test_poll_oversized_skipped_defaults_to_zero(store, monkeypatch):
     session = FakeSession(raws=[(1, build_raw())])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
 
     assert result.error is None
     assert result.oversized_skipped == 0
@@ -629,3 +642,165 @@ class StubMatcher:
 
     async def aclose(self):
         self.closed = True
+
+
+# --- sender allow-list ------------------------------------------------------
+#
+# The allow-list is the only thing deciding what enters Papra now, so these
+# cover the disposition, not just the parse: what happens to refused mail is
+# where data loss would live.
+
+async def test_denied_sender_is_retired_without_upload_or_poll_failure(store, monkeypatch):
+    """A stranger's mail is a NORMAL outcome, not a fault.
+
+    Three consecutive failures disable a mailbox, so if a refusal counted as a
+    failure, anyone who found the address could switch the mailbox off from
+    the outside.
+    """
+    session = FakeSession(raws=[(1, build_raw(sender="Stranger <spam@other.net>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    result = await poll_mailbox_once(store, client, make_mailbox(), ORG,
+                                     allowlist=parse_allowlist("x.com"))
+
+    assert result.error is None
+    assert client.uploads == []
+    assert result.messages_scanned == 1 and result.senders_denied == 1
+    assert result.documents_uploaded == 0
+    assert session.seen == [1] and session.deleted == []
+
+
+async def test_refused_mail_is_not_refused_again_on_every_poll(store, monkeypatch):
+    """Retiring a refused message must also advance the cursor."""
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    allow = parse_allowlist("x.com")
+
+    session = FakeSession(raws=[(1, build_raw(sender="Stranger <spam@other.net>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    first = await poll_mailbox_once(store, StubClient(), store.get_mailbox(mailbox_id),
+                                    store.get_org(org_id), allowlist=allow)
+    assert first.senders_denied == 1
+
+    updated = store.get_mailbox(mailbox_id)
+    assert updated.last_seen_uid == 1
+    assert updated.enabled is True and updated.consecutive_failures == 0
+
+    second = await poll_mailbox_once(store, StubClient(), updated,
+                                     store.get_org(org_id), allowlist=allow)
+    assert second.messages_scanned == 0 and second.senders_denied == 0
+
+
+async def test_unresolvable_sender_is_counted_as_malformed_not_as_a_denied_sender(
+    store, monkeypatch
+):
+    """The two verdicts must stay separate in the log and the counters: a
+    header that resolves to no address or to two is attacker-shaped input, and
+    reporting it as "a sender you might want to allow" teaches the operator to
+    add the wrong thing."""
+    session = FakeSession(raws=[(1, build_raw(sender=""))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    result = await poll_mailbox_once(store, client, make_mailbox(), ORG,
+                                     allowlist=parse_allowlist("x.com"))
+
+    assert result.malformed_senders == 1 and result.senders_denied == 0
+    assert result.error is None and client.uploads == []
+    assert session.seen == [1]
+
+
+async def test_an_unconfigured_allow_list_paused_rather_than_retiring(store, monkeypatch):
+    """No usable entry must PAUSE, not consume.
+
+    Marking mail seen while the operator is still writing PAPRA_ALLOWED_SENDERS
+    would retire the inbox one message at a time and leave nothing to recover
+    from the log. Nothing is fetched, nothing is marked seen, and the mailbox is
+    not failed — pausing is a decision to wait, not an outage.
+    """
+    session = FakeSession(raws=[(1, build_raw())])  # the usual allowed sender
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    result = await poll_mailbox_once(store, client, make_mailbox(), ORG,
+                                     allowlist=parse_allowlist(""))
+
+    assert result.ingestion_paused is True
+    assert result.error is None and result.senders_denied == 0
+    assert client.uploads == [] and session.seen == []
+    assert session.closed is False  # never even connected
+
+
+async def test_refused_mail_is_never_deleted_even_with_delete_after_download(
+    store, monkeypatch
+):
+    """Refusing a sender is not a licence to destroy the operator's mail. The
+    message stays on the server, which is what makes a corrected allow-list
+    recoverable instead of final."""
+    session = FakeSession(raws=[(1, build_raw(sender="Stranger <spam@other.net>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    await poll_mailbox_once(store, StubClient(), make_mailbox(delete_after_download=True),
+                            ORG, allowlist=parse_allowlist("x.com"))
+
+    assert session.deleted == []
+    assert session.seen == [1]
+
+
+async def test_refused_mail_does_not_let_the_cursor_pass_an_earlier_failure(
+    store, monkeypatch
+):
+    """Retiring a refused message must not launder the message before it that
+    failed to upload: the cursor stays behind the failure, or that document is
+    lost with nothing left to retry it."""
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    session = FakeSession(raws=[
+        (1, build_raw(message_id="<m1@x>", attachments=[("bad.pdf", b"%PDF-1")])),
+        (2, build_raw(message_id="<m2@x>", sender="Stranger <spam@other.net>")),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_mailbox_once(store, StubClient(fail_for={"bad.pdf"}),
+                                     store.get_mailbox(mailbox_id), store.get_org(org_id),
+                                     allowlist=parse_allowlist("x.com"))
+
+    assert result.senders_denied == 1
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 0
+
+
+async def test_a_forwarded_attachment_does_not_borrow_its_inner_sender(store, monkeypatch):
+    """The identity is the outer forwarding message. Anyone who can mail the
+    drop-box cannot get admitted by embedding a message from an allowed address
+    inside it — and the inner PDF stays out too, because the outer message was
+    refused before its parts were ever considered."""
+    raw = (
+        b"From: Stranger <spam@other.net>\r\n"
+        b"Message-ID: <outer@evil>\r\n"
+        b"Subject: invoice\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/mixed; boundary="b"\r\n\r\n'
+        b"--b\r\n"
+        b"Content-Type: message/rfc822\r\n\r\n"
+        b"From: Allowed <sender@x.com>\r\n"
+        b"Subject: looks trustworthy\r\n"
+        b"Content-Type: application/pdf\r\n"
+        b'Content-Disposition: attachment; filename="inner.pdf"\r\n'
+        b"Content-Transfer-Encoding: base64\r\n\r\n"
+        b"JVBERi0x\r\n"
+        b"--b--\r\n"
+    )
+    session = FakeSession(raws=[(1, raw)])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    result = await poll_mailbox_once(store, client, make_mailbox(), ORG,
+                                     allowlist=parse_allowlist("x.com"))
+
+    assert result.senders_denied == 1 and result.malformed_senders == 0
+    assert client.uploads == []

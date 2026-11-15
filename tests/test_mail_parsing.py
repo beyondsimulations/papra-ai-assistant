@@ -3,6 +3,8 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import pytest
+
 from papra_suite.mail import (
     Attachment,
     compute_file_hash,
@@ -15,13 +17,15 @@ from papra_suite.mail import (
 PDF_BYTES = b"%PDF-1.4 fake pdf body"
 
 
-def build_raw(*, subject="Invoice", message_id="<msg-1@example.com>", attachments=()):
+def build_raw(*, subject="Invoice", message_id="<msg-1@example.com>",
+              attachments=(), sender="sender@example.com"):
     message = EmailMessage()
-    message["From"] = "sender@example.com"
     message["To"] = "box@example.com"
     message["Subject"] = subject
     if message_id:
         message["Message-ID"] = message_id
+    if sender:
+        message["From"] = sender
     for filename, content, mime in attachments:
         message.add_attachment(content, maintype=mime[0], subtype=mime[1], filename=filename)
     return message.as_bytes()
@@ -210,3 +214,36 @@ def test_compute_file_hash():
     assert compute_file_hash(b"abc") == compute_file_hash(b"abc")
     assert compute_file_hash(b"abc") != compute_file_hash(b"abd")
     assert len(compute_file_hash(b"abc")) == 64
+
+
+# --- From: ambiguity at the parse layer ------------------------------------
+#
+# parse_message must not resolve ambiguity: it hands the allow-list either one
+# field's text or the ambiguity marker, and the marker is refused. Joining
+# duplicate fields into one string would let "a@x.com" plus an empty field
+# collapse into a single apparently valid address.
+
+def _raw_with(*headers):
+    return b"\r\n".join(h.encode() for h in headers) + b"\r\n\r\nbody"
+
+
+@pytest.mark.parametrize("second", ["From: spam@evil.net", "From: ", "From: tobi@x.com"],
+                         ids=["conflicting", "empty", "identical"])
+def test_duplicate_from_fields_are_ambiguous(second):
+    from papra_suite.allowlist import AMBIGUOUS_FROM
+    raw = _raw_with("From: tobi@x.com", second, "Subject: hi")
+    assert parse_message(raw).from_header == AMBIGUOUS_FROM
+
+
+def test_a_misleading_sender_header_does_not_change_the_identity():
+    # DMARC does not authenticate Sender:, so honouring it would hand the
+    # attacker the choice of which identity gets checked.
+    from papra_suite.allowlist import DENY_SENDER, parse_allowlist
+    raw = _raw_with("Sender: tobi@x.com", "From: spam@evil.net", "Subject: hi")
+    parsed = parse_message(raw)
+    assert parse_allowlist("x.com").verdict_for_header(parsed.from_header) is DENY_SENDER
+
+
+def test_a_missing_from_header_is_ambiguous():
+    from papra_suite.allowlist import AMBIGUOUS_FROM
+    assert parse_message(_raw_with("Subject: hi")).from_header == AMBIGUOUS_FROM

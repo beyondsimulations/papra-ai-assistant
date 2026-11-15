@@ -5,6 +5,7 @@ import pytest
 from papra_suite.config import ConfigError, load_config
 
 BASE_ENV = {
+    "PAPRA_ALLOWED_SENDERS": "sender@x.com",
     "PAPRA_BASE_URL": "http://papra:1221",
     "PAPRA_API_KEY": "ppapi_" + "x" * 64,
     "LLM_BASE_URL": "http://llm:8000",

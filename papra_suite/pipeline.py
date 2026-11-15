@@ -10,6 +10,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 
+from papra_suite.allowlist import AllowList
 from papra_suite.llm_client import LLMClient
 from papra_suite.ocr import OCR_SYSTEM_PROMPT, assemble_markdown, page_count, render_page
 from papra_suite.papra_client import PapraClient
@@ -156,7 +157,8 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     tasks = []
     for mailbox in store.list_mailboxes(enabled_only=True):
         tasks.append(asyncio.create_task(
-            _poll_loop(store, papra, mailbox), name=f"poll:{mailbox.id}"))
+            _poll_loop(store, papra, mailbox, allowlist=config.allowed_senders),
+            name=f"poll:{mailbox.id}"))
     for _ in range(config.ocr_concurrency):
         tasks.append(asyncio.create_task(worker_loop(
             store, kind="ocr",
@@ -211,7 +213,8 @@ async def serve(config, *, stop: asyncio.Event | None = None,
                 logger.exception("error closing store during shutdown")
 
 
-async def _poll_loop(store: Store, papra: PapraClient, mailbox) -> None:
+async def _poll_loop(store: Store, papra: PapraClient, mailbox, *,
+                 allowlist: AllowList) -> None:
     from papra_suite.mail import poll_mailbox_once
 
     # The loop owns no shared resource any more: the subject filter's killable
@@ -231,7 +234,8 @@ async def _poll_loop(store: Store, papra: PapraClient, mailbox) -> None:
                 break
             org = store.get_org(mailbox.org_id)
             if org is not None:
-                await poll_mailbox_once(store, papra, mailbox, org)
+                await poll_mailbox_once(store, papra, mailbox, org,
+                                    allowlist=allowlist)
             else:
                 logger.info("poll loop: org %s for mailbox %s not found; skipping",
                             mailbox.org_id, mailbox.id)

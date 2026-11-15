@@ -10,11 +10,13 @@ import asyncio
 
 import pytest
 
+from papra_suite.allowlist import parse_allowlist
 from papra_suite.config import load_config
 from papra_suite.pipeline import serve
 from papra_suite.store import Store
 
 BASE_ENV = {
+    "PAPRA_ALLOWED_SENDERS": "sender@x.com",
     "PAPRA_BASE_URL": "http://papra:1221", "PAPRA_API_KEY": "k",
     "LLM_BASE_URL": "http://llm:8000", "LLM_API_KEY": "k",
     "TITLE_MODEL": "t", "OCR_MODEL": "o", "ADMIN_PASSWORD": "p",
@@ -24,6 +26,10 @@ BASE_ENV = {
 # coroutine qualnames of the long-lived tasks serve spawns; after serve
 # returns, none of them may linger (clean shutdown, no dangling tasks)
 _SERVE_TASK_NAMES = {"_poll_loop", "worker_loop", "_sweep_loop"}
+
+# The poll loop now requires an allow-list; these tests stub the poll itself,
+# so the list only has to exist and not deny the loop its row re-fetch.
+ALLOW = parse_allowlist("x.com")
 
 
 def _dangling_serve_tasks() -> list:
@@ -118,7 +124,7 @@ async def test_serve_logs_unexpected_task_exit(tmp_path, monkeypatch, caplog):
     store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
                          username="u", password="p", poll_interval_s=3600)
 
-    async def dying_poll_loop(store, papra, mailbox):
+    async def dying_poll_loop(store, papra, mailbox, allowlist):
         raise RuntimeError("died fast")  # the long-lived task dies immediately
 
     monkeypatch.setattr(pipeline_mod, "_poll_loop", dying_poll_loop)
@@ -165,7 +171,7 @@ async def test_serve_logs_designed_task_exit_as_info(tmp_path, monkeypatch, capl
     mailbox_id = store.create_mailbox(org_id=org_id, host="127.0.0.1", port=1,
                                        username="u", password="p", poll_interval_s=0)
 
-    async def failing_poll(store_arg, papra, mailbox, org, *, matcher=None):
+    async def failing_poll(store_arg, papra, mailbox, org, allowlist=None):
         # one poll failure with disable_after=1 disables the mailbox row;
         # the REAL _poll_loop then re-fetches the row and stops by design
         store_arg.record_poll_failure(mailbox.id, "boom", disable_after=1)
@@ -331,7 +337,7 @@ async def test_poll_loop_sleeps_for_the_mailbox_poll_interval(tmp_path, monkeypa
     class _StopLoop(BaseException):
         pass
 
-    async def fake_poll(store_arg, papra, mailbox, org, *, matcher=None):
+    async def fake_poll(store_arg, papra, mailbox, org, allowlist=None):
         polls.append(mailbox.id)
         if len(polls) >= 3:
             raise _StopLoop()
@@ -348,7 +354,8 @@ async def test_poll_loop_sleeps_for_the_mailbox_poll_interval(tmp_path, monkeypa
     from papra_suite import pipeline as pipeline_mod
     monkeypatch.setattr(pipeline_mod, "asyncio", SimpleNamespace(sleep=spy_sleep))
     with pytest.raises(_StopLoop):
-        await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+        await _poll_loop(store, papra=None,
+                     mailbox=store.get_mailbox(mailbox_id), allowlist=ALLOW)
 
     assert slept == [45, 45]  # the configured cadence, not a hot spin
     assert polls == [mailbox_id, mailbox_id, mailbox_id]  # 3 polls, 2 sleeps in between
@@ -486,7 +493,7 @@ async def test_poll_loop_survives_get_org_failure():
     store = FailingOrgStore(mailbox)
 
     with pytest.raises(KeyboardInterrupt):
-        await _poll_loop(store, papra=None, mailbox=mailbox)
+        await _poll_loop(store, papra=None, mailbox=mailbox, allowlist=ALLOW)
 
     assert store.calls == 3  # the loop survived BOTH get_org failures
 
@@ -516,7 +523,7 @@ async def test_poll_loop_survives_get_mailbox_failure():
     store = FailingMailboxStore(mailbox)
 
     with pytest.raises(KeyboardInterrupt):
-        await _poll_loop(store, papra=None, mailbox=mailbox)
+        await _poll_loop(store, papra=None, mailbox=mailbox, allowlist=ALLOW)
 
     assert store.calls == 3  # the loop survived BOTH get_mailbox failures
 
@@ -542,7 +549,7 @@ async def test_poll_loop_polls_with_fresh_mailbox_row(tmp_path, monkeypatch):
     class _StopLoop(BaseException):
         pass
 
-    async def fake_poll(store_arg, papra, mailbox, org, *, matcher=None):
+    async def fake_poll(store_arg, papra, mailbox, org, allowlist=None):
         captured.append(mailbox.last_seen_uid)
         # simulate a successful poll persisting a new UID cursor
         store_arg.record_poll_success(
@@ -554,7 +561,8 @@ async def test_poll_loop_polls_with_fresh_mailbox_row(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mail_mod, "poll_mailbox_once", fake_poll)
     with pytest.raises(_StopLoop):
-        await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+        await _poll_loop(store, papra=None,
+                     mailbox=store.get_mailbox(mailbox_id), allowlist=ALLOW)
 
     # iteration 1 saw the initial (None) cursor; iteration 2 must have seen
     # the PERSISTED cursor (10) — a stale-snapshot mutant sees None twice
@@ -577,13 +585,14 @@ async def test_poll_loop_stops_when_mailbox_disabled_mid_loop(tmp_path, monkeypa
                                       username="u", password="p", poll_interval_s=0)
     polls = []
 
-    async def failing_poll(store_arg, papra, mailbox, org, *, matcher=None):
+    async def failing_poll(store_arg, papra, mailbox, org, allowlist=None):
         polls.append(mailbox.id)
         store_arg.record_poll_failure(mailbox.id, "boom", disable_after=1)
 
     monkeypatch.setattr(mail_mod, "poll_mailbox_once", failing_poll)
     with caplog.at_level(logging.INFO):
-        await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+        await _poll_loop(store, papra=None,
+                     mailbox=store.get_mailbox(mailbox_id), allowlist=ALLOW)
 
     assert polls == [mailbox_id]  # one poll, then the disabled row stopped the loop
     assert any("deleted or disabled" in record.getMessage() for record in caplog.records)
@@ -605,13 +614,14 @@ async def test_poll_loop_stops_when_mailbox_deleted_mid_loop(tmp_path, monkeypat
                                       username="u", password="p", poll_interval_s=0)
     polls = []
 
-    async def deleting_poll(store_arg, papra, mailbox, org, *, matcher=None):
+    async def deleting_poll(store_arg, papra, mailbox, org, allowlist=None):
         polls.append(mailbox.id)
         store_arg.delete_mailbox(mailbox.id)
 
     monkeypatch.setattr(mail_mod, "poll_mailbox_once", deleting_poll)
     with caplog.at_level(logging.INFO):
-        await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+        await _poll_loop(store, papra=None,
+                     mailbox=store.get_mailbox(mailbox_id), allowlist=ALLOW)
 
     assert polls == [mailbox_id]
     assert any("deleted or disabled" in record.getMessage() for record in caplog.records)
@@ -642,7 +652,7 @@ async def test_poll_loop_survives_missing_org_without_disable_storm(
 
     poll_calls = []
 
-    async def ghost_org_poll(store_arg, papra, mailbox, org, *, matcher=None):
+    async def ghost_org_poll(store_arg, papra, mailbox, org, allowlist=None):
         poll_calls.append(org)  # must NEVER run: org is None
 
     monkeypatch.setattr(mail_mod, "poll_mailbox_once", ghost_org_poll)
@@ -658,7 +668,8 @@ async def test_poll_loop_survives_missing_org_without_disable_storm(
     store.get_org = get_org
     with caplog.at_level(logging.INFO):
         with pytest.raises(KeyboardInterrupt):
-            await _poll_loop(store, papra=None, mailbox=store.get_mailbox(mailbox_id))
+            await _poll_loop(store, papra=None,
+                     mailbox=store.get_mailbox(mailbox_id), allowlist=ALLOW)
 
     assert poll_calls == []  # the guard held: no poll against a missing org
     mailbox = store.get_mailbox(mailbox_id)

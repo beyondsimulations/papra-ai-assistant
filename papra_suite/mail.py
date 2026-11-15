@@ -16,6 +16,7 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import Message
 
+from papra_suite.allowlist import AMBIGUOUS_FROM, DENY_MALFORMED, PERMISSION, AllowList
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.papra_client import PapraClient, PapraError
 from papra_suite.pipeline import enqueue_ocr_job
@@ -65,6 +66,11 @@ class ParsedMessage:
     subject: str | None
     pdf_attachments: list[Attachment] = field(default_factory=list)
     skipped_attachments: list[str] = field(default_factory=list)
+    # The raw From: header text, NOT a parsed address: the allow-list parses it
+    # and decides what counts as malformed. Duplicated From: fields are joined
+    # so the parser sees two addresses and calls it malformed rather than
+    # picking whichever identity the attacker happened to offer.
+    from_header: str | None = None
 
 
 def sniff_is_pdf(data: bytes) -> bool:
@@ -103,9 +109,14 @@ def _attachment_name(part: Message) -> str:
 def parse_message(raw: bytes) -> ParsedMessage:
     """Parse a raw MIME message; classify attachments by magic bytes, not labels."""
     message = message_from_bytes(raw)
+    # Exactly one From field or there is nothing to adjudicate: duplicate
+    # fields are ambiguous by construction and are never joined into one string
+    # for the parser to resolve at its leisure.
+    from_fields = [v for k, v in message.items() if k.lower() == "from"]
     parsed = ParsedMessage(
         message_id=message.get("Message-ID"),
         subject=_decode_header_value(message.get("Subject")),
+        from_header=from_fields[0] if len(from_fields) == 1 else AMBIGUOUS_FROM,
     )
     for part in message.walk():
         if part.get_content_maintype() == "multipart":
@@ -341,10 +352,20 @@ class PollResult:
     error: str | None = None
     # appended last: the pre-existing fields keep their positional order
     oversized_skipped: int = 0
+    # appended last, same reason: sender admission is a normal outcome, and it
+    # is counted so "why is my invoice missing?" is a query rather than an
+    # archaeology dig through logs
+    senders_denied: int = 0
+    malformed_senders: int = 0
+    # True when the allow-list holds no usable entry: nothing was fetched,
+    # nothing was ingested and nothing was retired, because pausing on a
+    # half-configured gate must not consume the inbox.
+    ingestion_paused: bool = False
 
 
 async def poll_mailbox_once(store: Store, client: PapraClient,
-                            mailbox: Mailbox, org: Org) -> PollResult:
+                            mailbox: Mailbox, org: Org, *,
+                            allowlist: AllowList) -> PollResult:
     """Poll one mailbox once. Never raises: failures land in the result and
     the mailbox's persisted error state (3 consecutive -> disabled).
 
@@ -355,17 +376,29 @@ async def poll_mailbox_once(store: Store, client: PapraClient,
     before retire, the cursor-prefix rule, cancellation that marks nothing, and
     a failure path that is visible instead of quiet.
     """
-    return await _poll_mailbox_once(store, client, mailbox, org)
+    return await _poll_mailbox_once(store, client, mailbox, org,
+                         allowlist=allowlist)
 
 
 async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox,
-                             org: Org) -> PollResult:
+                             org: Org, *, allowlist: AllowList) -> PollResult:
     SECRET_REGISTRY.add(mailbox.password)
     session = MailboxSession(
         host=mailbox.host, port=mailbox.port, username=mailbox.username,
         password=mailbox.password, ssl_mode=mailbox.ssl_mode,
     )
     result = PollResult()
+    if allowlist.paused:
+        # No usable entry, so nothing about any message is decided — and an
+        # undecided gate must not fetch, ingest or RETIRE anything. Marking mail
+        # seen while the operator is still writing the configuration would
+        # quietly consume the inbox, which is the one thing this branch exists
+        # to prevent. It is deliberately not a poll failure either: a
+        # half-configured mailbox must not be disabled by the 3-strike path.
+        result.ingestion_paused = True
+        logger.warning("ingest paused for mailbox %s: %s", mailbox.id,
+                       allowlist.describe())
+        return result
     try:
         await asyncio.to_thread(session.connect)
         uidvalidity = await asyncio.to_thread(session.select_inbox)
@@ -407,6 +440,27 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
             # event-loop block: MIME parsing must run off the loop like every
             # other blocking call in this poller (decisions doc §3)
             parsed = await asyncio.to_thread(parse_message, raw)
+            verdict = allowlist.verdict_for_header(parsed.from_header)
+            if verdict != PERMISSION:
+                # A rejected sender is a NORMAL outcome, not a fault. The
+                # message is retired and the cursor advances, so a busy junk
+                # folder cannot re-fetch and re-reject the same uids on every
+                # poll — and the poll itself must not fail, because three
+                # consecutive failures disable a mailbox and unsolicited mail
+                # must never be able to do that to you.
+                if verdict == DENY_MALFORMED:
+                    result.malformed_senders += 1
+                    logger.warning(
+                        "message uid=%s ignored: its From: header does not "
+                        "resolve to exactly one sender", uid)
+                else:
+                    result.senders_denied += 1
+                    logger.info("message uid=%s ignored: sender is not on the "
+                                "allow-list", uid)
+                seen_uids.append(uid)
+                if not prefix_failed:
+                    candidate_last_seen = uid
+                continue
             uploads_ok = True
             had_pdfs = False
             for attachment in parsed.pdf_attachments:
@@ -483,6 +537,15 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
     # None, i.e. on a rescan or when last_seen_uid was None — nothing to carry forward
     last_seen = candidate_last_seen if candidate_last_seen is not None else 0
     _record_success_quietly(store, mailbox.id, last_seen_uid=last_seen, uidvalidity=uidvalidity)
+    if result.senders_denied or result.malformed_senders:
+        # One line per poll, so "where is my invoice?" is answered by a count
+        # and a cursor rather than by reading a page of per-message logs — and
+        # the counts are the recovery breadcrumb, since the message itself is
+        # still on the server and can be replayed after the list is corrected.
+        logger.info("poll summary: %d scanned, %d uploaded, %d denied by sender "
+                    "allow-list, %d with an unresolvable sender",
+                    result.messages_scanned, result.documents_uploaded,
+                    result.senders_denied, result.malformed_senders)
     return result
 
 

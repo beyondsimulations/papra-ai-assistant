@@ -51,6 +51,34 @@ consulted. Poller disposition: reject = no body fetch, no upload, no dedup row, 
 Malformed `From:` is attacker input: skipped and counted, never an infrastructure failure,
 never a permanently stuck cursor.
 
+## Task 2 status (after review) — shipped shape, and what is still open
+
+Landed as: `allowlist.py` (pure parse + verdict), `AppConfig.allowed_senders` parsed at
+load time, a keyword-only required `allowlist` on `poll_mailbox_once` and `_poll_loop`,
+and a deny disposition that retires, advances, counts and never fails the poll.
+
+Four findings from review changed the design rather than annotating it:
+
+* **An unconfigured list pauses; it does not deny message by message.** Fetching and
+  marking `\Seen` while the operator is still writing `PAPRA_ALLOWED_SENDERS` would
+  consume the inbox one message at a time. `PollResult.ingestion_paused` plus a WARNING
+  per poll, no fetch, no retirement, and not a poll failure.
+* **Duplicate `From:` fields are ambiguous, never joined.** Joining them let
+  `tobi@x.com` plus an empty field collapse into one apparently valid address.
+* **RFC 2047 decoding must happen after structural parsing, not before.** With
+  decode-first, `From: =?utf-8?Q?a=40example=2Ecom?=` parses as the admitted address
+  `a@example.com`. Pinned by a mutant: restoring decode-first fails the test.
+* **`Sender:` is not consulted**, and the identity is the outer forwarding message — an
+  embedded message from an allowed address cannot borrow admission.
+
+Still open, and not claimed: header-first fetching (Task 3) is **not** implemented, so
+refused mail is still downloaded and parsed before being refused. The guarantee today is
+"refused mail is never ingested", not "refused mail costs nothing".
+
+Recovery path when the list is corrected: refused messages stay on the server and are
+never deleted, even with `delete_after_download=True`; replay is a cursor reset, and the
+per-poll summary line names how many were refused. A tested replay command is not built.
+
 ## Task 3: header-first fetch
 
 The poller must fetch headers before bodies so a rejected sender costs one header read.

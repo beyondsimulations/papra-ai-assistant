@@ -74,6 +74,9 @@ def main() -> int:
         finally:
             store.close()
         print(f"config ok; store migrated; data dir: {config.data_dir}")
+        # Printed last because it is the line that answers "why is nothing
+        # arriving?": an empty allow-list denies every sender by design.
+        print(f"senders: {config.allowed_senders.describe()}")
         return 0
 
     if args.command == "serve":

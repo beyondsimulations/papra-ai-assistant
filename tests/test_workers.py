@@ -24,6 +24,7 @@ from papra_suite.pipeline import (
 from papra_suite.store import Store
 
 BASE_ENV = {
+    "PAPRA_ALLOWED_SENDERS": "sender@x.com",
     "PAPRA_BASE_URL": "http://papra:1221", "PAPRA_API_KEY": "k",
     "LLM_BASE_URL": "http://llm:8000", "LLM_API_KEY": "k",
     "TITLE_MODEL": "t", "OCR_MODEL": "o", "ADMIN_PASSWORD": "p",
