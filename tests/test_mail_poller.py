@@ -999,8 +999,6 @@ async def test_replay_after_fixing_the_allow_list_ingests_once_and_never_twice(
     content dedup stops a second copy. A replay that double-ingested would be
     worse than no replay at all.
     """
-    from papra_suite.store import Store
-
     org_id = store.create_org(papra_org_id="org_papra", name="Test")
     mailbox_id = store.create_mailbox(
         org_id=org_id, host="imap.test", port=993, username="u", password="p"

@@ -130,14 +130,18 @@ def _wait_for_greenmail_delivery(message_id: str, *, timeout_s: float = 5.0) -> 
         time.sleep(0.05)
 
 
-def inject_message(*, to, subject, attachments=()):
+def inject_message(*, to, subject, attachments=(), sender="sender@example.com"):
     """Send a MIME message with (filename, bytes, mime-tuple) attachments via
-    GreenMail SMTP, then wait until it is visible in the IMAP INBOX."""
+    GreenMail SMTP, then wait until it is visible in the IMAP INBOX.
+
+    `sender` is settable so the allow-list can be exercised against a real
+    server rather than only against a fake IMAP double.
+    """
     import smtplib
     from email.message import EmailMessage
 
     message = EmailMessage()
-    message["From"] = "sender@example.com"
+    message["From"] = sender
     message["To"] = to
     message["Subject"] = subject
     message["Message-ID"] = f"<{uuid.uuid4().hex}@test>"

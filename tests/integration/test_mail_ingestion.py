@@ -1,9 +1,19 @@
 import pytest
 
+from papra_suite.allowlist import parse_allowlist
 from papra_suite.mail import poll_mailbox_once
 from papra_suite.papra_client import PapraClient
 from papra_suite.store import Store
-from tests.integration.conftest import inject_message, purge_greenmail_inbox
+from tests.integration.conftest import (
+    GREENMAIL_HOST,
+    GREENMAIL_IMAP_PORT,
+    inject_message,
+    purge_greenmail_inbox,
+)
+
+# inject_message sends as sender@example.com (see conftest); this is the list an
+# operator would write for their own forwarding address.
+ALLOW = parse_allowlist("sender@example.com")
 
 pytestmark = pytest.mark.integration
 
@@ -34,7 +44,7 @@ async def test_pdf_mail_becomes_document_and_ocr_job(ingestion_stack):
         attachments=[("rechnung.pdf", PDF_BYTES, ("application", "pdf"))],
     )
 
-    result = await poll_mailbox_once(store, client, mailbox, org)
+    result = await poll_mailbox_once(store, client, mailbox, org, allowlist=ALLOW)
 
     assert result.error is None
     assert result.documents_uploaded == 1 and result.messages_failed == 0
@@ -47,7 +57,8 @@ async def test_pdf_mail_becomes_document_and_ocr_job(ingestion_stack):
     assert updated.last_error is None and updated.last_seen_uid is not None
 
     # acceptance 3 (dedup): re-poll must not create a second document
-    result2 = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id), org)
+    result2 = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id),
+                                     org, allowlist=ALLOW)
     assert result2.documents_uploaded == 0
     documents_after, _ = await client.list_documents(papra_org_id, search_query="rechnung")
     assert len(documents_after) == len(documents)
@@ -60,7 +71,7 @@ async def test_non_pdf_mail_produces_no_document_and_no_error(ingestion_stack):
         attachments=[("photo.jpg", b"\xff\xd8 jpeg bytes", ("image", "jpeg"))],
     )
 
-    result = await poll_mailbox_once(store, client, mailbox, org)
+    result = await poll_mailbox_once(store, client, mailbox, org, allowlist=ALLOW)
 
     assert result.error is None
     assert result.documents_uploaded == 0
@@ -84,7 +95,7 @@ async def test_delete_after_download_removes_message(ingestion_stack):
         attachments=[("gone.pdf", PDF_BYTES, ("application", "pdf"))],
     )
 
-    result = await poll_mailbox_once(store, client, delete_mailbox, org)
+    result = await poll_mailbox_once(store, client, delete_mailbox, org, allowlist=ALLOW)
 
     assert result.documents_uploaded == 1 and result.error is None
     import imaplib
@@ -132,7 +143,7 @@ async def test_expunge_does_not_destroy_operator_deleted_mail(ingestion_stack):
     imap.uid("STORE", str(uids[0]), "+FLAGS", "(\\Deleted)")
     imap.logout()
 
-    result = await poll_mailbox_once(store, client, delete_mailbox, org)
+    result = await poll_mailbox_once(store, client, delete_mailbox, org, allowlist=ALLOW)
 
     assert result.error is None and result.documents_uploaded == 1
 
@@ -152,7 +163,7 @@ async def test_resent_document_409_is_swallowed(ingestion_stack):
         to=mailbox.username, subject="Rechnung 42",
         attachments=[("rechnung.pdf", PDF_BYTES, ("application", "pdf"))],
     )
-    result = await poll_mailbox_once(store, client, mailbox, org)
+    result = await poll_mailbox_once(store, client, mailbox, org, allowlist=ALLOW)
     assert result.documents_uploaded == 1 and result.messages_failed == 0
 
     # same PDF bytes, different subject -> new message-id -> passes our
@@ -161,12 +172,14 @@ async def test_resent_document_409_is_swallowed(ingestion_stack):
         to=mailbox.username, subject="FW: Rechnung 42 (resent)",
         attachments=[("rechnung.pdf", PDF_BYTES, ("application", "pdf"))],
     )
-    second = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id), org)
+    second = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id),
+                                     org, allowlist=ALLOW)
 
     assert second.messages_failed == 0 and second.error is None
 
     # the resent message is marked seen: a third poll finds nothing new
-    third = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id), org)
+    third = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id),
+                                    org, allowlist=ALLOW)
     assert third.messages_scanned == 0 and third.messages_failed == 0
 
     updated = store.get_mailbox(mailbox.id)
@@ -183,8 +196,78 @@ async def test_wrong_password_disables_mailbox_after_three_polls(ingestion_stack
     bad_mailbox = store.get_mailbox(mailbox_id)
 
     for _ in range(3):
-        result = await poll_mailbox_once(store, client, bad_mailbox, org)
+        result = await poll_mailbox_once(store, client, bad_mailbox, org, allowlist=ALLOW)
 
     assert result.error is not None
     updated = store.get_mailbox(mailbox_id)
     assert updated.enabled is False and updated.consecutive_failures == 3
+
+
+async def test_a_stranger_is_refused_and_replay_after_fixing_the_list_ingests_once(
+    ingestion_stack
+):
+    """The whole design, against a real IMAP server instead of a fake.
+
+    refused → nothing uploaded, mail retired, mailbox healthy → the operator
+    widens the list and replays → ingested → replay again → no second copy.
+    """
+    store, mailbox, org, client, papra_org_id = ingestion_stack
+    inject_message(
+        to=mailbox.username, subject="Rechnung 99", sender="stranger@notallowed.test",
+        attachments=[("rechnung99.pdf", PDF_BYTES, ("application", "pdf"))],
+    )
+
+    result = await poll_mailbox_once(store, client, mailbox, org, allowlist=ALLOW)
+
+    assert result.error is None                     # a refusal is not an outage
+    assert result.senders_denied == 1 and result.documents_uploaded == 0
+    documents, _ = await client.list_documents(papra_org_id, search_query="rechnung99")
+    assert documents == []
+    after_refusal = store.get_mailbox(mailbox.id)
+    assert after_refusal.last_seen_uid is not None  # retired, not retried forever
+    assert after_refusal.enabled is True and after_refusal.consecutive_failures == 0
+
+    # the operator adds the sender and rewinds the cursor
+    store.reset_mailbox_cursor(mailbox.id)
+    widened = parse_allowlist("sender@example.com, notallowed.test")
+
+    replayed = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id),
+                                       org, allowlist=widened)
+    assert replayed.documents_uploaded == 1
+    documents, _ = await client.list_documents(papra_org_id, search_query="rechnung99")
+    assert any(doc["name"] == "rechnung99.pdf" for doc in documents)
+
+    # and a second replay must not create a duplicate
+    store.reset_mailbox_cursor(mailbox.id)
+    again = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id), org,
+                                    allowlist=widened)
+    assert again.documents_uploaded == 0
+    documents, _ = await client.list_documents(papra_org_id, search_query="rechnung99")
+    assert len(documents) == 1
+
+
+async def test_an_empty_allow_list_pauses_without_touching_the_inbox(
+    ingestion_stack
+):
+    """Against a real server: paused means the message is still there, unread,
+    for the next poll after the operator fixes the configuration."""
+    import imaplib
+
+    store, mailbox, org, client, _org_id = ingestion_stack
+    inject_message(to=mailbox.username, subject="Rechnung 100",
+                   attachments=[("rechnung100.pdf", PDF_BYTES, ("application", "pdf"))])
+
+    result = await poll_mailbox_once(store, client, mailbox, org,
+                                     allowlist=parse_allowlist(""))
+
+    assert result.ingestion_paused is True and result.error is None
+    assert store.get_mailbox(mailbox.id).last_seen_uid is None
+
+    imap = imaplib.IMAP4(GREENMAIL_HOST, GREENMAIL_IMAP_PORT, timeout=10)
+    try:
+        imap.login(mailbox.username, mailbox.password)
+        imap.select("INBOX")
+        _status, unseen = imap.uid("SEARCH", None, "UNSEEN")
+        assert len(unseen[0].split()) == 1          # not fetched, not marked read
+    finally:
+        imap.logout()
