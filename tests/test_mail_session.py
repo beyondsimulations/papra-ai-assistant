@@ -27,6 +27,7 @@ class FakeImap:
 
     def __init__(self, search_uids=(1, 2, 3), bodies=None, fetch_responses=None,
                  sizes=None, size_responses=None, headers=None,
+                 vanished_after_probe=(),
                  capabilities=("IMAP4REV1",),
                  deleted_uids=(), no_store=False, no_uid_expunge=False,
                  no_search_deleted=False, no_expunge=False):
@@ -38,6 +39,10 @@ class FakeImap:
         self.headers = headers or {}      # uid -> raw header bytes
         self.size_probes = []   # uids probed with (RFC822.SIZE)
         self.header_calls = []  # uids whose BODY.PEEK[HEADER] was requested
+        # uids that exist for the first size probe and are expunged during the
+        # poll — the honest shape of "it vanished while we were working on it"
+        self.vanished_after_probe = set(vanished_after_probe)
+        self.size_probe_counts = {}
         self.fetch_calls = []    # uids whose BODY.PEEK[] was actually fetched
         self.capabilities = tuple(capabilities)   # imaplib exposes these at connect
         self.deleted_uids = set(deleted_uids)     # what UID SEARCH DELETED reports
@@ -81,6 +86,12 @@ class FakeImap:
             self.size_probes.append(uid)
             if uid in self.size_responses:
                 return ("OK", self.size_responses[uid])
+            self.size_probe_counts[uid] = self.size_probe_counts.get(uid, 0) + 1
+            if uid in self.vanished_after_probe and self.size_probe_counts[uid] > 1:
+                return ("OK", [None])
+            if not any(uid in table for table in (self.sizes, self.bodies,
+                                                  self.fetch_responses)):
+                return ("OK", [None])   # a server that no longer has this message
             size = self.sizes.get(uid, len(self.bodies.get(uid, b"")))
             return ("OK", [f"{uid} (RFC822.SIZE {size} UID {uid})".encode()])
         if args[1] == "(BODY.PEEK[HEADER])":
@@ -104,6 +115,11 @@ def test_fetch_since_skips_vanished_messages():
     good = b"Subject: ok\r\n\r\nbody"
     session._imap = FakeImap(
         search_uids=(1, 2, 3),
+        bodies={3: good},
+        # the skip is only honest because the server agrees the message is gone:
+        # a missing literal for a message that is still present must fail the
+        # poll instead, or the cursor passes mail nobody read
+        size_responses={1: [None], 2: [None]},
         fetch_responses={
             1: [b"1 (FLAGS (\\Deleted) UID 1)"],
             2: [None],
@@ -568,9 +584,11 @@ def test_no_admission_check_means_no_extra_fetch():
     assert [uid for uid, _ in batch.messages] == [1]
 
 
-def test_a_vanished_header_response_skips_the_message_without_failing_the_poll():
+def test_a_header_response_with_no_data_for_a_gone_message_is_skipped():
+    # expunged between the size probe and the header fetch: the confirmation
+    # probe agrees it is gone, so skipping is honest and the poll continues
     imap = FakeImap(search_uids=[1, 2], bodies={1: _PDF_BODY, 2: _PDF_BODY},
-                    headers={2: _hdr("ok@x.com")})  # uid 1 answers with no literal
+                    headers={2: _hdr("ok@x.com")}, vanished_after_probe={1})
     session = make_session()
     session._imap = imap
 
@@ -591,3 +609,50 @@ def test_an_oversized_message_is_still_skipped_before_any_header_fetch():
 
     assert batch.oversized_uids == [1]
     assert imap.header_calls == []
+
+
+# --- an unreadable answer is not a vanished message --------------------------
+#
+# Skipping a uid the cursor later passes loses that mail permanently. These pin
+# the two ways a FETCH answer can fail to be believed, and that neither one is
+# quietly treated as "gone".
+
+def test_a_response_without_data_for_a_still_present_message_fails_the_poll():
+    session = make_session()
+    imap = FakeImap(search_uids=(1,), bodies={1: b"Subject: ok\r\n\r\nbody"},
+                    fetch_responses={1: [b"1 (FLAGS (\\Seen) UID 1)"]})  # no literal
+    session._imap = imap
+
+    with pytest.raises(Exception) as excinfo:
+        session.fetch_since(None)
+
+    assert "no message data" in str(excinfo.value)
+
+
+def test_a_literal_for_a_different_uid_is_never_ingested_under_the_wrong_uid():
+    session = make_session()
+    imap = FakeImap(
+        search_uids=(1, 2), bodies={1: b"one", 2: b"two"},
+        fetch_responses={1: [(b"2 (UID 2 BODY[])", b"two")]},   # mismatched literal
+    )
+    session._imap = imap
+
+    with pytest.raises(Exception) as excinfo:
+        session.fetch_since(None)
+
+    assert "another message" in str(excinfo.value)
+    assert imap.fetch_calls == [1]      # the batch aborted, not carried on
+
+
+def test_a_confirmed_vanished_message_is_still_skipped_without_failing():
+    session = make_session()
+    good = b"Subject: ok\r\n\r\nbody"
+    session._imap = FakeImap(search_uids=(1, 2), bodies={1: good, 2: good},
+                             fetch_responses={1: [b"1 (UID 1)"]},
+                             # present for the first probe, gone by the time we
+                             # ask again — the confirmation says "skipped" is safe
+                             vanished_after_probe={1})
+
+    batch = session.fetch_since(None)
+
+    assert [uid for uid, _ in batch.messages] == [2]

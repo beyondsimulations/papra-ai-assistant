@@ -61,6 +61,7 @@ class FakeSession:
     raws_read: list = field(default_factory=list)       # uids whose body was read
     deleted: list = field(default_factory=list)
     fail_on_connect: Exception | None = None
+    fail_fetch_for: list = field(default_factory=list)  # uids with an unreadable answer
     closed: bool = False
 
     def connect(self):
@@ -78,6 +79,12 @@ class FakeSession:
         denied = []
         admitted = []
         for uid, raw in messages:
+            if uid in self.fail_fetch_for:
+                # an answer this client cannot read is NOT "the message is gone"
+                import imaplib
+
+                raise imaplib.IMAP4.error(
+                    f"UID FETCH for {uid} returned no message data")
             if admit is None:
                 admitted.append((uid, raw))
                 continue
@@ -849,9 +856,11 @@ async def test_a_refused_sender_never_has_its_body_read(store, monkeypatch):
     assert session.seen == [1]
 
 
-async def test_a_refusal_before_a_failed_upload_still_advances_the_cursor(
+async def test_a_refusal_before_a_failed_upload_advances_only_to_the_refusal(
     store, monkeypatch
 ):
+    """The refusal at uid 1 is decided, so the cursor may reach 1. The upload at
+    uid 2 FAILED, so it may not go past 1 — that document has to be retried."""
     org_id = store.create_org(papra_org_id="org_papra", name="Test")
     mailbox_id = store.create_mailbox(
         org_id=org_id, host="imap.test", port=993, username="u", password="p"
@@ -862,10 +871,59 @@ async def test_a_refusal_before_a_failed_upload_still_advances_the_cursor(
     ])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    await poll_with_allow_list(store, StubClient(), store.get_mailbox(mailbox_id),
-                               store.get_org(org_id))
+    await poll_with_allow_list(store, StubClient(fail_for={"a.pdf"}),
+                               store.get_mailbox(mailbox_id), store.get_org(org_id))
 
-    assert store.get_mailbox(mailbox_id).last_seen_uid == 2
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 1
+
+
+async def test_a_failure_before_a_later_refusal_keeps_the_cursor_behind_it(
+    store, monkeypatch
+):
+    """A refusal further along must not launder the failed upload before it."""
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    session = FakeSession(raws=[
+        (1, build_raw(message_id="<m1@x>", attachments=[("bad.pdf", b"%PDF-1")])),
+        (2, build_raw(message_id="<m2@x>", sender="Stranger <spam@other.net>")),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    await poll_with_allow_list(store, StubClient(fail_for={"bad.pdf"}),
+                               store.get_mailbox(mailbox_id), store.get_org(org_id))
+
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 0
+
+
+async def test_an_unreadable_fetch_answer_cannot_be_bypassed_by_the_next_message(
+    store, monkeypatch
+):
+    """The loss this guards: uid 1 answers unreadably, uid 2 works fine. If uid 1
+    were skipped, the cursor would reach 2 and uid 1 would never be searched
+    again — mail gone with no error anywhere. The poll must fail instead."""
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    session = FakeSession(
+        raws=[
+            (1, build_raw(message_id="<m1@x>", attachments=[("a.pdf", b"%PDF-1")])),
+            (2, build_raw(message_id="<m2@x>", attachments=[("b.pdf", b"%PDF-2")])),
+        ],
+        fail_fetch_for=[1],
+    )
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    result = await poll_with_allow_list(store, client, store.get_mailbox(mailbox_id),
+                                        store.get_org(org_id))
+
+    assert result.error is not None
+    assert client.uploads == []                      # nothing after it was ingested
+    assert session.seen == []                        # and nothing was retired
+    assert store.get_mailbox(mailbox_id).last_seen_uid is None
 
 
 async def test_an_oversized_message_is_still_counted_alongside_refusals(

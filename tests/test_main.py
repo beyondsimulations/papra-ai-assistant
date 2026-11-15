@@ -116,3 +116,101 @@ async def test_sigint_stops_serve_too(tmp_path, monkeypatch):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         store.close()
+
+
+def _replay_env(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("PAPRA_BASE_URL", "http://papra:1221")
+    monkeypatch.setenv("PAPRA_API_KEY", "k")
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm:8000")
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setenv("TITLE_MODEL", "t")
+    monkeypatch.setenv("OCR_MODEL", "o")
+    monkeypatch.setenv("ADMIN_PASSWORD", "p")
+    monkeypatch.setenv("PAPRA_ALLOWED_SENDERS", "sender@x.com")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+
+def _seed_store(tmp_path, *, last_seen_uid=42):
+    from papra_suite.store import Store
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    store.record_poll_failure(mailbox_id, "boom")
+    store.record_poll_failure(mailbox_id, "boom")
+    with store._lock, store._conn:  # set a cursor without a successful poll
+        store._conn.execute("UPDATE mailboxes SET last_seen_uid = ? WHERE id = ?",
+                            (last_seen_uid, mailbox_id))
+        store._conn.commit()
+    mailbox = store.get_mailbox(mailbox_id)
+    store.close()
+    return mailbox_id, mailbox
+
+
+def test_replay_dry_run_changes_nothing(monkeypatch, tmp_path, capsys):
+    from papra_suite.__main__ import main
+    from papra_suite.store import Store
+
+    _replay_env(monkeypatch, tmp_path, capsys)
+    mailbox_id, before = _seed_store(tmp_path)
+    monkeypatch.setattr("sys.argv", ["papra-suite", "replay", "--mailbox-id",
+                                     mailbox_id, "--dry-run"])
+
+    assert main() == 0
+    assert "dry run" in capsys.readouterr().out
+
+    store = Store(tmp_path / "state.db")
+    mailbox = store.get_mailbox(mailbox_id)
+    store.close()
+    assert mailbox.last_seen_uid == before.last_seen_uid
+    assert mailbox.consecutive_failures == 2  # untouched
+
+
+def test_replay_rewinds_the_cursor_and_clears_failure_state(monkeypatch, tmp_path,
+                                                            capsys):
+    from papra_suite.__main__ import main
+    from papra_suite.store import Store
+
+    _replay_env(monkeypatch, tmp_path, capsys)
+    mailbox_id, _ = _seed_store(tmp_path)
+    monkeypatch.setattr("sys.argv", ["papra-suite", "replay", "--mailbox-id",
+                                     mailbox_id])
+
+    assert main() == 0
+    assert "rewound from 42" in capsys.readouterr().out
+
+    store = Store(tmp_path / "state.db")
+    mailbox = store.get_mailbox(mailbox_id)
+    store.close()
+    assert mailbox.last_seen_uid is None
+    assert mailbox.consecutive_failures == 0 and mailbox.last_error is None
+
+
+def test_replay_can_resume_after_a_given_uid(monkeypatch, tmp_path, capsys):
+    from papra_suite.__main__ import main
+    from papra_suite.store import Store
+
+    _replay_env(monkeypatch, tmp_path, capsys)
+    mailbox_id, _ = _seed_store(tmp_path, last_seen_uid=99)
+    monkeypatch.setattr("sys.argv", ["papra-suite", "replay", "--mailbox-id",
+                                     mailbox_id, "--from-uid", "10"])
+
+    assert main() == 0
+    store = Store(tmp_path / "state.db")
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 10
+    store.close()
+
+
+def test_replay_names_the_known_mailboxes_for_a_typo(monkeypatch, tmp_path, capsys):
+    from papra_suite.__main__ import main
+
+    _replay_env(monkeypatch, tmp_path, capsys)
+    _seed_store(tmp_path)
+    monkeypatch.setattr("sys.argv", ["papra-suite", "replay", "--mailbox-id", "nope"])
+
+    assert main() == 2
+    err = capsys.readouterr().err
+    assert "unknown mailbox nope" in err and "known mailboxes:" in err

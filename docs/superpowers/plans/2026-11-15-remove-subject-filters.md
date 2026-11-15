@@ -112,21 +112,28 @@ size-cap logic requires, so batching them is a later optimization, not a claim h
 Mutants killed: removing the header gate (the body-request test fails), dropping
 `batch.denied` from the poll loop (counters and the cursor fail).
 
-## Task 3b — open, found in review, NOT yet fixed
+## Task 3b — closed (the three review findings, fixed)
 
-1. **An unrecognised FETCH response can lose mail.** Both the header fetch and the
-   body fetch treat a response whose literal cannot be matched as "the message
-   vanished" and skip it. If a later uid succeeds in the same poll, `last_seen_uid`
-   advances past the skipped one and it is never searched again — silent loss, not a
-   retry. Skipping is only safe when disappearance is *confirmed*; an unexpected
-   response shape (PARTIAL, untagged-only, a literal for a different uid) must abort
-   the batch so the cursor cannot pass it, and must never be recorded as a sender
-   refusal. Needs a response-shape check that verifies the returned uid/section, plus
-   a test that a low skipped uid cannot be bypassed by a higher successful one.
-2. **A test does not test its name.** `test_a_refusal_before_a_failed_upload_still_advances_the_cursor`
-   uses the ordinary StubClient, so it asserts the success path while claiming to
-   assert a failed upload. Needs a failing client and cursor == 1.
-3. No tested replay path for refused mail after the operator edits the allow-list.
+1. **An unreadable FETCH answer no longer means "vanished".** `_fetch_literal(uid,
+   section)` is the one path for both header and body fetches. A literal is accepted only
+   if the response describes the uid that was asked for (a literal for another message is
+   refused rather than ingested and retired under the wrong uid). A response with no
+   literal is confirmed against the metadata probe: confirmed gone → skip; still present
+   → raise, aborting the batch so the cursor cannot pass a message nobody read. The
+   trade-off is stated rather than hidden: a server that answers one message unreadably
+   forever will fail three polls and disable the mailbox, and a visible outage is the
+   right outcome next to a quiet hole in the archive.
+2. **The misnamed test is renamed and now fails an upload**, asserting the cursor stops
+   at the refusal (1) rather than at the failure (2); its mirror — failure first, refusal
+   second — keeps the cursor at 0.
+3. **Replay is a command, not a rumour:** `papra-suite replay --mailbox-id ID
+   [--from-uid N] [--dry-run]` rewinds the cursor and clears failure state, names the
+   known mailbox ids on a typo (exit 2), and is safe to run twice because Papra dedups by
+   content hash. Refused mail was never deleted — even with `delete_after_download=True` —
+   which is what makes this recovery possible at all.
+
+Mutants killed: no-literal treated as vanished again; uid validation removed; replay
+leaving failure state in place. 392 passed, 9 deselected, ruff clean.
 
 ## Task 4: authentication evidence — blocked, by design
 

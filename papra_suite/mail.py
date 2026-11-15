@@ -269,7 +269,7 @@ class MailboxSession:
                 # sender is not allowed — is the cost this ordering exists to
                 # remove, and it is the difference between a junk folder being
                 # cheap to refuse and being a bandwidth bill.
-                header = self._fetch_headers(uid)
+                header = self._fetch_literal(uid, "[HEADER]")
                 if header is None:
                     logger.warning("message uid=%s vanished before header fetch;"
                                    " skipping", uid)
@@ -280,31 +280,53 @@ class MailboxSession:
                                 " requested", uid)
                     batch.denied.append((uid, verdict))
                     continue
-            status, fetch_data = self._imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
-            if status != "OK":
-                raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
-            # A message can vanish between SEARCH and FETCH (another client
-            # expunged it): the response is then a bare bytes status line or
-            # [None]. Validate the shape instead of indexing blindly — an
-            # int/TypeError here would fail the whole poll.
-            entry = fetch_data[0] if fetch_data else None
-            if not (isinstance(entry, tuple) and len(entry) >= 2
-                    and isinstance(entry[1], bytes)):
+            raw = self._fetch_literal(uid, "[]")
+            if raw is None:
                 logger.warning("message uid=%s vanished before fetch; skipping", uid)
                 continue
-            batch.messages.append((uid, entry[1]))
+            batch.messages.append((uid, raw))
         return batch
 
-    def _fetch_headers(self, uid: int) -> bytes | None:
-        """Header bytes for one uid, or None if it vanished mid-poll."""
-        status, fetch_data = self._imap.uid("FETCH", str(uid), "(BODY.PEEK[HEADER])")
+    def _fetch_literal(self, uid: int, section: str) -> bytes | None:
+        """The literal for one uid, or None only if the message is GONE.
+
+        "I could not read your answer" and "that message no longer exists" are
+        different facts. The earlier code collapsed them into a skip, and a skip
+        is safe only when the message is really gone: if any later message in the
+        same poll succeeds, the cursor advances past the skipped uid and the
+        skipped one is never searched again — mail lost with no error anywhere.
+        So an unreadable shape is a failure that aborts the batch and keeps the
+        cursor where it is, and it is retried next poll. A permanently unreadable
+        message will eventually disable the mailbox through the failure path,
+        which is the right outcome: a visible outage beats a quiet hole.
+        """
+        status, fetch_data = self._imap.uid("FETCH", str(uid), f"(BODY.PEEK{section})")
         if status != "OK":
             raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
         entry = fetch_data[0] if fetch_data else None
-        if not (isinstance(entry, tuple) and len(entry) >= 2
-                and isinstance(entry[1], bytes)):
+        if isinstance(entry, tuple) and len(entry) >= 2 and isinstance(entry[1], bytes):
+            prefix = entry[0] if isinstance(entry[0], bytes) else b""
+            described = prefix.decode("ascii", errors="replace")
+            # The response must describe the uid that was asked for: a literal
+            # for another message would otherwise be ingested, deduplicated and
+            # retired under this uid.
+            if not re.search(rf"\bUID {uid}\b", described):
+                raise imaplib.IMAP4.error(
+                    f"UID FETCH for {uid} returned a response describing another "
+                    f"message ({described[:60]!r}); refusing to ingest it as {uid}"
+                )
+            return entry[1]
+        # No literal: benign if the message was expunged under us, and the
+        # metadata probe is the cheapest way to ask. Anything else — PARTIAL,
+        # untagged-only, a shape this client does not understand — means the
+        # message is still there and we did not read it.
+        if self._rfc822_size(uid) is None:
             return None
-        return entry[1]
+        raise imaplib.IMAP4.error(
+            f"UID FETCH for {uid} returned no message data while the message is "
+            "still present; not skipping it, because that message would never be "
+            "read"
+        )
 
     def _rfc822_size(self, uid: int) -> int | None:
         """Return the message's RFC822.SIZE, or None if it vanished/parse failed."""

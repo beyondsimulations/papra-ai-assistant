@@ -55,6 +55,18 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check", help="validate config, open and migrate the store, exit")
     sub.add_parser("serve", help="run the pipeline: pollers, OCR/title workers, sweep")
+    replay = sub.add_parser(
+        "replay",
+        help="rewind a mailbox's poll cursor so refused or missed mail is read "
+             "again (e.g. after correcting PAPRA_ALLOWED_SENDERS)",
+    )
+    replay.add_argument("--mailbox-id", required=True)
+    replay.add_argument(
+        "--from-uid", type=int, default=None,
+        help="resume after this UID; the default re-reads the whole mailbox",
+    )
+    replay.add_argument("--dry-run", action="store_true",
+                        help="report what would change and change nothing")
 
     args = parser.parse_args()
 
@@ -77,6 +89,33 @@ def main() -> int:
         # Printed last because it is the line that answers "why is nothing
         # arriving?": an empty allow-list denies every sender by design.
         print(f"senders: {config.allowed_senders.describe()}")
+        return 0
+
+    if args.command == "replay":
+        from papra_suite.store import Store
+
+        store = Store(config.data_dir / "state.db")
+        try:
+            mailbox = store.get_mailbox(args.mailbox_id)
+            if mailbox is None:
+                known = ", ".join(m.id for m in store.list_mailboxes()) or "none"
+                print(f"unknown mailbox {args.mailbox_id}; known mailboxes: {known}",
+                      file=sys.stderr)
+                return 2
+            scope = (f"mail after uid {args.from_uid}" if args.from_uid is not None
+                     else "the whole mailbox")
+            print(f"mailbox {mailbox.id} ({mailbox.username}@{mailbox.host}): "
+                  f"cursor is {mailbox.last_seen_uid}; replay would re-read "
+                  f"{scope}")
+            if args.dry_run:
+                print("dry run: nothing changed")
+                return 0
+            previous = store.reset_mailbox_cursor(args.mailbox_id,
+                                                  from_uid=args.from_uid)
+            print(f"cursor rewound from {previous} to {args.from_uid}; "
+                  "already-ingested documents are protected by content dedup")
+        finally:
+            store.close()
         return 0
 
     if args.command == "serve":

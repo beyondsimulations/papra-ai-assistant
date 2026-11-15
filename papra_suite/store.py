@@ -459,6 +459,29 @@ class Store:
                 (last_seen_uid, uidvalidity, _now(), mailbox_id),
             )
 
+    def reset_mailbox_cursor(self, mailbox_id: str, *,
+                             from_uid: int | None = None) -> int | None:
+        """Rewind the poll cursor so mail is read again; returns the old cursor.
+
+        This is the recovery path for a corrected sender allow-list: refused
+        messages were retired (marked seen) but never deleted and never
+        uploaded, so they are still on the server. Rewinding re-reads them and
+        the content dedup keeps already-ingested documents from being uploaded
+        twice. Failure state is cleared too, because the point is to try again.
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT last_seen_uid FROM mailboxes WHERE id = ?", (mailbox_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown mailbox: {mailbox_id}")
+            self._conn.execute(
+                "UPDATE mailboxes SET last_seen_uid = ?, last_error = NULL, "
+                "consecutive_failures = 0 WHERE id = ?",
+                (from_uid, mailbox_id),
+            )
+            return row[0]
+
     def record_poll_failure(self, mailbox_id: str, error: str, *,
                             disable_after: int = 3) -> None:
         with self._lock, self._conn:
