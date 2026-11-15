@@ -12,7 +12,6 @@ from papra_suite.mail import (
     MAX_MESSAGE_BYTES,
     MAX_POLL_BYTES,
     MailboxSession,
-    subject_matches,
 )
 
 
@@ -441,16 +440,6 @@ def test_close_swallows_logout_failure_and_is_idempotent():
 
     session.close()  # idempotent: no imap, no second logout, no raise
     assert rude.logout_calls == 1
-
-
-def test_subject_matches_truncates_beyond_cap():
-    # the match lives beyond char 1000: the cap must hide it (bounds the
-    # input for the super-linear regex backtracking class)
-    assert subject_matches("x" * 1000 + "needle", "needle") is False
-    # a match within the first 1000 chars still works on a long subject
-    assert subject_matches("needle" + "x" * 2000, "needle") is True
-
-
 def test_mark_seen_raises_on_store_no():
     # M2 carry-over: an unchecked ("NO", ...) STORE in mark_seen would mean
     # the \Seen flags were never set — the message would be re-fetched every

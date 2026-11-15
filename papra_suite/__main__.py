@@ -17,7 +17,7 @@ async def run_serve(config, **kwargs) -> None:
     WHY HANDLERS EXIST. serve already stops on an asyncio.Event, but with no
     handler SIGTERM's DEFAULT disposition is to terminate the process where it
     stands: serve's `finally` (cancel the poll loops and workers, close the
-    clients, close the store, and above all KillableMatcher.aclose() for every
+    clients, close the store, and above all the task teardowns for every
     poll loop's regex child) never runs. So a `docker stop` used to leave a
     busy child orphaned at ppid=1 — only the child's own self-deadline ended
     it, after it had burned a core for its whole budget. add_signal_handler is

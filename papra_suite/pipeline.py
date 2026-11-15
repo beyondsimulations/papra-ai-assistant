@@ -213,43 +213,31 @@ async def serve(config, *, stop: asyncio.Event | None = None,
 
 async def _poll_loop(store: Store, papra: PapraClient, mailbox) -> None:
     from papra_suite.mail import poll_mailbox_once
-    from papra_suite.safematch import KillableMatcher
 
-    # THE LIFECYCLE SEAM for the subject filter's regex child: one matcher per
-    # poll task, reused by every poll of this mailbox and closed here on the
-    # way out — normal exit (mailbox deleted or disabled) AND cancellation
-    # (serve shutdown), because aclose sits in a finally and CancelledError is
-    # a BaseException the loop's `except Exception` cannot swallow. A matcher
-    # left behind would be an orphan regex_worker process per poll loop; a
-    # matcher created per poll instead would pay a process start for every
-    # iteration. poll_mailbox_once still owns its own private matcher when
-    # called without one, so no caller can poll unkillably.
-    matcher = KillableMatcher()
-    try:
-        while True:
-            # Re-fetch the mailbox row EVERY iteration: the snapshot passed at
-            # startup goes stale immediately. Polling it forever would ignore the
-            # persisted UID cursor (re-fetching the whole mailbox each poll) and
-            # the enabled flag (a mailbox disabled at runtime must stop the loop).
-            mailbox_id = mailbox.id
-            try:
-                mailbox = store.get_mailbox(mailbox_id)
-                if mailbox is None or not mailbox.enabled:
-                    logger.info("poll loop stopping: mailbox %s deleted or disabled",
-                                mailbox_id)
-                    break
-                org = store.get_org(mailbox.org_id)
-                if org is not None:
-                    await poll_mailbox_once(store, papra, mailbox, org,
-                                            matcher=matcher)
-                else:
-                    logger.info("poll loop: org %s for mailbox %s not found; skipping",
-                                mailbox.org_id, mailbox.id)
-            except Exception:  # noqa: BLE001 - a re-fetch, org lookup, or poll failure must not kill the loop
-                logger.exception("poll loop error for mailbox %s", mailbox_id)
-            await asyncio.sleep(mailbox.poll_interval_s)
-    finally:
-        await matcher.aclose()
+    # The loop owns no shared resource any more: the subject filter's killable
+    # regex child is gone with it, so there is nothing here to tear down beyond
+    # the task itself. Cancellation stays the exit path for serve shutdown.
+    while True:
+        # Re-fetch the mailbox row EVERY iteration: the snapshot passed at
+        # startup goes stale immediately. Polling it forever would ignore the
+        # persisted UID cursor (re-fetching the whole mailbox each poll) and
+        # the enabled flag (a mailbox disabled at runtime must stop the loop).
+        mailbox_id = mailbox.id
+        try:
+            mailbox = store.get_mailbox(mailbox_id)
+            if mailbox is None or not mailbox.enabled:
+                logger.info("poll loop stopping: mailbox %s deleted or disabled",
+                            mailbox_id)
+                break
+            org = store.get_org(mailbox.org_id)
+            if org is not None:
+                await poll_mailbox_once(store, papra, mailbox, org)
+            else:
+                logger.info("poll loop: org %s for mailbox %s not found; skipping",
+                            mailbox.org_id, mailbox.id)
+        except Exception:  # noqa: BLE001 - a re-fetch, org lookup, or poll failure must not kill the loop
+            logger.exception("poll loop error for mailbox %s", mailbox_id)
+        await asyncio.sleep(mailbox.poll_interval_s)
 
 
 async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int) -> None:
