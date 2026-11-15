@@ -151,3 +151,52 @@ spec is amended to say so rather than leaving a strict check that only ever drop
   limits, per-sender quotas.
 - Anything that requires the operator to approve each import: the forwarding *is* the
   approval, and a second gate would undo the simplification.
+
+---
+
+## Revision 2 (2026-11-15, after review) — the allow-list was oversold; these corrections bind
+
+The claim that checking the provider's authentication note turns a `From:` allow-list into
+a lock was too confident, and the reviewer's objection is correct in a way that changes
+the design. **`Authentication-Results:` is a header, and a sender can put any header in a
+message they compose**, including `Authentication-Results: dmarc=pass`. Trusting any
+header that matches is a bypass, not a verification.
+
+So:
+
+1. **A trust boundary comes first, and a generic parser cannot supply it.** Before any
+   authentication check ships, we name *which* authentication-service identifier we trust
+   for the chosen provider, and confirm the provider strips or outranks a sender-supplied
+   header claiming that identity. Until that is established for the actual provider, the
+   verdict is **inconclusive, not authenticated** — and inconclusive behaves like
+   `absent` in the table above. A test where a message injects its own
+   `dmarc=pass` header is a required case, and it must not be ingested.
+2. **DMARC authenticates a domain, not a person.** It proves the visible `From:` *domain*
+   aligned. So the allow-list identity is the single outer `From:` address, and
+   **`Sender:` is no longer honoured** — DMARC does not authenticate it, so preferring it
+   would let an attacker choose the identity we check. For forwarded mail we authorise the
+   forwarding message itself, not addresses inside any attached message.
+3. **No universal `+suffix` stripping.** Plus-addressing means different things on
+   different providers; stripping it widens who is allowed in. Exact addresses first; a
+   domain entry is a deliberate, broader permission.
+4. **Relaxed mode relaxes only the evidence requirement.** An allow-listed sender is still
+   required; what the switch drops is the authentication proof, with a warning that
+   spoofing protection is gone. Previously it could have been read as "accept if no
+   header", which is wrong.
+
+**Separate mailbox, not an alias.** A shared mailbox makes admission depend on `To:`/`Cc:`,
+and those are sender-typed text, not proof of where the provider delivered the message;
+Bcc and forwarding can omit the real recipient entirely; and the app would then hold IMAP
+credentials to a personal inbox. So the app polls a mailbox that exists only for Papra.
+No `PAPRA_EXPECTED_RECIPIENT` is added: a configuration whose correctness depends on a
+header the attacker writes is not a configuration worth having.
+
+**Two implementation notes carried forward.** "No body fetch for rejected senders" is a
+*requirement*, not a description of existing code — the poller must fetch headers first and
+only then bodies. And a message we cannot parse is attacker-controlled input, not an
+infrastructure failure: it is skipped and counted, never retried forever, and never
+permanently blocks the cursor.
+
+`papra-suite check` stays configuration-only; reading a real message moves to an explicit
+diagnostic command that uses `BODY.PEEK`, changes no flags and no cursor, and prints
+headers and verdicts rather than message contents.
