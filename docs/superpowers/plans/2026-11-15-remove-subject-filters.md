@@ -84,6 +84,34 @@ per-poll summary line names how many were refused. A tested replay command is no
 The poller must fetch headers before bodies so a rejected sender costs one header read.
 This is a new requirement, not existing behaviour — measure the current fetch first.
 
+## Task 3 status — shipped
+
+`fetch_since(last_seen_uid, admit=None)` asks for `BODY.PEEK[HEADER]` after the size probe
+and before the body, and a refusal there is recorded in `FetchBatch.denied` instead of
+being downloaded, parsed and then refused. The policy stayed in `allowlist`
+(`admit_headers`); the session was handed a question about bytes, not a rule, so it can
+still be tested as transport. Callers that pass no `admit` pay no extra round-trip.
+
+Header parsing at the transport boundary is `extract_from_field(raw_bytes)`, which joins
+folded continuations and reports a repeated `From:` as ambiguous.
+
+Two things it found, both pinned by tests:
+
+* **The stdlib address parser fabricates addresses.** `getaddresses(["a@x.com more"])`
+  returns `a@x.commore` — it deletes the space and glues the words into an address nobody
+  wrote, which then passes a "is this a valid address" check over the parsed value. The
+  rule is therefore applied to the header's own text: an angle-addr must end the value,
+  and without angle brackets the value must be nothing but the address. Legacy
+  `Display Name a@x.com` is refused as ambiguous; no current client emits it.
+* **A folded continuation that muddies the address is refused, not interpreted.**
+
+Refused mail now costs a size probe and one header fetch — not a 20 MB download and a MIME
+parse. It still costs those two round-trips; per-message fetches are what the existing
+size-cap logic requires, so batching them is a later optimization, not a claim here.
+
+Mutants killed: removing the header gate (the body-request test fails), dropping
+`batch.denied` from the poll loop (counters and the cursor fail).
+
 ## Task 4: authentication evidence — blocked, by design
 
 No `Authentication-Results` parsing until the chosen provider is verified to strip or

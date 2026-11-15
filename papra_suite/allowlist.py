@@ -71,10 +71,66 @@ def parse_from_header(value: str | None) -> str | None:
     pairs = getaddresses([value])
     if len(pairs) != 1:
         return None
-    addr = parseaddr(pairs[0][1])[1].strip().lower()
+    # getaddresses is a parser, not a validator: it happily returns "a@x.com"
+    # for "a@x.com garbage", discarding whatever the sender wrote after the
+    # address. So the whole value must account for itself — either an angleaddr
+    # that ends the value, or nothing but the address. Junk after the address
+    # means the header is not saying one thing, and we refuse.
+    # Check the header's OWN text, because the parsed output cannot be trusted
+    # to resemble it: getaddresses("a@x.com more") returns "a@x.commore" — the
+    # space is deleted and the words glued into an address nobody wrote. A rule
+    # over the parsed value would pass that through as a valid domain.
+    text = value.strip()
+    addr = parseaddr(text)[1].strip().lower()
+    if "<" in text:
+        # An angle-addr must end the value; anything after it is a second claim.
+        if not text.endswith(">"):
+            return None
+    else:
+        # Without angle brackets the value must be the address and nothing else.
+        # Legacy "Display Name a@x.com" is refused with it: ambiguous, and not
+        # what any current mail client emits.
+        if any(c.isspace() for c in text) or text.lower() != addr:
+            return None
     if _ENCODED_WORD.search(addr) or not _STRICT_ADDRESS.match(addr):
         return None
     return addr
+
+
+def extract_from_field(header: bytes) -> str:
+    """The single From: value out of raw header bytes, or AMBIGUOUS_FROM.
+
+    Written against bytes rather than a parsed message because admission happens
+    on what the server sent, before any body is requested, and because a MIME
+    parser that helpfully resolves duplicates is doing exactly the thing this
+    function exists to refuse. Folded continuation lines are joined; a repeated
+    field is ambiguous; undecodable bytes are refused rather than raised — the
+    header is attacker-supplied input.
+    """
+    text = header.decode("ascii", errors="replace") if isinstance(header, bytes) else header
+    fields: list[tuple[str, str]] = []
+    name = value = None
+
+    def flush() -> None:
+        nonlocal name, value
+        if name is not None:
+            fields.append((name, value))
+        name = value = None
+
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line:
+            break  # end of headers; a "From:" line in the body is not a header
+        if line[0] in " \t" and name is not None:
+            value = f"{value} {line.strip()}"
+            continue
+        flush()
+        head, sep, rest = line.partition(":")
+        if sep:
+            name, value = head.strip().lower(), rest.strip()
+    flush()
+
+    values = [v for n, v in fields if n == "from"]
+    return values[0] if len(values) == 1 else AMBIGUOUS_FROM
 
 
 @dataclass(frozen=True)
@@ -105,6 +161,10 @@ class AllowList:
     def paused(self) -> bool:
         """No usable entries: ingest must not fetch, ingest or retire anything."""
         return not self.configured
+
+    def admit_headers(self, header: bytes) -> str:
+        """Verdict straight from raw header bytes — the fetch-time gate."""
+        return self.verdict_for_header(extract_from_field(header))
 
     def describe(self) -> str:
         if not self.configured:

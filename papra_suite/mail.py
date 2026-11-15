@@ -58,6 +58,10 @@ class FetchBatch:
     """
     messages: list[tuple[int, bytes]] = field(default_factory=list)
     oversized_uids: list[int] = field(default_factory=list)
+    # (uid, verdict) for messages refused on their headers alone: the body was
+    # never requested, so a refused sender costs a header read, not a download
+    # plus a MIME parse.
+    denied: list[tuple[int, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -218,7 +222,7 @@ class MailboxSession:
             return "0"
         return data[0].decode().split()[-1]
 
-    def fetch_since(self, last_seen_uid: int | None) -> FetchBatch:
+    def fetch_since(self, last_seen_uid: int | None, admit=None) -> FetchBatch:
         if last_seen_uid is None:
             status, data = self._imap.uid("SEARCH", None, "ALL")
         else:
@@ -259,6 +263,23 @@ class MailboxSession:
                 )
                 batch.oversized_uids.append(uid)
                 continue
+            if admit is not None:
+                # Decide on the headers BEFORE asking for the body. The
+                # alternative — download 20 MB, parse it, then notice the
+                # sender is not allowed — is the cost this ordering exists to
+                # remove, and it is the difference between a junk folder being
+                # cheap to refuse and being a bandwidth bill.
+                header = self._fetch_headers(uid)
+                if header is None:
+                    logger.warning("message uid=%s vanished before header fetch;"
+                                   " skipping", uid)
+                    continue
+                verdict = admit(header)
+                if verdict != PERMISSION:
+                    logger.info("message uid=%s refused on its headers; body not"
+                                " requested", uid)
+                    batch.denied.append((uid, verdict))
+                    continue
             status, fetch_data = self._imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
             if status != "OK":
                 raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
@@ -273,6 +294,17 @@ class MailboxSession:
                 continue
             batch.messages.append((uid, entry[1]))
         return batch
+
+    def _fetch_headers(self, uid: int) -> bytes | None:
+        """Header bytes for one uid, or None if it vanished mid-poll."""
+        status, fetch_data = self._imap.uid("FETCH", str(uid), "(BODY.PEEK[HEADER])")
+        if status != "OK":
+            raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
+        entry = fetch_data[0] if fetch_data else None
+        if not (isinstance(entry, tuple) and len(entry) >= 2
+                and isinstance(entry[1], bytes)):
+            return None
+        return entry[1]
 
     def _rfc822_size(self, uid: int) -> int | None:
         """Return the message's RFC822.SIZE, or None if it vanished/parse failed."""
@@ -404,7 +436,11 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
         uidvalidity = await asyncio.to_thread(session.select_inbox)
         rescan = mailbox.uidvalidity is not None and mailbox.uidvalidity != uidvalidity
         last_seen = None if (mailbox.last_seen_uid is None or rescan) else mailbox.last_seen_uid
-        batch = await asyncio.to_thread(session.fetch_since, last_seen)
+        # Admission is handed to the fetch so a refused sender is decided on its
+        # headers: the policy stays here, the transport stays in the session, and
+        # what the session is told is a question about bytes, not a rule.
+        batch = await asyncio.to_thread(session.fetch_since, last_seen,
+                                        allowlist.admit_headers)
     except Exception as error:  # noqa: BLE001 - the poller never crashes the loop
         result.error = str(error)
         await asyncio.to_thread(session.close)
@@ -419,12 +455,40 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
     try:
         # merge messages and oversized uids back into uid order so the
         # freeze-on-failure semantics stay position-correct
+        # merge messages, oversized uids and header-stage refusals back into uid
+        # order so the freeze-on-failure semantics stay position-correct
         entries = sorted(
-            [(uid, raw) for uid, raw in batch.messages]
-            + [(uid, None) for uid in batch.oversized_uids]
+            [(uid, 0, raw) for uid, raw in batch.messages]
+            + [(uid, 1, None) for uid in batch.oversized_uids]
+            + [(uid, 2, verdict) for uid, verdict in batch.denied]
         )
-        for uid, raw in entries:
+
+        def retire_refused(refused_uid: int, verdict: str) -> None:
+            # A rejected sender is a NORMAL outcome, not a fault. The message is
+            # retired and the cursor advances, so a busy junk folder cannot
+            # re-fetch and re-reject the same uids on every poll — and the poll
+            # itself must not fail, because three consecutive failures disable a
+            # mailbox and unsolicited mail must never be able to do that.
+            nonlocal candidate_last_seen
+            if verdict == DENY_MALFORMED:
+                result.malformed_senders += 1
+                logger.warning("message uid=%s ignored: its From: header does not "
+                               "resolve to exactly one sender", refused_uid)
+            else:
+                result.senders_denied += 1
+                logger.info("message uid=%s ignored: sender is not on the allow-list",
+                            refused_uid)
+            seen_uids.append(refused_uid)
+            if not prefix_failed:
+                candidate_last_seen = refused_uid
+
+        for uid, kind, payload in entries:
             result.messages_scanned += 1
+            if kind == 2:
+                # refused on its headers; its body was never requested
+                retire_refused(uid, payload)
+                continue
+            raw = payload
             if raw is None:
                 logger.warning(
                     "message uid=%s skipped: exceeds the per-message size cap", uid
@@ -442,24 +506,11 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
             parsed = await asyncio.to_thread(parse_message, raw)
             verdict = allowlist.verdict_for_header(parsed.from_header)
             if verdict != PERMISSION:
-                # A rejected sender is a NORMAL outcome, not a fault. The
-                # message is retired and the cursor advances, so a busy junk
-                # folder cannot re-fetch and re-reject the same uids on every
-                # poll — and the poll itself must not fail, because three
-                # consecutive failures disable a mailbox and unsolicited mail
-                # must never be able to do that to you.
-                if verdict == DENY_MALFORMED:
-                    result.malformed_senders += 1
-                    logger.warning(
-                        "message uid=%s ignored: its From: header does not "
-                        "resolve to exactly one sender", uid)
-                else:
-                    result.senders_denied += 1
-                    logger.info("message uid=%s ignored: sender is not on the "
-                                "allow-list", uid)
-                seen_uids.append(uid)
-                if not prefix_failed:
-                    candidate_last_seen = uid
+                # Defence in depth: the fetch already refused on the headers, so
+                # reaching here means a caller handed this loop a body that was
+                # never admitted, or a header that reads differently once parsed.
+                # Either way the answer is the same refusal, not a new path.
+                retire_refused(uid, verdict)
                 continue
             uploads_ok = True
             had_pdfs = False

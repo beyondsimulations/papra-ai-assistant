@@ -10,9 +10,11 @@ a verified provider trust boundary (see the spec's Revision 2).
 import pytest
 
 from papra_suite.allowlist import (
+    AMBIGUOUS_FROM,
     DENY_MALFORMED,
     DENY_SENDER,
     PERMISSION,
+    extract_from_field,
     parse_allowlist,
     parse_from_header,
 )
@@ -133,3 +135,68 @@ class TestAmbiguousInput:
 
     def test_a_display_name_containing_a_comma_is_still_one_address(self):
         assert parse_from_header('"Müller, Hans" <a@x.com>') == "a@x.com"
+
+
+class TestHeaderFieldExtraction:
+    """Admission now happens on raw header bytes fetched from the server, so the
+    field must be found there — folded lines, repeated fields and case and all —
+    without ever interpreting the body."""
+
+    def _h(self, *lines):
+        return b"\r\n".join(line.encode() for line in lines) + b"\r\n\r\nbody"
+
+    def test_a_plain_field_is_found(self):
+        assert extract_from_field(self._h("From: a@x.com", "Subject: s")) == "a@x.com"
+
+    def test_the_field_name_is_case_insensitive(self):
+        assert extract_from_field(self._h("FROM: a@x.com")) == "a@x.com"
+
+    def test_a_folded_field_is_unfolded(self):
+        raw = self._h("From: Long Name", "\t<a@x.com>")
+        assert parse_from_header(extract_from_field(raw)) == "a@x.com"
+
+    def test_a_repeated_field_is_ambiguous_not_first_wins(self):
+        raw = self._h("From: a@x.com", "From: b@evil.net")
+        assert extract_from_field(raw) == AMBIGUOUS_FROM
+
+    def test_a_folded_continuation_that_muddies_the_address_is_refused(self):
+        # The continuation is joined (that is what folding means), and the
+        # joined value is no longer one address — so it is refused rather than
+        # guessed at. Fail closed on input only an attacker writes.
+        raw = self._h("From: a@x.com", "\tmore", "Subject: s")
+        assert parse_from_header(extract_from_field(raw)) is None
+
+    def test_absent_field_is_ambiguous(self):
+        assert extract_from_field(self._h("Subject: s")) == AMBIGUOUS_FROM
+
+    def test_headers_without_crlf_still_parse(self):
+        assert extract_from_field(b"From: a@x.com\n\nbody") == "a@x.com"
+
+    def test_undecodable_bytes_never_raise_and_are_never_admitted(self):
+        # Header bytes are attacker-supplied: a decode error must degrade to a
+        # refusal, never to an exception (which would fail the whole poll) and
+        # never to a permission.
+        al = parse_allowlist("x.com")
+        for raw in (b"From: \x00\x01\r\n\r\n", b"\xff\xfe\r\n\r\n", b""):
+            assert isinstance(extract_from_field(raw), str)
+            assert al.admit_headers(raw) != PERMISSION
+
+    def test_a_mangled_display_name_does_not_void_a_clean_address(self):
+        # Display names carry no authorization weight: undecodable bytes in one
+        # are cosmetic, and refusing here would deny ordinary mail.
+        assert parse_from_header(b"=\xff\xfe= <a@x.com>".decode("ascii",
+                                                                "replace")) == "a@x.com"
+
+    def test_content_after_the_address_is_refused(self):
+        # getaddresses would return a@x.com and silently discard the rest, which
+        # is precisely how a header gets to mean two things.
+        assert parse_from_header("a@x.com <evil@evil.net>") is None
+        assert parse_from_header("a@x.com , b@x.com") is None
+        assert parse_from_header("a@x.com,") is None
+        assert parse_from_header("<a@x.com> trailing") is None
+
+    def test_admit_headers_answers_from_raw_bytes(self):
+        al = parse_allowlist("x.com")
+        assert al.admit_headers(self._h("From: invoice@x.com")) == PERMISSION
+        assert al.admit_headers(self._h("From: invoice@evil.net")) == DENY_SENDER
+        assert al.admit_headers(b"Subject: nothing here") == DENY_MALFORMED

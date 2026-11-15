@@ -8,6 +8,7 @@ import threading
 
 import pytest
 
+from papra_suite.allowlist import parse_allowlist
 from papra_suite.mail import (
     MAX_MESSAGE_BYTES,
     MAX_POLL_BYTES,
@@ -25,7 +26,8 @@ class FakeImap:
     """Minimal imaplib double: canned SEARCH result, per-uid FETCH responses."""
 
     def __init__(self, search_uids=(1, 2, 3), bodies=None, fetch_responses=None,
-                 sizes=None, size_responses=None, capabilities=("IMAP4REV1",),
+                 sizes=None, size_responses=None, headers=None,
+                 capabilities=("IMAP4REV1",),
                  deleted_uids=(), no_store=False, no_uid_expunge=False,
                  no_search_deleted=False, no_expunge=False):
         self.search_uids = list(search_uids)
@@ -33,7 +35,9 @@ class FakeImap:
         self.fetch_responses = fetch_responses or {}  # uid -> raw body-fetch_data list
         self.sizes = sizes or {}                       # uid -> explicit RFC822.SIZE
         self.size_responses = size_responses or {}    # uid -> raw size-fetch_data list
+        self.headers = headers or {}      # uid -> raw header bytes
         self.size_probes = []   # uids probed with (RFC822.SIZE)
+        self.header_calls = []  # uids whose BODY.PEEK[HEADER] was requested
         self.fetch_calls = []    # uids whose BODY.PEEK[] was actually fetched
         self.capabilities = tuple(capabilities)   # imaplib exposes these at connect
         self.deleted_uids = set(deleted_uids)     # what UID SEARCH DELETED reports
@@ -79,6 +83,12 @@ class FakeImap:
                 return ("OK", self.size_responses[uid])
             size = self.sizes.get(uid, len(self.bodies.get(uid, b"")))
             return ("OK", [f"{uid} (RFC822.SIZE {size} UID {uid})".encode()])
+        if args[1] == "(BODY.PEEK[HEADER])":
+            self.header_calls.append(uid)
+            raw = self.headers.get(uid)
+            if raw is None:
+                return ("OK", [f"{uid} (UID {uid})".encode()])
+            return ("OK", [(f"{uid} (UID {uid} BODY[HEADER])".encode(), raw)])
         self.fetch_calls.append(uid)
         if uid in self.fetch_responses:
             return ("OK", self.fetch_responses[uid])
@@ -513,3 +523,71 @@ def test_select_inbox_raises_on_select_no():
 
     with pytest.raises(imaplib.IMAP4.error, match="select"):
         session.select_inbox()
+
+
+# --- header-first admission (T3) --------------------------------------------
+#
+# Admission is decided on the headers, so a refused sender costs a header read
+# and not a full body download plus a MIME parse. These pin the ORDER of
+# commands, because "refused mail is cheap" is only true if the body was never
+# asked for.
+
+def _hdr(addr):
+    return f"From: {addr}\r\nSubject: invoice\r\n\r\n".encode()
+
+
+_PDF_BODY = b"From: x\r\n\r\n%PDF-1"
+
+
+def test_a_refused_sender_never_has_its_body_requested():
+    imap = FakeImap(
+        search_uids=[1, 2],
+        bodies={1: _PDF_BODY, 2: _PDF_BODY},
+        headers={1: _hdr("Stranger <spam@evil.net>"), 2: _hdr("ok@x.com")},
+    )
+    session = make_session()
+    session._imap = imap
+
+    batch = session.fetch_since(None, admit=parse_allowlist("x.com").admit_headers)
+
+    assert imap.header_calls == [1, 2]
+    assert imap.fetch_calls == [2]          # uid 1 was refused before its body
+    assert [uid for uid, _ in batch.denied] == [1]
+    assert [uid for uid, _ in batch.messages] == [2]
+
+
+def test_no_admission_check_means_no_extra_fetch():
+    # Callers that do not gate must not pay for a header round-trip.
+    imap = FakeImap(search_uids=[1], bodies={1: _PDF_BODY}, headers={1: _hdr("a@x.com")})
+    session = make_session()
+    session._imap = imap
+
+    batch = session.fetch_since(None)
+
+    assert imap.header_calls == []
+    assert [uid for uid, _ in batch.messages] == [1]
+
+
+def test_a_vanished_header_response_skips_the_message_without_failing_the_poll():
+    imap = FakeImap(search_uids=[1, 2], bodies={1: _PDF_BODY, 2: _PDF_BODY},
+                    headers={2: _hdr("ok@x.com")})  # uid 1 answers with no literal
+    session = make_session()
+    session._imap = imap
+
+    batch = session.fetch_since(None, admit=parse_allowlist("x.com").admit_headers)
+
+    assert batch.denied == []
+    assert [uid for uid, _ in batch.messages] == [2]
+    assert 1 not in imap.fetch_calls
+
+
+def test_an_oversized_message_is_still_skipped_before_any_header_fetch():
+    imap = FakeImap(search_uids=[1], sizes={1: MAX_MESSAGE_BYTES + 1},
+                    bodies={1: b""}, headers={1: _hdr("ok@x.com")})
+    session = make_session()
+    session._imap = imap
+
+    batch = session.fetch_since(None, admit=parse_allowlist("x.com").admit_headers)
+
+    assert batch.oversized_uids == [1]
+    assert imap.header_calls == []

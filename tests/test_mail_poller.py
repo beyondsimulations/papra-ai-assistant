@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from papra_suite.allowlist import parse_allowlist
+from papra_suite.allowlist import PERMISSION, parse_allowlist
 from papra_suite.mail import FetchBatch, PollResult, poll_mailbox_once
 from papra_suite.store import Mailbox, Org, Store
 
@@ -43,12 +43,22 @@ def build_raw(subject="Invoice", message_id="<m1@x>",
     ])
 
 
+def _headers_of(raw: bytes) -> bytes:
+    """Header block of a raw message, the way IMAP would hand it back."""
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        if sep in raw:
+            return raw.split(sep, 1)[0] + sep
+    return raw
+
+
 @dataclass
 class FakeSession:
     uidvalidity: str = "111"
     raws: list = field(default_factory=list)     # [(uid, raw)]
     oversized: list = field(default_factory=list)  # uids above the per-message cap
     seen: list = field(default_factory=list)
+    header_checked: list = field(default_factory=list)  # uids read as headers only
+    raws_read: list = field(default_factory=list)       # uids whose body was read
     deleted: list = field(default_factory=list)
     fail_on_connect: Exception | None = None
     closed: bool = False
@@ -60,12 +70,28 @@ class FakeSession:
     def select_inbox(self):
         return self.uidvalidity
 
-    def fetch_since(self, last_seen_uid):
+    def fetch_since(self, last_seen_uid, admit=None):
         messages = self.raws if last_seen_uid is None \
             else [(uid, raw) for uid, raw in self.raws if uid > last_seen_uid]
         oversized = self.oversized if last_seen_uid is None \
             else [uid for uid in self.oversized if uid > last_seen_uid]
-        return FetchBatch(messages=list(messages), oversized_uids=list(oversized))
+        denied = []
+        admitted = []
+        for uid, raw in messages:
+            if admit is None:
+                admitted.append((uid, raw))
+                continue
+            # A transport-shaped fake: admission is answered from the header
+            # bytes only, and a refused message is never handed over as a body.
+            self.header_checked.append(uid)
+            verdict = admit(_headers_of(raw))
+            if verdict != PERMISSION:
+                denied.append((uid, verdict))
+                continue
+            self.raws_read.append(uid)
+            admitted.append((uid, raw))
+        return FetchBatch(messages=admitted, oversized_uids=list(oversized),
+                          denied=denied)
 
     def mark_seen(self, uids):
         self.seen.extend(uids)
@@ -351,7 +377,7 @@ async def test_poll_resumes_after_cap_truncated_batch(store, monkeypatch):
     )
 
     class TruncatingSession(FakeSession):
-        def fetch_since(self, last_seen_uid):
+        def fetch_since(self, last_seen_uid, admit=None):
             batch = super().fetch_since(last_seen_uid)
             batch.messages = batch.messages[:3]   # simulates the aggregate break
             return batch
@@ -804,3 +830,53 @@ async def test_a_forwarded_attachment_does_not_borrow_its_inner_sender(store, mo
 
     assert result.senders_denied == 1 and result.malformed_senders == 0
     assert client.uploads == []
+
+
+# --- header-first admission (poller side) -----------------------------------
+
+async def test_a_refused_sender_never_has_its_body_read(store, monkeypatch):
+    """The claim is about ORDER, so the assertion is about order: the refusal is
+    recorded, and the body is never handed over to be parsed."""
+    session = FakeSession(raws=[(1, build_raw(sender="Stranger <spam@other.net>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    result = await poll_with_allow_list(store, client, make_mailbox(), ORG)
+
+    assert session.header_checked == [1]
+    assert session.raws_read == []
+    assert client.uploads == [] and result.senders_denied == 1
+    assert session.seen == [1]
+
+
+async def test_a_refusal_before_a_failed_upload_still_advances_the_cursor(
+    store, monkeypatch
+):
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    session = FakeSession(raws=[
+        (1, build_raw(message_id="<m1@x>", sender="Stranger <spam@other.net>")),
+        (2, build_raw(message_id="<m2@x>", attachments=[("a.pdf", b"%PDF-1")])),
+    ])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    await poll_with_allow_list(store, StubClient(), store.get_mailbox(mailbox_id),
+                               store.get_org(org_id))
+
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 2
+
+
+async def test_an_oversized_message_is_still_counted_alongside_refusals(
+    store, monkeypatch
+):
+    session = FakeSession(
+        raws=[(2, build_raw(sender="Stranger <spam@other.net>"))], oversized=[1]
+    )
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
+
+    assert result.oversized_skipped == 1 and result.senders_denied == 1
+    assert result.messages_scanned == 2
