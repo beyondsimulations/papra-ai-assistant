@@ -10,6 +10,7 @@ import sys
 
 import pytest
 
+import papra_suite.store as store_module
 from papra_suite.__main__ import main
 from tests.test_config import BASE_ENV
 
@@ -39,7 +40,7 @@ def test_check_success_migrates_and_exits_zero(monkeypatch, tmp_path):
         user_version = conn.execute("PRAGMA user_version").fetchone()[0]
     finally:
         conn.close()
-    assert user_version == 1
+    assert user_version == len(store_module.MIGRATIONS)
 
 
 def test_check_config_error_exits_two(monkeypatch, capsys, tmp_path):

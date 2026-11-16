@@ -310,7 +310,10 @@ def test_failed_migration_is_rolled_back_atomically(tmp_path, monkeypatch):
     monkeypatch.undo()
     fresh = Store(tmp_path / "state.db")
     fresh.migrate()
-    assert fresh._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    # the version a clean re-migrate must land on is "every real migration", not
+    # the literal 1 this assertion was written against (there are two now)
+    assert fresh._conn.execute("PRAGMA user_version").fetchone()[0] == len(
+        store_module.MIGRATIONS)
     assert fresh._conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scratch'"
     ).fetchone() is None
@@ -710,3 +713,151 @@ def test_claim_next_job_retries_when_race_steals_candidate(tmp_path):
         assert statuses == {"doc_0": "running", "doc_1": "running", "doc_2": "pending"}
     finally:
         store.close()
+
+
+# -- ingest_events ---------------------------------------------------------
+
+def _event_kinds():
+    return store_module.INGEST_EVENT_KINDS
+
+
+def test_migration_002_adds_ingest_events(tmp_path):
+    """A database already at migration 001 is upgraded in place to 002."""
+    db_path = tmp_path / "state.db"
+    store = Store(db_path)
+    store.migrate()
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == len(
+        store_module.MIGRATIONS)
+    tables = {row[0] for row in store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    indexes = {row[0] for row in store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_ingest%'")}
+    assert "ingest_events" in tables
+    assert {"idx_ingest_events_ts", "idx_ingest_events_mailbox"} <= indexes
+    store.close()
+
+    # migrating again is a no-op, not a second CREATE that errors
+    store = Store(db_path)
+    store.migrate()
+    store.migrate()
+    store.close()
+
+
+def test_record_and_list_roundtrip_every_kind(store):
+    for kind in _event_kinds():
+        store.record_ingest_event(
+            mailbox_id="mb_1", uid=100, kind=kind, uidvalidity="8813",
+            papra_org_id="org_1", filename=f"file-{kind}.pdf",
+            sender="billing@example.de", detail="because")
+    events = store.list_ingest_events()
+    assert {e.kind for e in events} == set(_event_kinds())
+    event = events[0]
+    assert (event.uid, event.uidvalidity, event.papra_org_id) == (100, "8813", "org_1")
+    assert event.sender == "billing@example.de" and event.detail == "because"
+    assert event.ts and event.id
+
+
+def test_unknown_kind_is_refused(store):
+    """The closed set is enforced where it is written, so a call-site typo
+    fails in the developer's test run instead of inventing a sixth outcome."""
+    with pytest.raises(ValueError):
+        store.record_ingest_event(mailbox_id="mb_1", uid=1, kind="sender_maybe")
+
+
+def test_uid_is_required_by_the_schema(store):
+    with pytest.raises(sqlite3.IntegrityError):
+        store._conn.execute(
+            "INSERT INTO ingest_events (ts, mailbox_id, uid, kind)"
+            " VALUES ('now', 'mb_1', NULL, 'sender_denied')")
+
+
+def test_list_orders_newest_first_with_id_tiebreak(store):
+    """Rows written inside one clock tick must still have a stable order, or
+    'newest first' depends on sqlite's mood."""
+    for _ in range(3):
+        store.record_ingest_event(mailbox_id="mb_1", uid=1, kind="sender_denied")
+    ids = [event.id for event in store.list_ingest_events()]
+    assert len(ids) == 3 and ids == sorted(ids, reverse=True)
+
+
+def test_list_filters(store):
+    store.record_ingest_event(mailbox_id="mb_1", uid=1, kind="sender_denied")
+    store.record_ingest_event(mailbox_id="mb_2", uid=2, kind="upload_failed")
+    assert {e.mailbox_id for e in store.list_ingest_events(mailbox_id="mb_2")} == {"mb_2"}
+    assert {e.kind for e in store.list_ingest_events(kinds=["sender_denied"])} == {
+        "sender_denied"}
+    assert store.list_ingest_events(kinds=[]) == []
+    future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    assert store.list_ingest_events(since=future) == []
+
+
+def test_list_clamps_limit(store):
+    for i in range(5):
+        store.record_ingest_event(mailbox_id="mb_1", uid=i, kind="sender_denied")
+    assert len(store.list_ingest_events(limit=0)) == 1
+    assert len(store.list_ingest_events(limit=-3)) == 1
+    assert len(store.list_ingest_events(limit=10_000)) == 5
+
+
+# -- the untrusted-string boundary ----------------------------------------
+
+def test_sanitise_strips_control_chars_and_collapses_whitespace():
+    from papra_suite.store import sanitize_event_text
+
+    assert sanitize_event_text("a\x00b\x1bc\r\nd", limit=100) == "a b c d"
+    assert sanitize_event_text("   \x1b  ", limit=100) is None
+    assert sanitize_event_text(None, limit=100) is None
+    assert sanitize_event_text(42, limit=100) == "42"
+
+
+def test_sanitise_truncates_within_its_own_budget():
+    from papra_suite.store import sanitize_event_text
+
+    out = sanitize_event_text("x" * 500, limit=200)
+    assert len(out) <= 200 and out.endswith("…")
+    # the limit itself is honoured for a value exactly at the boundary
+    assert sanitize_event_text("y" * 200, limit=200) == "y" * 200
+
+
+def test_sanitise_keeps_quotes_and_does_not_escape():
+    """This is SQLite text bound by parameter. HTML-escaping or quote-stripping
+    here would destroy the evidence the row exists to preserve."""
+    from papra_suite.store import sanitize_event_text
+
+    raw = 'Robert"; DROP TABLE ingest_events; --.pdf'
+    assert sanitize_event_text(raw, limit=200) == raw
+
+
+def test_record_ingest_event_sanitises_every_text_field(store):
+    store.record_ingest_event(
+        mailbox_id="mb_1", uid=7, kind="attachment_unsupported",
+        filename="evil\x00name.pdf", sender="a@b.de\nFAKE ROW",
+        detail="PapraError(status=502)")
+    event = store.list_ingest_events()[0]
+    assert event.filename == "evil name.pdf"
+    assert event.sender == "a@b.de FAKE ROW"
+    assert "\n" not in event.sender and "\x00" not in event.filename
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM ingest_events").fetchone()[0] == 1
+
+
+def test_prune_keeps_the_window(store):
+    old = (datetime.now(UTC) - timedelta(days=91)).isoformat()
+    recent = (datetime.now(UTC) - timedelta(days=89)).isoformat()
+    for uid, ts in ((1, old), (2, recent)):
+        store._conn.execute(
+            "INSERT INTO ingest_events (ts, mailbox_id, uid, kind) VALUES (?, 'mb_1', ?,"
+            " 'sender_denied')", (ts, uid))
+    store._conn.commit()
+    store.record_ingest_event(mailbox_id="mb_1", uid=3, kind="sender_denied")
+    store.set_setting("ignored", "x")
+    assert store.prune_ingest_events(retention_days=90) == 1
+    assert sorted(e.uid for e in store.list_ingest_events()) == [2, 3]
+    # the recent row survives an idempotent second pass
+    assert store.prune_ingest_events(retention_days=90) == 0
+    assert store.get_setting("ignored") == "x"
+
+
+def test_prune_with_a_bounded_window_touches_nothing_fresh(store):
+    store.record_ingest_event(mailbox_id="mb_1", uid=1, kind="upload_failed")
+    assert store.prune_ingest_events(retention_days=90) == 0

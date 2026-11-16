@@ -20,6 +20,12 @@ LOG_RING_BUFFER_SIZE = 1000
 
 VALID_SSL_MODES = ("ssl", "starttls", "plain")
 
+# How long a "this is why nothing arrived" row stays worth keeping. Ninety days
+# outlives every realistic "where is my invoice?" question while keeping the
+# table small enough to read; older than that, the answer belongs to the logs or
+# to `replay`, not to this window.
+INGEST_EVENT_RETENTION_DAYS = 90
+
 
 def _migration_001_initial(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -123,7 +129,92 @@ def _migration_001_initial(conn: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS = [_migration_001_initial]
+def _migration_002_ingest_events(conn: sqlite3.Connection) -> None:
+    """Why a message or attachment was not ingested.
+
+    Additive: nothing that exists is touched, and existing databases open
+    unchanged and are bumped from user_version 1 to 2. Rows are dispositions —
+    one per message-or-attachment per poll that decided about it — and they are
+    retained for INGEST_EVENT_RETENTION_DAYS, so this is a window, not an
+    archive. See docs/superpowers/plans/2026-11-16-ingest-visibility.md.
+    """
+    conn.execute(
+        """
+        CREATE TABLE ingest_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            mailbox_id TEXT NOT NULL,
+            uid INTEGER NOT NULL,
+            uidvalidity TEXT,
+            papra_org_id TEXT,
+            kind TEXT NOT NULL,
+            filename TEXT,
+            sender TEXT,
+            detail TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX idx_ingest_events_ts ON ingest_events(ts)")
+    conn.execute(
+        "CREATE INDEX idx_ingest_events_mailbox ON ingest_events(mailbox_id, ts)"
+    )
+
+
+MIGRATIONS = [_migration_001_initial, _migration_002_ingest_events]
+
+# The closed set of outcomes worth recording. A sixth value must be added here
+# and written at a call site, never invented by a call site: `record_ingest_event`
+# refuses anything else, so a typo at a call site fails in the developer's test
+# run instead of quietly becoming an outcome nobody renders.
+INGEST_EVENT_KINDS = (
+    "attachment_unsupported",   # a document format this pipeline does not take
+    "sender_denied",            # the allow-list refused the sender
+    "sender_malformed",         # From: did not resolve to exactly one sender
+    "message_oversized",        # over MAX_MESSAGE_BYTES, body never fetched
+    "upload_failed",            # Papra refused the upload (non-409)
+)
+
+# Field budgets for attacker-supplied text. These strings are evidence about a
+# message, not documents to store in full: a 5 MB MIME filename must not become
+# a 5 MB row, and the row has to stay readable on one CLI line.
+EVENT_TEXT_LIMITS = {"filename": 200, "sender": 254, "detail": 300, "uidvalidity": 64}
+
+
+def sanitize_event_text(value: object, *, limit: int) -> str | None:
+    """Bound attacker-supplied text for an ingest_events column.
+
+    Every value here comes from a message someone else sent: a filename from a
+    MIME part, a sender from a header, a classification derived from an upstream
+    error. Three things happen and nothing else:
+
+    - control characters (``ord(ch) < 32``, plus DEL) become a **space**, never
+      removed. Deleting them would splice two words into one and destroy the
+      evidence; a space keeps the row honest and keeps one event on one line,
+      which is what protects ``papra-suite events`` from a filename that
+      contains a newline.
+    - runs of whitespace collapse and the ends strip, for the same reason.
+    - the result is truncated to ``limit`` **inclusive**, with a trailing "…"
+      when characters were lost. A truncation that overflows its own budget is
+      the bug this rule exists to prevent.
+
+    What is deliberately NOT done: no HTML escaping and no quote stripping. This
+    is SQLite text bound by parameter, and mangling the bytes would corrupt the
+    record while buying no safety. Whatever renders these rows in a web page
+    escapes at render time — that is that renderer's job, and this is the reason
+    the raw value is kept.
+
+    Returns ``None`` for empty or whitespace-only input, so an absent field
+    stays absent instead of becoming an empty string.
+    """
+    if value is None:
+        return None
+    text = "".join(" " if (ord(ch) < 32 or ord(ch) == 127) else ch for ch in str(value))
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
 
 
 @dataclass
@@ -167,6 +258,39 @@ class Job:
     error: str | None
     created_at: str
     updated_at: str
+
+
+@dataclass
+class IngestEvent:
+    """One recorded decision NOT to ingest something.
+
+    `uidvalidity` travels with `uid` because an IMAP uid is only meaningful
+    inside one UIDVALIDITY epoch: after a mailbox is rebuilt the uids restart
+    and can name a different message, so a row quoting a bare uid would point
+    at the wrong mail — and the recovery documentation tells operators to act on
+    that uid. The poller holds the value from `select_inbox` on every poll, so
+    recording it is free and recovering it later is not possible.
+    """
+
+    id: int
+    ts: str
+    mailbox_id: str
+    uid: int
+    uidvalidity: str | None
+    papra_org_id: str | None
+    kind: str
+    filename: str | None
+    sender: str | None
+    detail: str | None
+
+
+def _row_to_ingest_event(row: sqlite3.Row) -> IngestEvent:
+    return IngestEvent(
+        id=row["id"], ts=row["ts"], mailbox_id=row["mailbox_id"], uid=row["uid"],
+        uidvalidity=row["uidvalidity"], papra_org_id=row["papra_org_id"],
+        kind=row["kind"], filename=row["filename"], sender=row["sender"],
+        detail=row["detail"],
+    )
 
 
 def _row_to_mailbox(row: sqlite3.Row) -> Mailbox:
@@ -267,6 +391,90 @@ class Store:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    # -- ingest events -------------------------------------------------------
+
+    def record_ingest_event(
+        self, *, mailbox_id: str, uid: int, kind: str, uidvalidity: str | None = None,
+        papra_org_id: str | None = None, filename: str | None = None,
+        sender: str | None = None, detail: str | None = None,
+    ) -> None:
+        """Record one decision NOT to ingest something.
+
+        `kind` is validated against `INGEST_EVENT_KINDS` here rather than at the
+        call sites, so an unknown outcome is a programming error raised now, not
+        a row some future renderer has to guess about. Every attacker-supplied
+        string goes through `sanitize_event_text` on the way in: the columns hold
+        a MIME filename, a header value and an upstream classification, and a
+        writer must not be able to forget that.
+        """
+        if kind not in INGEST_EVENT_KINDS:
+            raise ValueError(f"unknown ingest event kind: {kind!r}")
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO ingest_events (ts, mailbox_id, uid, uidvalidity,"
+                " papra_org_id, kind, filename, sender, detail)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _now(), mailbox_id, uid,
+                    sanitize_event_text(uidvalidity, limit=EVENT_TEXT_LIMITS["uidvalidity"]),
+                    sanitize_event_text(papra_org_id, limit=64),
+                    kind,
+                    sanitize_event_text(filename, limit=EVENT_TEXT_LIMITS["filename"]),
+                    sanitize_event_text(sender, limit=EVENT_TEXT_LIMITS["sender"]),
+                    sanitize_event_text(detail, limit=EVENT_TEXT_LIMITS["detail"]),
+                ),
+            )
+
+    def list_ingest_events(
+        self, *, mailbox_id: str | None = None, kinds: list[str] | None = None,
+        since: str | None = None, limit: int = 200,
+    ) -> list[IngestEvent]:
+        """Newest first. `ts DESC, id DESC` because two events can share a
+        millisecond and an unstable order would make 'the last 200' mean
+        something different on every read. `kinds=[]` is an empty answer, not
+        'no filter' — an empty filter set selecting everything would turn a
+        caller's empty list into the whole table."""
+        bounded = max(1, min(int(limit), 1000))
+        sql = "SELECT * FROM ingest_events"
+        clauses: list[str] = []
+        params: list[object] = []
+        if mailbox_id is not None:
+            clauses.append("mailbox_id = ?")
+            params.append(mailbox_id)
+        if kinds is not None:
+            if not kinds:
+                return []
+            clauses.append(f"kind IN ({', '.join('?' * len(kinds))})")
+            params.extend(kinds)
+        if since is not None:
+            clauses.append("ts >= ?")
+            params.append(since)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(bounded)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_ingest_event(row) for row in rows]
+
+    def prune_ingest_events(self, retention_days: int = INGEST_EVENT_RETENTION_DAYS) -> int:
+        """Drop events older than the retention window; return how many went.
+
+        The comparison is lexical on purpose: `_now()` and `_iso()` both produce
+        a zero-padded UTC ISO timestamp ending "+00:00", and for that fixed shape
+        lexical order equals chronological order (the "+00:00" separator sorts
+        before the "." of a fractional second, so a whole second still sorts
+        first). If `_now()`'s format ever changes — a different offset, a space
+        instead of a "T", a naive timestamp — this comparison silently stops
+        meaning what it says, and this is the sentence that says so.
+        """
+        cutoff = _iso(datetime.now(UTC) - timedelta(days=retention_days))
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM ingest_events WHERE ts < ?", (cutoff,)
+            )
+        return cursor.rowcount
 
     # -- jobs ---------------------------------------------------------------
 
