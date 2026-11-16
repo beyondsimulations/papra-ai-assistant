@@ -394,6 +394,22 @@ class Store:
 
     # -- ingest events -------------------------------------------------------
 
+    def table_columns(self, table: str) -> list[str]:
+        """The columns a table actually has, or [] when the table is absent.
+
+        Lets a reader print what the database knows instead of assuming its own
+        schema: a newer CLI reading an older store should drop the column, not
+        print a lie or raise. `PRAGMA table_info` takes its argument as text and
+        cannot be parameter-bound, so the name is interpolated — hence the
+        identifier guard, which keeps this usable for names this program knows
+        and useless as an injection point for a name it does not.
+        """
+        if not table.isidentifier():
+            raise ValueError(f"not a table name: {table!r}")
+        with self._lock:
+            rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return [row["name"] for row in rows]
+
     def record_ingest_event(
         self, *, mailbox_id: str, uid: int, kind: str, uidvalidity: str | None = None,
         papra_org_id: str | None = None, filename: str | None = None,

@@ -7,6 +7,7 @@ closed — the tests keep using their store handle after serve returns).
 """
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -709,4 +710,26 @@ async def test_serve_with_sweep_disabled_spawns_no_sweep_task(tmp_path, monkeypa
 
     assert sweeps == []  # the sweep task never spawned
     assert not _dangling_serve_tasks()
+    store.close()
+
+
+async def test_serve_prunes_old_ingest_events_at_startup(tmp_path):
+    """Retention is enforced where the store is opened, not by an operator
+    remembering to run a vacuum. The assertion is that serve itself removed the
+    old row and kept the fresh one — not that the method exists."""
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    old_ts = (datetime.now(UTC) - timedelta(days=91)).isoformat()
+    store._conn.execute(
+        "INSERT INTO ingest_events (ts, mailbox_id, uid, kind) VALUES (?, 'mb1', 1,"
+        " 'sender_denied')", (old_ts,))
+    store._conn.commit()
+    store.record_ingest_event(mailbox_id="mb1", uid=2, kind="sender_denied")
+
+    stop = asyncio.Event()
+    stop.set()   # startup work runs before serve waits, so this still exercises it
+    await serve(config, stop=stop, store=store)
+
+    assert [event.uid for event in store.list_ingest_events()] == [2]
     store.close()

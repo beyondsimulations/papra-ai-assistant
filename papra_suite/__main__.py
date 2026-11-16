@@ -1,14 +1,132 @@
+"""The `papra-suite` entry point.
+
+Commands are deliberately boring: `check` proves the deployment can start,
+`serve` runs it, `replay` rewinds a cursor, `events` answers "why did nothing
+arrive?" from the durable record. Nothing here decides policy; the store and the
+pipeline do, and this file turns arguments into calls and rows into text.
+"""
+
 import argparse
 import contextlib
+import json
 import signal
 import sys
 
 from papra_suite import __version__
 from papra_suite.config import ConfigError, load_config
+from papra_suite.store import INGEST_EVENT_KINDS
 
 # Signals that must stop the service cleanly. SIGTERM is what `docker stop`
 # sends; SIGINT is Ctrl-C.
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+def _run_events(config, args) -> int:
+    """`papra-suite events`: read the durable answer to "why did nothing arrive?"
+
+    Read-only: it never migrates. A command that migrated on read would let a
+    curiosity query perform a schema change, and the schema belongs to `check`
+    and `serve`. An unmigrated store is therefore a stated condition, not a
+    traceback and not a silent empty table.
+    """
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    from papra_suite.store import INGEST_EVENT_RETENTION_DAYS, Store
+
+    unknown = [kind for kind in (args.kind or []) if kind not in INGEST_EVENT_KINDS]
+    if unknown:
+        print(f"unknown kind: {', '.join(unknown)}",
+              file=sys.stderr)
+        print(f"known kinds: {', '.join(INGEST_EVENT_KINDS)}", file=sys.stderr)
+        return 2
+    if args.since is not None and args.since < 1:
+        print("--since must be at least 1 day", file=sys.stderr)
+        return 2
+
+    store = Store(config.data_dir / "state.db")
+    try:
+        known = store.table_columns("ingest_events")
+        if not known:
+            print("no ingest_events table in this store yet",
+                  file=sys.stderr)
+            print("run `papra-suite check` to migrate it; nothing to list",
+                  file=sys.stderr)
+            return 2
+        if args.since is not None:
+            since = (datetime.now(UTC) - timedelta(days=args.since)).isoformat()
+        else:
+            since = None
+        rows = store.list_ingest_events(
+            mailbox_id=args.mailbox_id, kinds=args.kind, since=since,
+            limit=args.limit,
+        )
+        columns = [name for name in EVENT_COLUMNS if name in known]
+    except sqlite3.Error as error:
+        print(f"could not read ingest events: {error}", file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+
+    if not rows:
+        # An empty answer still says what was asked, because "no rows" and "no
+        # rows for mailbox mb_7 in the last 3 days" are different answers.
+        print(f"no matching ingest events{_describe_event_scope(args)}")
+        print(f"note: this table holds the last {INGEST_EVENT_RETENTION_DAYS} days, "
+              "and a message that ingested successfully never appears in it")
+        return 0
+
+    print("\t".join(columns))
+    for row in rows:
+        print("\t".join(_render_event_value(getattr(row, name)) for name in columns))
+    return 0
+
+
+# Printed in this order; anything the store does not have is skipped rather than
+# printed empty, so an older database read by a newer CLI still says what it
+# actually knows instead of inventing a column of dashes.
+EVENT_COLUMNS = (
+    "ts", "mailbox_id", "uid", "uidvalidity", "kind", "papra_org_id",
+    "sender", "filename", "detail",
+)
+
+
+def _render_event_value(value) -> str:
+    """One field, one line, whatever it contains.
+
+    Absent renders as `-`, never as an empty field: "no sender was recorded" and
+    "a sender was recorded that renders as nothing" have to be distinguishable,
+    and a zero-width field in a tab-separated row shifts every column after it.
+
+    Text is quoted with JSON escaping when it contains whitespace, a quote or a
+    backslash, and left bare otherwise. The reason to quote is that these values
+    are bytes someone else sent — a MIME filename, a From: field — and a value
+    carrying a tab or a newline would otherwise forge a column or a whole row.
+    The store already turns control characters into spaces; this is the second
+    half of the answer, and it is deliberately not the store's job, because rows
+    written before that rule existed are still in old databases. Common values
+    stay unquoted so `cut -f` and `grep` work on ordinary days.
+    """
+    if value is None:
+        return "-"
+    if not isinstance(value, str):
+        return str(value)
+    if value == "":
+        return '""'
+    if any(char.isspace() for char in value) or '"' in value or "\\" in value:
+        return json.dumps(value)
+    return value
+
+
+def _describe_event_scope(args) -> str:
+    parts = []
+    if args.mailbox_id:
+        parts.append(f"for mailbox {args.mailbox_id}")
+    if args.kind:
+        parts.append("of kind " + ", ".join(args.kind))
+    if args.since is not None:
+        parts.append(f"in the last {args.since} day(s)")
+    return (" " + " ".join(parts)) if parts else ""
 
 
 async def run_serve(config, **kwargs) -> None:
@@ -67,6 +185,20 @@ def main() -> int:
     )
     replay.add_argument("--dry-run", action="store_true",
                         help="report what would change and change nothing")
+
+    events = sub.add_parser(
+        "events",
+        help="list recorded reasons why a message or attachment was NOT ingested",
+    )
+    events.add_argument("--limit", type=int, default=200,
+                        help="most recent rows to show (clamped to 1..1000)")
+    events.add_argument("--mailbox-id", default=None, help="only this mailbox")
+    events.add_argument(
+        "--kind", action="append", default=None,
+        help="only this outcome; repeatable (" + ", ".join(INGEST_EVENT_KINDS) + ")",
+    )
+    events.add_argument("--since", type=int, default=None, metavar="DAYS",
+                        help="only rows from the last DAYS days")
 
     args = parser.parse_args()
 
@@ -127,6 +259,9 @@ def main() -> int:
         finally:
             store.close()
         return 0
+
+    if args.command == "events":
+        return _run_events(config, args)
 
     if args.command == "serve":
         import asyncio

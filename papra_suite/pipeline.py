@@ -138,6 +138,15 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     recovered = store.recover_running_jobs()
     if recovered:
         logger.info("recovered %d stale running job(s) at startup", recovered)
+    # Ingest events are pruned once here rather than by a periodic task. The
+    # window is 90 days and a container restarts far more often than that, so a
+    # scheduled pruner would be a second thing to get right for no gain — and
+    # unlike the jobs table, a stale row here costs disk and a longer listing,
+    # never correctness.
+    pruned_events = store.prune_ingest_events()
+    if pruned_events:
+        logger.info("pruned %d ingest event(s) outside the retention window",
+                    pruned_events)
     setup_logging(store)
     register_config_secrets(config)
 
