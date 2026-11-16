@@ -1,9 +1,15 @@
 # OCR content search intermittently unreliable — characterisation, not a fix
 
 Date: 2026-11-16
-Status: **open problem.** No fix approved. A candidate workaround is on hold until the
-reproduction is characterised, because the strongest claim made while investigating this
-failed to survive its own control experiment.
+Status: **explained — see the addendum at the foot of this file.** The original problem
+(search missing content that should be there) has a measured cause: Papra's own asynchronous
+content extraction overwrites the `content` column that our OCR worker writes. Read the
+addendum before quoting anything above; the sections below are kept in full because the
+sequence of claims and retractions is itself the record.
+
+No fix is approved. The remediation needs its own short spec, because the fix the earlier
+sections contemplated (read-then-write before a rename) targeted a mechanism that measured
+clean.
 
 Replaces an earlier draft of this document titled "Renaming a document destroys its OCR
 content", which asserted a cause and prescribed a fix. That title was wrong and the document
@@ -216,3 +222,112 @@ If the matrix yields a reproduction, report it with: the pinned digest, the pair
 reproduction, the repair by resending content, and the `If-Match` / `If-Unmodified-Since`
 behaviour (accepted and ignored). Without a reproduction there is nothing to file, and a
 report of "search sometimes misses" is noise.
+
+---
+
+# Addendum, same day: the writer was found. It is Papra's own content extraction
+
+Status: **measured, with a positive control and paired arms.** Everything below was run on
+the pinned digest `sha256:d1f596a3…` against the scratch stack; probe scripts and their raw
+logs are in `/tmp/papra-content-extraction-probes/` (numbered, logs suffixed `.log`).
+
+## The finding
+
+**Papra extracts text from every uploaded document asynchronously and writes it into the
+same `content` column our OCR worker writes.** The extraction is enabled by default and
+cannot be turned off: `CONTENT_EXTRACTION_STRATEGY` is validated against
+`internal | mistral-ocr | docling | azure-di | custom-http`, and setting it to `""` is a
+fatal startup error (measured: the container exits with `CONFIG_VALIDATION_ERROR`). When a
+`PATCH(content)` lands before the extraction finishes, the extraction lands afterwards and
+replaces what we wrote. This is a **write-integrity** problem, not a search defect: the
+index faithfully follows whichever value is in the column.
+
+**Positive control** (`03-positive-control.py`, n=1). Upload a `text/plain` document whose
+own body is `THEIR-EXTRACTED-TEXT-9f3c\nsecond line\n`, then `PATCH(content: "OURS-PATCHED-VALUE-1")`
+after the upload returns 200. At t+0.2 s the stored content is `THEIR-EXTRACTED-TEXT-9f3c…`,
+and it is still that at t+20 s. The value that displaces ours is **the extraction's output**,
+not a blank and not an index artefact. A second document, never patched, holds its own
+extracted text from t+0.2 s — so the extraction is what writes it, always, patched or not.
+
+**Paired arms** (`02-paired-arms.py`, n=5 each; the search token appears only in the content,
+never in the filename — the earlier probes' filename tokens made every content search a name
+match). Arm A, `PATCH(content)` at upload+0.00 s: content length 24 at t+0.2 s, then **0 from
+t+2 s through t+60 s, and content-search MISS at every one of those ticks, 5/5**. Arm B,
+`PATCH(content)` at upload+10.0 s: **content length 24 and search HIT at every tick through
+t+60 s, 5/5.** The arms differ in one variable: when the write happened relative to upload.
+
+**Delay sweep** (`07-delay-sweep.py`, n=3 each): writes at upload+1/3/5/8/15 s survived to
+t+40 s, 15/15, for a 193-byte PDF on an idle server. So the window for that fixture is
+usually well under a second — which is why a probe that PATCHes, then does anything else, can
+see the content and never see it disappear.
+
+## How long the window is, and why no sleep fixes it
+
+Extraction latency measured on this digest (`04-`, `05-`, `06-` probes):
+
+| fixture | extraction visible by |
+|---|---|
+| 2-page fitz PDF with a text layer | t+0.24 s (non-empty and unchanged) |
+| 1-page 200-dpi image-only scan | t+1.0 s (Tesseract: `GESCANTER TEXT 4211`) |
+| 8-page 200-dpi scan, 17.7 MiB | t+8.2 s (5,639 characters) |
+
+And under load, the window outlives any fixed wait. `06-scan-race-and-repair.py`, 8-page
+scans, n=4: two documents had already lost the write by t+20 s; the other two still held it at
+t+20 s, were **re-`PATCH`ed at t+20 s**, and by t+65 s both held 5,639 characters — Papra's
+extraction, over a write that had already survived twenty seconds. Read the lengths, not the
+survived flag: that probe's last-line flag was computed against a literal `'token'` and is
+wrong for every row (the two 18-character rows *are* the probe's own content, and both
+searched as HIT). So: **a rewrite is not durable, and "wait N seconds then write" is not a
+synchronisation contract.** There is no field on the document that reports extraction state
+(`GET` returns `content` only; no `contentExtraction*`, no `ETag`, no status).
+
+## What this explains, and what it does not
+
+Explains, for the record: a content write near upload time is destroyed, so "matched at t+0,
+stopped matching later" (probes #2, #3), "`GET` returned the document without the marker"
+(probe #6), and a burst of same-shaped trials failing together (probe #4, 0/5) are all
+consistent with this writer. The matrix's 35 clean trials are also consistent with it: on an
+idle server the window for a small fixture is sub-second, and every matrix trial wrote content
+and then did other HTTP work before observing it.
+
+Does **not** establish, and must not be quoted as establishing:
+
+- **That renaming destroys anything.** Still withdrawn. A rename-only `PATCH` measured after
+  settle left the content intact at t+1, t+10 and t+30 (`04-window-and-burst.py`, arm C, n=1).
+  The rename was never the writer; it was adjacent in time to the upload.
+- That this was the cause of the specific failures in probes #2–#6. Those trials recorded no
+  timings, so their attribution stays probable. What is now proven is that a different,
+  reproducible mechanism exists and is always on.
+- That the multi-word / punctuation under-matching in *Follow-up measurement* above is
+  explained by this. It is a separate observation, and its own control (a term absent from one
+  document but present in the other) still needs re-running: `gamma` "missing" from a document
+  whose content had already been replaced by the extraction is this bug, not query grammar,
+  and the probes cannot currently tell those two apart.
+
+## What this does to the product, in one paragraph
+
+Two writers, one column, no completion signal. Our OCR worker normally lands well after the
+extraction — real OCR takes seconds — so today the pipeline usually wins by accident, and the
+sweep's seen-table then records the document as processed so nothing re-writes it. When we
+lose the race the outcome is silent: the document carries Papra's Tesseract text instead of
+our markdown, the job is `done`, and the operator has no signal. Two further consequences,
+both for the operator to rule on rather than for this document to assume: the extraction works
+on scans on this image without any external model, which asks whether our OCR worker duplicates
+a Papra feature that is always on; and `custom-http` is a supported strategy, which means Papra
+can be configured to *ask us* for content instead of racing us for the column — writer
+ownership rather than reconciliation.
+
+## Consequences for the plans written from this document
+
+1. An acceptance test that asserts searchable content at t+0 proves nothing about durability.
+   The MCP plan's criterion-5 test asserts after an observable boundary (content stable across
+   two reads) and reports the window it waited through, labelled as evidence and not as a
+   guarantee.
+2. Remediation is **not** in either current plan. It gets its own short correctness spec, with
+   a target, a removal criterion, and the conflict policy written down — the same bar this
+   document set for the rename workaround. Options on the table: own the column by serving
+   Papra's `custom-http` extraction; reconcile with a bounded observation window and a visible
+   failure state; or accept the loss and make it observable through `ingest_events`.
+3. The remediation is not the withdrawn workaround, and does not reinstate it: the
+   read-then-`PATCH(name+content)` before a rename targeted a mechanism that measured clean.
+
