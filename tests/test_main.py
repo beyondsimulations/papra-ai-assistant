@@ -326,13 +326,52 @@ def test_events_empty_answer_says_what_was_asked(monkeypatch, tmp_path, capsys):
     _events_env(monkeypatch, tmp_path)
     _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied")])
     monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--kind",
-                                      "upload_failed", "--since", "3"])
+                                      "upload_failed", "--since", "2099-01-01"])
 
     assert main() == 0
     out = capsys.readouterr().out
     assert "no matching ingest events" in out
-    assert "upload_failed" in out and "3 day" in out
+    assert "upload_failed" in out and "since 2099-01-01" in out
     assert "90 days" in out       # says what the window is, so empty is readable
+
+
+def test_events_rejects_a_malformed_since_date(monkeypatch, tmp_path, capsys):
+    """`--since` is a date, not a number of days: "7" would silently mean the year
+    7 AD to a lexical timestamp comparison, which reads as an empty inbox."""
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied")])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--since", "7"])
+
+    assert main() == 2
+    assert "2026-11-09" in capsys.readouterr().err   # names the expected shape
+
+
+def test_events_since_is_a_utc_date_boundary(monkeypatch, tmp_path, capsys):
+    """The cutoff is midnight UTC of the given day, and a row from that day is
+    inside the window: an off-by-one here silently hides a day of refusals."""
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    _events_env(monkeypatch, tmp_path)
+    yesterday = datetime.now(UTC) - timedelta(days=1)
+    _seed_events(tmp_path, [
+        dict(mailbox_id="mb_7", uid=1, kind="sender_denied"),
+        dict(mailbox_id="mb_7", uid=2, kind="upload_failed"),
+    ])
+    # age one row to just before midnight UTC of yesterday, leave the other now
+    midnight = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+    boundary = midnight - timedelta(seconds=1)
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute("UPDATE ingest_events SET ts = ? WHERE uid = 2",
+                 (boundary.isoformat(),))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--since",
+                                      yesterday.date().isoformat()])
+
+    assert main() == 0
+    lines = _data_lines(capsys.readouterr().out)
+    assert len(lines) == 1 and "\t2\t" not in lines[0]   # only uid 1 survives
 
 
 def test_events_rejects_an_unknown_kind(monkeypatch, tmp_path, capsys):
@@ -345,25 +384,80 @@ def test_events_rejects_an_unknown_kind(monkeypatch, tmp_path, capsys):
     assert "unknown kind" in err and "sender_denied" in err
 
 
-def test_events_on_an_unmigrated_store_says_so_instead_of_tracing_back(
+def test_events_refuses_a_missing_database_without_creating_one(
         monkeypatch, tmp_path, capsys):
-    """`events` never migrates — a curiosity query must not perform a schema
-    change — so an old store is a stated condition with the fix in the message."""
+    """Store.__init__ creates the parent directory AND the file, so checking for a
+    missing database after opening one is impossible: the symptom the operator came
+    to read would have been replaced by an empty store that answers "no events".
+    The file must not exist afterwards, in any size."""
     _events_env(monkeypatch, tmp_path)
     monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
 
     assert main() == 2
     err = capsys.readouterr().err
+    assert "no database at" in err and "papra-suite check" in err
+    assert not (tmp_path / "state.db").exists()
+
+
+def test_events_on_an_unmigrated_store_says_so_instead_of_tracing_back(
+        monkeypatch, tmp_path, capsys):
+    """`events` never migrates — a curiosity query must not perform a schema
+    change — so a store that predates the table is a stated condition with the fix
+    in the message, and the distinction from "no database at all" is preserved."""
+    _events_env(monkeypatch, tmp_path)
+    (tmp_path / "state.db").touch()      # a database file with no tables
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
+
+    assert main() == 2
+    err = capsys.readouterr().err
     assert "no ingest_events table" in err and "papra-suite check" in err
-    assert not (tmp_path / "state.db").exists() or _table_is_absent(tmp_path)
 
 
-def _table_is_absent(tmp_path):
-    import sqlite3
+def test_events_json_emits_the_record_fields(monkeypatch, tmp_path, capsys):
+    """`--json` is the record, not the display: `-` for absent is a rendering
+    convention, and a script reading null as "-" is a bug waiting for a quiet
+    day."""
+    import dataclasses
+    import json
 
-    conn = sqlite3.connect(tmp_path / "state.db")
-    try:
-        return conn.execute("SELECT name FROM sqlite_master WHERE name ="
-                            " 'ingest_events'").fetchone() is None
-    finally:
-        conn.close()
+    from papra_suite.store import IngestEvent
+
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=512, kind="sender_denied",
+                                 sender="Stranger <spam@other.net>")])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--json"])
+
+    assert main() == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["uid"] for row in rows] == [512]
+    assert rows[0]["uidvalidity"] is None
+    assert set(rows[0]) == {field.name for field in dataclasses.fields(IngestEvent)}
+
+
+def test_check_counts_yesterday_and_today_apart(monkeypatch, tmp_path, capsys):
+    """`check` is the command an operator already runs, so the counts live there:
+    "polling fine, nothing arrives" should be one command, not two."""
+    from datetime import UTC, datetime, timedelta
+
+    from papra_suite.store import Store
+
+    _events_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "config ok" in out and "events (last 24h): none" in out
+
+    store = Store(tmp_path / "state.db")
+    store.record_ingest_event(mailbox_id="mb_7", uid=1, kind="sender_denied")
+    store.record_ingest_event(mailbox_id="mb_7", uid=2, kind="sender_denied")
+    old = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+    store._conn.execute(
+        "INSERT INTO ingest_events (ts, mailbox_id, uid, kind) VALUES (?, 'mb_7', 3,"
+        " 'upload_failed')", (old,))
+    store._conn.commit()
+    store.close()
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "events (last 24h): sender_denied=2" in out
+    assert "upload_failed" not in out.split("events (last 24h)")[1]

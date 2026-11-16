@@ -474,6 +474,24 @@ class Store:
             rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_ingest_event(row) for row in rows]
 
+    def count_ingest_events_by_kind(self, *, since: str | None = None) -> dict[str, int]:
+        """How many events of each kind, optionally only at or after `since`.
+
+        Counted in SQL rather than by listing rows: this backs `check`'s summary
+        line, and a listing cap would silently turn a bad day into a normal-looking
+        one. Kinds with no rows are absent rather than zero — the caller prints what
+        happened, not the closed set.
+        """
+        sql = "SELECT kind, COUNT(*) AS n FROM ingest_events"
+        params: list[object] = []
+        if since is not None:
+            sql += " WHERE ts >= ?"
+            params.append(since)
+        sql += " GROUP BY kind"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return {row["kind"]: row["n"] for row in rows}
+
     def prune_ingest_events(self, retention_days: int = INGEST_EVENT_RETENTION_DAYS) -> int:
         """Drop events older than the retention window; return how many went.
 

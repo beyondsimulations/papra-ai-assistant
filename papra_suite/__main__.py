@@ -8,9 +8,12 @@ pipeline do, and this file turns arguments into calls and rows into text.
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import signal
+import sqlite3
 import sys
+from datetime import UTC, datetime, timedelta
 
 from papra_suite import __version__
 from papra_suite.config import ConfigError, load_config
@@ -21,6 +24,31 @@ from papra_suite.store import INGEST_EVENT_KINDS
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 
+def _recent_event_counts(store) -> str:
+    """One line for `check`: what the poller decided against in the last day.
+
+    This is the line that turns "the mailbox is polling but nothing arrives" into
+    a one-command answer, because `check` is the command an operator already runs
+    when something is wrong — and the counts say "three senders refused today"
+    without anyone having to open a second command.
+
+    It never fails `check`. A fresh or empty store has no events, which is not a
+    configuration error, and a check that exited non-zero for an empty table would
+    train people to stop running check; so an unreadable table degrades to a
+    stated reason on the same line rather than a new exit code.
+    """
+    try:
+        counts = store.count_ingest_events_by_kind(
+            since=(datetime.now(UTC) - timedelta(days=1)).isoformat()
+        )
+    except sqlite3.Error as error:
+        return f"events (last 24h): unavailable ({type(error).__name__})"
+    if not counts:
+        return "events (last 24h): none"
+    summary = ", ".join(f"{kind}={counts[kind]}" for kind in sorted(counts))
+    return f"events (last 24h): {summary}"
+
+
 def _run_events(config, args) -> int:
     """`papra-suite events`: read the durable answer to "why did nothing arrive?"
 
@@ -29,22 +57,34 @@ def _run_events(config, args) -> int:
     and `serve`. An unmigrated store is therefore a stated condition, not a
     traceback and not a silent empty table.
     """
-    import sqlite3
-    from datetime import UTC, datetime, timedelta
-
     from papra_suite.store import INGEST_EVENT_RETENTION_DAYS, Store
-
     unknown = [kind for kind in (args.kind or []) if kind not in INGEST_EVENT_KINDS]
     if unknown:
         print(f"unknown kind: {', '.join(unknown)}",
               file=sys.stderr)
         print(f"known kinds: {', '.join(INGEST_EVENT_KINDS)}", file=sys.stderr)
         return 2
-    if args.since is not None and args.since < 1:
-        print("--since must be at least 1 day", file=sys.stderr)
+    since = None
+    if args.since is not None:
+        try:
+            since = datetime.strptime(args.since, "%Y-%m-%d").replace(
+                tzinfo=UTC).isoformat()
+        except ValueError:
+            print(f"--since wants a date like 2026-11-09, got {args.since!r}",
+                  file=sys.stderr)
+            return 2
+
+    # A missing database is refused BEFORE the store is opened: Store.__init__
+    # creates the parent directory and the file, so by the time a Store exists
+    # there is never a "missing database" left to report — the symptom an
+    # operator came to read would have been replaced by an empty one.
+    db_path = config.data_dir / "state.db"
+    if not db_path.exists():
+        print(f"no database at {db_path}", file=sys.stderr)
+        print("run `papra-suite check` first; nothing to list", file=sys.stderr)
         return 2
 
-    store = Store(config.data_dir / "state.db")
+    store = Store(db_path)
     try:
         known = store.table_columns("ingest_events")
         if not known:
@@ -53,10 +93,6 @@ def _run_events(config, args) -> int:
             print("run `papra-suite check` to migrate it; nothing to list",
                   file=sys.stderr)
             return 2
-        if args.since is not None:
-            since = (datetime.now(UTC) - timedelta(days=args.since)).isoformat()
-        else:
-            since = None
         rows = store.list_ingest_events(
             mailbox_id=args.mailbox_id, kinds=args.kind, since=since,
             limit=args.limit,
@@ -68,9 +104,17 @@ def _run_events(config, args) -> int:
     finally:
         store.close()
 
+    if args.json:
+        # Exactly the dataclass fields, no formatting decisions smuggled in: a
+        # script should not have to re-derive what a record is from column order,
+        # and `-` for absent is a display convention that would be a lie as JSON.
+        print(json.dumps([dataclasses.asdict(row) for row in rows],
+                         ensure_ascii=False, indent=None))
+        return 0
+
     if not rows:
         # An empty answer still says what was asked, because "no rows" and "no
-        # rows for mailbox mb_7 in the last 3 days" are different answers.
+        # rows for mailbox mb_7 since 2026-11-09" are different answers.
         print(f"no matching ingest events{_describe_event_scope(args)}")
         print(f"note: this table holds the last {INGEST_EVENT_RETENTION_DAYS} days, "
               "and a message that ingested successfully never appears in it")
@@ -129,7 +173,7 @@ def _describe_event_scope(args) -> str:
     if args.kind:
         parts.append("of kind " + ", ".join(args.kind))
     if args.since is not None:
-        parts.append(f"in the last {args.since} day(s)")
+        parts.append(f"since {args.since}")
     return (" " + " ".join(parts)) if parts else ""
 
 
@@ -201,8 +245,10 @@ def main() -> int:
         "--kind", action="append", default=None,
         help="only this outcome; repeatable (" + ", ".join(INGEST_EVENT_KINDS) + ")",
     )
-    events.add_argument("--since", type=int, default=None, metavar="DAYS",
-                        help="only rows from the last DAYS days")
+    events.add_argument("--since", default=None, metavar="YYYY-MM-DD",
+                        help="only rows at or after that UTC date")
+    events.add_argument("--json", action="store_true",
+                        help="emit the records as JSON instead of one line each")
 
     args = parser.parse_args()
 
@@ -219,12 +265,18 @@ def main() -> int:
         store = Store(config.data_dir / "state.db")
         try:
             store.migrate()
+            # Read while the store is still open: `check` closes it in a finally,
+            # and querying a closed store raises — which the helper would report
+            # as "unavailable" instead of the counts that are the point of the
+            # line.
+            recent_events = _recent_event_counts(store)
         finally:
             store.close()
         print(f"config ok; store migrated; data dir: {config.data_dir}")
         # Printed last because it is the line that answers "why is nothing
         # arriving?": an empty allow-list denies every sender by design.
         print(f"senders: {config.allowed_senders.describe()}")
+        print(recent_events)
         return 0
 
     if args.command == "replay":
