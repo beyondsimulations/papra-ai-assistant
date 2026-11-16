@@ -352,3 +352,36 @@ async def test_a_refused_sender_records_one_row_and_is_not_refused_again(
 
     assert first.senders_denied == 1 and second.messages_scanned == 0
     assert len(store.list_ingest_events()) == 1
+
+
+async def test_an_event_rows_uid_replays_the_message_it_named(ingestion_stack):
+    """`--from-uid N` re-reads mail strictly AFTER N, so the uid printed beside a
+    refused message is one past the number an operator has to pass.
+
+    Written as the operator reads it — look at the row, rewind, expect the document
+    back — because the off-by-one is otherwise invisible: `replay --from-uid <uid>`
+    is accepted, reports a rewind, and leaves the one message they came for behind.
+    """
+    store, mailbox, org, client, _ = ingestion_stack
+    inject_message(
+        subject="refused invoice", to="ingest@localhost",
+        sender="stranger@notallowed.test",
+        attachments=[("inv.pdf", PDF_BYTES + b"-uid-boundary", ("application", "pdf"))],
+    )
+    first = await poll_mailbox_once(store, client, mailbox, org, allowlist=ALLOW)
+    assert first.senders_denied == 1
+    row, = store.list_ingest_events()
+
+    widened = parse_allowlist("sender@example.com, notallowed.test")
+
+    store.reset_mailbox_cursor(mailbox.id, from_uid=row.uid)
+    same_cursor = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id),
+                                          org, allowlist=widened)
+    assert same_cursor.messages_scanned == 0    # the uid itself stays behind
+    assert same_cursor.documents_uploaded == 0
+
+    store.reset_mailbox_cursor(mailbox.id, from_uid=row.uid - 1)
+    replayed = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id),
+                                       org, allowlist=widened)
+    assert replayed.messages_scanned == 1
+    assert replayed.documents_uploaded == 1

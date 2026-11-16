@@ -113,9 +113,14 @@ Two things this table is not:
   startup and after every sweep pass, so an empty result can mean "outside the
   window". It names its own window when it prints nothing, and it restates the
   filter you asked with.
-- **It is not a delivery log.** A message that ingested successfully never appears
-  here, and a persistent upload failure writes one row per poll for the same uid.
-  Count the rows per uid before concluding there were five bad messages.
+- **It is not a delivery log.** Success is never recorded, but a message can still
+  appear here for the part it skipped: a mail whose invoice PDF uploaded and whose
+  `.zip` did not leaves a row, and that row does not mean the mail failed. A
+  persistent upload failure also writes one row per poll for the same uid, so count
+  rows per uid before concluding there were five bad messages.
+- **Absence here is not absence in Papra.** No rows is equally consistent with
+  everything having ingested, with the 90 days having passed, and with the event
+  write itself failing (which is logged, never stored).
 
 A refused sender is a normal outcome, not a fault: the mail is marked `\Seen`,
 never deleted, and the cursor moves past it. So the recovery for "the allow-list
@@ -161,9 +166,14 @@ duplicating: Papra dedups by content hash per organisation, so a re-uploaded doc
 answers `409 already_exists`, which this pipeline treats as already-ingested success
 rather than as an error or a second copy.
 
-So the path back is **re-add the orgs and mailboxes, then let the sweep run** — not
-"restore from backup", because there is hardly anything to restore: the documents
-never left Papra.
+Two different recoveries, worth not confusing:
+
+- **You have a known-good copy of `state.db`.** Restore it and everything in the
+  table above comes back — credentials, cursors, dedup state, pending jobs. Do it
+  with `serve` stopped.
+- **You have no copy.** Re-add the orgs and mailboxes and let the pollers and the
+  sweep run. This is the cheaper path than it sounds, because the documents never
+  left Papra; what you rebuild is routing, not content.
 
 Three consequences worth knowing before it happens:
 
@@ -175,16 +185,23 @@ Three consequences worth knowing before it happens:
   Documents that are already in Papra are the **sweep's** job, so missing content
   comes back through sweep passes, one bounded page at a time: a full re-OCR of the
   archive at LLM cost, spread over however many passes it takes.
-- **A cold copy of the file is what a restore consists of**, plus the credentials you
-  kept somewhere else. Copy it while `serve` is stopped, or you restore a
-  half-written database.
+- **A copy of the file is what a restore consists of**, plus the credentials you kept
+  somewhere else. The database runs in WAL mode, so a bare `cp` of a live one can
+  miss transactions still sitting in `-wal` and can catch a torn state: copy with
+  `serve` stopped, or use SQLite's own online backup (`VACUUM INTO` or the backup
+  API) which takes a consistent snapshot.
 
 ### A sender was wrongly refused
 
 `papra-suite events --kind sender_denied` shows what was refused, when, and the
-`From:` text that was refused. Fix `PAPRA_ALLOWED_SENDERS`, then
-`papra-suite replay --mailbox-id … --from-uid …`. The mail is still on the server,
-because a refusal marks it `\Seen` and never deletes it.
+`From:` text that was refused. Fix `PAPRA_ALLOWED_SENDERS`, then replay. The mail is
+still on the server, because a refusal marks it `\Seen` and never deletes it.
+
+`replay --from-uid N` re-reads mail **strictly after N**, so to get the message back
+whose row says `uid=18413`, pass `--from-uid 18412`. Passing `18413` is a valid
+rewind that does not re-read it — the one mistake this interface makes it easy to
+make. Omitting `--from-uid` re-reads the whole mailbox, which is the safe default
+when several messages were refused.
 
 The `uid` in a row is only meaningful together with the `uidvalidity` printed beside
 it. Quote both when you go looking for the message: after a mailbox rebuild the
@@ -194,8 +211,13 @@ numbering restarts and the same uid can name a different message.
 
 `serve` rewinds jobs left `running` when it starts, so a container killed
 mid-document retries that document. The `jobs` table holds the rest — `status`,
-`attempts` and `error` say what has been tried. If a document has no job at all,
-`papra-suite events` answers the question that comes first: whether it ever arrived.
+`attempts` and `error` say what has been tried.
+
+`papra-suite events` answers the question before that only partly: a row can tell
+you a sender was refused, an attachment skipped, or an upload rejected, but the
+absence of a row does **not** mean the document arrived — it is equally consistent
+with success, with the 90-day window having passed, or with the event write having
+failed. For "is this document in Papra", ask Papra.
 
 ### One caveat over all three
 
