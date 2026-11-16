@@ -201,6 +201,11 @@ def test_replay_can_resume_after_a_given_uid(monkeypatch, tmp_path, capsys):
 
     assert main() == 0
     store = Store(tmp_path / "state.db")
+    # The cursor IS the last uid seen, so uid 10 itself will not be read again.
+    # `papra-suite events` prints uids, and its help and README both tell the reader
+    # to pass one LESS than the uid they want — an off-by-one here means the message
+    # an operator came for is the one message that stays behind. Pinned end-to-end
+    # against a real IMAP server in tests/integration/test_mail_ingestion.py.
     assert store.get_mailbox(mailbox_id).last_seen_uid == 10
     store.close()
 
@@ -461,3 +466,62 @@ def test_check_counts_yesterday_and_today_apart(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "events (last 24h): sender_denied=2" in out
     assert "upload_failed" not in out.split("events (last 24h)")[1]
+
+
+def test_events_escapes_bytes_a_terminal_would_act_on(monkeypatch, tmp_path, capsys):
+    """The threat is not a newline, it is an escape sequence.
+
+    These rows are written straight into the table, bypassing the store's writer,
+    because that is exactly the case the renderer exists for: a database written by
+    an older build, or by hand while debugging, still contains what the messages
+    contained. `\\x1b[2J` clears a screen and C1 CSI (`\\x9b`) starts a control
+    sequence; neither contains whitespace, so a quoting rule keyed on whitespace
+    alone prints them raw and lets the filename format the terminal showing it.
+    """
+    import sqlite3
+
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied")])
+    hostile = ["\x1b[2Jevil.pdf", "a\x9bQ", "line\u2028break", "zero\u200bwidth"]
+    conn = sqlite3.connect(tmp_path / "state.db")
+    for index, value in enumerate(hostile):
+        conn.execute("INSERT INTO ingest_events (ts, mailbox_id, uid, kind, filename)"
+                     " VALUES ('2026-11-16T00:00:00+00:00', 'mb_7', ?, 'sender_denied',"
+                     " ?)", (index + 2, value))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert len(_data_lines(out)) == len(hostile) + 1
+    for raw in ("\x1b", "\x9b", "\u2028", "\u200b"):
+        assert raw not in out                 # never raw
+    for escaped in ("\\u001b", "\\u009b", "\\u2028", "\\u200b"):
+        assert escaped in out                 # and visible as what it was
+
+
+def test_events_json_leaves_no_terminal_control_bytes(monkeypatch, tmp_path, capsys):
+    """`--json` is machine output, but machine output is piped into `less` and
+    pasted into terminals. json.dumps escapes C0 and leaves C1 and U+2028 raw; the
+    escaping stays inside the JSON string, so the document is still valid."""
+    import json
+    import sqlite3
+
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied",
+                                 filename="R\u00f6ntgen.pdf")])
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute("INSERT INTO ingest_events (ts, mailbox_id, uid, kind, filename)"
+                 " VALUES ('2026-11-16T00:00:00+00:00', 'mb_7', 2, 'sender_denied',"
+                 " 'a\x9bb\u2028')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--json"])
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "\x9b" not in out and "\u2028" not in out
+    rows = json.loads(out)                     # still parseable
+    assert rows[0]["filename"] == "R\u00f6ntgen.pdf"   # readable, not \\u00f6
+    assert any(row["filename"] == "a\x9bb\u2028" for row in rows)  # value preserved

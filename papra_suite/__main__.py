@@ -13,6 +13,7 @@ import json
 import signal
 import sqlite3
 import sys
+import unicodedata
 from datetime import UTC, datetime, timedelta
 
 from papra_suite import __version__
@@ -108,16 +109,18 @@ def _run_events(config, args) -> int:
         # Exactly the dataclass fields, no formatting decisions smuggled in: a
         # script should not have to re-derive what a record is from column order,
         # and `-` for absent is a display convention that would be a lie as JSON.
-        print(json.dumps([dataclasses.asdict(row) for row in rows],
-                         ensure_ascii=False, indent=None))
+        print(_dump_json([dataclasses.asdict(row) for row in rows]))
         return 0
 
     if not rows:
         # An empty answer still says what was asked, because "no rows" and "no
         # rows for mailbox mb_7 since 2026-11-09" are different answers.
         print(f"no matching ingest events{_describe_event_scope(args)}")
-        print(f"note: this table holds the last {INGEST_EVENT_RETENTION_DAYS} days, "
-              "and a message that ingested successfully never appears in it")
+        print(f"note: this table holds the last {INGEST_EVENT_RETENTION_DAYS} days. "
+              "A successful ingestion is never recorded, but a message can still "
+              "appear here for the attachment it skipped while another one "
+              "uploaded, so no rows means no skipped or failed part — not that "
+              "nothing arrived")
         return 0
 
     print("\t".join(columns))
@@ -135,21 +138,61 @@ EVENT_COLUMNS = (
 )
 
 
+# Categories that must never reach a terminal raw: C0 and C1 controls (including
+# ESC 0x1b and C1 CSI 0x9b, which are active escape sequences), format characters
+# (zero-width space, which splices two values into one visually), surrogates and
+# unassigned code points, and the Unicode line separators U+2028 / U+2029, which
+# some renderers treat as a line break and so can still forge a row.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+
+# Short escapes for the controls an operator actually meets, so a quoted value
+# reads as "line\nbreak" rather than as a wall of \u000a.
+_SHORT_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t",
+                  "\b": "\\b", "\f": "\\f"}
+
+# The same characters json.dumps leaves alone (it escapes only <0x20 plus " and \),
+# listed explicitly because escaping them inside a JSON string literal is always
+# legal and they can appear nowhere in JSON's structural syntax.
+_JSON_UNSAFE = {chr(cp): f"\\u{cp:04x}"
+                for cp in [*range(0x80, 0xA0), 0x2028, 0x2029]}
+
+
+def _quote_untrusted(value: str) -> str:
+    """Wrap a value in quotes and escape everything a terminal could act on."""
+    chars: list[str] = []
+    for char in value:
+        if char in ('"', "\\"):
+            chars.append("\\" + char)
+        elif char in _SHORT_ESCAPES:
+            chars.append(_SHORT_ESCAPES[char])
+        elif unicodedata.category(char) in _UNSAFE_CATEGORIES:
+            chars.append(f"\\u{ord(char):04x}")
+        else:
+            chars.append(char)
+    return '"' + "".join(chars) + '"'
+
+
 def _render_event_value(value) -> str:
     """One field, one line, whatever it contains.
 
     Absent renders as `-`, never as an empty field: "no sender was recorded" and
-    "a sender was recorded that renders as nothing" have to be distinguishable,
-    and a zero-width field in a tab-separated row shifts every column after it.
+    "a sender was recorded that renders as nothing" have to be distinguishable, and
+    a zero-width field in a tab-separated row shifts every column after it.
 
-    Text is quoted with JSON escaping when it contains whitespace, a quote or a
-    backslash, and left bare otherwise. The reason to quote is that these values
-    are bytes someone else sent — a MIME filename, a From: field — and a value
-    carrying a tab or a newline would otherwise forge a column or a whole row.
-    The store already turns control characters into spaces; this is the second
-    half of the answer, and it is deliberately not the store's job, because rows
-    written before that rule existed are still in old databases. Common values
-    stay unquoted so `cut -f` and `grep` work on ordinary days.
+    Quoting rule: quote when the value is not printable, contains whitespace, or
+    contains a quote or a backslash; leave everything else bare so `cut -f` and
+    `grep` work on ordinary days. The trigger is `isprintable()` plus the character
+    categories above rather than "contains whitespace", because the thing to fear in
+    a terminal is not a newline but an **escape sequence**: a stored
+    `\x1b[2Jevil.pdf` contains no whitespace at all, and printed raw its bytes drive
+    the terminal that is supposed to be displaying them.
+
+    This is deliberately the renderer's job and not the store's. The store turns
+    control characters into spaces on write, but rows written before that rule
+    existed are still sitting in old databases, and a reader must not assume its own
+    write path produced the bytes it is about to print. Printable non-ASCII stays as
+    typed: escaping `ä` as `\u00e4` would be no safer here, and reading the line is
+    the only job this output has.
     """
     if value is None:
         return "-"
@@ -157,13 +200,24 @@ def _render_event_value(value) -> str:
         return str(value)
     if value == "":
         return '""'
-    if any(char.isspace() for char in value) or '"' in value or "\\" in value:
-        # ensure_ascii=False: the escape-everything default would write a German
-        # filename as "R\u00f6ntgen", which is inert but unreadable, and reading
-        # it is the only job this line has. Non-ASCII stays as typed; the
-        # characters that could forge a field or a row are still escaped.
-        return json.dumps(value, ensure_ascii=False)
-    return value
+    needs_quoting = (not value.isprintable()
+                     or any(char.isspace() for char in value)
+                     or '"' in value or "\\" in value)
+    return _quote_untrusted(value) if needs_quoting else value
+
+
+def _dump_json(payload) -> str:
+    """JSON for scripts, with the characters a terminal could act on escaped.
+
+    `--json` is machine output, but machine output gets piped into `less` and
+    pasted into terminals, and json.dumps leaves C1 controls and U+2028/U+2029 as
+    raw bytes. Escaping them after serialising keeps non-ASCII readable (which
+    `ensure_ascii=True` would destroy) and the document valid.
+    """
+    text = json.dumps(payload, ensure_ascii=False)
+    for char, escaped in _JSON_UNSAFE.items():
+        text = text.replace(char, escaped)
+    return text
 
 
 def _describe_event_scope(args) -> str:
@@ -229,7 +283,9 @@ def main() -> int:
     replay.add_argument("--mailbox-id", required=True)
     replay.add_argument(
         "--from-uid", type=int, default=None,
-        help="resume after this UID; the default re-reads the whole mailbox",
+        help="rewind so that mail strictly AFTER this UID is re-read; to re-read a "
+             "UID shown by `events`, pass one LESS than that UID. The default "
+             "re-reads the whole mailbox",
     )
     replay.add_argument("--dry-run", action="store_true",
                         help="report what would change and change nothing")
