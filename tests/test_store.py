@@ -861,3 +861,45 @@ def test_prune_keeps_the_window(store):
 def test_prune_with_a_bounded_window_touches_nothing_fresh(store):
     store.record_ingest_event(mailbox_id="mb_1", uid=1, kind="upload_failed")
     assert store.prune_ingest_events(retention_days=90) == 0
+
+
+def test_attacker_shaped_values_are_bounded_and_the_table_survives(store):
+    """The three shapes that make a "log the raw string" decision embarrassing:
+    something enormous, something with control characters, and something that
+    looks like an injection. Each is stored, each comes back within its budget and
+    with no control characters, and the table is still there to read them from."""
+    from papra_suite.store import EVENT_TEXT_LIMITS
+
+    store.record_ingest_event(mailbox_id="mb_1", uid=1,
+                              kind="attachment_unsupported", filename="x" * 5000)
+    store.record_ingest_event(mailbox_id="mb_1", uid=2,
+                              kind="attachment_unsupported",
+                              filename="a\x00b\x1bc\r\nd\x7fe")
+    store.record_ingest_event(mailbox_id="mb_1", uid=3,
+                              kind="attachment_unsupported",
+                              filename='Robert"; DROP TABLE ingest_events; --')
+
+    by_uid = {event.uid: event for event in store.list_ingest_events()}
+    assert len(by_uid) == 3
+    long_name = by_uid[1].filename
+    assert len(long_name) == EVENT_TEXT_LIMITS["filename"] and long_name.endswith("…")
+    assert by_uid[2].filename == "a b c d e"    # controls became spaces, not holes
+    assert by_uid[3].filename == 'Robert"; DROP TABLE ingest_events; --'
+    for event in by_uid.values():
+        assert not any(ord(ch) < 32 or ord(ch) == 127 for ch in (event.filename or ""))
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM ingest_events").fetchone()[0] == 3
+
+
+def test_detail_budget_is_its_own_and_not_the_filename_one(store):
+    """`detail` carries an upstream classification, which can be long. Sharing one
+    budget constant across fields is how a filename ends up truncating a reason."""
+    from papra_suite.store import EVENT_TEXT_LIMITS
+
+    assert EVENT_TEXT_LIMITS["detail"] != EVENT_TEXT_LIMITS["filename"]
+    store.record_ingest_event(mailbox_id="mb_1", uid=1, kind="upload_failed",
+                              detail="y" * 4000, filename="z" * 4000)
+    event = store.list_ingest_events()[0]
+    assert len(event.detail) == EVENT_TEXT_LIMITS["detail"]
+    assert len(event.filename) == EVENT_TEXT_LIMITS["filename"]
+    assert event.detail.endswith("…")

@@ -564,16 +564,19 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
                 event_kind = "sender_denied"
                 logger.info("message uid=%s ignored: sender is not on the allow-list",
                             refused_uid)
-            seen_uids.append(refused_uid)
-            if not prefix_failed:
-                candidate_last_seen = refused_uid
-            # The refused address is recorded here and only here. Counters say
-            # "a sender was refused"; the operator's question is "whose mail".
+            # Recorded BEFORE the \Seen mark is attempted: a refused message we
+            # then fail to retire is still a message we decided about, and this row
+            # is the record of that decision. Counters say "a sender was refused";
+            # the operator's question is "whose mail", and the address is in hand
+            # here and nowhere later.
             _record_event_quietly(
                 store, mailbox_id=mailbox.id, uid=refused_uid, kind=event_kind,
                 uidvalidity=uidvalidity, papra_org_id=org.papra_org_id,
                 sender=from_field,
             )
+            seen_uids.append(refused_uid)
+            if not prefix_failed:
+                candidate_last_seen = refused_uid
 
         for uid, kind, payload in entries:
             result.messages_scanned += 1

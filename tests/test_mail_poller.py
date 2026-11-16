@@ -1085,8 +1085,11 @@ async def test_an_unsupported_attachment_is_recorded_with_sender_and_name(store,
     session = FakeSession(raws=[(1, raw)])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
 
+    # the row AND the counter, in one assertion pair: the two are answers to the
+    # same question and must not be able to drift apart
+    assert result.attachments_skipped == 1
     event, = _events(store)
     assert event.kind == "attachment_unsupported"
     assert event.filename == "invoice.zip"
@@ -1139,8 +1142,9 @@ async def test_an_oversized_message_is_recorded_without_inventing_a_name(
     session = FakeSession(raws=[], oversized=[7])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
 
+    assert result.oversized_skipped == 1
     event, = _events(store)
     assert event.kind == "message_oversized" and event.uid == 7
     assert event.filename is None and event.sender is None
@@ -1153,8 +1157,9 @@ async def test_a_failed_upload_is_recorded_without_the_upstream_body(store, monk
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
     client = StubClient(fail_for={"big.pdf"})
 
-    await poll_with_allow_list(store, client, make_mailbox(), ORG)
+    result = await poll_with_allow_list(store, client, make_mailbox(), ORG)
 
+    assert result.messages_failed == 1
     event, = _events(store)
     assert event.kind == "upload_failed" and event.filename == "big.pdf"
     assert event.detail == "PapraError(status=500)"
@@ -1167,10 +1172,18 @@ async def test_a_conflict_is_not_recorded_as_a_failed_upload(store, monkeypatch)
     session = FakeSession(raws=[(1, build_raw(attachments=[("dup.pdf", b"%PDF-1")]))])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
 
-    await poll_with_allow_list(store, StubClient(conflict_for={"dup.pdf"}),
-                               make_mailbox(), ORG)
+    mailbox = make_mailbox()
+    result = await poll_with_allow_list(store, StubClient(conflict_for={"dup.pdf"}),
+                                        mailbox, ORG)
 
     assert _events(store) == []
+    # ...and it is still a SUCCESS: the dedup hash is recorded, so the next poll
+    # does not upload the same bytes a third time.
+    from papra_suite.mail import dedup_hash
+
+    assert result.messages_failed == 0
+    assert store.dedup_exists(
+        dedup_hash(mailbox.id, "<m1@x>", "dup.pdf", len(b"%PDF-1")))
 
 
 async def test_a_paused_allow_list_records_nothing_at_all(store, monkeypatch):
@@ -1223,16 +1236,25 @@ class ExplodingStore:
 
 async def test_an_event_write_that_fails_does_not_fail_the_poll(store, monkeypatch):
     """The quiet-catch is the whole point: an evidence row is worth less than a
-    mailbox that keeps ingesting."""
+    mailbox that keeps ingesting. So the poll must still upload, still mark
+    \Seen, and still advance the persisted cursor with nothing recorded."""
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
     session = FakeSession(raws=[(1, build_raw(attachments=[("a.pdf", b"%PDF-1"),
                                                           ("x.zip", b"PK\x03\x04")]))])
     monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
-    client = StubClient()
 
-    result = await poll_with_allow_list(ExplodingStore(store), client, make_mailbox(), ORG)
+    result = await poll_with_allow_list(ExplodingStore(store), StubClient(),
+                                        store.get_mailbox(mailbox_id),
+                                        store.get_org(org_id))
 
     assert result.error is None
     assert result.documents_uploaded == 1 and result.attachments_skipped == 1
+    assert session.seen == [1]                          # mail still retired
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 1   # cursor still moved
+    assert _events(store) == []                          # and nothing half-written
 
 
 async def test_the_quiet_catch_does_not_swallow_a_programming_error(store):
