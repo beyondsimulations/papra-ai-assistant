@@ -285,7 +285,7 @@ def test_events_quotes_a_value_that_could_forge_a_row(monkeypatch, tmp_path, cap
     _events_env(monkeypatch, tmp_path)
     _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied")])
     conn = sqlite3.connect(tmp_path / "state.db")
-    conn.execute("UPDATE ingest_events SET filename = ?", ("evil\nname.pdf",))
+    conn.execute("UPDATE ingest_events SET filename = ?", ("R\u00f6ntgen\nname.pdf",))
     conn.commit()
     conn.close()
     monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
@@ -294,6 +294,8 @@ def test_events_quotes_a_value_that_could_forge_a_row(monkeypatch, tmp_path, cap
     out = capsys.readouterr().out
     assert len(_data_lines(out)) == 1
     assert "\\n" in out            # escaped, so the byte is visible and inert
+    assert "R\u00f6ntgen" in out   # readable, not escaped into \u00f6: reading is
+                                    # the only job this line has
 
 
 def test_events_clamps_the_limit(monkeypatch, tmp_path, capsys):

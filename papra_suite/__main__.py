@@ -114,7 +114,11 @@ def _render_event_value(value) -> str:
     if value == "":
         return '""'
     if any(char.isspace() for char in value) or '"' in value or "\\" in value:
-        return json.dumps(value)
+        # ensure_ascii=False: the escape-everything default would write a German
+        # filename as "R\u00f6ntgen", which is inert but unreadable, and reading
+        # it is the only job this line has. Non-ASCII stays as typed; the
+        # characters that could forge a field or a row are still escaped.
+        return json.dumps(value, ensure_ascii=False)
     return value
 
 

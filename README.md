@@ -73,6 +73,7 @@ trust boundary is verified for a specific provider.
 | `papra-suite check` | config + migrations, prints the parsed allow-list, changes nothing |
 | `papra-suite serve` | pollers, OCR and title workers, sweep loop |
 | `papra-suite replay --mailbox-id ID [--from-uid N] [--dry-run]` | rewind the poll cursor |
+| `papra-suite events [--limit N] [--mailbox-id ID] [--kind K] [--since D]` | why messages and attachments were **not** ingested |
 
 `replay` is the answer to "I set the allow-list wrong for a week." Refused mail
 was retired but never deleted, so rewinding re-reads it, and Papra's content-hash
@@ -80,16 +81,75 @@ dedup means already-ingested documents are not uploaded twice. It also
 re-enables a mailbox that repeated failures had disabled, and refuses to move the
 cursor forward.
 
+### Where did my attachment go?
+
+`papra-suite events` is the durable answer. The per-poll log lines and the summary
+counters say *how many*; this says *which one, from whom, and why*, and it survives
+log rotation. Output is one event per line, tab-separated, newest first, and prints
+from whatever columns the store actually has.
+
+| `kind` | what happened | what the row can tell you |
+|---|---|---|
+| `sender_denied` | the allow-list refused the sender | the `From:` text that was refused |
+| `sender_malformed` | `From:` did not resolve to exactly one sender | the header text that could not be read |
+| `attachment_unsupported` | an attachment that is not a supported document | its filename, and who sent it |
+| `message_oversized` | the message is over the per-message size cap | the uid only: the body was never read |
+| `upload_failed` | Papra refused the upload | filename and `PapraError(status=…)`, never the response body |
+
+Every row carries `uid` and `uidvalidity`. That pair is what makes it actionable:
+the message is still on the server, and the two values together name it — a bare uid
+does not, because a rebuilt mailbox restarts its numbering and can point at a
+different message. `uid` is also the value `replay --from-uid` wants.
+
+Two things this table is not:
+
+- **It is not an archive.** Rows are kept for 90 days and pruned at every `serve`
+  startup, so an empty result can mean "outside the window". It names its own
+  window when it prints nothing, and it restates the filter you asked with.
+- **It is not a delivery log.** A message that ingested successfully never appears
+  here, and a persistent upload failure writes one row per poll for the same uid.
+  Count the rows per uid before concluding there were five bad messages.
+
+A refused sender is a normal outcome, not a fault: the mail is marked `\Seen`,
+never deleted, and the cursor moves past it. So the recovery for "the allow-list
+was wrong" is to fix `PAPRA_ALLOWED_SENDERS` and run `replay` — the mail is still
+there.
+
 ## When something goes wrong
 
 - **Nothing arrives, no errors** → run `check`. An empty allow-list pauses.
 - **A mailbox turned red** → three consecutive poll failures disabled it. The
   stored error says why; `replay` clears the state and re-enables it.
-- **A specific message is missing** → check `senders denied` / `malformed` in the
-  per-poll summary line, then `replay`.
-- **The store is the only state.** Deleting `DATA_DIR` loses cursors, job queue
-  and dedup; mail stays on the server, so re-ingest is possible but documents
-  will be re-uploaded.
+- **A specific message is missing** → `papra-suite events`. It says which uid was
+  refused, skipped or failed and why; `replay` re-reads it once the cause is fixed.
+- **An attachment vanished** → `papra-suite events --kind attachment_unsupported`.
+  This is the only durable place a skipped attachment appears: the message it came
+  in on is marked `\Seen` and, with delete-after-download, deleted, so there is
+  nothing left to go and look at.
+
+### What losing `state.db` costs
+
+The SQLite file under `DATA_DIR` is the only state this software keeps. Papra holds
+the documents; everything about *how* they got there lives in that one file:
+
+| Lost with `state.db` | Consequence |
+|---|---|
+| Organisations and mailboxes (host, user, **password**) | re-add every mailbox; the IMAP passwords are gone, so this is also the file to treat as a secret when backing it up |
+| Poll cursors and `UIDVALIDITY` | every mailbox is read from the beginning again |
+| Content dedup hashes and the seen-document table | everything is attempted again |
+| Job queue (OCR and title work) | pending and in-flight work is gone, and the seen-document table that tells the sweep what it already handled is gone with it — so the sweep re-enqueues OCR for the whole archive and pays the LLM cost again |
+| Settings | today that is only the sweep's resume offsets (`sweep_offset:<org>`); losing them re-scans from page one. Anything a later version stores here is lost the same way |
+| `log_lines` ring buffer | the in-app log history |
+| `ingest_events` | the 90-day "why was this skipped" window |
+
+**The documents themselves are safe in Papra**, and re-ingest is safe: Papra dedups
+by content hash per organisation, so a re-uploaded document answers `409
+already_exists`, which the pipeline treats as already-ingested success rather than
+as an error or a duplicate. So a restore from backup, or simply letting the pollers
+run over the whole inbox again, converges instead of duplicating.
+
+What is not recoverable from anywhere else: the mailbox credentials, and the cursor
+positions that keep a large inbox from being re-read from the start.
 
 ## Development
 
