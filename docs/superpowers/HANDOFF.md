@@ -174,3 +174,40 @@ Probes and raw logs are committed under `docs/superpowers/probes/2026-11-16*/`.
 - Fail closed on unknown mail/search responses; never render an unavailable archive as "nothing
   found".
 - No new dependencies without saying so; pin exactly; name the transitive tail.
+
+## ingest-visibility executed — 2026-11-16 evening
+
+Branch `ingest-visibility` (off `simplify-ingest`) implements
+`plans/2026-11-16-ingest-visibility.md` in full; the execution log at the end of that
+plan is the record, including every deviation and why.
+
+- `ingest_events` (migration 002, additive, `uid NOT NULL` **and** `uidvalidity`), five
+  recorded dispositions, 90-day retention pruned at startup and after each sweep pass,
+  `papra-suite events` (+ `--json`), and the per-kind 24 h line on `check`.
+- Gates at handoff: ruff clean, **445** unit passed / 14 deselected, **14** integration
+  passed against the scratch stack, mutants 4/4 caught. The stack's container image IDs
+  equal the digests now pinned in `docker-compose.test.yml`.
+- Two branches now hang off `simplify-ingest`: `ingest-visibility`, and
+  `ocr-prompt-language` (the OCR prompt's "German or English" assumption, moved out
+  because the ingest plan's review gate excludes `ocr.py`). Neither is merged.
+
+Corrections found by writing the code, worth keeping in mind:
+
+- **`papra-suite replay --from-uid N` re-reads strictly after N.** The uid that
+  `events` prints is therefore one past the value to pass. Fixed in README and in the
+  `--from-uid` help, pinned by an integration test.
+- **`events` cannot prove absence.** It records skipped and failed parts, so a row can
+  exist for a message that mostly succeeded, and no rows is equally consistent with
+  success, with the window having passed, or with the event write failing. Two README
+  sentences said otherwise and were wrong.
+- **A renderer quoting on whitespace is not a defence.** ESC has no whitespace;
+  a row containing `\x1b[2J` printed raw and drove the terminal showing it.
+
+Still open, unchanged by this branch:
+
+- The MCP search-server plan is **approved and unimplemented**.
+- The content-write race still has **no chosen remediation** (custom-http extraction,
+  bounded reconciliation, or accept-and-expose). Nothing in this branch fixes it; the
+  README states it as a limitation of recovery instead of promising restored OCR text.
+- `gamma` from the old search matrix still needs the GET-before-search method re-run
+  before anyone states a cause.

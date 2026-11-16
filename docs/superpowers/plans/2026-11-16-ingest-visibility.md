@@ -305,3 +305,74 @@ Advisor review of the whole branch, then a pass over:
   report. The cursor semantics beat the audit trail, always.
 - If the digest-pinned image fails an integration test that `:latest` passes, that is a finding
   about a drift we have been living with — report it, do not re-pin to whatever is newest.
+
+---
+
+## Execution log — 2026-11-16, branch `ingest-visibility`
+
+Tasks 1–8 implemented. Final gates: `ruff check .` clean; `pytest -q -m "not
+integration"` → 445 passed, 14 deselected; `PAPRA_REQUIRE_STACK=1 pytest -q
+tests/integration` → 14 passed. The integration run counts as pinned-image evidence
+because the running containers' image IDs are exactly the digests now in
+`docker-compose.test.yml` (`papra d1f596a3…`, `greenmail 309ba544…`).
+
+Mutation check for 3.8: deleting each `_record_event_quietly` call site fails tests,
+4 of 4 (`sender_denied` and `sender_malformed` share a site; 3 tests fail there).
+
+Where the code differs from the text above, and why:
+
+- **2.1 — sanitiser placement.** Applied inside `record_ingest_event` rather than at
+  every call site, so no writer can omit it. Per-field budgets, with a test pinning
+  `filename` and `detail` apart.
+- **3.x — quiet-catch scope.** `(ValueError, sqlite3.Error)`, as this plan wrote. Letting
+  the store's `ValueError` escape would have traded a typo in our own source for a
+  frozen cursor and, three polls later, a disabled mailbox. The closed set is still
+  enforced: the store refuses an unknown kind, and every kind has a test asserting its
+  **row** appears, so a typo fails in the suite instead of reaching an operator.
+- **4.2 — prune points.** Startup and after each sweep pass, as written; the call sits
+  outside the sweep loop's `try`, because a prune failure must not swallow the sweep's
+  own summary line — that line is the evidence that externally uploaded documents were
+  discovered.
+- **5.1/5.2 — CLI.** `--since` takes `YYYY-MM-DD` (a day count compared lexically
+  against ISO timestamps silently means "the year 7"), and `--json` emits the record
+  fields. A missing database is refused before `Store()` exists, per 5.6.
+- **7.1 — scope.** `titles.py` changed here; the OCR prompt's identical assumption moved
+  to its own branch (`ocr-prompt-language`, based on the shared parent), because gate 5
+  excludes `ocr.py` and the diacritic argument deserves a change of its own.
+
+Found while executing, not in the plan:
+
+- **`replay --from-uid N` re-reads strictly after N.** So the uid printed beside a
+  refused message has to be passed **minus one** — passing it verbatim reports a
+  successful rewind while leaving the one message the operator came for behind.
+  Documented in the README and in the option's own help; pinned end-to-end against the
+  real IMAP server (replay at N re-reads nothing, at N−1 the document arrives).
+- **A quoting rule keyed on whitespace does not stop a terminal.** `ESC` contains no
+  whitespace; the renderer now keys on `isprintable()` plus the unsafe Unicode
+  categories, and escapes C1 and U+2028/U+2029 in JSON output too. Tested by writing
+  such rows straight into the table, which is the case it exists for (older builds and
+  hand-edited databases).
+- **Two claims in the first README draft were false.** "A message that ingested
+  successfully never appears here" — my own integration test forwards a mail whose PDF
+  uploaded *and* whose `.zip` was skipped; and "events says whether the document ever
+  arrived" — absence here is equally consistent with success, retention, or a failed
+  event write. Both rewritten.
+
+Review gate:
+
+1. No path where an event write fails a poll or stalls a cursor: asserted for both
+   failure modes (locked database, rejected kind) with upload, `\Seen` and cursor
+   advance all still checked.
+2. Event strings reach a terminal bounded (store) and escaped (renderer); log lines
+   carry our own identifiers, and `upload_failed` stores `PapraError(status=500)`, never
+   `str(error)`.
+3. Every kind fails a test when its write is removed (4/4 mutants caught).
+4. Retention cannot eat a live question: an 89-day row survives, a 91-day row goes, and
+   `events` reads without pruning.
+5. `git diff main -- papra_suite` touches `__main__.py`, `mail.py`, `pipeline.py`,
+   `store.py`, `titles.py` — no `mcp/`, no `ocr.py`, no `papra_client.py`, and the only
+   cursor-adjacent diff in `mail.py` is comment text.
+
+Stop conditions: none triggered. `ingest_events` needed no change to `mailboxes` or
+`jobs`; `retire_refused` gained its row without touching the cursor-prefix ordering; the
+digest-pinned image passed everything `:latest` passed.
