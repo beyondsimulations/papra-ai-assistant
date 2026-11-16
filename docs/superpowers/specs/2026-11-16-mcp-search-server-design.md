@@ -367,12 +367,20 @@ allow-list); relevance ranking; a local search index.
 4. **Query handling — decided: we tokenise, Papra never sees prose.** Papra ships a search
    *language* (`name:`, `content:`, `tag:`, `date:`, `AND`/`OR`/`NOT`, quoting) and on the pinned
    image it is not even enforced as field syntax (`content:<token>` matched a token that appears
-   only in a filename). Measured behaviour: single bare tokens match reliably; multi-word phrases,
-   hyphenated tokens and numbers with punctuation under-match, reproducibly. So:
+   only in a filename). Measured behaviour, re-measured cleanly on 2026-11-16 with every document
+   read back before any search ran (characterisation spec, *Third pass*): **single tokens match by
+   prefix on the complete token** (`alpha` finds `alphabet`, `Rechnung` finds `Rechnungen`, `lpha`
+   finds nothing), **punctuation separates tokens** (`AZ-99QK` is found by `az` and by `99qk`, and
+   a glued `az99qk` finds nothing), and **diacritics are kept, not folded** (`Wäsche` is not found
+   by `Waesche`, `Straße` not by `Strasse`). Multi-word queries are not an AND. So:
 
-   - `search_documents(query)` splits the query into words, strips punctuation and operator
-     characters, and runs **one Papra query per token — at most 6** — intersecting document ids
-     locally before ordering and applying the global `limit`.
+   - `search_documents(query)` splits the query into words, splits each word again on any
+     character that is not a Unicode letter or digit, casefolds, and runs **one Papra query per
+     token — at most 6** — intersecting document ids locally before ordering and applying the
+     global `limit`. Splitting mirrors what Papra indexes; **gluing fragments back together is
+     forbidden**, because the glued form is not in the index. Diacritics are preserved exactly as
+     typed (`str.isalnum()`, not `[a-z0-9]`), because folding them is what makes German queries
+     unfindable.
    - Quoting is not used: quoting a phrase measured *worse* than the bare form.
    - Field syntax is never forwarded, so a caller cannot express a query our permission model did
      not consider. Organisation scoping stays outside the grammar entirely; a document that tells
@@ -382,5 +390,10 @@ allow-list); relevance ranking; a local search index.
      archive: Kreuzakt's approach — own the index, stem at index time — accepted as a future
      trade rather than a present one.
    - Consequence for honesty: intersection means a document using a synonym ("Miete" vs "Miete
-     Nebenkosten") can be missed for reasons that are ours, not Papra's. The tool description says
-     an empty result is not proof of absence.
+     Nebenkosten") can be missed for reasons that are ours, not Papra's — and prefix matching means
+     a hit can also be broader than the word typed (`Miete` legitimately returns `Mietschulden`).
+     The tool description says an empty result is not proof of absence and a non-empty one is not
+     proof of an exact match.
+   - Consequence for completeness: intersecting one page per token loses documents, so each token
+     query is paged until its `documentsCount` is exhausted or a page budget is spent, and a search
+     that ran out of budget reports `truncated` rather than looking complete.

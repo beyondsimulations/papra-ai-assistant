@@ -1,11 +1,13 @@
 # OCR content search intermittently unreliable — characterisation, not a fix
 
 Date: 2026-11-16
-Status: **explained — see the addendum at the foot of this file.** The original problem
-(search missing content that should be there) has a measured cause: Papra's own asynchronous
-content extraction overwrites the `content` column that our OCR worker writes. Read the
-addendum before quoting anything above; the sections below are kept in full because the
-sequence of claims and retractions is itself the record.
+Status: **mechanism found and reproduced for the missing content writes** — see the addendum at
+the foot of this file. A content write that lands before Papra's own asynchronous extraction
+finishes is replaced by that extraction. Read the addendum before quoting anything above; the
+sections below are kept in full because the sequence of claims and retractions is itself the
+record. What the addendum does **not** explain, and does not claim to: the multi-word and
+punctuation under-matching, and the cause of each individual old probe — those trials recorded no
+timings, so their attribution stays inferred.
 
 No fix is approved. The remediation needs its own short spec, because the fix the earlier
 sections contemplated (read-then-write before a rename) targeted a mechanism that measured
@@ -190,6 +192,62 @@ What this does **not** establish, and must not be quoted as established:
   is consistent with a cache; the matrix's zero misses are consistent with it too, because every
   trial there used a fresh phrase and therefore a fresh key.
 
+### Third pass, done cleanly: what a single token actually does
+
+Same day, after the write race was understood. Method changed in the one way that matters: every
+document is read back with `GET` and its stored `content` verified **before** any search runs, and
+no filename contains any query token, so a match can only be attributed to the token under test.
+Scripts: `docs/superpowers/probes/2026-11-16-search-grammar/`. The pattern below is deterministic
+across every trial.
+
+| content | queried with | result |
+|---|---|---|
+| `alphabet` | `alpha` | **found** |
+| `alpha` | `alphabet` | not found |
+| `Rechnungen` | `Rechnung` | **found** |
+| `Strassenverkehr` | `Strasse`, `Strassen` | **found** both |
+| `Strasse` | `Strassen` | not found |
+| `alpha` | `lpha` | not found |
+| `AZ-99QK` | `99qk`, `AZ-99QK` | **found** both |
+| `AZ-99QK` | `az99qk` (glued) | not found |
+| `info@beispiel.de` | `info`, `beispiel`, `de` | **found** all three |
+| `MwSt 19 Prozent` | `Mw`, `19` | **found** both |
+| `Wäsche` | `Wäsche`, `Wä` | **found** both |
+| `Wäsche` | `Waesche` | not found |
+| `Straße` / `Grüße` | `Strasse` / `Grusse` | not found |
+| `Café` / `Köln` | `Cafe` / `Koln` | **found** (so Papra's own folding is uneven — another reason not to imitate it) |
+
+**Single tokens match by prefix, on the complete token, not as a substring.** `alpha` finds
+`alphabet`; `Strassen` does not find `Strasse`; `lpha` finds nothing. Short tokens match, and with
+prefix matching a short token is noise rather than silence — `Mw` finds `MwSt`, and `W` finds
+`Wäsche`.
+
+**Punctuation separates tokens; it does not destroy matching.** `AZ-99QK` is indexed as `az` and
+`99qk`, and both halves find it. What does *not* work is gluing them: `az99qk` finds nothing.
+
+Three corrections to what this document said earlier, all in the same direction — the grammar was
+less broken than it looked:
+
+1. "Hyphenated tokens under-match reproducibly" is **wrong as a statement about Papra**.
+   `AZ-99QK` and `delta-1a`-shaped content are found by either half and by the whole string. A
+   query that failed to find them was querying a string the index never contained, or was reading
+   content that had already been replaced.
+2. "`gamma` is present in both documents' content and found in only one" is **not explained by the
+   grammar** and stays the one open anomaly here. The old run inferred the index state from search
+   results alone and never read the document back; with the write race now known, the leading
+   candidate is that the content at query time was not the content that was written. Re-running
+   that exact pair with the `GET`-before-search method closes it, and nothing should be claimed
+   about it until then.
+3. The "index staleness / per-query cache" hypothesis is no longer needed for the single-token
+   cases: with the two confounds removed, matching is deterministic across every trial. The cache
+   hypothesis is not disproven for multi-word queries, which were never the shape we forward.
+
+What follows for the MCP tokeniser is now concrete instead of defensive: split on anything that is
+not a Unicode letter or digit, keep diacritics exactly as typed, never glue fragments back together,
+never forward a phrase, and intersect the per-token id sets locally. Prefix matching means a hit is
+a *prefix* hit and must be described that way to the caller: `Miete` legitimately returns
+`Mietschulden`, and pretending otherwise would be the misleading part.
+
 ### Consequences for the MCP design
 
 1. `search_documents` cannot present an empty result as "the archive does not contain this".
@@ -228,19 +286,25 @@ report of "search sometimes misses" is noise.
 # Addendum, same day: the writer was found. It is Papra's own content extraction
 
 Status: **measured, with a positive control and paired arms.** Everything below was run on
-the pinned digest `sha256:d1f596a3…` against the scratch stack; probe scripts and their raw
-logs are in `/tmp/papra-content-extraction-probes/` (numbered, logs suffixed `.log`).
+the pinned digest `sha256:d1f596a3…` against the scratch stack. Scripts and their raw logs are
+committed under `docs/superpowers/probes/2026-11-16-content-extraction/` (numbered, logs suffixed
+`.log`; read that directory's README first — it names the two known flaws in the scripts, one of
+which changes how `06.log` must be read).
 
 ## The finding
 
 **Papra extracts text from every uploaded document asynchronously and writes it into the
-same `content` column our OCR worker writes.** The extraction is enabled by default and
-cannot be turned off: `CONTENT_EXTRACTION_STRATEGY` is validated against
+same `content` column our OCR worker writes.** On this pinned image the extraction is on by
+default and cannot be switched off: `CONTENT_EXTRACTION_STRATEGY` is validated against
 `internal | mistral-ocr | docling | azure-di | custom-http`, and setting it to `""` is a
-fatal startup error (measured: the container exits with `CONFIG_VALIDATION_ERROR`). When a
-`PATCH(content)` lands before the extraction finishes, the extraction lands afterwards and
-replaces what we wrote. This is a **write-integrity** problem, not a search defect: the
-index faithfully follows whichever value is in the column.
+fatal startup error (measured: the container exits with `CONFIG_VALIDATION_ERROR`). Quote that
+narrowly: it proves *this image, left at its defaults, always has a second writer*, not that
+every conceivable deployment does — `mistral-ocr`, `docling`, `azure-di` and `custom-http` are
+other services with their own timings and failure modes. What holds for any of them is that our
+write and the extractor's write land in one column, and whichever finishes last owns the
+document. When a `PATCH(content)` lands before the extraction finishes, the extraction lands
+afterwards and replaces what we wrote. This is a **write-integrity** problem, not a search
+defect: the index faithfully follows whichever value is in the column.
 
 **Positive control** (`03-positive-control.py`, n=1). Upload a `text/plain` document whose
 own body is `THEIR-EXTRACTED-TEXT-9f3c\nsecond line\n`, then `PATCH(content: "OURS-PATCHED-VALUE-1")`
@@ -288,7 +352,9 @@ stopped matching later" (probes #2, #3), "`GET` returned the document without th
 (probe #6), and a burst of same-shaped trials failing together (probe #4, 0/5) are all
 consistent with this writer. The matrix's 35 clean trials are also consistent with it: on an
 idle server the window for a small fixture is sub-second, and every matrix trial wrote content
-and then did other HTTP work before observing it.
+and then did other HTTP work before observing it. **"Consistent with" is the strongest phrase
+available here** — none of those trials recorded when it wrote relative to upload, so their
+cause stays inferred even though the mechanism itself is measured.
 
 Does **not** establish, and must not be quoted as establishing:
 

@@ -14,6 +14,15 @@ facts.
 Next step is **implementation plans**, not more design: one plan for the MCP server, one for the
 small ingest-visibility changes (below). No implementation before the plans are approved.
 
+**Status of that: both plans are written and await approval —
+`docs/superpowers/plans/2026-11-16-mcp-search-server.md` and
+`docs/superpowers/plans/2026-11-16-ingest-visibility.md`.** No product code has been written for
+either. They were reviewed against the advisor once and corrected on five points: tools return
+pydantic models (a `dict` return publishes no output schema), search is paged per token instead of
+intersecting one page each, oversized upstream responses are `invalid_upstream_response`, the
+read-only database checks are spelled out, and the acceptance test no longer claims a settle
+boundary it cannot observe.
+
 **Added the same afternoon, and it outranks the paragraph above.** The content-search
 intermittency has a measured cause, and it is not a search defect: see *Two writers, one
 column* at the end of this file. Read it before writing or approving either plan — it changes
@@ -53,10 +62,16 @@ what the MCP acceptance test is allowed to claim and it reopens nothing else.
   the real writer is *Two writers, one column* below. It is a different mechanism and it does
   not reinstate this claim.
 - **"Papra full-text search over OCR content is verified working."** Overstated twice before it
-  was understood. What's true: single bare alphanumeric tokens in content are found reliably;
-  multi-word phrases, hyphenated tokens and numbers with punctuation under-match **reproducibly**
-  on the pinned image. `list_documents` never returns a `content` field (verified twice), so
-  search results cannot carry snippets.
+  was understood, and the *correction* was then wrong in the other direction. What a clean
+  measurement (every document read back before searching, `docs/superpowers/probes/2026-11-16-search-grammar/`)
+  shows: **single tokens match by prefix on the complete token** (`alpha` finds `alphabet`,
+  `Rechnung` finds `Rechnungen`, `lpha` finds nothing), punctuation **separates** tokens
+  (`AZ-99QK` is found by `az` and by `99qk`; a glued `az99qk` finds nothing), and diacritics are
+  kept rather than folded (`Wäsche` is **not** found by `Waesche`). So the earlier claim that
+  hyphenated and punctuation-bearing tokens "under-match reproducibly" was a tokeniser artefact,
+  not a Papra defect — and the one case that still has no explanation is `gamma` missing from a
+  document that demonstrably contained it. `list_documents` never returns a `content` field
+  (verified twice), so search results cannot carry snippets.
 - **"Characters ≈ pages/tokens"**, **"8 orgs is a security boundary"**, and **"one new
   dependency"** (one *direct*; the transitive tail is real) were all wrong and are corrected in
   the specs.
@@ -80,13 +95,22 @@ what the MCP acceptance test is allowed to claim and it reopens nothing else.
 - Papra pinned by digest in the specs: `sha256:d1f596a3…`, built 2026-10-22. `:latest` in
   `docker-compose.test.yml` should be pinned; pulling returned the same digest, so `:latest`
   carries no version signal.
-- Probe scripts (throwaway, `/tmp`): `char_matrix.py` (the 7-variable matrix, log at
-  `/tmp/matrix.log`), `char_grammar.py`-style query-shape probes. Re-run before filing anything
-  upstream.
+- Probes are **committed**, because `/tmp` does not survive and the claims need to stay checkable:
+  `docs/superpowers/probes/2026-11-16/` with its README naming each script's finding **and its
+  known flaws** (`06.log` must be read by content length, not by its `ours=` flag; the kept SDK
+  spike is kept because two of its auth checks proved nothing). The older query-shape probes
+  (`/tmp/char_matrix.py`, `/tmp/matrix.log`) are not committed and are superseded by the search
+  grammar directory. Re-run before filing anything upstream.
 - MCP SDK facts measured live, `mcp==2.3.0`: 401/401/200 for none/wrong/right token, 401 for
-  query-string tokens, 421 for bad Host, 403 for bad Origin; `token_verifier` requires `auth`;
-  `AccessToken` requires `client_id` and `scopes` or the *correct* token 500s; uvicorn logs to
-  **stdout** and logs full URLs including query strings (a refused token appeared verbatim).
+  query-string tokens **with no header sent**, 401 for a follow-up request that really does carry
+  the session id, 401 for `DELETE` without a token, 421 for bad Host, 403 for bad Origin;
+  `token_verifier` requires `auth`; `AccessToken` requires `client_id` and `scopes` or the
+  *correct* token 500s; **a tool returning `dict` publishes no output schema and no structured
+  content — return pydantic models**; **the SDK validates argument types and presence and nothing
+  else** (`limit=0`, `limit=10⁹`, a 10 000-character query and unknown extra keys all reach the
+  function); default `allowed_hosts` are port-wildcards, so a bare `Host: 127.0.0.1` gets 421;
+  uvicorn logs to **stdout** and logs full URLs including query strings (a refused token appeared
+  verbatim).
 
 ## Two writers, one column — measured 2026-11-16 afternoon
 
@@ -125,18 +149,23 @@ Consequences, in order of importance:
    `ingest_events`. The operator chooses; nothing in the pipeline may claim a content write is
    durable until then.
 3. **The MCP plan's criterion-5 test must not assert at t+0.** A content hit at t+0 is exactly
-   the state that can be destroyed. Assert after an observable boundary (content unchanged across
-   two reads), report the window waited through, and label it evidence, not a guarantee.
+3. **The MCP plan's criterion-5 test must not assert at t+0.** A content hit at t+0 is exactly
+   the state that can be destroyed. Nor is "content unchanged across two reads" a completion
+   signal — an extraction queued behind three others looks identical to a finished one, and there
+   is nothing to wait on. The test therefore writes once, observes a bounded window, classifies
+   the outcome as found / vanished / never-appeared, and asserts only the part MCP owns: while the
+   stored content still holds the token, the tool finds it. No repair logic in the test — that
+   would hide the defect this file is still carrying.
 4. **It probably also explains the old 0/5 and "matched then stopped" results**, and the matrix's
    35 clean trials (sub-second window, and every trial did other HTTP work between writing and
    observing). Attribution for those specific probes stays probable — they recorded no timings.
 
-Two things it does **not** touch: the multi-word and punctuation under-matching still needs its
-own control arm (`gamma` is not a clean negative control — fitz lays `alpha beta gamma` on one
-page, so every text fixture contains all three), and `titles.py` still renames with `PATCH(name)`
-alone.
+Two things it does **not** touch: `titles.py` still renames with `PATCH(name)` alone, and the
+query-grammar question is closed separately by the characterisation spec's *Third pass* section —
+except for the `gamma` case, which needs the same GET-before-search method re-run before anyone
+claims a cause for it.
 
-Probes and raw logs: `/tmp/papra-content-extraction-probes/`, numbered 00–07 with `.log` files.
+Probes and raw logs are committed under `docs/superpowers/probes/2026-11-16*/`.
 
 ## House rules this session earned
 

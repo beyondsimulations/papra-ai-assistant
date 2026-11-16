@@ -18,6 +18,11 @@ timeout = 120
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# The measurement scripts under docs/superpowers/probes/ are evidence, not product code: they
+# are kept as they ran, so the quoted logs can be reproduced by the file that produced them.
+# Reformatting them would sever claim from script, so they are excluded from lint rather than
+# tidied. They are not tests and pytest never collects them (testpaths = ["tests"]).
+extend-exclude = ["docs/superpowers/probes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

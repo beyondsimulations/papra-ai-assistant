@@ -1,0 +1,16 @@
+delay    1 s doc0: survived to t+40
+delay    1 s doc1: survived to t+40
+delay    1 s doc2: survived to t+40
+delay    3 s doc0: survived to t+40
+delay    3 s doc1: survived to t+40
+delay    3 s doc2: survived to t+40
+delay    5 s doc0: survived to t+40
+delay    5 s doc1: survived to t+40
+delay    5 s doc2: survived to t+40
+delay    8 s doc0: survived to t+40
+delay    8 s doc1: survived to t+40
+delay    8 s doc2: survived to t+40
+delay   15 s doc0: survived to t+40
+delay   15 s doc1: survived to t+40
+delay   15 s doc2: survived to t+40
+--- done ---

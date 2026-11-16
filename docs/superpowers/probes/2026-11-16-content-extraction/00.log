@@ -1,0 +1,27 @@
+Traceback (most recent call last):
+  File "/private/tmp/mcpspike6/fts_race.py", line 113, in <module>
+    main()
+  File "/private/tmp/mcpspike6/fts_race.py", line 107, in main
+    for log in pool.map(trial, range(DOCS)):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/tobi/.local/share/uv/python/cpython-3.12.15-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py", line 619, in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/tobi/.local/share/uv/python/cpython-3.12.15-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py", line 317, in _result_or_cancel
+    return fut.result(timeout)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/Users/tobi/.local/share/uv/python/cpython-3.12.15-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py", line 456, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/Users/tobi/.local/share/uv/python/cpython-3.12.15-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+  File "/Users/tobi/.local/share/uv/python/cpython-3.12.15-macos-aarch64-none/lib/python3.12/concurrent/futures/thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/private/tmp/mcpspike6/fts_race.py", line 67, in trial
+    ).raise_for_status().json()["document"]
+      ^^^^^^^^^^^^^^^^^^
+  File "/tmp/mcpdep/lib/python3.12/site-packages/httpx/_models.py", line 829, in raise_for_status
+    raise HTTPStatusError(message, request=request, response=self)
+httpx.HTTPStatusError: Client error '409 Conflict' for url 'http://127.0.0.1:12210/api/organizations/org_nfmakqj7qevj18im7d7ck1x7/documents'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/409

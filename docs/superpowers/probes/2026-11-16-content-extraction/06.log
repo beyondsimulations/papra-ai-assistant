@@ -1,0 +1,8 @@
+scan fixture size: 17.7 MiB, 8 pages at 200 dpi
+1. extraction settled after 8.2s, content length 5639
+
+2. race: upload then PATCH(content) immediately (n=4)
+   doc0: after 20s ours=False | after repair+45s ours=False searchable=True len=18
+   doc1: after 20s ours=False | after repair+45s ours=False searchable=True len=18
+   doc2: after 20s ours=True | after repair+45s ours=False searchable=False len=5639
+   doc3: after 20s ours=True | after repair+45s ours=False searchable=False len=5639
