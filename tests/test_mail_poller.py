@@ -1,10 +1,11 @@
 import asyncio
 import imaplib
+import sqlite3
 from dataclasses import dataclass, field
 
 import pytest
 
-from papra_suite.allowlist import PERMISSION, parse_allowlist
+from papra_suite.allowlist import PERMISSION, extract_from_field, parse_allowlist
 from papra_suite.mail import FetchBatch, MailboxSession, PollResult, poll_mailbox_once
 from papra_suite.store import Mailbox, Org, Store
 from tests.test_mail_session import FakeImap
@@ -94,7 +95,7 @@ class FakeSession:
             self.header_checked.append(uid)
             verdict = admit(_headers_of(raw))
             if verdict != PERMISSION:
-                denied.append((uid, verdict))
+                denied.append((uid, verdict, extract_from_field(_headers_of(raw))))
                 continue
             self.raws_read.append(uid)
             admitted.append((uid, raw))
@@ -1064,3 +1065,180 @@ async def test_replay_re_enables_a_mailbox_disabled_by_repeated_failures(store):
     revived = store.get_mailbox(mailbox_id)
     assert revived.enabled is True
     assert revived.consecutive_failures == 0 and revived.last_error is None
+
+
+# --- ingest events: the durable answer to "why did nothing arrive?" ---------
+#
+# These rows are the only durable record of a message that was decided against.
+# The counters say how many; the row says which one, from whom, and why. So each
+# kind gets its own assertion, including the fields that make it actionable —
+# a row that cannot be acted on is a counter with extra steps.
+
+def _events(store):
+    return store.list_ingest_events()
+
+
+async def test_an_unsupported_attachment_is_recorded_with_sender_and_name(store, monkeypatch):
+    """The message it rode in on is marked \Seen and, with delete_after_download,
+    deleted — so this row is the only place the skipped .zip will ever appear."""
+    raw = build_raw(attachments=[("a.pdf", b"%PDF-1"), ("invoice.zip", b"PK\x03\x04")])
+    session = FakeSession(raws=[(1, raw)])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
+
+    event, = _events(store)
+    assert event.kind == "attachment_unsupported"
+    assert event.filename == "invoice.zip"
+    assert event.uid == 1 and event.mailbox_id == "mb1"
+    assert "sender@x.com" in event.sender
+    assert event.papra_org_id == "org_papra"
+    assert event.uidvalidity == session.uidvalidity
+
+
+async def test_a_refused_sender_is_recorded_with_the_address_that_was_refused(
+        store, monkeypatch):
+    """The address is captured at the header refusal, the only place it exists.
+
+    `parse_message` never runs for a refused message, so a `sender` column left
+    to the parse stage would always be NULL for exactly the rows where "whose mail
+    was it?" is the question.
+    """
+    session = FakeSession(raws=[(1, build_raw(sender="Stranger <spam@other.net>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG,
+                                     allowlist=parse_allowlist("x.com"))
+
+    event, = _events(store)
+    assert result.senders_denied == 1
+    assert event.kind == "sender_denied" and event.uid == 1
+    assert "spam@other.net" in event.sender
+
+
+async def test_an_unresolvable_sender_is_recorded_as_malformed_with_its_text(
+        store, monkeypatch):
+    """The malformed row keeps the text that could not be parsed: for these rows
+    there is no address to report, so the unparseable header IS the evidence."""
+    session = FakeSession(raws=[(1, build_raw(sender="a@x.com, b@x.com"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG,
+                                     allowlist=ALLOW)
+
+    event, = _events(store)
+    assert result.malformed_senders == 1
+    assert event.kind == "sender_malformed"
+    assert event.sender and "@" in event.sender
+
+
+async def test_an_oversized_message_is_recorded_without_inventing_a_name(
+        store, monkeypatch):
+    """The size gate fires before the body is read, so the honest row names the
+    uid and the mailbox and claims nothing about filename or sender."""
+    session = FakeSession(raws=[], oversized=[7])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
+
+    event, = _events(store)
+    assert event.kind == "message_oversized" and event.uid == 7
+    assert event.filename is None and event.sender is None
+
+
+async def test_a_failed_upload_is_recorded_without_the_upstream_body(store, monkeypatch):
+    """`PapraError.__str__` embeds 200 characters of response body. That belongs
+    in a log line, not in a durable table an operator dumps to a terminal."""
+    session = FakeSession(raws=[(1, build_raw(attachments=[("big.pdf", b"%PDF-1")]))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient(fail_for={"big.pdf"})
+
+    await poll_with_allow_list(store, client, make_mailbox(), ORG)
+
+    event, = _events(store)
+    assert event.kind == "upload_failed" and event.filename == "big.pdf"
+    assert event.detail == "PapraError(status=500)"
+    assert "upload failed for" not in event.detail   # the message text, not the row
+
+
+async def test_a_conflict_is_not_recorded_as_a_failed_upload(store, monkeypatch):
+    """409 means Papra already holds those bytes: success, not an outcome worth
+    an operator's attention."""
+    session = FakeSession(raws=[(1, build_raw(attachments=[("dup.pdf", b"%PDF-1")]))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    await poll_with_allow_list(store, StubClient(conflict_for={"dup.pdf"}),
+                               make_mailbox(), ORG)
+
+    assert _events(store) == []
+
+
+async def test_a_paused_allow_list_records_nothing_at_all(store, monkeypatch):
+    """Paused decides nothing about any message, so it must produce no event
+    rows either — not even a row saying "we did not look"."""
+    session = FakeSession(raws=[(1, build_raw(sender="Stranger <spam@other.net>"))],
+                          oversized=[9])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_mailbox_once(store, StubClient(), make_mailbox(), ORG,
+                                     allowlist=parse_allowlist(""))
+
+    assert result.ingestion_paused and _events(store) == []
+    assert session.seen == []
+
+
+async def test_a_refusal_records_one_row_per_poll_not_one_per_attempt(store, monkeypatch):
+    """The first poll refuses and advances the cursor; the second sees nothing
+    new. Two rows for one uid would mean the cursor rule for refusals broke,
+    which is the bug that re-fetches refused mail forever."""
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    session = FakeSession(raws=[(1, build_raw(sender="Stranger <spam@other.net>"))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    allow = parse_allowlist("x.com")
+
+    await poll_mailbox_once(store, StubClient(), store.get_mailbox(mailbox_id),
+                            store.get_org(org_id), allowlist=allow)
+    second = await poll_mailbox_once(store, StubClient(), store.get_mailbox(mailbox_id),
+                                     store.get_org(org_id), allowlist=allow)
+
+    assert second.messages_scanned == 0
+    assert len(_events(store)) == 1
+
+
+class ExplodingStore:
+    """Only the event write is broken; everything else behaves."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def record_ingest_event(self, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+
+async def test_an_event_write_that_fails_does_not_fail_the_poll(store, monkeypatch):
+    """The quiet-catch is the whole point: an evidence row is worth less than a
+    mailbox that keeps ingesting."""
+    session = FakeSession(raws=[(1, build_raw(attachments=[("a.pdf", b"%PDF-1"),
+                                                          ("x.zip", b"PK\x03\x04")]))])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    client = StubClient()
+
+    result = await poll_with_allow_list(ExplodingStore(store), client, make_mailbox(), ORG)
+
+    assert result.error is None
+    assert result.documents_uploaded == 1 and result.attachments_skipped == 1
+
+
+async def test_the_quiet_catch_does_not_swallow_a_programming_error(store):
+    """An unknown kind must escape, or the closed set is decorative: a call-site
+    typo would invent an outcome no renderer knows and no test would notice."""
+    from papra_suite.mail import _record_event_quietly
+
+    with pytest.raises(ValueError):
+        _record_event_quietly(store, mailbox_id="mb1", uid=1, kind="sender_maybe")
