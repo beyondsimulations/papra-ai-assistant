@@ -138,15 +138,12 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     recovered = store.recover_running_jobs()
     if recovered:
         logger.info("recovered %d stale running job(s) at startup", recovered)
-    # Ingest events are pruned once here rather than by a periodic task. The
-    # window is 90 days and a container restarts far more often than that, so a
-    # scheduled pruner would be a second thing to get right for no gain — and
-    # unlike the jobs table, a stale row here costs disk and a longer listing,
-    # never correctness.
-    pruned_events = store.prune_ingest_events()
-    if pruned_events:
-        logger.info("pruned %d ingest event(s) outside the retention window",
-                    pruned_events)
+    # Ingest events are pruned here at startup and once per sweep pass rather
+    # than by a periodic task of their own. The window is 90 days and a container
+    # restarts far more often than that, so a dedicated pruner would be a second
+    # thing to get right for no gain — and unlike the jobs table, a stale row here
+    # costs disk and a longer listing, never correctness.
+    _prune_ingest_events_quietly(store)
     setup_logging(store)
     register_config_secrets(config)
 
@@ -253,6 +250,25 @@ async def _poll_loop(store: Store, papra: PapraClient, mailbox, *,
         await asyncio.sleep(mailbox.poll_interval_s)
 
 
+def _prune_ingest_events_quietly(store: Store) -> int:
+    """Drop expired ingest events, and never at the cost of ingesting.
+
+    Retention is the least important write in this process, so it cannot be
+    allowed to fail a poll, a sweep pass or a startup: a locked or full database
+    must cost the operator a stale listing, not a stalled pipeline. A warning is
+    logged rather than silence because a prune that never succeeds means the table
+    grows without bound and disk is a slow way to learn that.
+    """
+    try:
+        pruned = store.prune_ingest_events()
+    except sqlite3.Error as error:
+        logger.warning("could not prune ingest events: %s", error)
+        return 0
+    if pruned:
+        logger.info("pruned %d ingest event(s) outside the retention window", pruned)
+    return pruned
+
+
 async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int) -> None:
     while True:
         try:
@@ -263,6 +279,13 @@ async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int) -> None
                             result.non_pdf_skipped)
         except Exception:  # noqa: BLE001
             logger.exception("sweep loop error")
+        # Retention rides the sweep's heartbeat instead of a timer of its own: the
+        # window is 90 days, so one pass per sweep is orders of magnitude more
+        # often than needed, and it adds no concurrency and no new failure
+        # surface. It sits OUTSIDE the try above on purpose — a prune that goes
+        # wrong must not swallow this pass's sweep summary, which is the line that
+        # says whether externally uploaded documents were discovered.
+        _prune_ingest_events_quietly(store)
         await asyncio.sleep(interval_s)
 
 
