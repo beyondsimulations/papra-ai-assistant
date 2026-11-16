@@ -107,6 +107,26 @@ paired trials — at which point a fix spec gets written against a known reprodu
 cells report 0/5 with controls intact, at which point probes #2–#6 are recorded as
 artefacts of their own construction, the specific confound is named, and this document closes.
 
+### Matrix result (2026-11-16)
+
+All seven variables, 5 paired trials each, checked at t+0, t+30 and t+300 after the rename:
+**zero misses, zero control misses, zero content loss.** Variables: baseline rename-vs-no-rename,
+name containing a prefix of the phrase, hyphenated phrase, invalid-PDF bytes fixture, zero delay,
+60 s delay, pairs spread across three organisations.
+
+So the rename does not destroy anything, and probes #2–#6 are artefacts. The likely confound is
+**query shape**, measured separately and reproducible on demand (see *Follow-up measurement*
+below): multi-word, hyphenated and punctuation-bearing queries under-match on this image, which
+describes most of the queries in the failed probes. Two caveats kept on the record rather than
+smoothed over:
+
+- The attribution is probable, not proven. `quokka-marmalade-protocol` is hyphenated and matched
+  reliably in the existing integration test, while `zephy-1a` and `delta-1a` did not match in the
+  follow-up probes. Token shape does not cleanly separate the two sets.
+- The follow-up probes searched seconds after writing content; the matrix did too and found
+  everything, using a fresh phrase per trial. A short-lived per-query cache remains an untested
+  explanation for the difference.
+
 ## Interim protections, justified without a reproduction
 
 These are cheap, and each is defensible on its own merits rather than on the unproven defect:

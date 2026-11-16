@@ -351,10 +351,12 @@ allow-list); relevance ranking; a local search index.
 
 ## Open items
 
-1. **Which MCP client, decided.** pi, Claude Code and Cursor accept a configured static bearer
-   header; ChatGPT/Codex and Claude.ai-style connectors expect OAuth. The design holds for the
-   first group and cannot serve the second without building an authorization server. Decided by
-   naming the client, then by the on-device smoke test.
+1. **Which MCP client — decided.** The targets are **pi** and **Hermes**, the operator's own
+   agent stack, both of which send a configured `Authorization` header. OAuth is therefore not
+   required and no authorization server will be built. pi's own documentation is explicit: "OAuth
+   applies to HTTP servers without an `Authorization` header." Revisit only if a hosted, OAuth-only
+   connector (ChatGPT/Codex, Claude.ai connectors) becomes a real requirement — see *Operations*
+   for the one concession that keeps that door open.
 2. **Search reliability is an open question.** Some probes failed to find content they should
    have; a controlled run did not reproduce the failure. Recorded in
    `2026-11-16-ocr-content-search-intermittent-characterisation-design.md`. Until that closes,
@@ -362,14 +364,23 @@ allow-list); relevance ranking; a local search index.
    which is why empty results are reported with what was searched and which orgs were reached.
 3. **Papra `latest` is pinned by digest as of 2026-11-16.** A newer image may change search
    behaviour in either direction; the characterisation spec carries the open question.
-4. **Papra's search query is a query *language*, not a string.** Papra ships a search parser
-   (`packages/search-parser`) supporting `name:`, `content:`, `tag:`, `created:`, `date:`,
-   `date:>=…`, `has:date`, `has:tags`, `AND`/`OR`/`NOT`, and quoting — and a community MCP
-   server for Papra documents that same grammar. Our `search_documents(query)` passes text
-   straight into it, which means an agent (or a document that tells an agent to search for
-   `content: secret-org-name`) can express queries we never intended, including against
-   organisations the operator can reach but did not think to search. Three options: pass the
-   grammar through and document it; always quote the query as a literal phrase; or accept a
-   structured parameter set (`query`, `name:`, `tag:`, `since:`) that we translate ourselves and
-   keep org scoping outside the grammar. **Unresolved, and it interacts with the allow-list:**
-   a grammar that can name a field can name things our permission model did not consider.
+4. **Query handling — decided: we tokenise, Papra never sees prose.** Papra ships a search
+   *language* (`name:`, `content:`, `tag:`, `date:`, `AND`/`OR`/`NOT`, quoting) and on the pinned
+   image it is not even enforced as field syntax (`content:<token>` matched a token that appears
+   only in a filename). Measured behaviour: single bare tokens match reliably; multi-word phrases,
+   hyphenated tokens and numbers with punctuation under-match, reproducibly. So:
+
+   - `search_documents(query)` splits the query into words, strips punctuation and operator
+     characters, and runs **one Papra query per token — at most 6** — intersecting document ids
+     locally before ordering and applying the global `limit`.
+   - Quoting is not used: quoting a phrase measured *worse* than the bare form.
+   - Field syntax is never forwarded, so a caller cannot express a query our permission model did
+     not consider. Organisation scoping stays outside the grammar entirely; a document that tells
+     an agent to search `content: <something>` reaches a tokeniser, not Papra.
+   - Cost: up to 6 local requests per search, within the 15 s whole-call budget, and it is the
+     shape Papra answers reliably. Escalation path if this ever feels clumsy against a real
+     archive: Kreuzakt's approach — own the index, stem at index time — accepted as a future
+     trade rather than a present one.
+   - Consequence for honesty: intersection means a document using a synonym ("Miete" vs "Miete
+     Nebenkosten") can be missed for reasons that are ours, not Papra's. The tool description says
+     an empty result is not proof of absence.
