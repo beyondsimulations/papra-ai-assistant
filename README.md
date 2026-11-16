@@ -70,10 +70,15 @@ trust boundary is verified for a specific provider.
 
 | Command | |
 |---|---|
-| `papra-suite check` | config + migrations, prints the parsed allow-list, changes nothing |
+| `papra-suite check` | config + migrations, the parsed allow-list, and what was refused in the last 24 h; changes nothing |
 | `papra-suite serve` | pollers, OCR and title workers, sweep loop |
 | `papra-suite replay --mailbox-id ID [--from-uid N] [--dry-run]` | rewind the poll cursor |
-| `papra-suite events [--limit N] [--mailbox-id ID] [--kind K] [--since D]` | why messages and attachments were **not** ingested |
+| `papra-suite events [--limit N] [--mailbox-id ID] [--kind K] [--since YYYY-MM-DD] [--json]` | why messages and attachments were **not** ingested |
+
+`check` ends with one line — `events (last 24h): sender_denied=3, upload_failed=1`
+— because `check` is the command an operator already runs when something is wrong,
+and "the mailbox polls fine but nothing arrives" should not need a second one. An
+empty or fresh store prints `none`; it never fails the check.
 
 `replay` is the answer to "I set the allow-list wrong for a week." Refused mail
 was retired but never deleted, so rewinding re-reads it, and Papra's content-hash
@@ -85,8 +90,9 @@ cursor forward.
 
 `papra-suite events` is the durable answer. The per-poll log lines and the summary
 counters say *how many*; this says *which one, from whom, and why*, and it survives
-log rotation. Output is one event per line, tab-separated, newest first, and prints
-from whatever columns the store actually has.
+log rotation. Output is one event per line, tab-separated, newest first, printing
+whatever columns the store actually has. `--json` gives the record fields instead,
+with `null` for absent rather than the display's `-`.
 
 | `kind` | what happened | what the row can tell you |
 |---|---|---|
@@ -103,9 +109,10 @@ different message. `uid` is also the value `replay --from-uid` wants.
 
 Two things this table is not:
 
-- **It is not an archive.** Rows are kept for 90 days and pruned at every `serve`
-  startup, so an empty result can mean "outside the window". It names its own
-  window when it prints nothing, and it restates the filter you asked with.
+- **It is not an archive.** Rows are kept for 90 days and pruned at `serve`
+  startup and after every sweep pass, so an empty result can mean "outside the
+  window". It names its own window when it prints nothing, and it restates the
+  filter you asked with.
 - **It is not a delivery log.** A message that ingested successfully never appears
   here, and a persistent upload failure writes one row per poll for the same uid.
   Count the rows per uid before concluding there were five bad messages.
@@ -127,29 +134,80 @@ there.
   in on is marked `\Seen` and, with delete-after-download, deleted, so there is
   nothing left to go and look at.
 
-### What losing `state.db` costs
+## Recovery
+
+There is no backup tooling, and nothing below pretends otherwise. "Back up
+`state.db` periodically" is only a strategy if the copy is restorable and you know
+what it returns, so this says exactly what a restore recovers and what no restore
+can.
+
+### `state.db` is lost or corrupt
 
 The SQLite file under `DATA_DIR` is the only state this software keeps. Papra holds
-the documents; everything about *how* they got there lives in that one file:
+the documents; everything about *how* they got there lives in that one file.
 
 | Lost with `state.db` | Consequence |
 |---|---|
-| Organisations and mailboxes (host, user, **password**) | re-add every mailbox; the IMAP passwords are gone, so this is also the file to treat as a secret when backing it up |
+| Organisations and mailboxes (host, user, **password**) | re-add every mailbox, with a password you have to still have |
 | Poll cursors and `UIDVALIDITY` | every mailbox is read from the beginning again |
-| Content dedup hashes and the seen-document table | everything is attempted again |
-| Job queue (OCR and title work) | pending and in-flight work is gone, and the seen-document table that tells the sweep what it already handled is gone with it — so the sweep re-enqueues OCR for the whole archive and pays the LLM cost again |
-| Settings | today that is only the sweep's resume offsets (`sweep_offset:<org>`); losing them re-scans from page one. Anything a later version stores here is lost the same way |
+| Content dedup hashes and the seen-document table | everything still in an inbox is attempted again |
+| Job queue (OCR and title work) | pending and in-flight work is gone |
+| Settings | today that is only the sweep's resume offsets (`sweep_offset:<org>`), so the sweep re-scans from page one |
 | `log_lines` ring buffer | the in-app log history |
 | `ingest_events` | the 90-day "why was this skipped" window |
 
-**The documents themselves are safe in Papra**, and re-ingest is safe: Papra dedups
-by content hash per organisation, so a re-uploaded document answers `409
-already_exists`, which the pipeline treats as already-ingested success rather than
-as an error or a duplicate. So a restore from backup, or simply letting the pollers
-run over the whole inbox again, converges instead of duplicating.
+**The documents themselves are safe in Papra**, and re-ingest converges instead of
+duplicating: Papra dedups by content hash per organisation, so a re-uploaded document
+answers `409 already_exists`, which this pipeline treats as already-ingested success
+rather than as an error or a second copy.
 
-What is not recoverable from anywhere else: the mailbox credentials, and the cursor
-positions that keep a large inbox from being re-read from the start.
+So the path back is **re-add the orgs and mailboxes, then let the sweep run** — not
+"restore from backup", because there is hardly anything to restore: the documents
+never left Papra.
+
+Three consequences worth knowing before it happens:
+
+- **Mailbox passwords live only in that file.** Losing it means having them again to
+  put the mailboxes back — which is also the reason to treat the file, and any copy of
+  it, as a secret.
+- **Re-ingesting mail does not restore the processing.** A document already in Papra
+  is answered with a 409, and a 409 deliberately does not enqueue OCR or titling.
+  Documents that are already in Papra are the **sweep's** job, so missing content
+  comes back through sweep passes, one bounded page at a time: a full re-OCR of the
+  archive at LLM cost, spread over however many passes it takes.
+- **A cold copy of the file is what a restore consists of**, plus the credentials you
+  kept somewhere else. Copy it while `serve` is stopped, or you restore a
+  half-written database.
+
+### A sender was wrongly refused
+
+`papra-suite events --kind sender_denied` shows what was refused, when, and the
+`From:` text that was refused. Fix `PAPRA_ALLOWED_SENDERS`, then
+`papra-suite replay --mailbox-id … --from-uid …`. The mail is still on the server,
+because a refusal marks it `\Seen` and never deletes it.
+
+The `uid` in a row is only meaningful together with the `uidvalidity` printed beside
+it. Quote both when you go looking for the message: after a mailbox rebuild the
+numbering restarts and the same uid can name a different message.
+
+### OCR or title jobs are stuck
+
+`serve` rewinds jobs left `running` when it starts, so a container killed
+mid-document retries that document. The `jobs` table holds the rest — `status`,
+`attempts` and `error` say what has been tried. If a document has no job at all,
+`papra-suite events` answers the question that comes first: whether it ever arrived.
+
+### One caveat over all three
+
+**A content write to Papra is not known to be durable.** Papra runs its own content
+extraction on every upload and writes the same `content` column this pipeline writes
+after OCR. The two race, and measurements on the pinned image show the later writer
+winning: an OCR patch that lands while Papra's extraction is still in flight is
+simply gone, and content search then finds nothing for that document. So nothing here
+promises "your documents come back with their OCR text" — the documents come back,
+the text may not. The mechanism and the numbers are in the characterisation spec's
+addendum,
+`docs/superpowers/specs/2026-11-16-ocr-content-search-intermittent-characterisation-design.md`.
 
 ## Development
 
