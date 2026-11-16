@@ -1257,10 +1257,37 @@ async def test_an_event_write_that_fails_does_not_fail_the_poll(store, monkeypat
     assert _events(store) == []                          # and nothing half-written
 
 
-async def test_the_quiet_catch_does_not_swallow_a_programming_error(store):
-    """An unknown kind must escape, or the closed set is decorative: a call-site
-    typo would invent an outcome no renderer knows and no test would notice."""
+async def test_a_rejected_kind_costs_a_row_and_not_the_poll(store, monkeypatch, caplog):
+    """The store refuses an unknown kind; the poller survives it.
+
+    Both halves matter. If the poller let the ValueError escape, a bug in this
+    program would freeze a cursor and walk the mailbox into the three-strike
+    disable path. If it swallowed the error silently, the closed kind set would be
+    decorative and a typo would look like a quiet mailbox. So: the error is logged,
+    the row is absent, the poll completes and the cursor advances.
+    """
+    import logging
+
     from papra_suite.mail import _record_event_quietly
 
-    with pytest.raises(ValueError):
+    org_id = store.create_org(papra_org_id="org_papra", name="Test")
+    mailbox_id = store.create_mailbox(
+        org_id=org_id, host="imap.test", port=993, username="u", password="p"
+    )
+    with caplog.at_level(logging.ERROR):
         _record_event_quietly(store, mailbox_id="mb1", uid=1, kind="sender_maybe")
+    assert any("could not record ingest event" in record.getMessage()
+               for record in caplog.records)
+    assert _events(store) == []
+
+    session = FakeSession(raws=[(1, build_raw())])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+    monkeypatch.setattr(
+        store, "record_ingest_event",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("unknown ingest event kind")),
+    )
+    result = await poll_with_allow_list(store, StubClient(),
+                                        store.get_mailbox(mailbox_id),
+                                        store.get_org(org_id))
+    assert result.error is None and result.documents_uploaded == 1
+    assert store.get_mailbox(mailbox_id).last_seen_uid == 1

@@ -741,30 +741,31 @@ def _record_event_quietly(
     uidvalidity: str | None = None, papra_org_id: str | None = None,
     filename: str | None = None, sender: str | None = None, detail: str | None = None,
 ) -> None:
-    """Record one decision NOT to ingest something, without ever failing a poll.
+    """Record one decision NOT to ingest something, and never let that write cost
+    the poll.
 
-    The catch is `sqlite3.Error` alone, and what that leaves out matters. An
-    unknown `kind` raises `ValueError` from the store, and catching it here would
-    make the closed set decorative: a call-site typo would invent an outcome no
-    renderer knows, log nothing, and pass every test. Letting it escape is the
-    right severity because it is a programming error, not a condition — it cannot
-    be caused by anything a server or a sender sends, only by a change to this
-    program, and the tests reach it before an operator does. `record_ingest_event`
-    raises no other runtime ValueError (it checks no foreign key), so the narrower
-    catch gives up nothing that `_record_success_quietly` needed its `ValueError`
-    for: that one writes a cursor for a mailbox row that can be deleted mid-poll.
+    The catch is `(ValueError, sqlite3.Error)` — the same pair
+    `_record_success_quietly` uses — because this boundary ranks ingestion above
+    its own audit trail. An unknown `kind` raises `ValueError` from the store, and
+    swallowing it here is deliberate: the alternative is a frozen cursor, a
+    `last_error` nobody can act on and, after three polls, a disabled mailbox —
+    consequences that a message someone else sent would then be able to cause
+    through a bug in this program. The closed set is still enforced, just not
+    here: `store.record_ingest_event` refuses an unknown kind (test_store), and
+    every kind has a test asserting its ROW appears, so a call-site typo that
+    reaches this catch fails a test instead of reaching an operator.
 
-    A database failure never raises here. This row is evidence about a poll; a
-    poll that was otherwise fine must not be failed by the thing that records why
-    messages were skipped, and losing an evidence row is not worth a stalled
-    mailbox.
+    So the split is: the store raises, the tests fail, the poller survives. A
+    logged ERROR with a traceback is what an operator gets, and that is the right
+    trade — losing an evidence row is not worth a stalled mailbox, and a programming
+    error is not worth a mailbox that an outsider can switch off.
     """
     try:
         store.record_ingest_event(
             mailbox_id=mailbox_id, uid=uid, kind=kind, uidvalidity=uidvalidity,
             papra_org_id=papra_org_id, filename=filename, sender=sender, detail=detail,
         )
-    except sqlite3.Error:
+    except (ValueError, sqlite3.Error):
         logger.error(
             "could not record ingest event %s for uid=%s (mailbox %s)",
             kind, uid, mailbox_id, exc_info=True,
