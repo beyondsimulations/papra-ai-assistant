@@ -179,6 +179,15 @@ def compute_file_hash(content: bytes) -> str:
 VANISHED = object()  # validated absence, not "could not read"
 
 
+def _unquoted(prefix: bytes) -> str:
+    """A FETCH response prefix as text, with quoted strings collapsed.
+
+    Quoted values are data, not attributes: an INTERNALDATE or a ENVELOPE that
+    happens to contain the text "UID 9" must not be read as the message's uid.
+    """
+    return re.sub(rb'"[^"]*"', b'""', prefix).decode("ascii", errors="replace")
+
+
 class MailboxSession:
     """Sync imaplib wrapper — every method runs inside asyncio.to_thread."""
 
@@ -306,19 +315,34 @@ class MailboxSession:
         status, fetch_data = self._imap.uid("FETCH", str(uid), f"(BODY.PEEK{section})")
         if status != "OK":
             raise imaplib.IMAP4.error(f"UID FETCH failed for {uid}")
-        entry = fetch_data[0] if fetch_data else None
-        if isinstance(entry, tuple) and len(entry) >= 2 and isinstance(entry[1], bytes):
-            prefix = entry[0] if isinstance(entry[0], bytes) else b""
-            described = prefix.decode("ascii", errors="replace")
-            # The response must describe the uid that was asked for: a literal
-            # for another message would otherwise be ingested, deduplicated and
-            # retired under this uid.
+        # Servers put the literal in different places: some send unsolicited
+        # items alongside it, and imaplib hands the whole tagged response back.
+        # Scanning every item is what keeps a well-behaved server from being
+        # read as a broken one — while a literal for ANOTHER uid is still a
+        # refusal, never a message ingested and retired under the wrong uid.
+        literal = None
+        for entry in fetch_data or []:
+            if not (isinstance(entry, tuple) and len(entry) >= 2
+                    and isinstance(entry[1], bytes)):
+                continue
+            described = _unquoted(entry[0] if isinstance(entry[0], bytes) else b"")
             if not re.search(rf"\bUID {uid}\b", described):
                 raise imaplib.IMAP4.error(
-                    f"UID FETCH for {uid} returned a response describing another "
+                    f"UID FETCH for {uid} returned a literal describing another "
                     f"message ({described[:60]!r}); refusing to ingest it as {uid}"
                 )
-            return entry[1]
+            # A PARTIAL literal is an incomplete body. Ingesting half a PDF and
+            # retiring the mail that contained it is worse than failing: the
+            # truncated document would be OCR'd, titled and never looked at
+            # again. Fail the poll; the next attempt asks for the whole thing.
+            if re.search(r"\bPARTIAL\b", described):
+                raise imaplib.IMAP4.error(
+                    f"UID FETCH for {uid} returned a PARTIAL (truncated) literal; "
+                    "refusing to ingest an incomplete document"
+                )
+            literal = entry[1]
+        if literal is not None:
+            return literal
         # No literal: benign if the message was expunged under us, and the
         # metadata probe is the cheapest way to ask. Anything else — PARTIAL,
         # untagged-only, a shape this client does not understand — means the
@@ -349,7 +373,7 @@ class MailboxSession:
             raise imaplib.IMAP4.error(
                 f"UID FETCH for {uid} returned unreadable metadata "
                 f"({entry!r:.60}); not treating that as a deleted message")
-        if not re.search(rf"\bUID {uid}\b", entry.decode("ascii", errors="replace")):
+        if not re.search(rf"\bUID {uid}\b", _unquoted(entry)):
             raise imaplib.IMAP4.error(
                 f"UID FETCH for {uid} returned metadata describing another message "
                 f"({entry!r:.60})")

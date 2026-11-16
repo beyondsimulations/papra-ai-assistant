@@ -677,3 +677,72 @@ def test_a_confirmed_vanished_message_is_still_skipped_without_failing():
     batch = session.fetch_since(None)
 
     assert [uid for uid, _ in batch.messages] == [2]
+
+
+# --- unusual FETCH response shapes ------------------------------------------
+#
+# GreenMail will never send these, so they are scripted directly: the question is
+# not "does our server do this" but "what would we do if one did". A response
+# shape being read as a vanished message loses mail; being read as a complete
+# document corrupts it.
+
+
+def test_a_literal_beside_another_item_is_still_found():
+    # unsolicited items (FLAGS, ENVELOPE) alongside the literal are normal in
+    # some servers' tagged responses; the literal must not be missed just
+    # because it was not first
+    session = make_session()
+    good = b"Subject: ok\r\n\r\nbody"
+    session._imap = FakeImap(
+        search_uids=(1,), bodies={1: good},
+        fetch_responses={1: [
+            (b"1 (UID 1 FLAGS (\\Seen))", b""),        # a FLAGS-only item
+            (b"1 (UID 1 BODY[])", good),
+        ]},
+    )
+
+    batch = session.fetch_since(None)
+
+    assert batch.messages == [(1, good)]
+
+
+def test_a_partial_truncated_literal_is_refused_and_the_batch_aborts():
+    session = make_session()
+    session._imap = FakeImap(
+        search_uids=(1,), bodies={1: b"a-whole-pdf"},
+        fetch_responses={1: [(b"1 (UID 1 PARTIAL 0 3) BODY[]", b"a-w")]},
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        session.fetch_since(None)
+
+    assert "PARTIAL" in str(excinfo.value)
+
+
+def test_a_uid_mentioned_inside_a_quoted_value_does_not_count():
+    # "UID 1" as data (an INTERNALDATE, an ENVELOPE fragment) is not the
+    # message's uid attribute; without this, a literal belonging to something
+    # else could be ingested and retired under this uid
+    session = make_session()
+    session._imap = FakeImap(
+        search_uids=(1,), bodies={1: b"x"},
+        fetch_responses={1: [(b'1 (INTERNALDATE "1 Jan 2026 UID 1" BODY[])', b"x")]},
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        session.fetch_since(None)
+
+    assert "another message" in str(excinfo.value)
+
+
+def test_metadata_naming_another_uid_inside_quotes_is_refused_too():
+    session = make_session()
+    session._imap = FakeImap(
+        search_uids=(1,), bodies={1: b"x"},
+        size_responses={1: [b'1 (INTERNALDATE "9 Jan 2026 UID 9" RFC822.SIZE 5)']},
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        session.fetch_since(None)
+
+    assert "another message" in str(excinfo.value)
