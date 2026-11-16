@@ -21,7 +21,9 @@ def make_pdf(pages: list[str]) -> bytes:
 def test_prompt_is_the_spec_wording():
     assert OCR_SYSTEM_PROMPT == (
         "Transcribe this document page to clean markdown. Preserve structure: "
-        "headings, lists, tables. Output only the markdown. Text is German or English."
+        "headings, lists, tables. Output only the markdown. Transcribe every word "
+        "exactly as printed, in the document's own language, keeping accents and "
+        "diacritics; never translate."
     )
 
 
@@ -85,3 +87,21 @@ def test_render_pages_empty_pdf():
 def test_assemble_markdown_joins_pages():
     assert assemble_markdown(["# A", "# B"]) == "# A\n\n# B"
     assert assemble_markdown([]) == ""
+
+
+def test_the_ocr_prompt_nominates_no_language():
+    """The OCR prompt used to say "Text is German or English", and that is not a
+    cosmetic assumption.
+
+    A model told which languages to expect is a model invited to correct the one it
+    did not expect. Papra's search does not fold diacritics — measured on the pinned
+    image: `Wäsche` is found by `Wäsche` and by `Wä`, never by `Waesche`, and
+    `Straße` is not found by `Strasse` — so a transcription that normalises `ä` to
+    `ae` while "cleaning up" a page makes the document unfindable for anyone who
+    types the word the way it is printed. The prompt therefore asks for the page
+    back as printed, in its own language, accents kept.
+    """
+    lowered = OCR_SYSTEM_PROMPT.lower()
+    assert "german" not in lowered and "english" not in lowered
+    assert "own language" in lowered and "never translate" in lowered
+    assert "accents" in lowered
