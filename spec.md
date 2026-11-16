@@ -28,7 +28,7 @@ One Python service that replaces papra-companion + papra-ai + papra-mcp: email i
 - Multiple organizations, ids `org_...`, visible in the Papra URL.
 - LLM endpoint: any OpenAI-compatible server (vLLM, Ollama, LM Studio, MLX-based); discovered via `GET /v1/models`. Needs one text model for titles and one vision model for OCR (a Qwen3-VL or Qwen2.5-VL class model is the reference choice for document work).
 - Deployment host: Docker with a compose tool (plain docker-compose or Dokploy). The operator needs one external network name for the compose file and one host for SSH access.
-- Document languages: configurable per prompt; reference deployment processes German and English.
+- Document languages: not assumed anywhere in the pipeline. The prompts instruct the model to keep the document's own language and never translate. The reference deployment happens to process German and English, and Papra's search does not fold diacritics (measured: `Wäsche` is found by `Wäsche` and `Wä`, never by `Waesche`), so a transcription that normalises `ä` to `ae` makes the document unfindable.
 
 ## 4. Architecture
 
@@ -90,7 +90,7 @@ Tables: `orgs` (id, papra_org_id, name), `mailboxes` (id, org_id, host, port, us
 
 ### 5.4 OCR worker (PDFs only)
 
-- Input: document id. Download the file from Papra, render each page to PNG at ~150 DPI with PyMuPDF, base64 the page, send one chat-completions request per page with the page image as an image content part and a fixed system prompt: "Transcribe this document page to clean markdown. Preserve structure: headings, lists, tables. Output only the markdown. Text is German or English."
+- Input: document id. Download the file from Papra, render each page to PNG at ~150 DPI with PyMuPDF, base64 the page, send one chat-completions request per page with the page image as an image content part and a fixed system prompt: "Transcribe this document page to clean markdown. Preserve structure: headings, lists, tables. Output only the markdown. Transcribe every word exactly as printed, in the document's own language, keeping accents and diacritics; never translate."
 - Guard rails: skip pages over a max pixel budget (configurable, default ~2 MP per page) by downscaling; hard cap pages per document (default 50) with a dashboard warning; time out single requests (default 300 s, the MLX server can be slow on cold models); on model overload/timeout, retry with backoff, max 3 attempts, then mark failed and show in dashboard.
 - Assemble page outputs into one markdown document, write back to Papra via the update-document endpoint.
 

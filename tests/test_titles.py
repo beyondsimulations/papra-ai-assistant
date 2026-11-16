@@ -139,3 +139,25 @@ async def test_generate_title_falls_back_on_a_permanent_completion():
 
     assert title == "rechnung-42.pdf"   # the filename, not the truncated title
     assert calls["n"] == 1              # and asked exactly once: permanent
+
+
+def test_neither_prompt_nominates_a_language():
+    """Nothing in the pipeline knows what language a document is in.
+
+    The operator forwards whatever arrives, so a prompt that names two languages
+    tells the model the third one is a mistake to be corrected. For titles that
+    means a translated title nobody recognises when they search for it. For OCR it
+    is worse, because Papra's search does not fold diacritics — measured: `Wäsche`
+    is found by `Wäsche` and by `Wä`, never by `Waesche`, and `Straße` is not found
+    by `Strasse` — so a transcription that "helpfully" writes ae for ä makes the
+    document unfindable for anyone who types the word the way it is printed.
+    """
+    from papra_suite.ocr import OCR_SYSTEM_PROMPT
+    from papra_suite.titles import TITLE_SYSTEM_PROMPT
+
+    for prompt in (OCR_SYSTEM_PROMPT, TITLE_SYSTEM_PROMPT):
+        lowered = prompt.lower()
+        assert "german" not in lowered and "english" not in lowered
+        assert "own language" in lowered
+    assert "never translate" in TITLE_SYSTEM_PROMPT.lower()
+    assert "accents" in OCR_SYSTEM_PROMPT.lower()
