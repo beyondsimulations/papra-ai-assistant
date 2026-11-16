@@ -69,16 +69,82 @@ Authentication and Host/Origin validation are provided by the SDK
 (`TransportSecuritySettings`, `BearerAuthBackend`, `TokenVerifier`). Our code is one
 `verify_token` doing a constant-time compare — we do not hand-roll a security control.
 
-Deployment default: **bind loopback and expose with `tailscale serve`** — tailnet-only,
-HTTPS, no `0.0.0.0` listener. Binding the tailscale interface directly is available via
-`PAPRA_MCP_HOST`. `tailscale serve`, never Funnel. Tailnet ACLs still restrict which devices
-may connect; "on Tailscale" is not by itself an authorisation boundary.
+Two SDK details that fail loudly if got wrong, both verified in v2.3.0 source:
 
-The 401 challenge's `resource_metadata` points at `/.well-known/oauth-protected-resource`,
-which answers 200; that document in turn advertises an authorization-server URL that 404s, as
-an artefact of `issuer_url` naming this server. A client configured with a manual bearer header
-is expected to work; **an OAuth-only client is expected not to**, and this is unverified until
-the intended client is tested (see *Validation*).
+- `AccessToken` **requires** `client_id` and `scopes`, not just the token. A verifier returning
+  `AccessToken(token=t)` raises inside `verify_token`, so the *correct* token answers 500 while
+  wrong tokens look fine. Assert the success path in a test, not just the rejections.
+- `validate_token_resource` left unset emits a deprecation warning and behaves as `False`; it
+  becomes `True` in 3.0. Set it explicitly so an SDK upgrade cannot silently change what our
+  tokens must carry.
+
+Deployment default: **bind loopback and expose with `tailscale serve`** — tailnet-only, HTTPS,
+no `0.0.0.0` listener. `tailscale serve`, never Funnel.
+
+**The Host allow-list is a deployment blocker, not a footnote.** `streamable_http_app()` cannot
+know the hostname it will be served behind, so with no explicit `transport_security` it accepts
+only `127.0.0.1`, `localhost`, `[::1]` — and `tailscale serve` presents a `.ts.net` host. Every
+request then dies with **421 before anything MCP-shaped runs**, the client sees a generic
+transport error, and the rejected hostname appears only in the *server's* log. Therefore:
+
+- Set `allowed_hosts` explicitly to the tailscale hostname **in both forms**, `"host.ts.net"`
+  and `"host.ts.net:*"`, in **lowercase** — entries are exact strings, Serve forwards the bare
+  host without a port, and a case-sensitivity bug (python-sdk#3437) makes an uppercase entry
+  reject every WHATWG-`fetch`-based client.
+- Treat a `:*` entry as weaker than it looks: python-sdk#3463 accepts `base:9000.evil` because
+  the suffix is not validated as a port. Prefer the exact `host` plus `host:443` over a bare
+  `host:*`.
+- `allowed_origins` matters only to browsers; nothing else sends `Origin`. Keep the 403 test
+  anyway, since it is cheap and it is what a browser-based MCP client will hit.
+- Run uvicorn with `--proxy-headers` and `--forwarded-allow-ips=<tailscale proxy address>`:
+  without it, a redirect such as `/mcp` → `/mcp/` is issued as `http://` and the client refuses
+  the downgrade from HTTPS.
+- Binding the tailscale interface with `PAPRA_MCP_HOST` does **not** allow-list that hostname;
+  it only disarms the localhost default, which leaves *every* Host and Origin accepted. Say what
+  you mean in `transport_security`.
+
+No tailnet ACLs are used, by the operator's decision: the tailnet is treated as trusted and
+private. That makes the bearer token the sole access control, which is why tokens are
+per-device and revocable (see *Operations*), and why Host/Origin validation stays on rather
+than being disabled behind the proxy.
+
+`tailscale serve` also injects `Tailscale-User-*` identity headers and strips client-supplied
+identity headers, which is a second signal we could require in addition to the token. Not
+currently planned: it couples us to one tunnel implementation, and a stolen token from a device
+on the tailnet would still pass it.
+
+A static bearer token over a private network is a **normal private/self-hosted MCP deployment**,
+not an exotic shortcut: Notion's own MCP server documents it as its production HTTP auth
+(`--auth-token`), Outline supports it alongside OAuth, Atlassian supports an API token
+alongside OAuth 2.1, and Obsidian's de-facto local REST plugin and Logseq's most-used server
+use nothing else. The spec is honest about the status: **authorization is OPTIONAL**, so a
+fixed resource-server bearer token is *unaddressed* rather than endorsed — pre-registered OAuth
+*client* credentials are the spec-sanctioned thing, and those are not what we are doing.
+
+What it depends on is the client, and the clients differ sharply:
+
+| client | static `Authorization` header | evidence |
+|---|---|---|
+| pi | yes — `--bearer-token-env-var`, and "OAuth applies to HTTP servers without an `Authorization` header" | installed pi `docs/mcp.md` |
+| Claude Code / CLI | yes — `claude mcp add --transport http … --header` | vendor MCP docs |
+| Cursor | yes — `headers` in `mcp.json` | vendor MCP docs |
+| Claude.ai / Desktop connectors | beta, limited organisations (`static_headers`); otherwise OAuth | vendor connector docs |
+| ChatGPT / Codex | OAuth 2.1 with Protected Resource Metadata expected; no static-header option documented | vendor docs |
+
+So the open risk is not "is our scheme legitimate" — it is **which client Tobias actually points
+at it**. An OAuth-only client cannot be satisfied by us without building an authorization
+server, which is out of scope.
+
+**Discovery document: pick one, deliberately.** With `resource_server_url=<public URL>` we serve
+Protected Resource Metadata which advertises an `authorization_servers` issuer that 404s — an
+OAuth-capable client follows that pointer into a dead end (python-sdk#3283 documents exactly
+this loop with the MCP Inspector). With `resource_server_url=None`, verified in v2.3.0 source:
+the bearer gate is still enforced on every request, no `resource_metadata` pointer is sent, and
+the fake issuer is advertised nowhere. That is the configuration to ship, with two caveats
+written down rather than hidden: it is **not documented as supported** (open PR #3292 proposes a
+different fix), and a PRM-dependent client then gets 404s instead of a dead end. Test both
+against the intended client and keep whichever works; the choice is version-pinned behaviour,
+so it is asserted in a test, not in prose.
 
 **Log and secret handling.** Measured on the same build: uvicorn's access log writes to
 **stdout**, and it logs full URLs **including query strings** — the refused query-string token
@@ -285,12 +351,25 @@ allow-list); relevance ranking; a local search index.
 
 ## Open items
 
-1. **Client compatibility unverified.** Static bearer header versus OAuth-only clients.
-   Resolved by the intended-client smoke test, not by reasoning.
+1. **Which MCP client, decided.** pi, Claude Code and Cursor accept a configured static bearer
+   header; ChatGPT/Codex and Claude.ai-style connectors expect OAuth. The design holds for the
+   first group and cannot serve the second without building an authorization server. Decided by
+   naming the client, then by the on-device smoke test.
 2. **Search reliability is an open question.** Some probes failed to find content they should
    have; a controlled run did not reproduce the failure. Recorded in
    `2026-11-16-ocr-content-search-intermittent-characterisation-design.md`. Until that closes,
    `search_documents` may return an empty result set for an archive that contains the document,
    which is why empty results are reported with what was searched and which orgs were reached.
 3. **Papra `latest` is pinned by digest as of 2026-11-16.** A newer image may change search
-   behaviour in either direction; the defect spec carries the removal criterion.
+   behaviour in either direction; the characterisation spec carries the open question.
+4. **Papra's search query is a query *language*, not a string.** Papra ships a search parser
+   (`packages/search-parser`) supporting `name:`, `content:`, `tag:`, `created:`, `date:`,
+   `date:>=…`, `has:date`, `has:tags`, `AND`/`OR`/`NOT`, and quoting — and a community MCP
+   server for Papra documents that same grammar. Our `search_documents(query)` passes text
+   straight into it, which means an agent (or a document that tells an agent to search for
+   `content: secret-org-name`) can express queries we never intended, including against
+   organisations the operator can reach but did not think to search. Three options: pass the
+   grammar through and document it; always quote the query as a literal phrase; or accept a
+   structured parameter set (`query`, `name:`, `tag:`, `since:`) that we translate ourselves and
+   keep org scoping outside the grammar. **Unresolved, and it interacts with the allow-list:**
+   a grammar that can name a field can name things our permission model did not consider.

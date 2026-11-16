@@ -92,6 +92,15 @@ Variables, one flipped at a time against a shared control:
 5. Delay between content write and rename: 0 s, 1 s, 10 s, 60 s.
 6. One organisation vs several.
 7. Observation only vs an unrelated read (`GET`) interleaved, to test whether reads perturb it.
+8. **Query text that Papra's search grammar interprets.** Added after the matrix was written,
+   because research into Papra's source turned up a search *language*: `packages/search-parser`
+   parses `name:`, `content:`, `tag:`, `created:`, `date:`, `has:date`, `AND`/`OR`/`NOT` and
+   quoting. Several of the original failing probes searched for text containing punctuation —
+   `1.234,56`, hyphenated tokens, multi-word phrases — which such a parser may treat as field
+   filters or operators rather than as text. If so, those probes measured the query parser and
+   not the index, which would explain failures that no control run has been able to reproduce.
+   Cells: bare single token, hyphenated token, decimal-with-comma, multi-word phrase, quoted
+   phrase — same content in every cell, only the query shape varying.
 
 Completion rule: the matrix is complete when either a variable reproduces failure in ≥3 of 5
 paired trials — at which point a fix spec gets written against a known reproduction — or all
@@ -114,6 +123,57 @@ These are cheap, and each is defensible on its own merits rather than on the unp
   server, an empty result is reported alongside what was searched and which organisations were
   reachable. This costs nothing and is the only honest posture while search integrity is an
   open question.
+
+## Follow-up measurement: query shape matters far more than the rename did
+
+Later the same day, while checking Papra's source for a different reason, it turned out Papra
+ships a search **query language** (`packages/search-parser`: `name:`, `content:`, `tag:`,
+`date:`, `AND`/`OR`/`NOT`, quoting). Testing that against the pinned image produced behaviour
+that is reproducible on demand, unlike everything above:
+
+One organisation, two documents, content set the same way in both:
+
+| content | `alpha` | `gamma` | `alpha gamma` |
+|---|---|---|---|
+| `alpha beta gamma delta` (plain.pdf) | found | found | found |
+| `# alpha (beta) gamma; delta-1a` (punct.pdf) | found | **not found** | **not found** |
+
+- `gamma` is present in both documents' content and is found in only one of them.
+- `delta-1a`, a hyphenated token that is literally in the content, is not found — and neither is
+  the `delta` half of it in that same document.
+- Field syntax is **not** enforced on this image: `content:<token>` where the token appears only
+  in a *filename* still matched, so the colon is not selecting a field.
+- Multi-term queries behave like an intersection: `alpha gamma` returned only the document where
+  both matched.
+
+Why this matters more than the rename question: an agent's most natural query is two or three
+words, and on this build that is exactly the shape that under-matches. `search_documents` would
+answer "no such document" to a good question.
+
+What this does **not** establish, and must not be quoted as established:
+
+- It contradicts other runs. `quokka-marmalade-protocol` and `zephyrqx429` — both hyphenated or
+  alphanumeric tokens in content — matched reliably in the existing test and in the matrix, while
+  `zephy-1a` and `delta-1a` did not here. Nothing about token shape separates the two sets.
+- The matrix (variables A–D, 5 paired trials each, three observation windows) showed **zero
+  misses**, including for a document whose content contains punctuation. So punctuation in
+  *content* is not sufficient to cause a miss; the miss appeared in a run where the same content
+  shape was queried seconds after the write.
+- Whether this is index staleness, a per-query result cache serving a value computed before the
+  index caught up, or the query parser, is **unknown**. The Y-at-t+0-then-N pattern seen earlier
+  is consistent with a cache; the matrix's zero misses are consistent with it too, because every
+  trial there used a fresh phrase and therefore a fresh key.
+
+### Consequences for the MCP design
+
+1. `search_documents` cannot present an empty result as "the archive does not contain this".
+   Results must carry the query as sent and the orgs reached, and the tool description must say
+   under-matching is known behaviour.
+2. A query normalisation decision is now required and is not made yet (see MCP spec, open
+   items): pass text through, quote it, or accept structured parameters.
+3. For an upstream report, the minimal repro is the two-document table above: identical
+   `PATCH(content)` path, both documents containing `gamma`, one found.
+
 
 ## On the workaround
 
