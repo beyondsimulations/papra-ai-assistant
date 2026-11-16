@@ -8,9 +8,7 @@ logger = logging.getLogger(__name__)
 
 OCR_SYSTEM_PROMPT = (
     "Transcribe this document page to clean markdown. Preserve structure: "
-    "headings, lists, tables. Output only the markdown. Transcribe every word "
-    "exactly as printed, in the document's own language, keeping accents and "
-    "diacritics; never translate."
+    "headings, lists, tables. Output only the markdown. Text is German or English."
 )
 
 
