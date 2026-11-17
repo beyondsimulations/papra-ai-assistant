@@ -973,6 +973,7 @@ v1's `deliver_content` returned early when Kreuzakt's hash equalled `delivered_s
 
 **Interfaces:**
 - Consumes: `PapraClient.get_document/update_document`, `KreuzaktClient.get_document`, `Store.ledger_record_delivery/ledger_bump_repair/ledger_stats/get_generation`.
+- Also produces (added after Task 4, which found the gap): `Store.ledger_delivered_refs(*, org_ids=None, limit=100) -> list[LedgerRef]` for the verification walk, and **this** is the task that writes `EMPTY_EXTRACTION_SHA` into `delivered_sha` — until it does, `ledger_stats()["extraction_empty"]` is a convincing `0` that means nothing, so a test must assert the counter moves.
 - Produces:
   - `async def deliver_content(papra, store, ref, kz_doc, *, generation) -> str` → `"delivered" | "skipped-empty" | "skipped-current"`
   - `VerifyResult(scanned: int, diverged: int, repaired: int, suppressed: int, empty: int, lookup_errors: int)`
@@ -1233,6 +1234,7 @@ git add -A && git commit -m "feat(index): metadata delivery on Papra-side baseli
 
 **Interfaces:**
 - Consumes: `ledger_mark_deleted/mark_restored/ledger_queue_cleanup/ledger_cleanup_due/ledger_cleanup_result/ledger_resolve`, `KreuzaktClient.delete_document`, `PapraClient.list_documents`, `Store.get_generation`.
+- Also produces (added after Task 4, which found the gap): `Store.ledger_unbind(kreuzakt_id, *, reason) -> int` — clears `kreuzakt_id` on every reference still pointing at a destroyed document so they become `ledger_needs_index` candidates again. The hazard Task 4 identified by hand: a restore that arrives **after** the upstream delete completed leaves a live `kreuzakt_id` aimed at a document that no longer exists, and the search path would keep returning a hit that resolves to nothing.
 - Produces:
   - `async def reconcile_deletions(store, papra, kz) -> DeletionResult(refs_marked: int, upstream_deleted: int, upstream_pending: int, restored: int, aborted: bool, capped: int)`
   - `async def run_cleanup(store, kz) -> CleanupResult(attempted: int, deleted: int, deferred: int, failed: int)`
