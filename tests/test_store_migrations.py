@@ -12,8 +12,15 @@ operator has.
 
 import sqlite3
 
+import pytest
+
 import papra_suite.store as store_module
 from papra_suite.store import Store
+
+
+def tables(conn) -> set[str]:
+    return {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
 
 
 def build_store_at_version(path, version: int):
@@ -66,13 +73,62 @@ def test_migration_003_adds_ledger_with_generation_and_cleanup(tmp_path):
     store.close()
 
 
+def test_failed_migration_003_leaves_nothing_behind_and_can_be_retried(tmp_path, monkeypatch):
+    """A migration that dies partway must leave the file exactly as it was.
+
+    `migrate()` wraps every migration in `BEGIN IMMEDIATE` and rolls back on
+    failure, which is what makes a half-applied upgrade retryable on the next
+    start. `executescript` voids that contract: it commits the pending
+    transaction before it runs, so a statement after the first one failing leaves
+    `index_ledger` permanently applied while `user_version` stays 2 — and because
+    003 has no `IF NOT EXISTS`, the next `migrate()` dies on "table index_ledger
+    already exists" and the store can never be opened again. That is not a corner
+    case: it is the upgrade path every operator's file takes.
+
+    The failure is injected *after* the real 003 has run, so this says nothing
+    about which statement broke. It demands only the two properties that keep an
+    operator's database alive: nothing half-applied remains, and the retry works.
+    """
+    db_path = tmp_path / "db.sqlite"
+    build_store_at_version(db_path, 2)
+    real = store_module._migration_003_index_ledger
+
+    def exploding(conn):
+        real(conn)
+        raise RuntimeError("simulated: a statement after the table failed")
+
+    monkeypatch.setattr(store_module, "MIGRATIONS",
+                        [*store_module.MIGRATIONS[:2], exploding])
+    store = Store(db_path)
+    try:
+        with pytest.raises(RuntimeError, match="simulated"):
+            store.migrate()
+        assert "index_ledger" not in tables(store._conn)
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    finally:
+        store.close()
+
+    # The next start is the one that matters: an unpatched migrate() has to land
+    # on 3 rather than die on a table a rolled-back migration left behind.
+    monkeypatch.undo()
+    store = Store(db_path)
+    try:
+        store.migrate()
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert "index_ledger" in tables(store._conn)
+    finally:
+        store.close()
+
+
 def test_migration_003_upgrade_keeps_001_rows(tmp_path):
     """003 is additive: the row that was already there is still there.
 
     `index_ledger` is a new table, so nothing here *should* touch `documents` —
-    but 003 runs `executescript`, which commits implicitly, and an implicit commit
-    inside a migration is exactly the kind of thing that turns a failed upgrade
-    into a half-written one. The row is the canary.
+    but a migration that committed implicitly could turn a failed upgrade into a
+    half-written one, and the row is the canary for exactly that. (003 used to run
+    `executescript`, which does commit implicitly; see
+    `test_failed_migration_003_leaves_nothing_behind_and_can_be_retried`.) The row
+    is the canary.
     """
     db_path = tmp_path / "db.sqlite"
     build_store_at_version(db_path, 2)

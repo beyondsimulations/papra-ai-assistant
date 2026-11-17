@@ -224,8 +224,19 @@ def _migration_003_index_ledger(conn: sqlite3.Connection) -> None:
     restored Kreuzakt restarts its ids at 1, so bumping the generation makes
     every stale row unresolvable and eligible for re-index from Papra's bytes —
     which is why nothing here matches by id or filename prefix.
+
+    Every statement is applied with its own `conn.execute`, like 001 and 002, and
+    that is load-bearing rather than stylistic. `migrate()` runs each migration
+    inside a `BEGIN IMMEDIATE` and rolls back on failure; `executescript` commits
+    that transaction before it starts and releases the write lock, so a later
+    statement failing would leave the earlier `CREATE TABLE` permanently applied at
+    the old `user_version` — an unretryable upgrade, since 003 has no
+    `IF NOT EXISTS` — and the racing-migrator guard in `migrate()` would lose its
+    lock mid-flight. Statements run one at a time, inside the transaction, so a
+    failure anywhere leaves the file exactly as it was and the next start retries.
     """
-    conn.executescript("""
+    conn.execute(
+        """
         CREATE TABLE index_ledger (
             papra_org_id        TEXT NOT NULL,
             papra_document_id   TEXT NOT NULL,
@@ -250,13 +261,18 @@ def _migration_003_index_ledger(conn: sqlite3.Connection) -> None:
             cleanup_attempts    INTEGER NOT NULL DEFAULT 0,
             cleanup_next_at     TEXT,
             PRIMARY KEY (papra_org_id, papra_document_id)
-        );
-        CREATE INDEX idx_index_ledger_kreuzakt ON index_ledger (kreuzakt_id)
-            WHERE kreuzakt_id IS NOT NULL AND deleted_at IS NULL;
-        CREATE INDEX idx_index_ledger_hash ON index_ledger (file_hash);
-        CREATE INDEX idx_index_ledger_cleanup ON index_ledger (cleanup_state, cleanup_next_at)
-            WHERE cleanup_state = 'pending';
-    """)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX idx_index_ledger_kreuzakt ON index_ledger (kreuzakt_id)"
+        " WHERE kreuzakt_id IS NOT NULL AND deleted_at IS NULL"
+    )
+    conn.execute("CREATE INDEX idx_index_ledger_hash ON index_ledger (file_hash)")
+    conn.execute(
+        "CREATE INDEX idx_index_ledger_cleanup ON index_ledger"
+        " (cleanup_state, cleanup_next_at) WHERE cleanup_state = 'pending'"
+    )
 
 
 MIGRATIONS = [
