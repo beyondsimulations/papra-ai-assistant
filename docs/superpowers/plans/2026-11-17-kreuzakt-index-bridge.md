@@ -77,7 +77,9 @@ All live in `tests/conftest.py` unless a task says otherwise.
 | `seed_listing` | `seed_listing(fake_papra, *, count, mime="application/pdf", org_id="org-a") -> list[str]` — ids `doc-0…doc-N`, returns them |
 | `seed_deleted_in_papra` | `seed_deleted_in_papra(fake_papra, *, count, org_id="org-a") -> None` |
 | `FakePapra` | `get_document` returns a dict copy from `.documents`; `update_document` records into `.last_patch` and bumps `.patch_calls`; `list_documents` honours `page_index`/`page_size` and raises when `.raise_on_list`; `.raise_on_get` makes `get_document` raise `PapraError`; `.delete_calls`/`.get_calls` counted |
-| `FakeKreuzakt` | `.high_water` int, `.upload_calls`/`.high_water_calls`/`.calls` lists, `.document` (a `KzDocument`), `.hits`, `.raw_search`, `.never_completes`, `.missing_documents`, `.error`, `.health`, `fail_delete(id)` |
+| `FakeKreuzakt` | `.high_water` int, `.upload_calls`/`.high_water_calls`/`.calls` lists, `.document` (a `KzDocument`), `.hits`, `.raw_search`, `.never_completes`, `.missing_documents`, `.error`, `.health`, `.on_wait` (callable fired inside `wait_for_queue_row`), `fail_delete(id)` |
+| fixtures `fake_papra` / `fake_kz` | the injected instances of `FakePapra` / `FakeKreuzakt` used by every test above; `caplog` is pytest's own fixture and needs no declaration here |
+| `_fill` / `papra_doc` | `_fill(n)` returns `n` placeholder rows so a page can be made "full" deliberately; `papra_doc(**over)` builds a Papra detail dict with `isDeleted=False` |
 | `make_client` / `queue_page` / `load` | Task 5's MockTransport rig; `queue_page(rows)` wraps rows in the envelope captured in Task 3; `load(name)` reads `tests/fixtures/<name>` |
 | `kz_doc` | `kz_doc(*, title="Rechnung 4711", description="Rechnung ueber 1.234,56 Euro", content=KZ_TEXT, document_date="2025-10-01") -> KzDocument` |
 | `KZ_TEXT` / `sha_of` / `seed_delivered` | the canonical Kreuzakt text, `sha_of(text)`, and a ledger row already marked delivered for it |
@@ -242,6 +244,11 @@ Two contracts are unmeasured and load-bearing: Kreuzakt's queue semantics under 
 7. Behaviour of `POST /api/queue/{id}/retry`: new row or reused row?
 8. What `rescan`/`reindex-all` does to `document_id`, `updated_at`, and `content`.
 9. Whether `document_id` can ever be null on a `completed` row.
+10. **Whether `id` is monotonic and the default ordering is by id** — the high-water-mark correlation
+    is only sound if both hold, and the client refuses to correlate on a scan that did not prove
+    exhaustion. If ordering turns out to be by `created_at` with ties, correlation must switch to
+    `(created_at, id)` and this plan changes before Task 5 is written.
+
 Record the answer to #9 explicitly: Task 6 treats null-on-completed as a retryable anomaly and that decision needs evidence.
 
 - [ ] **Step 2: Kreuzakt queue test fixture derived from the measurement**
@@ -292,8 +299,8 @@ The ledger is the authorization boundary, so it is built and tested before anyth
   - `Store.ledger_protect(*, papra_org_id, papra_document_id, field) -> None` / `Store.ledger_clear_protection(*, field=None, org_id=None, document_id=None) -> int`
   - `Store.ledger_bump_repair(*, papra_org_id, papra_document_id) -> int` — rolling 24 h window, resets to 1 when `last_repair_at` is older
   - `Store.ledger_stats(*, org_ids=None) -> dict[str, int]` — keys `references, indexed_current, delivered, extraction_empty, protected_name, protected_date, protected_notes, repairs_24h, cleanup_pending`
-  - `Store.ledger_queue_cleanup(*, papra_org_id, papra_document_id, due_at) -> None`, `Store.ledger_cleanup_due(*, now, limit=50) -> list[LedgerRef]`, `Store.ledger_cleanup_result(*, papra_org_id, papra_document_id, ok, next_at=None) -> None`
   - `Store.get_generation() -> int` / `Store.bump_generation() -> int` (via `settings["index_generation"]`, default `1`)
+  - `Store.ledger_queue_cleanup(*, papra_org_id, papra_document_id, due_at, kreuzakt_id, generation) -> None`, `Store.ledger_cleanup_due(*, now, limit=50) -> list[LedgerRef]`, `Store.ledger_cleanup_result(*, papra_org_id, papra_document_id, ok, next_at=None, reason=None) -> None`
 
 - [ ] **Step 1: Write the failing migration test**
 
@@ -304,6 +311,7 @@ def test_migration_003_adds_ledger_with_generation_and_cleanup(tmp_path):
     assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(index_ledger)")}
     assert {"papra_original_name", "delivered_generation", "cleanup_state",
+            "cleanup_kreuzakt_id", "cleanup_generation",
             "cleanup_attempts", "cleanup_next_at", "written_date", "written_notes",
             "date_protected", "notes_protected"} <= cols
     idx = {r["name"] for r in store._conn.execute("PRAGMA index_list(index_ledger)")}
@@ -368,7 +376,8 @@ def test_cleanup_due_ignores_done_and_future_rows(store):
         store.ledger_upsert_reference(papra_org_id="o", papra_document_id=doc,
                                       file_hash=H, papra_original_name=f"{doc}.pdf")
     store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="due",
-                              due_at="2026-11-17T00:00:00+00:00")
+                              due_at="2026-11-17T00:00:00+00:00",
+                              kreuzakt_id=7, generation=store.get_generation())
     def repatch(doc, state, nxt):
         store._conn.execute("UPDATE index_ledger SET cleanup_state=?, cleanup_next_at=? "
                             "WHERE papra_document_id=?", (state, nxt, doc))
@@ -416,6 +425,8 @@ def _migration_003_index_ledger(conn: sqlite3.Connection) -> None:
             last_repair_at      TEXT,
             deleted_at          TEXT,
             cleanup_state       TEXT NOT NULL DEFAULT 'none',
+            cleanup_kreuzakt_id INTEGER,
+            cleanup_generation  INTEGER,
             cleanup_attempts    INTEGER NOT NULL DEFAULT 0,
             cleanup_next_at     TEXT,
             PRIMARY KEY (papra_org_id, papra_document_id)
@@ -487,8 +498,19 @@ async def test_upload_returns_relative_path_and_sends_files_field():
     assert b'name="files"' in upload_bodies[0]        # the handler records request bodies
 
 async def test_high_water_mark_walks_pages_and_returns_max_id():
-    pages = ["/api/queue?page=1", [101, 100], ["/api/queue?page=2", []]]
-    assert await client.queue_high_water_mark() == 101
+    client, _ = make_client([("/api/queue?page=1", queue_page([{"id": 101}, ..._fill(99)],
+                                                              full=True)),
+                             ("/api/queue?page=2", queue_page([{"id": 150}])),
+                             ])
+    assert await client.queue_high_water_mark() == 150
+
+
+async def test_high_water_mark_refuses_to_return_an_unproven_scan():
+    """Every page full to the cap means we never proved exhaustion: fail closed."""
+    client, _ = make_client([("/api/queue", queue_page([{"id": i} for i in range(100)],
+                                                      full=True))])
+    with pytest.raises(KreuzaktError, match="scan incomplete"):
+        await client.queue_high_water_mark()
 
 async def test_wait_for_queue_row_requires_exact_filename_and_greater_id():
     """Suffix matching and 'newest row' are both guesses; neither is used."""
@@ -581,18 +603,24 @@ class KreuzaktClient:
         return [_to_queue_entry(row) for row in rows]
 
     async def queue_high_water_mark(self) -> int:
-        """Highest queue id right now. Recorded BEFORE upload, then our row is the
-        one whose filename matches exactly and whose id exceeds this. Newest-row
-        guessing breaks the moment two uploads are in flight."""
+        """Highest queue id right now, or a loud failure. Recorded BEFORE upload,
+        then our row is the one whose filename matches exactly and whose id
+        exceeds this. Newest-row guessing breaks the moment two uploads are in
+        flight, and a *partially scanned* mark is worse than none: it would let a
+        pre-existing row be mistaken for ours. So exhaustion is proven (a short
+        page) or the scan raises; the page cap is a fuse, not an exit.
+        """
         highest = 0
         for page in range(1, _QUEUE_PAGES_MAX + 1):
             rows = await self.queue_page(page=page)
             if not rows:
-                break
+                return highest
             highest = max([highest] + [row.id for row in rows])
             if len(rows) < _QUEUE_PAGE_SIZE:
-                break
-        return highest
+                return highest
+        raise KreuzaktError(
+            f"queue scan incomplete after {_QUEUE_PAGES_MAX * _QUEUE_PAGE_SIZE} rows; "
+            "refusing to correlate on a partial high-water mark")
 ```
 `wait_for_queue_row` loops: walk pages, collect rows with `row.filename == filename and row.id > after_id`, raise `KreuzaktError("ambiguous correlation: N rows")` if more than one is terminal, return the first `completed`/`failed`, and raise `KreuzaktError("no queue row for {filename} within {timeout_s}s")` on timeout. `delete_document` accepts 204 and 404 (already gone is gone); anything else raises.
 
@@ -602,6 +630,8 @@ class KreuzaktClient:
 kreuzakt_base_url: str          # PAPRA_KREUZAKT_URL, default "http://kreuzakt:3000"
 index_content_delivery: bool    # PAPRA_INDEX_CONTENT_DELIVERY, default False
 index_metadata_delivery: bool   # PAPRA_INDEX_METADATA_DELIVERY, default False
+legacy_workers: bool            # PAPRA_LEGACY_WORKERS, default True; when False the ocr/title worker
+                                # loops never start and no legacy job is enqueued
 index_scan_pages: int           # PAPRA_INDEX_SCAN_PAGES, default 5
 index_max_scan_rows: int        # PAPRA_INDEX_MAX_SCAN_ROWS, default 500
 index_poll_interval_s: float    # PAPRA_INDEX_POLL_INTERVAL_S, default 2.0
@@ -687,6 +717,14 @@ async def test_empty_content_is_recorded_as_extraction_empty(store, fake_papra, 
     assert any("extraction-empty" in r.message for r in caplog.records)
 
 
+async def test_generation_change_mid_flight_discards_the_result(store, fake_papra, fake_kz):
+    """The race generation exists to catch: rebuild lands between upload and bind."""
+    fake_kz.on_wait = lambda: store.bump_generation()
+    with pytest.raises(IndexFailed, match="generation changed mid-flight"):
+        await run_index_job(fake_kz, store, job, papra=fake_papra, poll_s=0, wait_timeout_s=5)
+    assert store.ledger_get(job.papra_org_id, job.document_id).kreuzakt_id is None
+
+
 async def test_queue_timeout_raises_so_the_job_retries_with_backoff(store, fake_papra, fake_kz):
     fake_kz.never_completes = True
     with pytest.raises(KreuzaktError, match="no queue row"):
@@ -706,7 +744,7 @@ async def test_ambiguous_correlation_is_reported_not_guessed(store, fake_kz):
 
 ```python
 async def run_index_job(kz, store, job, *, papra, poll_s=2.0, wait_timeout_s=900):
-    generation = store.get_generation()
+    generation = store.get_generation()          # fenced: see the note below
     ref = store.ledger_get(job.papra_org_id, job.document_id) or _create(store, job)
 
     document = await papra.get_document(job.papra_org_id, job.document_id)
@@ -728,9 +766,17 @@ async def run_index_job(kz, store, job, *, papra, poll_s=2.0, wait_timeout_s=900
         if entry.document_id is None:
             raise IndexFailed("queue row completed without document_id")
         kreuzakt_id = entry.document_id
-        store.ledger_set_kreuzakt_id(papra_org_id=job.papra_org_id,
-                                     papra_document_id=job.document_id,
-                                     kreuzakt_id=kreuzakt_id, generation=generation)
+        # Conditional accept: a rebuild that happened while we waited has to win.
+        # Binding an id from the old index under the new generation would point a
+        # live reference at a meaningless integer, which is the exact failure
+        # generation was added to prevent.
+        bound = store.ledger_set_kreuzakt_id(papra_org_id=job.papra_org_id,
+                                             papra_document_id=job.document_id,
+                                             kreuzakt_id=kreuzakt_id,
+                                             generation=generation,
+                                             only_if_generation=generation)
+        if not bound:
+            raise IndexFailed("generation changed mid-flight; result discarded")
 
     kz_doc = await kz.get_document(kreuzakt_id)
     empty = not kz_doc.content.strip()
@@ -741,6 +787,9 @@ async def run_index_job(kz, store, job, *, papra, poll_s=2.0, wait_timeout_s=900
     return IndexOutcome(kreuzakt_id=kreuzakt_id, content_len=len(kz_doc.content),
                         empty_content=empty, delivered=not empty)
 ```
+`ledger_set_kreuzakt_id` therefore becomes `-> bool`, performing `UPDATE … WHERE delivered_generation IS NULL OR delivered_generation = :expected` inside one transaction, and `Store.get_generation()` is read at job start only.
+
+The delivery call is also gated **inside** `deliver_content` (Task 7), not only here: a flag that is checked solely by the scheduler can be bypassed by the webhook path, the convergence pass, or a CLI invocation.
 `_create` records `papra_original_name=document["name"]` at first sight — the baseline Task 8 needs, captured here because this is the first moment we hold the Papra document.
 
 - [ ] **Step 3: Enqueue and wire, preserving crash ordering**
@@ -810,6 +859,19 @@ v1's `deliver_content` returned early when Kreuzakt's hash equalled `delivered_s
 - [ ] **Step 1: Write the failing tests — the first one is the mutation target**
 
 ```python
+async def test_delivery_gate_blocks_every_writer_while_the_flag_is_off(fake_papra, fake_kz, store):
+    """One gate, four paths. A scheduler-only flag can be bypassed by an incident path."""
+    store.set_setting("index_content_delivery", "false")
+    assert (await run_index_job(fake_kz, store, job, papra=fake_papra,
+                                poll_s=0, wait_timeout_s=5)).delivered is False
+    for coro in (deliver_content(fake_papra, store, ref, fake_kz.document, generation=1),
+                 deliver_metadata(fake_papra, store, ref, fake_kz.document)):
+        with pytest.raises(DeliveryDisabled):
+            await coro
+    assert (await verify_once(store, fake_papra, fake_kz)).repaired == 0
+    assert fake_papra.patch_calls == 0
+
+
 async def test_papra_overwriting_us_is_detected_and_repaired(fake_papra, fake_kz, store):
     """The defect v1 shipped: delivered_sha still matches, Papra's text is not ours."""
     seed_delivered(store, sha_of=KZ_TEXT)                  # ledger says delivered
@@ -854,10 +916,15 @@ async def test_wrong_generation_row_is_not_repaired(store, fake_papra, fake_kz):
 async def deliver_content(papra, store, ref, kz_doc, *, generation) -> str:
     """Write Kreuzakt's text into Papra, unless doing so would lose text.
 
-    Order matters: the emptiness guard runs before any skip-shortcut, because a
-    guard placed after a cheap equality check can be reordered into a wipe by
-    someone optimising this function later.
+    The flag is checked here as well as in the scheduler: convergence, the webhook
+    receiver and the CLI all reach this function, and a gate that lives only in the
+    loop can be bypassed by the paths that matter most during an incident.
+    Order also matters within the body: the emptiness guard runs before any
+    skip-shortcut, because a guard placed after a cheap equality check can be
+    reordered into a wipe by someone optimising this function later.
     """
+    if not store.settings_flag("index_content_delivery"):
+        raise DeliveryDisabled("content delivery is off")     # intake checks first; others get it loud
     current = await papra.get_document(ref.papra_org_id, ref.papra_document_id)
     papra_content = current.get("content") or ""
     sha = hashlib.sha256(kz_doc.content.encode()).hexdigest()
@@ -896,15 +963,26 @@ Callers pass notes already truncated by `truncate_notes(text, limit=2000)` from 
 
 `serve()` starts `_verification_loop` alongside `_sweep_loop`. `check` prints `index: 512 refs, 508 current, 505 delivered, 3 extraction-empty, 2 repairs(24h), 1 cleanup-pending`.
 
-Handover is explicit and ordered, in `README.md`:
-```bash
-papra-suite jobs --kind ocr --status pending     # must be empty
-papra-suite jobs --kind ocr --status running     # must be empty
-papra-suite jobs --kind ocr --drain              # refuses while anything is pending
-# only then:
-PAPRA_INDEX_CONTENT_DELIVERY=true   # in the suite's env, then recreate the container
-```
-A flag flipped while old jobs are queued lets the old writer land afterwards, which reads as a broken new writer. Add `Store.count_jobs(kind, status)` and the `--drain` refusal to this task so the README instruction is enforced by code rather than by good intentions.
+Handover is a gate, not a sequence of hopes, and it is ordered so that no two writers can own the same
+column at the same moment. A momentarily empty queue is **not** proof of quiescence — a worker loop can
+claim the next job a second later — so the producers are stopped first:
+
+1. `PAPRA_LEGACY_WORKERS=false` in the suite env, recreate the container. This stops the `ocr` and
+   `title` **worker loops from claiming anything** and stops `enqueue_index_job` creating new legacy
+   jobs. `Config.legacy_workers` (default `true`) is that flag; with it false `serve()` does not start
+   those loops at all.
+2. Prove quiescence rather than assuming it, twice a minute apart:
+   ```bash
+   papra-suite jobs --kind ocr --status pending    # empty
+   papra-suite jobs --kind ocr --status running    # empty
+   papra-suite jobs --kind ocr --drain             # refuses while anything exists
+   ```
+3. Only then `PAPRA_INDEX_CONTENT_DELIVERY=true`, recreate the container.
+
+The same three steps apply to metadata with `--kind title` and `PAPRA_INDEX_METADATA_DELIVERY`. Content
+and metadata handover stay independent and independently reversible until Task 16 removes the code.
+`Store.count_jobs(kind, status)` and the `--drain` refusal make step 2 enforced by code rather than by
+good intentions, and `test_drain_refuses_while_any_job_is_pending_or_running` proves it.
 
 - [ ] **Step 5: Integration, mutation check, commit**
 
@@ -1004,7 +1082,7 @@ def ownership(ref, *, field: str, current) -> OwnershipVerdict:
         return OwnershipVerdict((current or "") == (ref.papra_original_name or ""), "no-baseline")
     return OwnershipVerdict(not (current or ""), "empty-required")
 ```
-`deliver_metadata` fetches Papra's document once, evaluates all three fields, writes in one PATCH where anything changed, then records **exactly the values sent** via `ledger_record_metadata`, and calls `ledger_protect` for each field whose verdict was `not-ours`, logging once per field.
+`deliver_metadata` starts with the same boundary gate as content — `if not store.settings_flag("index_metadata_delivery"): raise DeliveryDisabled("metadata delivery is off")` — so a webhook trigger or a manual call cannot rename documents while the old title worker still owns `name`. It then fetches Papra's document once, evaluates all three fields, writes in one PATCH where anything changed, records **exactly the values sent** via `ledger_record_metadata`, and calls `ledger_protect` for each field whose verdict was `not-ours`, logging once per field.
 
 - [ ] **Step 3: The CLI, which is the only way protection is undone**
 
@@ -1095,6 +1173,30 @@ async def test_restore_needs_current_generation_before_it_can_resolve(fake_papra
     ref = store.ledger_get("org-a", "doc-1")
     assert ref.deleted_at is None and ref.delivered_generation != store.get_generation()
     assert store.ledger_needs_index(generation=store.get_generation())     # must be re-indexed
+async def test_restore_while_cleanup_is_pending_cancels_the_upstream_delete(fake_kz, store):
+    """Durable intent must not outlive the reason for it."""
+    seed_reference(store, deleted=True, kreuzakt_id=7)
+    await reconcile_deletions(store, fake_papra, fake_kz)
+    await run_cleanup(store, fake_kz)                # queued, not yet executed?
+    fake_papra.documents["doc-1"]["isDeleted"] = False
+    store.ledger_mark_restored(papra_org_id="org-a", papra_document_id="doc-1")
+    await run_cleanup(store, fake_kz)
+    assert fake_kz.deleted == []
+    assert store.ledger_get("org-a", "doc-1").cleanup_state == "skipped"
+
+
+async def test_cleanup_never_deletes_a_reused_integer_after_a_rebuild(fake_kz, store):
+    """The dangerous one: id 7 meant one document before the rebuild, another after."""
+    seed_reference(store, deleted=True, kreuzakt_id=7)
+    await reconcile_deletions(store, fake_papra, fake_kz)
+    store.bump_generation()
+    seed_ledger(store, document_id="doc-new", kreuzakt_id=7, generation=store.get_generation())
+    await run_cleanup(store, fake_kz)
+    assert fake_kz.deleted == []
+    assert store.ledger_get("org-a", "doc-1").cleanup_state == "skipped"
+    assert any("cleanup skipped: generation changed" in r.message for r in caplog.records)
+
+
 async def test_a_failing_listing_aborts_the_whole_pass(fake_papra, store):
     """Never infer mass deletion from a paging error."""
     fake_papra.raise_on_list = True
@@ -1111,7 +1213,14 @@ async def test_deletion_pass_is_capped_per_pass(fake_papra, fake_kz, store):
 
 Walk each org's listing with `list_documents(page_index=…, page_size=100)` until the returned count drops below the page size; collect `isDeleted` documents and the set of ids seen. **Any exception during the walk discards the pass**: `logger.error("listing failed, skipping deletion pass org=%s page=%s", ...)` and `aborted=True`. Proposed marks are sorted by `papra_document_id` and truncated to `MAX_DELETIONS_PER_PASS`, logging `deletion pass capped at N, N remaining for next pass` at ERROR so a mass-deletion event is loud rather than efficient. For each mark: `ledger_mark_deleted` **first**, then `ledger_queue_cleanup` when the remaining count is 0. Ordering is the invariant: a crash between the two leaves an orphan index entry that a later pass retries, never a live reference pointing at a destroyed entry.
 
-`run_cleanup` drains `ledger_cleanup_due(now=…, limit=50)`, calls `delete_document`, and records `ledger_cleanup_result(ok=…, next_at=…)` with `defer = CLEANUP_BACKOFF_S * attempts`; on the fifth failure log at ERROR naming the Kreuzakt id and stop retrying (`cleanup_state='failed'`), leaving the operator `papra-suite ledger --cleanup` to force a retry.
+`run_cleanup` drains `ledger_cleanup_due(now=…, limit=50)` and **revalidates before acting**, because a
+queued delete can outlive both its reason and its target's meaning: skip with `cleanup_state='skipped'`
+and an INFO line if the reference is no longer deleted, if `cleanup_generation != store.get_generation()`,
+or if `ledger_resolve([cleanup_kreuzakt_id], generation=current)` returns anything (a live reference still
+needs that document). Only then call `delete_document(cleanup_kreuzakt_id)`, and record
+`ledger_cleanup_result(ok=…, next_at=…)` with `defer = CLEANUP_BACKOFF_S * attempts`; on the fifth failure
+log at ERROR naming the Kreuzakt id and stop retrying (`cleanup_state='failed'`), leaving the operator
+`papra-suite ledger --cleanup` to force a retry.
 
 - [ ] **Step 3: Hook both into the sweep and log the counts**
 
@@ -1402,11 +1511,16 @@ async def test_page_size_multiple_of_100_stops_at_exhaustion_not_budget(store, f
     assert page.partial is False and page.scanned == 100
 
 async def test_full_page_from_a_dominant_bucket_still_fills_the_callers_page(store, fake_kz):
-    """99 hits from another bucket, then ours: the caller still gets a full page."""
-    fake_kz.hits = [hit(i) for i in range(1, 100)] + [hit_for("doc-ours")]
-    page = await search_documents(ctx, store, fake_papra, fake_kz, "versicherung",
-                                 page=1, page_size=5)
-    assert len(page.items) == 5 and page.partial is False
+    """99 hits from a bucket this token cannot see, then five it can: page one is full."""
+    foreign = [hit(900 + i) for i in range(99)]
+    for i in range(1, 6):                                   # five authorized Papra docs
+        seed_ledger(store, document_id=f"doc-own-{i}", kreuzakt_id=i, generation=1)
+        fake_papra.documents[f"doc-own-{i}"] = papra_doc(document_id=f"doc-own-{i}")
+    fake_kz.hits = foreign + [hit_for(f"doc-own-{i}") for i in range(1, 6)]
+    page = await search_documents(ctx_scoped_to("org-a"), store, fake_papra, fake_kz,
+                                 "versicherung", page=1, page_size=5)
+    assert [i.document_id for i in page.items] == [f"doc-own-{i}" for i in range(1, 6)]
+    assert page.partial is False and page.scanned == 104
 
 
 async def test_budget_exhaustion_reports_partial_and_counts_scanned(store, fake_kz):
@@ -1769,10 +1883,22 @@ The review rejected v1 as executable and named six defects. Each is resolved abo
 | Date/notes ownership undefined; truncation recorded the wrong value; no un-protect interface | Task 8: first write requires an empty Papra value, dates normalised with blanks skipped, `written_notes` records what was sent, `ledger_clear_protection` + `metadata --force --yes-i-mean-it` |
 | Filename/hash-prefix remap on rebuild was unsafe | Task 11 replaces it with generation + re-index from Papra's bytes; a stale generation serves nothing |
 | Re-index would silently skip everything (`document_seen` misuse) | Tasks 6/15 derive eligibility from the ledger's generation, never from ingestion history |
-| Delete propagation needed durable retry, and mass-deletion safety | Task 9: ledger cleanup state machine, five attempts, abort-on-listing-failure, per-pass cap with a loud log |
+| Delete propagation needed durable retry, and mass-deletion safety | Task 9: ledger cleanup state machine carrying the target id **and its generation**, revalidated before every delete, five attempts, abort-on-listing-failure, per-pass cap with a loud log |
+| In-flight jobs could bind a stale Kreuzakt id after a rebuild | Task 6 fences the write (`only_if_generation`), with `test_generation_change_mid_flight_discards_the_result` |
+| A queued delete could destroy a reused integer id, or outlive a restore | Task 9: `cleanup_state='skipped'` when the reference is restored, the generation moved, or a live reference still resolves to that id |
+| Writer handover needed a gate, not an empty-queue glance | Tasks 5/7/8: `PAPRA_LEGACY_WORKERS=false` stops the loops and the producers first, drain proves quiescence, and `deliver_content`/`deliver_metadata` raise `DeliveryDisabled` at the shared boundary so no path bypasses it |
+| Queue scan could report a partial high-water mark | Task 5 raises instead of returning an unproven mark; Task 3 question 10 must confirm id monotonicity and ordering before Task 5 is written |
+| One impossible test, and undeclared fixture names | Task 13's dominant-bucket test now seeds five authorized references; `fake_papra`/`fake_kz`/`_fill`/`papra_doc` are declared in the scaffolding table |
 | `index_status` leaked corpus-wide counts to scoped tokens | Task 12 returns queue counts only to `--all-buckets` tokens |
 | Paging: `partial` misreported, many-to-one expansion unspecified, no input bounds | Task 13 states stop conditions, the definition of `partial`, expansion/dedup rules, bounds, and tests for exact multiples of 100 and pages past the end |
 | Webhooks could protect our own writes | Task 10 demotes events to reconciliation hints; ownership decisions stay in Task 8's comparison; replay suppression via `Store.add_dedup` |
 | House style: literal `...`, guessed payloads, mental mutation checks | Fixtures come from Task 3's captures instead of invented field names; every mutation check is a `sed` + `pytest` command pair; no placeholder test bodies remain — each named test has assertions in it |
 
 Still open, and honestly so: Kreuzakt's German quality against omlx (Task 16 Step 1 is the first real evidence, and rollback is cheap until Step 4); queue retention beyond a few thousand rows; Papra actor attribution if the probe cannot find it; and upstream durability — the exit is re-indexing from Papra, not swapping indexers in place.
+
+**Status of this plan.** A second review round added the fencing and handover items now in Tasks 5–9
+(conditional id binding, generation-aware cleanup, the `DeliveryDisabled` boundary, `legacy_workers`
+quiescence, the fail-closed queue scan). They are **specified, not executed**: no code in this plan has
+been written or run, so no test named here has passed. Only Task 1 is safe to carry out before those
+tests exist, because it changes nothing but branch topology — and no flag that lets the bridge write to
+Papra should be flipped before the race-focused tests in Tasks 6–9 are green.

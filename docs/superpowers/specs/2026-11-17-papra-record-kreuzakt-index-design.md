@@ -398,7 +398,11 @@ one bucket's filename and still be referenced by several. So the ledger carries 
 rebuild bumps the generation, which makes every stale row ineligible for resolution and re-queues the
 document from Papra's authoritative bytes. Kreuzakt's own dedup then collapses the re-uploads back onto
 single documents. An unnoticed volume restore therefore cannot serve stale mappings, because the
-generation it was written under no longer exists.
+generation it was written under no longer exists. Two consequences are load-bearing rather than
+theoretical: a job that finishes *during* a rebuild must bind its Kreuzakt id **conditionally on the
+generation not having moved**, and a queued upstream delete carries the id and generation it was raised
+against and revalidates both before acting — otherwise a restored document, or a reused integer, gets
+destroyed on a stale intent.
 
 Numbering note: `ingest-visibility` already adds migration 002, so this is **003** and lands after
 that merge, or is renumbered if the operator prefers the other order. Same lesson as that branch:
@@ -534,11 +538,14 @@ Ordered so that each step's failure is reversible without touching the system of
    this is the last phase where a bridge bug cannot corrupt the record. "Untouched" means the new
    writer is silent; the old OCR and title workers are still running during this phase, so Papra keeps
    its existing text and titles rather than losing them early.
-4. **Content delivery, with the old writer drained first.** Stop feeding the `ocr` queue, wait until no
-   `ocr` job is pending or running (`papra-suite jobs --status pending` and `--status running` both
-   empty for that kind), then set `PAPRA_INDEX_CONTENT_DELIVERY=true`. Two writers must never own the
-   same column at the same moment; a flag flipped while old jobs are queued lets them land afterwards
-   and looks like the new writer is broken. Content and metadata handover are separate and
+4. **Content delivery, with the old writer stopped and drained first.** `PAPRA_LEGACY_WORKERS=false`
+   stops the `ocr`/`title` loops from claiming anything **and** stops new legacy jobs being enqueued;
+   then prove quiescence (`papra-suite jobs --kind ocr --status pending` and `--status running` both
+   empty, checked twice a minute apart, `--drain` refusing while anything remains); then set
+   `PAPRA_INDEX_CONTENT_DELIVERY=true`. An empty queue seen once is not proof of quiescence — a running
+   loop claims the next job a second later. Two writers must never own the same column at the same
+   moment, and the delivery flag is enforced at the shared write boundary, so the convergence pass, a
+   webhook trigger and a CLI call cannot bypass it. Content and metadata handover are separate and
    independently reversible.
 5. **Title delivery the same way**: drain `title` jobs, then enable metadata delivery, so a rename
    problem is separable from a text problem.
