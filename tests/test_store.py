@@ -311,7 +311,7 @@ def test_failed_migration_is_rolled_back_atomically(tmp_path, monkeypatch):
     fresh = Store(tmp_path / "state.db")
     fresh.migrate()
     # the version a clean re-migrate must land on is "every real migration", not
-    # the literal 1 this assertion was written against (there are two now)
+    # the literal 1 this assertion was written against (three since migration 003)
     assert fresh._conn.execute("PRAGMA user_version").fetchone()[0] == len(
         store_module.MIGRATIONS)
     assert fresh._conn.execute(
@@ -748,7 +748,7 @@ def test_upgrade_from_001_adds_ingest_events_and_keeps_rows(tmp_path):
     ever been applied, the file holds rows, and the current code opens it. The
     test above starts from an empty database, so it never runs 002 as an upgrade
     and never asks whether 001's data survived it — and its user_version check
-    tracks len(MIGRATIONS), so nothing there pins the number 2."""
+    tracks len(MIGRATIONS), so nothing there pins the number 3."""
     db_path = tmp_path / "state.db"
     conn = sqlite3.connect(db_path)
     store_module._migration_001_initial(conn)
@@ -773,8 +773,12 @@ def test_upgrade_from_001_adds_ingest_events_and_keeps_rows(tmp_path):
     store = Store(db_path)
     store.migrate()
     try:
-        # Adding a migration 003 must bump this expected value to 3: that is the intended signal.
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        # 003 (index_ledger) is the migration this path now runs, so the expected
+        # value moved 2 -> 3 when it landed. Adding a migration 004 must bump it to
+        # 4: that is the intended signal, and pinning the literal rather than
+        # len(MIGRATIONS) is the whole point — a test that tracked the list length
+        # could not notice a migration that never ran.
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
         tables = {row[0] for row in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "ingest_events" in tables

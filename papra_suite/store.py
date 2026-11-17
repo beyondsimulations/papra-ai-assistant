@@ -1,4 +1,6 @@
+import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -6,6 +8,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -25,6 +29,55 @@ VALID_SSL_MODES = ("ssl", "starttls", "plain")
 # table small enough to read; older than that, the answer belongs to the logs or
 # to `replay`, not to this window.
 INGEST_EVENT_RETENTION_DAYS = 90
+
+# -- index ledger constants ---------------------------------------------------
+
+# Kreuzakt ids are only meaningful inside one index generation. This is the
+# settings key that holds the current one; it starts at 1 and is bumped when
+# Kreuzakt is wiped or restored from a different backup, after which every
+# existing id may name a different document.
+INDEX_GENERATION_KEY = "index_generation"
+
+DEFAULT_GENERATION = 1
+
+# How long a repair counts toward "this document keeps diverging". Two repairs
+# inside this window is the suppression threshold Task 7 acts on, so the window
+# and the counter have to agree about what "recent" means.
+REPAIR_WINDOW_H = 24
+
+# How many failed upstream deletes `ledger_cleanup_result` tolerates before it
+# stops retrying and leaves the row for `papra-suite ledger --cleanup`. Five is
+# "the outage is not a blip" without being "we gave up on the operator's data".
+CLEANUP_MAX_ATTEMPTS = 5
+
+# The three fields we may write into Papra, and therefore the only fields that
+# can be protected. A field name outside this set is a programming error, never
+# a column name to interpolate.
+PROTECTION_FIELDS = ("name", "date", "notes")
+
+# Spellings an operator types into a settings row that mean "on". Anything else —
+# including a missing key and a typo like `ture` — is off: a delivery flag that
+# fails open would let the bridge write into Papra while the old writers still
+# own those fields, which is the one state this milestone is designed to prevent.
+TRUTHY_SETTING_VALUES = ("1", "true", "yes", "on")
+
+# sha256 of the empty string. Kreuzakt returning no text is a *fact about the
+# document*, and `extraction_empty` in `ledger_stats` is the operator's only
+# window onto how often that happens (§9's quality signal for the extractor).
+# The ledger cannot observe Kreuzakt's content, so a caller that saw an empty
+# extraction records it by delivering against this hash; nothing here invents it.
+EMPTY_EXTRACTION_SHA = hashlib.sha256(b"").hexdigest()
+
+# `ledger_stats`' keys and the SQL aliases that carry them. The pairs are spelled
+# out because `references` is a SQL keyword: its alias is `n_references`, so the
+# mapping has to exist somewhere rather than be assumed to be the identity.
+LEDGER_STAT_KEYS = (("references", "n_references"), ("indexed_current", "indexed_current"),
+                    ("delivered", "delivered"), ("extraction_empty", "extraction_empty"),
+                    ("protected_name", "protected_name"),
+                    ("protected_date", "protected_date"),
+                    ("protected_notes", "protected_notes"),
+                    ("repairs_24h", "repairs_24h"),
+                    ("cleanup_pending", "cleanup_pending"))
 
 
 def _migration_001_initial(conn: sqlite3.Connection) -> None:
@@ -160,7 +213,57 @@ def _migration_002_ingest_events(conn: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS = [_migration_001_initial, _migration_002_ingest_events]
+def _migration_003_index_ledger(conn: sqlite3.Connection) -> None:
+    """One row per PAPRA document: a reference, not a pairing.
+
+    Kreuzakt dedupes by file hash, so identical bytes in two buckets produce one
+    Kreuzakt document and two rows sharing kreuzakt_id. No unique index on
+    kreuzakt_id: resolution returns a set and deletes are reference-counted.
+
+    kreuzakt ids are only meaningful within an index generation. A wiped or
+    restored Kreuzakt restarts its ids at 1, so bumping the generation makes
+    every stale row unresolvable and eligible for re-index from Papra's bytes —
+    which is why nothing here matches by id or filename prefix.
+    """
+    conn.executescript("""
+        CREATE TABLE index_ledger (
+            papra_org_id        TEXT NOT NULL,
+            papra_document_id   TEXT NOT NULL,
+            kreuzakt_id         INTEGER,
+            file_hash           TEXT NOT NULL,
+            papra_original_name TEXT,
+            delivered_at        TEXT,
+            delivered_sha       TEXT,
+            delivered_generation INTEGER,
+            written_name        TEXT,
+            name_protected      INTEGER NOT NULL DEFAULT 0,
+            written_date        TEXT,
+            date_protected      INTEGER NOT NULL DEFAULT 0,
+            written_notes       TEXT,
+            notes_protected     INTEGER NOT NULL DEFAULT 0,
+            repair_count        INTEGER NOT NULL DEFAULT 0,
+            last_repair_at      TEXT,
+            deleted_at          TEXT,
+            cleanup_state       TEXT NOT NULL DEFAULT 'none',
+            cleanup_kreuzakt_id INTEGER,
+            cleanup_generation  INTEGER,
+            cleanup_attempts    INTEGER NOT NULL DEFAULT 0,
+            cleanup_next_at     TEXT,
+            PRIMARY KEY (papra_org_id, papra_document_id)
+        );
+        CREATE INDEX idx_index_ledger_kreuzakt ON index_ledger (kreuzakt_id)
+            WHERE kreuzakt_id IS NOT NULL AND deleted_at IS NULL;
+        CREATE INDEX idx_index_ledger_hash ON index_ledger (file_hash);
+        CREATE INDEX idx_index_ledger_cleanup ON index_ledger (cleanup_state, cleanup_next_at)
+            WHERE cleanup_state = 'pending';
+    """)
+
+
+MIGRATIONS = [
+    _migration_001_initial,
+    _migration_002_ingest_events,
+    _migration_003_index_ledger,
+]
 
 # The closed set of outcomes worth recording. A sixth value must be added here
 # and written at a call site, never invented by a call site: `record_ingest_event`
@@ -261,6 +364,52 @@ class Job:
 
 
 @dataclass
+class LedgerRef:
+    """One Papra document's row in `index_ledger`.
+
+    A *reference*, not a pairing: two Papra buckets holding identical bytes share
+    one `kreuzakt_id`, and `delivered_generation` says which index that integer
+    came from. Every field here is either something Kreuzakt can be asked again
+    (`kreuzakt_id`, `file_hash`) or something only this table remembers — the
+    Papra-side baseline `papra_original_name`, what we last wrote (`written_*`),
+    and whether a human has taken the field away from us (`*_protected`).
+
+    The three `*_protected` flags are `bool`, not the stored `int`: the delivery
+    code asks `if ref.name_protected:`, and handing it a raw 1 would turn
+    "protected" into a value that behaves as true everywhere and as `True`
+    nowhere.
+    """
+
+    papra_org_id: str
+    papra_document_id: str
+    kreuzakt_id: int | None
+    file_hash: str
+    papra_original_name: str | None
+    delivered_at: str | None
+    delivered_sha: str | None
+    delivered_generation: int | None
+    written_name: str | None
+    name_protected: bool
+    written_date: str | None
+    date_protected: bool
+    written_notes: str | None
+    notes_protected: bool
+    repair_count: int
+    last_repair_at: str | None
+    deleted_at: str | None
+    cleanup_state: str
+    cleanup_attempts: int
+    cleanup_next_at: str | None
+    # Carried last, with defaults: the delete-propagation pass revalidates a
+    # queued upstream delete from these two columns after a restart, and it reads
+    # them off the refs `ledger_cleanup_due` hands back. Keeping them behind the
+    # contract's field list means a caller that builds a LedgerRef from a dict of
+    # defaults does not have to know they exist.
+    cleanup_kreuzakt_id: int | None = None
+    cleanup_generation: int | None = None
+
+
+@dataclass
 class IngestEvent:
     """One recorded decision NOT to ingest something.
 
@@ -302,6 +451,23 @@ def _row_to_mailbox(row: sqlite3.Row) -> Mailbox:
         enabled=bool(row["enabled"]), last_seen_uid=row["last_seen_uid"],
         uidvalidity=row["uidvalidity"], last_poll_at=row["last_poll_at"],
         last_error=row["last_error"], consecutive_failures=row["consecutive_failures"],
+    )
+
+
+def _row_to_ledger_ref(row: sqlite3.Row) -> LedgerRef:
+    return LedgerRef(
+        papra_org_id=row["papra_org_id"], papra_document_id=row["papra_document_id"],
+        kreuzakt_id=row["kreuzakt_id"], file_hash=row["file_hash"],
+        papra_original_name=row["papra_original_name"], delivered_at=row["delivered_at"],
+        delivered_sha=row["delivered_sha"], delivered_generation=row["delivered_generation"],
+        written_name=row["written_name"], name_protected=bool(row["name_protected"]),
+        written_date=row["written_date"], date_protected=bool(row["date_protected"]),
+        written_notes=row["written_notes"], notes_protected=bool(row["notes_protected"]),
+        repair_count=row["repair_count"], last_repair_at=row["last_repair_at"],
+        deleted_at=row["deleted_at"], cleanup_state=row["cleanup_state"],
+        cleanup_attempts=row["cleanup_attempts"], cleanup_next_at=row["cleanup_next_at"],
+        cleanup_kreuzakt_id=row["cleanup_kreuzakt_id"],
+        cleanup_generation=row["cleanup_generation"],
     )
 
 
@@ -391,6 +557,72 @@ class Store:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    def settings_flag(self, name: str) -> bool:
+        """A settings row read as a boolean, missing key meaning off.
+
+        The delivery flags decide whether this program is allowed to write into
+        Papra at all, so the read fails closed: only `TRUTHY_SETTING_VALUES` mean
+        on, and everything else (absent, empty, unrecognised) is off. A helper
+        rather than `get_setting(...) == "1"` at each call site because the CLI, the
+        daemon and the worker loops all ask the same question and must not be able
+        to disagree about what the operator typed.
+        """
+        value = self.get_setting(name)
+        return value is not None and value.strip().lower() in TRUTHY_SETTING_VALUES
+
+    def _read_generation(self) -> int:
+        """Current index generation, read from `settings`.
+
+        **Caller must already hold `self._lock`** — `threading.Lock` is not
+        reentrant, so `get_generation()` cannot be called from inside a locked
+        block. A value that is not a positive integer reads as
+        `DEFAULT_GENERATION`: raising here would make `check` unrunnable, and
+        silently reading a garbage value as, say, 0 would mark every row stale.
+        Defaulting keeps the store readable and the operator's way out (set the
+        key again) open.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (INDEX_GENERATION_KEY,)
+        ).fetchone()
+        try:
+            generation = int(row["value"])
+        except (TypeError, ValueError):
+            return DEFAULT_GENERATION
+        return generation if generation >= DEFAULT_GENERATION else DEFAULT_GENERATION
+
+    def get_generation(self) -> int:
+        """The generation newly bound kreuzakt ids belong to (default 1)."""
+        with self._lock:
+            return self._read_generation()
+
+    def bump_generation(self) -> int:
+        """Declare the current kreuzakt ids meaningless; return the new generation.
+
+        Called after Kreuzakt is wiped or restored from another backup. Every row
+        that still carries the old `delivered_generation` stops resolving and
+        becomes eligible for re-index from Papra's bytes, which is the whole
+        rebuild story — nothing has to be deleted here for it to work.
+        """
+        with self._lock:
+            # BEGIN IMMEDIATE, not the usual `with self._conn`: two processes both
+            # reading generation 1 and both writing 2 would leave stale rows looking
+            # current after a rebuild, which is the one outcome a generation must
+            # never allow. Taking the write lock first makes read-then-write atomic
+            # across processes.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                next_generation = self._read_generation() + 1
+                self._conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (INDEX_GENERATION_KEY, str(next_generation)),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return next_generation
 
     # -- ingest events -------------------------------------------------------
 
@@ -836,3 +1068,493 @@ class Store:
                 "SELECT ts, level, line FROM log_lines ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [(row["ts"], row["level"], row["line"]) for row in reversed(rows)]
+
+    # -- index ledger ---------------------------------------------------------
+    #
+    # Everything the MCP layer is allowed to answer about a Kreuzakt document is
+    # derived from these rows, so the read paths below are authorization code.
+    # Two rules hold across all of them and are the reason they look fussy:
+    #
+    #   * a row resolves only while `deleted_at IS NULL` AND its
+    #     `delivered_generation` equals the generation asked about. A Kreuzakt id
+    #     is an integer in *some* index; after a rebuild the same integer names a
+    #     different document, so "wrong generation" must be no answer at all.
+    #   * a write never overwrites a value it did not come to write. Upserts keep
+    #     protection, delivery state and the first-seen Papra name, because each
+    #     of those is either a human's decision or the baseline a later decision
+    #     is measured against.
+
+    def ledger_upsert_reference(
+        self, *, papra_org_id: str, papra_document_id: str, file_hash: str,
+        papra_original_name: str | None = None,
+    ) -> None:
+        """Record that this Papra document exists, without disturbing anything else.
+
+        `file_hash` follows the bytes (it is what Kreuzakt deduped on, so a stale
+        one would make a resolution vouch for content it never saw), while
+        `papra_original_name` keeps the first value it was given: that column is
+        the ownership baseline the metadata delivery compares Papra's current name
+        against, and moving it under the comparison would either protect a field
+        forever or authorise a rename we did not make. Protection flags, the
+        written values and the delivery columns are not mentioned in the UPDATE at
+        all, so a re-ingest cannot clear them by construction.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO index_ledger (papra_org_id, papra_document_id, file_hash,"
+                " papra_original_name) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(papra_org_id, papra_document_id) DO UPDATE SET"
+                " file_hash = excluded.file_hash,"
+                " papra_original_name = COALESCE(index_ledger.papra_original_name,"
+                " excluded.papra_original_name)",
+                (papra_org_id, papra_document_id, file_hash, papra_original_name),
+            )
+
+    def ledger_set_kreuzakt_id(
+        self, *, papra_org_id: str, papra_document_id: str, kreuzakt_id: int,
+        generation: int, only_if_generation: int | None = None,
+    ) -> bool:
+        """Bind a kreuzakt id; report whether the row now holds it.
+
+        With `only_if_generation` the write is fenced: it happens only while the
+        generation in `settings` still equals that value, and returns False
+        otherwise, leaving the row exactly as it was. That is the conditional
+        accept the index job needs — a rebuild that lands between the upload and
+        this write has to win, because binding an id from the destroyed index
+        under the new generation would point a live reference at a meaningless
+        integer. `False` must be a real answer: a `None`-returning version would
+        make a refused bind look like a successful one.
+
+        The read of the generation and the UPDATE happen in one `BEGIN IMMEDIATE`
+        transaction, so a `bump_generation()` from another thread or process
+        cannot slip between them.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if (only_if_generation is not None
+                        and self._read_generation() != only_if_generation):
+                    self._conn.rollback()
+                    return False
+                cursor = self._conn.execute(
+                    "UPDATE index_ledger SET kreuzakt_id = ?, delivered_generation = ?"
+                    " WHERE papra_org_id = ? AND papra_document_id = ?",
+                    (kreuzakt_id, generation, papra_org_id, papra_document_id),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return cursor.rowcount > 0
+
+    def ledger_get(self, papra_org_id: str, papra_document_id: str) -> LedgerRef | None:
+        """The row for one Papra document, deleted or stale included.
+
+        Deliberately unfiltered: the callers that need `deleted_at` and
+        `delivered_generation` themselves (the delete pass, the CLI, the re-index
+        decision) are the reason this is not `ledger_resolve` by another name.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM index_ledger WHERE papra_org_id = ? AND papra_document_id = ?",
+                (papra_org_id, papra_document_id),
+            ).fetchone()
+        return _row_to_ledger_ref(row) if row else None
+
+    def ledger_resolve(self, kreuzakt_ids, *, generation: int) -> list[LedgerRef]:
+        """Active references of `generation` that point at these Kreuzakt ids.
+
+        This is the authorization boundary. Anything not returned does not exist
+        as far as the MCP server is concerned: an unknown id, a soft-deleted row,
+        a row bound under an older generation. An empty input is an empty answer,
+        never "no filter" — the alternative would turn a caller with nothing
+        resolved into a caller with the whole table.
+
+        Rows come back per reference, not per Kreuzakt document, because two
+        buckets can share one id and each has to be filtered against its own
+        token scope afterwards.
+        """
+        ids = list(kreuzakt_ids)
+        if not ids:
+            return []
+        placeholders = ", ".join("?" * len(ids))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM index_ledger WHERE kreuzakt_id IN (" + placeholders
+                + ") AND deleted_at IS NULL AND delivered_generation = ?"
+                " ORDER BY papra_org_id, papra_document_id",
+                (*ids, generation),
+            ).fetchall()
+        return [_row_to_ledger_ref(row) for row in rows]
+
+    def ledger_needs_index(
+        self, *, generation: int, org_id: str | None = None, limit: int = 100,
+    ) -> list[LedgerRef]:
+        """Live references that have no usable id in `generation`.
+
+        Either never indexed, or bound under a generation that no longer means
+        what it said. This is the eligibility rule the sweep and the rebuild use,
+        and it is derived from the ledger alone — never from `document_seen`,
+        which records ingestion history and would make a rebuild look already
+        done. Soft-deleted documents are excluded: the delete pass owns those.
+        """
+        bounded = max(1, min(int(limit), 1000))
+        sql = (
+            "SELECT * FROM index_ledger WHERE deleted_at IS NULL"
+            " AND (kreuzakt_id IS NULL OR delivered_generation IS NULL"
+            " OR delivered_generation != ?)"
+        )
+        params: list[object] = [generation]
+        if org_id is not None:
+            sql += " AND papra_org_id = ?"
+            params.append(org_id)
+        sql += " ORDER BY papra_org_id, papra_document_id LIMIT ?"
+        params.append(bounded)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_ledger_ref(row) for row in rows]
+
+    def ledger_mark_deleted(
+        self, *, papra_org_id: str, papra_document_id: str,
+    ) -> tuple[int | None, int]:
+        """Soft-delete one reference; return `(kreuzakt_id, remaining_active_same_generation)`.
+
+        `(-1, -1)` means the row has no Kreuzakt id (or does not exist), i.e.
+        there is nothing upstream to delete — a different answer from `(7, 0)`,
+        which means "this was the last live reference to Kreuzakt document 7" and
+        is what authorises the upstream delete.
+
+        The count is taken in the same transaction as the UPDATE, so two
+        concurrent deletes of the two shared references cannot both see "one left"
+        and both skip the upstream delete, leaving an orphan in Kreuzakt. Only
+        rows of the *current* generation count as remaining: a stale sibling
+        resolves to nothing and therefore protects nothing.
+        """
+        with self._lock, self._conn:
+            # Read inside the transaction, not before it: the generation the count
+            # is scoped to has to be the generation that was current when the UPDATE
+            # took the write lock, or a `bump_generation()` landing in between would
+            # make "how many are left?" answer about an index that no longer exists.
+            generation = self._read_generation()
+            now = _now()
+            row = self._conn.execute(
+                "SELECT kreuzakt_id FROM index_ledger"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (papra_org_id, papra_document_id),
+            ).fetchone()
+            self._conn.execute(
+                "UPDATE index_ledger SET deleted_at = ?"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (now, papra_org_id, papra_document_id),
+            )
+            if row is None or row["kreuzakt_id"] is None:
+                return (-1, -1)
+            remaining = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM index_ledger WHERE kreuzakt_id = ?"
+                " AND deleted_at IS NULL AND delivered_generation = ?",
+                (row["kreuzakt_id"], generation),
+            ).fetchone()["n"]
+        return (row["kreuzakt_id"], remaining)
+
+    def ledger_mark_restored(self, *, papra_org_id: str, papra_document_id: str) -> None:
+        """Clear `deleted_at`, which is the whole of a restore here.
+
+        Nothing else is touched, deliberately. The generation is left alone, so a
+        document deleted before a rebuild comes back stale rather than falsely
+        current — stale means the sweep re-indexes it, which is the correct answer
+        and not a state a restore can shortcut. A queued upstream delete is left
+        pending for the cleanup pass to revalidate and skip: the revalidation is
+        what proves the pass still checks, and a restore that quietly rewrote the
+        cleanup state would hide that it never did.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE index_ledger SET deleted_at = NULL"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (papra_org_id, papra_document_id),
+            )
+
+    def ledger_record_delivery(
+        self, *, papra_org_id: str, papra_document_id: str, delivered_at: str,
+        delivered_sha: str, generation: int,
+    ) -> None:
+        """Record what we last wrote into Papra, and under which generation.
+
+        `delivered_sha` is the hash of the text we delivered — the convergence pass
+        compares Kreuzakt's current text against it, and `EMPTY_EXTRACTION_SHA` is
+        how "extraction produced nothing" becomes countable.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE index_ledger SET delivered_at = ?, delivered_sha = ?,"
+                " delivered_generation = ?"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (delivered_at, delivered_sha, generation, papra_org_id, papra_document_id),
+            )
+
+    def ledger_record_metadata(
+        self, *, papra_org_id: str, papra_document_id: str, name: str | None = None,
+        date: str | None = None, notes: str | None = None,
+    ) -> None:
+        """Record exactly the values we sent to Papra.
+
+        Only the arguments that were given are written: an omitted field keeps its
+        previous value, because "we did not touch `notes` this time" must not
+        erase the record of what we wrote last time. Protection is not touched —
+        lifting a protection is an operator decision with its own call, and a
+        delivery that could clear one would un-protect a human's rename as a side
+        effect of writing.
+        """
+        columns = {"name": name, "date": date, "notes": notes}
+        given = [field for field, value in columns.items() if value is not None]
+        if not given:
+            return
+        assignments = ", ".join(f"written_{field} = ?" for field in given)
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"UPDATE index_ledger SET {assignments}"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (*[columns[field] for field in given], papra_org_id, papra_document_id),
+            )
+
+    def ledger_protect(
+        self, *, papra_org_id: str, papra_document_id: str, field: str,
+    ) -> None:
+        """Say "hands off this field" for one reference, permanently.
+
+        A human edit makes the field theirs for the life of this reference; the
+        only way back is `ledger_clear_protection`. `field` is checked against
+        `PROTECTION_FIELDS` because it becomes part of a column name — a typo must
+        be an exception here, not a protection that silently protects nothing.
+        """
+        if field not in PROTECTION_FIELDS:
+            raise ValueError(
+                f"field must be one of {', '.join(PROTECTION_FIELDS)}; got {field!r}"
+            )
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"UPDATE index_ledger SET {field}_protected = 1"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (papra_org_id, papra_document_id),
+            )
+
+    def ledger_clear_protection(
+        self, *, field: str | None = None, org_id: str | None = None,
+        document_id: str | None = None,
+    ) -> int:
+        """Operator-only un-protect; return how many references were changed.
+
+        `field=None` clears all three fields on each matched reference, and the
+        count is references rather than flags: the CLI has to answer "how many
+        documents did this change?", and counting flags would report three times
+        the blast radius for the same documents.
+
+        Every argument narrows the scope, so calling this with nothing at all
+        clears protection corpus-wide. That is intended to be the operator typing
+        a deliberate command, and the return value is what makes that radius
+        legible in the CLI instead of a silent success.
+        """
+        if field is not None and field not in PROTECTION_FIELDS:
+            raise ValueError(
+                f"field must be one of {', '.join(PROTECTION_FIELDS)}; got {field!r}"
+            )
+        fields = PROTECTION_FIELDS if field is None else (field,)
+        sql = "UPDATE index_ledger SET " + ", ".join(f"{f}_protected = 0" for f in fields)
+        clauses: list[str] = []
+        params: list[object] = []
+        if org_id is not None:
+            clauses.append("papra_org_id = ?")
+            params.append(org_id)
+        if document_id is not None:
+            clauses.append("papra_document_id = ?")
+            params.append(document_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        with self._lock, self._conn:
+            cursor = self._conn.execute(sql, params)
+        return cursor.rowcount
+
+    def ledger_bump_repair(
+        self, *, papra_org_id: str, papra_document_id: str,
+    ) -> int:
+        """Count a repair against this reference in a rolling 24 h window.
+
+        Returns the new count, or 1 when the previous repair is older than the
+        window — which is what makes "diverged more than twice in a day" a
+        per-document judgement rather than a lifetime one. A permanently counted
+        repair would suppress every future repair on a document that had one bad
+        week.
+
+        Raises for a reference that does not exist: repairing a document the ledger
+        never saw is a caller bug, and answering 1 would let the caller proceed to
+        write to Papra on a document it cannot vouch for.
+        """
+        now = _now()
+        cutoff = _iso(datetime.now(UTC) - timedelta(hours=REPAIR_WINDOW_H))
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT repair_count, last_repair_at FROM index_ledger"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (papra_org_id, papra_document_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"unknown ledger reference: {papra_org_id}/{papra_document_id}"
+                )
+            in_window = row["last_repair_at"] is not None and row["last_repair_at"] >= cutoff
+            count = row["repair_count"] + 1 if in_window else 1
+            self._conn.execute(
+                "UPDATE index_ledger SET repair_count = ?, last_repair_at = ?"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (count, now, papra_org_id, papra_document_id),
+            )
+        return count
+
+    def ledger_stats(self, *, org_ids: list[str] | None = None) -> dict[str, int]:
+        """Corpus counts for `check` and `index_status`.
+
+        Counted in SQL, not by listing rows: a listing cap would turn a bad day
+        into a normal-looking one.
+
+        * `references` — every row, deleted or stale included.
+        * `indexed_current` — has an id in the current generation. Everything that
+          answers "is the index healthy?" is generation-scoped, because after a
+          rebuild a stale row is not indexed, it is backlog.
+        * `delivered` — we wrote text into Papra for it, in the current generation.
+        * `extraction_empty` — `delivered_sha` is `EMPTY_EXTRACTION_SHA`.
+        * `protected_*` — fields a human took away from us.
+        * `repairs_24h` — repairs inside the rolling window, summed.
+        * `cleanup_pending` — upstream deletes still queued, any generation: they
+          still have to be revalidated and drained, so they stay visible.
+
+        `org_ids=[]` is "no buckets", not "no filter": a token with nothing
+        granted must not receive corpus-wide counts.
+        """
+        keys = LEDGER_STAT_KEYS
+        if org_ids is not None and not org_ids:
+            return {key: 0 for key, _ in keys}
+        generation = self.get_generation()
+        cutoff = _iso(datetime.now(UTC) - timedelta(hours=REPAIR_WINDOW_H))
+        sql = (
+            "SELECT COUNT(*) AS n_references,"
+            " SUM(CASE WHEN kreuzakt_id IS NOT NULL AND delivered_generation = ?"
+            " THEN 1 ELSE 0 END) AS indexed_current,"
+            " SUM(CASE WHEN delivered_at IS NOT NULL AND delivered_generation = ?"
+            " THEN 1 ELSE 0 END) AS delivered,"
+            " SUM(CASE WHEN delivered_sha = ? AND delivered_generation = ?"
+            " THEN 1 ELSE 0 END) AS extraction_empty,"
+            " SUM(name_protected) AS protected_name,"
+            " SUM(date_protected) AS protected_date,"
+            " SUM(notes_protected) AS protected_notes,"
+            " SUM(CASE WHEN last_repair_at IS NOT NULL AND last_repair_at >= ?"
+            " THEN repair_count ELSE 0 END) AS repairs_24h,"
+            " SUM(CASE WHEN cleanup_state = 'pending' THEN 1 ELSE 0 END) AS cleanup_pending"
+            " FROM index_ledger"
+        )
+        params: list[object] = [generation, generation, EMPTY_EXTRACTION_SHA, generation,
+                                cutoff]
+        if org_ids is not None:
+            sql += " WHERE papra_org_id IN (" + ", ".join("?" * len(org_ids)) + ")"
+            params.extend(org_ids)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return {key: int(row[alias] or 0) for key, alias in keys}
+
+    # -- ledger cleanup queue -------------------------------------------------
+
+    def ledger_queue_cleanup(
+        self, *, papra_org_id: str, papra_document_id: str, due_at: str,
+        kreuzakt_id: int, generation: int,
+    ) -> None:
+        """Make "delete Kreuzakt document N" outlive this process.
+
+        The intent has to live in the ledger: a crash between marking a reference
+        deleted and deleting upstream must not lose the orphan. `cleanup_kreuzakt_id`
+        and `cleanup_generation` are recorded together because the id is only
+        correct for that generation — the cleanup pass refuses to act when they no
+        longer agree with the store, which is what stops a rebuilt index's reused
+        integer from being deleted.
+
+        `cleanup_attempts` is deliberately not reset: re-queueing a document must
+        not hand a permanently failing delete a fresh allowance.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE index_ledger SET cleanup_state = 'pending', cleanup_next_at = ?,"
+                " cleanup_kreuzakt_id = ?, cleanup_generation = ?"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (due_at, kreuzakt_id, generation, papra_org_id, papra_document_id),
+            )
+
+    def ledger_cleanup_due(self, *, now: str, limit: int = 50) -> list[LedgerRef]:
+        """Queued upstream deletes that have come due, earliest first.
+
+        `done` and `failed` rows are excluded by state, so a permanently failed
+        delete stops being retried forever instead of being re-attempted by every
+        pass; a future `cleanup_next_at` is the backoff. The caller still has to
+        revalidate each one — being due is not the same as being allowed.
+        """
+        bounded = max(1, min(int(limit), 1000))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM index_ledger WHERE cleanup_state = 'pending'"
+                " AND cleanup_next_at IS NOT NULL AND cleanup_next_at <= ?"
+                " ORDER BY cleanup_next_at, papra_document_id LIMIT ?",
+                (now, bounded),
+            ).fetchall()
+        return [_row_to_ledger_ref(row) for row in rows]
+
+    def ledger_cleanup_result(
+        self, *, papra_org_id: str, papra_document_id: str, ok: bool,
+        next_at: str | None = None, reason: str | None = None,
+    ) -> None:
+        """Record one upstream delete attempt and move the state machine.
+
+        Success closes the row (`done`, no next time). Failure keeps it `pending`
+        with the caller's backoff — or, after `CLEANUP_MAX_ATTEMPTS`, marks it
+        `failed` and logs one ERROR, because "we are still trying" repeated every
+        pass is noise while "we have stopped trying" is the fact an operator has
+        to hear exactly once. There is no reason column in the schema, so the
+        upstream error travels in that log line.
+        """
+        permanent = False
+        cleanup_kreuzakt_id: int | None = None
+        attempts = 0
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT cleanup_attempts, cleanup_kreuzakt_id FROM index_ledger"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (papra_org_id, papra_document_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"unknown ledger reference: {papra_org_id}/{papra_document_id}"
+                )
+            if ok:
+                self._conn.execute(
+                    "UPDATE index_ledger SET cleanup_state = 'done', cleanup_next_at = NULL"
+                    " WHERE papra_org_id = ? AND papra_document_id = ?",
+                    (papra_org_id, papra_document_id),
+                )
+            else:
+                attempts = row["cleanup_attempts"] + 1
+                permanent = attempts >= CLEANUP_MAX_ATTEMPTS
+                self._conn.execute(
+                    "UPDATE index_ledger SET cleanup_state = ?, cleanup_attempts = ?,"
+                    " cleanup_next_at = ?"
+                    " WHERE papra_org_id = ? AND papra_document_id = ?",
+                    ("failed" if permanent else "pending", attempts,
+                     next_at if next_at is not None else _now(),
+                     papra_org_id, papra_document_id),
+                )
+                cleanup_kreuzakt_id = row["cleanup_kreuzakt_id"]
+        if permanent:
+            logger.error(
+                "cleanup failed permanently papra=%s/%s kreuzakt=%s after %s attempts: %s",
+                papra_org_id, papra_document_id, cleanup_kreuzakt_id, attempts, reason,
+            )
+        else:
+            logger.warning(
+                "cleanup failed, will retry papra=%s/%s kreuzakt=%s attempt=%s: %s",
+                papra_org_id, papra_document_id, cleanup_kreuzakt_id, attempts, reason,
+            )
