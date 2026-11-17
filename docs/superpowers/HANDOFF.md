@@ -224,7 +224,12 @@ that file.
 
 Gates at the merge, on this branch: ruff clean, **446** unit passed / 14 deselected,
 **14** integration passed against the scratch stack, `/api/health` ok afterwards. The
-stack's running image IDs equal the digests now pinned in `docker-compose.test.yml`
+**14** integration tests ran against the **already-running** shared scratch stack
+(`make test-integration`, which brings nothing up and takes nothing down): **no compose
+lifecycle command was run on this branch** — no `stack-up`, no `stack-down`, no
+`stack-digests`. The stack was already up from earlier work on this machine and was left
+running for whatever comes next. The stack's running image IDs equal the digests now
+pinned in `docker-compose.test.yml`
 (`papra d1f596a3…`, `greenmail 309ba544…`), so the integration run exercised the pinned
 set. Execution happens in the worktree `.worktrees/kreuzakt-index-bridge`; the plan is
 `plans/2026-11-17-kreuzakt-index-bridge.md`.

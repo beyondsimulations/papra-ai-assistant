@@ -236,7 +236,7 @@ addendum,
 ```bash
 make install-uv       # deps into .venv (uv); `make install` is the pip variant
 make lint             # ruff over the tree (measurement probes are excluded)
-make test-unit        # 445 tests, no Docker, ~18 s
+make test-unit        # 447 tests, no Docker, ~18 s
 make stack-up         # scratch Papra + GreenMail, images pinned by digest
 make ci               # lint + unit + integration against the running stack
 make test-ci          # CI shape: up -> run everything -> down -v   (DESTRUCTIVE)
