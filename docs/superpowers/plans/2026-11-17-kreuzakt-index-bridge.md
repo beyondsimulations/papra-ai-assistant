@@ -37,7 +37,16 @@
 - Images pinned by digest: Papra `sha256:d1f596a35332ad04d8a69d88a5e19bc82acd47f2bc2fe687dd2145b1ef5a8b19`, GreenMail `sha256:309ba544ea482e5d4265d09921cdab07c8dad2cc4481d715c9b8ff5d3f0a149f`, Kreuzakt `sha256:4a0109d03d663338fd967662aa0151ec7684d2ba31cdfd12f1bf4f3901b1cd8d`.
 - **Integration tests run on atlas**, the `x86_64` server, as a process on that host (`ssh atlas` then `make test-integration`). `DOCKER_HOST=ssh://atlas` moves Docker operations only — it does not move pytest's network namespace, so a laptop test process cannot reach containers that publish no port. The laptop runs unit tests with fake transports.
 - Gates per task: `make lint`, `make test-unit`, plus `PAPRA_REQUIRE_STACK=1 make test-integration` on atlas wherever a task touches the stack.
-- Mutation checks are **executed**, not imagined: apply the patch with `sed`, run the named test, confirm it fails, then `git checkout --` the file. The command and the failing test name go in the task's commit message.
+- Mutation checks are **executed**, not imagined — and they run in a shadow copy, never in the working tree.
+  The in-place recipe this plan used to carry (`sed -i` then `git checkout -- <file>`) cost an implementer its
+  entire uncommitted implementation: the revert restored the file from HEAD, which is not what "revert the
+  mutation" means while a task is mid-flight. The procedure is therefore:
+  `rm -rf /tmp/mutant && mkdir -p /tmp/mutant && cp -r papra_suite tests /tmp/mutant`, apply the `sed`
+  **inside `/tmp/mutant`**, run `cd /tmp/mutant && <worktree>/.venv/bin/python -m pytest <the named test> -x -q`
+  and confirm it FAILS, then run the same test in the worktree and confirm it PASSES. Never `git checkout --`
+  or `git stash` to undo a mutation. The command pair and the failing test name go in the task's commit message.
+- Commit with **explicit paths**. `git add -A` is forbidden in this plan: more than one task can be in flight in
+  this worktree, and a wildcard add commits another agent's unfinished work into your commit.
 - `Makefile` keeps `VENV ?= .venv/bin/`; destructive targets stay separate; the daily loop never `down -v`s the scratch stack.
 - TDD: failing test first, see it fail, minimal implementation, see it pass, commit.
 
@@ -1085,7 +1094,7 @@ Callers pass notes already truncated by `truncate_notes(text, limit=2000)` from 
 
 - [ ] **Step 4: Loop, `check` line, and the drain step before flipping delivery on**
 
-`serve()` starts `_verification_loop` alongside `_sweep_loop`. `check` prints `index: 512 refs, 508 current, 505 delivered, 3 extraction-empty, 2 repairs(24h), 1 cleanup-pending`.
+`serve()` starts `_verification_loop` alongside `_sweep_loop`. `check` prints `index: 512 refs, 508 current, 505 delivered, 3 extraction-empty, 2 repairs(24h), 1 cleanup-pending (failed 1)`.
 
 Handover is a gate, not a sequence of hopes, and it is ordered so that no two writers can own the same
 column at the same moment. A momentarily empty queue is **not** proof of quiescence — a worker loop can
@@ -1112,11 +1121,17 @@ good intentions, and `test_drain_refuses_while_any_job_is_pending_or_running` pr
 
 Integration: overwrite Papra's content behind our back, run `verify_once`, assert Papra's content **equals the text captured from Kreuzakt for that document** — transport fidelity is exact even when the model is not.
 ```bash
-sed -i.bak '/if not kz_doc.content.strip():/,+2d' papra_suite/indexing.py
-pytest tests/test_content_delivery.py::test_empty_kreuzakt_text_never_overwrites_non_empty_papra -x -q
-git checkout -- papra_suite/indexing.py && rm -f papra_suite/indexing.py.bak
-git add -A && git commit -m "feat(index): content delivery and divergence-visible convergence"
+# Mutation check (b) via the shadow-copy procedure (see Global constraints); never `git checkout --`.
+rm -rf /tmp/mutant && mkdir -p /tmp/mutant && cp -r papra_suite tests /tmp/mutant
+sed -i '' '/if not kz_doc.content.strip():/,+2d' /tmp/mutant/papra_suite/indexing.py
+cd /tmp/mutant && /absolute/path/to/worktree/.venv/bin/python -m pytest \
+  tests/test_content_delivery.py::test_empty_kreuzakt_text_never_overwrites_non_empty_papra -x -q   # must FAIL
+# re-run the same test in the worktree: must PASS. Then, from the worktree, with explicit paths:
+git add papra_suite/indexing.py papra_suite/pipeline.py papra_suite/papra_client.py \
+        tests/test_content_delivery.py tests/integration/test_index_pipeline.py README.md
 ```
+
+Commit as `feat(index): content delivery and divergence-visible convergence`.
 
 ---
 
@@ -1219,12 +1234,17 @@ When `index_metadata_delivery` is on, `enqueue_index_job` skips the `ocr` enqueu
 - [ ] **Step 5: Mutation check (c), gates, commit**
 
 ```bash
-sed -i.bak 's/if getattr(ref, f"{field}_protected"):/if False:/' papra_suite/indexing.py
-pytest tests/test_metadata_delivery.py::test_human_rename_protects_permanently_and_logs_once -x -q
-git checkout -- papra_suite/indexing.py && rm -f papra_suite/indexing.py.bak
-make lint && make test-unit
-git add -A && git commit -m "feat(index): metadata delivery on Papra-side baselines with explicit un-protect"
+# Mutation check (c) via the shadow-copy procedure (see Global constraints); never `git checkout --`.
+rm -rf /tmp/mutant && mkdir -p /tmp/mutant && cp -r papra_suite tests /tmp/mutant
+sed -i '' 's/if getattr(ref, f"{field}_protected"):/if False:/' /tmp/mutant/papra_suite/indexing.py
+cd /tmp/mutant && /absolute/path/to/worktree/.venv/bin/python -m pytest \
+  tests/test_metadata_delivery.py::test_human_rename_protects_permanently_and_logs_once -x -q   # must FAIL
+# re-run the same test in the worktree: must PASS.
+make lint && make test-unit   # from the worktree
+git add papra_suite/indexing.py papra_suite/pipeline.py tests/test_metadata_delivery.py README.md
 ```
+
+Commit as `feat(index): metadata delivery on Papra-side baselines with explicit un-protect`.
 
 ---
 
@@ -1347,18 +1367,36 @@ needs that document). Only then call `delete_document(cleanup_kreuzakt_id)`, and
 log at ERROR naming the Kreuzakt id and stop retrying (`cleanup_state='failed'`), leaving the operator
 `papra-suite ledger --cleanup` to force a retry.
 
+**Queue-side rule (added after Task 4, which changed what `ledger_mark_deleted` can return):** decide from
+the returned **id**, not from `remaining == 0`. `ledger_mark_deleted` now answers `(-1, -1)` both when the
+reference has no Kreuzakt id and when its binding belongs to a stale generation, and `(-1, -1)` must never
+reach `ledger_queue_cleanup` — queuing `kreuzakt_id = -1` would put a bogus delete in the durable queue that
+then passes every revalidation of Task 9 (no reference resolves to `-1`, the generation matches) and burns
+five attempts on nothing. Guard on `kreuzakt_id > 0` before queueing, and assert the guard in a test.
+
 - [ ] **Step 3: Hook both into the sweep and log the counts**
 
-`sweep_once` calls `reconcile_deletions` then `run_cleanup` at the end and adds their counts to `SweepResult`; `check` shows `cleanup-pending`.
+`sweep_once` calls `reconcile_deletions` then `run_cleanup` at the end and adds their counts to `SweepResult`;
+`check` shows `cleanup-pending`. Note the definition Task 4 settled: `cleanup_pending` is **inclusive** — it
+counts `pending` **and** `failed`, because a permanently failed delete still owes an upstream delete — and
+`cleanup_failed` is the failed subset. Print them together as `cleanup-pending=N (failed=M)` so the two are
+never read as disjoint.
 
 - [ ] **Step 4: Mutation check (d) and commit**
 
 ```bash
-sed -i.bak 's/if remaining == 0:/if True:/' papra_suite/indexing.py
-pytest tests/test_deletion_propagation.py::test_shared_document_survives_one_reference_being_deleted -x -q
-git checkout -- papra_suite/indexing.py && rm -f papra_suite/indexing.py.bak
-git add -A && git commit -m "feat(index): crash-durable reference-counted delete propagation"
+# Mutation check (d) — shadow copy, never `git checkout --`: the revert wipes uncommitted work.
+rm -rf /tmp/mutant && mkdir -p /tmp/mutant && cp -r papra_suite tests /tmp/mutant
+sed -i '' 's/if remaining == 0:/if True:/' /tmp/mutant/papra_suite/indexing.py
+cd /tmp/mutant && /absolute/path/to/worktree/.venv/bin/python -m pytest \
+  tests/test_deletion_propagation.py::test_shared_document_survives_one_reference_being_deleted -x -q
+#   must FAIL here; then re-run the same test in the worktree, which must PASS
+cd /absolute/path/to/worktree
+git add papra_suite/indexing.py tests/test_deletion_propagation.py papra_suite/pipeline.py
 ```
+
+Put the command pair and the failing test name in the commit message, then commit as
+`feat(index): crash-durable reference-counted delete propagation`.
 
 ---
 
@@ -1460,7 +1498,7 @@ v1 proposed matching stale ids to fresh documents via `file_hash` prefixes and o
 
 **Interfaces:**
 - Consumes: `Store.get_generation/bump_generation/ledger_needs_index`, `KreuzaktClient.health`, `enqueue_index_job`.
-- Produces: `async def reconcile_generation(store, kz) -> RebuildResult(generation: int, stale: int, requeued: int)`, CLI `papra-suite ledger (--status | --invalidate | --cleanup)`, where `--cleanup` forces one immediate pass over rows in `cleanup_state='failed'`.
+- Produces: `async def reconcile_generation(store, kz) -> RebuildResult(generation: int, stale: int, requeued: int)`, CLI `papra-suite ledger (--status | --invalidate | --cleanup)`, where `--cleanup` forces one immediate pass over rows in `cleanup_state='failed'` **and passes `reset_attempts=True` to `ledger_queue_cleanup`** — that parameter exists precisely for this deliberate operator reset, and without it a forced pass gets one attempt before re-failing (Task 4 left the wiring here on purpose).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1763,12 +1801,17 @@ Cache `papra.get_document` for the duration of the call in a dict — the invari
 - [ ] **Step 4: Run mutation check (a), gates, commit**
 
 ```bash
-sed -i.bak 's/if ctx.scope_all or ref.papra_org_id in ctx.org_ids:/if True:/' papra_suite/mcp_tools.py
-pytest tests/test_mcp_search.py::test_four_buckets_four_tokens_see_nothing_foreign -x -q
-git checkout -- papra_suite/mcp_tools.py && rm -f papra_suite/mcp_tools.py.bak
-make lint && make test-unit
-git add -A && git commit -m "feat(mcp): search and list filtered by the ledger, fail-closed and bounded"
+# Mutation check (a) via the shadow-copy procedure (see Global constraints); never `git checkout --`.
+rm -rf /tmp/mutant && mkdir -p /tmp/mutant && cp -r papra_suite tests /tmp/mutant
+sed -i '' 's/if ctx.scope_all or ref.papra_org_id in ctx.org_ids:/if True:/' /tmp/mutant/papra_suite/mcp_tools.py
+cd /tmp/mutant && /absolute/path/to/worktree/.venv/bin/python -m pytest \
+  tests/test_mcp_search.py::test_four_buckets_four_tokens_see_nothing_foreign -x -q   # must FAIL
+# re-run the same test in the worktree: must PASS.
+make lint && make test-unit   # from the worktree
+git add papra_suite/mcp_tools.py papra_suite/mcp_server.py tests/test_mcp_search.py README.md
 ```
+
+Commit as `feat(mcp): search and list filtered by the ledger, fail-closed and bounded`.
 
 ---
 
@@ -1990,7 +2033,9 @@ ssh atlas 'cd ~/papra-ai-assistant && PAPRA_REQUIRE_STACK=1 make test-integratio
 ```
 Expected green, with the integration count lower by exactly the deleted worker tests — state the number in the commit message.
 ```bash
-git add -A && git commit -m "refactor!: remove our OCR and title workers; Kreuzakt extracts"
+git add -A papra_suite tests docs README.md Makefile docker-compose.test.yml
+# scoped paths, not a bare `git add -A` (see Global constraints)
+git commit -m "refactor!: remove our OCR and title workers; Kreuzakt extracts"
 ```
 Then rewrite `HANDOFF.md`: the topology, the two delivery flags and their drain-first rule, the generation command for rebuilds, where the four executed mutation checks live, and what remains unmeasured.
 
