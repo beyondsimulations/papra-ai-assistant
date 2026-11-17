@@ -58,19 +58,22 @@ def build_store_at_version(path, version: int):
 
 
 def test_migration_003_adds_ledger_with_generation_and_cleanup(tmp_path):
-    build_store_at_version(tmp_path / "db.sqlite", 2)
-    store = Store(tmp_path / "db.sqlite")
+    db_path = tmp_path / "db.sqlite"
+    build_store_at_version(db_path, 2)
+    store = Store(db_path)
     store.migrate()
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
-    cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(index_ledger)")}
-    assert {"papra_original_name", "delivered_generation", "cleanup_state",
-            "cleanup_kreuzakt_id", "cleanup_generation",
-            "cleanup_attempts", "cleanup_next_at", "written_date", "written_notes",
-            "date_protected", "notes_protected"} <= cols
-    idx = {r["name"] for r in store._conn.execute("PRAGMA index_list(index_ledger)")}
-    assert {"idx_index_ledger_kreuzakt", "idx_index_ledger_hash",
-            "idx_index_ledger_cleanup"} <= idx
-    store.close()
+    try:
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(index_ledger)")}
+        assert {"papra_original_name", "delivered_generation", "cleanup_state",
+                "cleanup_kreuzakt_id", "cleanup_generation",
+                "cleanup_attempts", "cleanup_next_at", "written_date", "written_notes",
+                "date_protected", "notes_protected"} <= cols
+        idx = {r["name"] for r in store._conn.execute("PRAGMA index_list(index_ledger)")}
+        assert {"idx_index_ledger_kreuzakt", "idx_index_ledger_hash",
+                "idx_index_ledger_cleanup"} <= idx
+    finally:
+        store.close()
 
 
 def test_failed_migration_003_leaves_nothing_behind_and_can_be_retried(tmp_path, monkeypatch):

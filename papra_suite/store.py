@@ -20,6 +20,36 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat()
 
 
+def _require_store_utc_iso(value: str, field: str) -> str:
+    """Reject a timestamp the store could not have produced itself.
+
+    Backoffs are compared as text — `cleanup_next_at <= ?` — which is
+    chronological only while every stored value carries the same `+00:00` offset.
+    A `Z` suffix sorts after every offset, a naive value and a `+01:00` one are
+    silently hours away from what they mean, and the only symptom is a delete that
+    fired early or a row that never came due: a mis-timed backoff with no error
+    anywhere. The write boundary is therefore the honest place to guard, and it is
+    cheaper than moving every comparison in this file onto timestamp arithmetic.
+
+    The accepted form is exactly what `_now()`/`_iso()` produce: the offset must be
+    zero and `fromisoformat(...).isoformat()` must reproduce the input, which
+    refuses `Z`, a space separator, a missing offset and a non-zero offset.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{field} must be a UTC ISO-8601 timestamp like {_now()}; got {value!r}"
+        ) from exc
+    if (parsed.tzinfo is None or parsed.utcoffset() != timedelta(0)
+            or parsed.isoformat() != value):
+        raise ValueError(
+            f"{field} must be the store's own UTC form — 'T' separator, +00:00"
+            f" offset — like {_now()}; got {value!r}"
+        )
+    return value
+
+
 LOG_RING_BUFFER_SIZE = 1000
 
 VALID_SSL_MODES = ("ssl", "starttls", "plain")
@@ -77,7 +107,8 @@ LEDGER_STAT_KEYS = (("references", "n_references"), ("indexed_current", "indexed
                     ("protected_date", "protected_date"),
                     ("protected_notes", "protected_notes"),
                     ("repairs_24h", "repairs_24h"),
-                    ("cleanup_pending", "cleanup_pending"))
+                    ("cleanup_pending", "cleanup_pending"),
+                    ("cleanup_failed", "cleanup_failed"))
 
 
 def _migration_001_initial(conn: sqlite3.Connection) -> None:
@@ -1188,7 +1219,20 @@ class Store:
         The read of the generation and the UPDATE happen in one `BEGIN IMMEDIATE`
         transaction, so a `bump_generation()` from another thread or process
         cannot slip between them.
+
+        `generation` and `only_if_generation` have to name the same index when
+        both are given. Passing a stale stamp with a fresh fence would return True
+        while writing a `delivered_generation` that no backfill can ever match:
+        the row stops resolving, stops looking like work to the sweep, and reports
+        success — so the mismatch is refused as the caller bug it is.
         """
+        if only_if_generation is not None and generation != only_if_generation:
+            raise ValueError(
+                f"generation ({generation}) and only_if_generation "
+                f"({only_if_generation}) disagree: the stamp and the fence describe"
+                " one index, or the row would be bound to a generation that cannot "
+                "resolve it"
+            )
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1284,6 +1328,13 @@ class Store:
         which means "this was the last live reference to Kreuzakt document 7" and
         is what authorises the upstream delete.
 
+        A row still bound under a superseded generation also answers `(-1, -1)`,
+        and that is the answer that has to be in the returned *id* and not just in
+        the count: a stale integer means nothing, so it cannot authorise anything,
+        and handing it back as though it did would point the caller's delete at
+        whatever a restore has since filed under that number. The row is still
+        soft-deleted — the reference is gone either way — it just queues nothing.
+
         The count is taken in the same transaction as the UPDATE, so two
         concurrent deletes of the two shared references cannot both see "one left"
         and both skip the upstream delete, leaving an orphan in Kreuzakt. Only
@@ -1313,7 +1364,7 @@ class Store:
                 generation = self._read_generation()
                 now = _now()
                 row = self._conn.execute(
-                    "SELECT kreuzakt_id FROM index_ledger"
+                    "SELECT kreuzakt_id, delivered_generation FROM index_ledger"
                     " WHERE papra_org_id = ? AND papra_document_id = ?",
                     (papra_org_id, papra_document_id),
                 ).fetchone()
@@ -1323,6 +1374,16 @@ class Store:
                     (now, papra_org_id, papra_document_id),
                 )
                 if row is None or row["kreuzakt_id"] is None:
+                    self._conn.commit()
+                    return (-1, -1)
+                if row["delivered_generation"] != generation:
+                    # The binding is from an index that no longer exists. `remaining`
+                    # would be a truthful 0 and `(id, 0)` reads as permission, and the
+                    # cleanup pass downstream cannot recover it: its own generation
+                    # check compares against the generation the row is *queued* under,
+                    # which a bump makes current, and `ledger_resolve` is empty only
+                    # because the backfill has not rebound anything yet. So: no id,
+                    # no permission. The re-index will rebind and re-derive it.
                     self._conn.commit()
                     return (-1, -1)
                 remaining = self._conn.execute(
@@ -1478,6 +1539,21 @@ class Store:
             cursor = self._conn.execute(sql, params)
         return cursor.rowcount
 
+    def _read_repair_row(self, papra_org_id: str, papra_document_id: str) -> sqlite3.Row | None:
+        """The repair columns of one reference.
+
+        **Caller must already hold `self._lock` and the write transaction.** The
+        same reason `_read_cleanup_row` is a method rather than two inline
+        statements: what makes the counter correct is that this read happens while
+        the write lock is held, and that is not observable from the outside unless
+        the read sits somewhere a test can stand.
+        """
+        return self._conn.execute(
+            "SELECT repair_count, last_repair_at FROM index_ledger"
+            " WHERE papra_org_id = ? AND papra_document_id = ?",
+            (papra_org_id, papra_document_id),
+        ).fetchone()
+
     def ledger_bump_repair(
         self, *, papra_org_id: str, papra_document_id: str,
     ) -> int:
@@ -1495,23 +1571,34 @@ class Store:
         """
         now = _now()
         cutoff = _iso(datetime.now(UTC) - timedelta(hours=REPAIR_WINDOW_H))
-        with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT repair_count, last_repair_at FROM index_ledger"
-                " WHERE papra_org_id = ? AND papra_document_id = ?",
-                (papra_org_id, papra_document_id),
-            ).fetchone()
-            if row is None:
-                raise ValueError(
-                    f"unknown ledger reference: {papra_org_id}/{papra_document_id}"
+        with self._lock:
+            # BEGIN IMMEDIATE, like the other read-modify-writes here (the delete
+            # count, the cleanup counter): `with self._conn` opens the transaction
+            # at the first DML, so the SELECT would run outside it and two repairs
+            # — the verification pass and an operator's forced one — could both read
+            # 1 and both write 2. The lost increment is not cosmetic: Task 7
+            # suppresses on two repairs inside this window, so the document that
+            # keeps diverging is the one that never gets suppressed.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._read_repair_row(papra_org_id, papra_document_id)
+                if row is None:
+                    self._conn.rollback()
+                    raise ValueError(
+                        f"unknown ledger reference: {papra_org_id}/{papra_document_id}"
+                    )
+                in_window = (row["last_repair_at"] is not None
+                             and row["last_repair_at"] >= cutoff)
+                count = row["repair_count"] + 1 if in_window else 1
+                self._conn.execute(
+                    "UPDATE index_ledger SET repair_count = ?, last_repair_at = ?"
+                    " WHERE papra_org_id = ? AND papra_document_id = ?",
+                    (count, now, papra_org_id, papra_document_id),
                 )
-            in_window = row["last_repair_at"] is not None and row["last_repair_at"] >= cutoff
-            count = row["repair_count"] + 1 if in_window else 1
-            self._conn.execute(
-                "UPDATE index_ledger SET repair_count = ?, last_repair_at = ?"
-                " WHERE papra_org_id = ? AND papra_document_id = ?",
-                (count, now, papra_org_id, papra_document_id),
-            )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         return count
 
     def ledger_stats(self, *, org_ids: list[str] | None = None) -> dict[str, int]:
@@ -1525,11 +1612,27 @@ class Store:
           answers "is the index healthy?" is generation-scoped, because after a
           rebuild a stale row is not indexed, it is backlog.
         * `delivered` — we wrote text into Papra for it, in the current generation.
+
+        `indexed_current` and `delivered` count soft-deleted rows too: both answer
+        "does a binding with this meaning exist in the index?", which a row still
+        carrying it does, queued delete or not. That is a defensible reading, and
+        it is not what the key's name suggests — a corpus with deletions in flight
+        shows `indexed_current` above the number of live references. `references`
+        is the denominator to read them against; nothing here filters on
+        `deleted_at`.
+
         * `extraction_empty` — `delivered_sha` is `EMPTY_EXTRACTION_SHA`.
         * `protected_*` — fields a human took away from us.
         * `repairs_24h` — repairs inside the rolling window, summed.
-        * `cleanup_pending` — upstream deletes still queued, any generation: they
-          still have to be revalidated and drained, so they stay visible.
+        * `cleanup_pending` — upstream deletes still owed, any generation, whether
+          still retrying or given up. The count is deliberately the whole debt: on
+          the fifth failure a row leaves `pending`, and a counter that watched only
+          `pending` would fall to 0 exactly when automatic retry stops — the
+          operator's number going quiet while the debt turns permanent.
+        * `cleanup_failed` — the subset of `cleanup_pending` the retries have
+          stopped on, i.e. the rows that wait for `papra-suite ledger --cleanup`.
+          `cleanup_pending - cleanup_failed` are still being retried. Rows
+          `skipped` by the cleanup pass are in neither: nothing is owed on them.
 
         `org_ids=[]` is "no buckets", not "no filter": a token with nothing
         granted must not receive corpus-wide counts.
@@ -1552,7 +1655,9 @@ class Store:
             " SUM(notes_protected) AS protected_notes,"
             " SUM(CASE WHEN last_repair_at IS NOT NULL AND last_repair_at >= ?"
             " THEN repair_count ELSE 0 END) AS repairs_24h,"
-            " SUM(CASE WHEN cleanup_state = 'pending' THEN 1 ELSE 0 END) AS cleanup_pending"
+            " SUM(CASE WHEN cleanup_state IN ('pending', 'failed')"
+            " THEN 1 ELSE 0 END) AS cleanup_pending,"
+            " SUM(CASE WHEN cleanup_state = 'failed' THEN 1 ELSE 0 END) AS cleanup_failed"
             " FROM index_ledger"
         )
         params: list[object] = [generation, generation, EMPTY_EXTRACTION_SHA, generation,
@@ -1568,7 +1673,7 @@ class Store:
 
     def ledger_queue_cleanup(
         self, *, papra_org_id: str, papra_document_id: str, due_at: str,
-        kreuzakt_id: int, generation: int,
+        kreuzakt_id: int, generation: int, reset_attempts: bool = False,
     ) -> None:
         """Make "delete Kreuzakt document N" outlive this process.
 
@@ -1579,34 +1684,83 @@ class Store:
         longer agree with the store, which is what stops a rebuilt index's reused
         integer from being deleted.
 
-        `cleanup_attempts` is deliberately not reset: re-queueing a document must
-        not hand a permanently failing delete a fresh allowance.
+        `cleanup_attempts` is deliberately not reset, and that default is what
+        keeps the cap meaning anything: re-queueing happens on ordinary traffic (a
+        document deleted, restored, deleted again), and if every re-queue refilled
+        the allowance a permanently failing delete would get five fresh attempts
+        forever and never reach `failed`. So the counter survives by default, and
+        `reset_attempts=True` exists for the one caller that is entitled to refill
+        it — `papra-suite ledger --cleanup`, where the operator is saying "the
+        outage is over, try again". Without that, his forced pass got exactly one
+        attempt: the row is already at the maximum, so the first failure wrote
+        `failed` again even with Kreuzakt healthy.
         """
+        _require_store_utc_iso(due_at, "due_at")
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE index_ledger SET cleanup_state = 'pending', cleanup_next_at = ?,"
-                " cleanup_kreuzakt_id = ?, cleanup_generation = ?"
+                " cleanup_kreuzakt_id = ?, cleanup_generation = ?,"
+                " cleanup_attempts = CASE WHEN ? THEN 0 ELSE cleanup_attempts END"
                 " WHERE papra_org_id = ? AND papra_document_id = ?",
-                (due_at, kreuzakt_id, generation, papra_org_id, papra_document_id),
+                (due_at, kreuzakt_id, generation, 1 if reset_attempts else 0,
+                 papra_org_id, papra_document_id),
             )
 
     def ledger_cleanup_due(self, *, now: str, limit: int = 50) -> list[LedgerRef]:
         """Queued upstream deletes that have come due, earliest first.
 
-        `done` and `failed` rows are excluded by state, so a permanently failed
-        delete stops being retried forever instead of being re-attempted by every
-        pass; a future `cleanup_next_at` is the backoff. The caller still has to
-        revalidate each one — being due is not the same as being allowed.
+        `done`, `failed` and `skipped` rows are excluded by state, so a permanently
+        failed delete stops being retried forever instead of being re-attempted by
+        every pass, and one the cleanup pass decided against stays decided; a
+        future `cleanup_next_at` is the backoff. A `pending` row with no
+        `cleanup_next_at` at all is due immediately — nothing scheduled it away,
+        and `NULL <= now` is NULL, which would otherwise strand the delete out of
+        sight of every later pass. The caller still has to revalidate each one —
+        being due is not the same as being allowed.
         """
         bounded = max(1, min(int(limit), 1000))
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM index_ledger WHERE cleanup_state = 'pending'"
-                " AND cleanup_next_at IS NOT NULL AND cleanup_next_at <= ?"
+                " AND (cleanup_next_at IS NULL OR cleanup_next_at <= ?)"
                 " ORDER BY cleanup_next_at, papra_document_id LIMIT ?",
                 (now, bounded),
             ).fetchall()
         return [_row_to_ledger_ref(row) for row in rows]
+
+    def ledger_skip_cleanup(
+        self, *, papra_org_id: str, papra_document_id: str, reason: str | None = None,
+    ) -> None:
+        """Record "this queued delete is not ours to perform" as its own outcome.
+
+        The cleanup pass has three honest reasons to reach for it instead of
+        success: the Papra document was restored, the generation moved so the
+        queued id names different content now, or a live reference still resolves
+        to that id. None of them is a success (nothing was deleted upstream) and
+        none is a failure (nothing is retrying), so the state machine carries a
+        fourth outcome rather than making the pass hand-write an UPDATE against the
+        table the MCP server authorizes from.
+
+        `skipped` is terminal and silent in the counts: not due again, not in
+        `cleanup_pending` or `cleanup_failed`, and not retried by a forced pass — a
+        row that becomes owed again is re-queued explicitly by
+        `ledger_queue_cleanup`, which is the only thing that moves it back to
+        `pending`. The one line it writes is INFO, because "we deliberately did not
+        delete this" is the answer to "why is that still in Kreuzakt?" and must not
+        read as a failing delete. Raises for a reference the ledger never saw, like
+        the other cleanup writers.
+        """
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE index_ledger SET cleanup_state = 'skipped', cleanup_next_at = NULL"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (papra_org_id, papra_document_id),
+            )
+            unknown = cursor.rowcount == 0
+        if unknown:
+            raise ValueError(f"unknown ledger reference: {papra_org_id}/{papra_document_id}")
+        logger.info("cleanup skipped papra=%s/%s: %s",
+                    papra_org_id, papra_document_id, reason)
 
     def _read_cleanup_row(self, papra_org_id: str, papra_document_id: str) -> sqlite3.Row | None:
         """The cleanup columns of one reference.
@@ -1637,7 +1791,12 @@ class Store:
         "we are still trying" repeated every pass is noise while "we have stopped
         trying" is the fact an operator has to hear exactly once. There is no reason
         column in the schema, so the upstream error travels in that log line.
+
+        The fourth outcome, `skipped`, is `ledger_skip_cleanup`'s: it is a decision
+        about whether the delete should happen at all, not an attempt that failed.
         """
+        if next_at is not None:
+            _require_store_utc_iso(next_at, "next_at")
         permanent_now = False
         was_failed = False
         cleanup_kreuzakt_id: int | None = None

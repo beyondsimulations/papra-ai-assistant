@@ -160,6 +160,28 @@ def test_set_kreuzakt_id_on_unknown_reference_is_false(store):
                                         kreuzakt_id=7, generation=1) is False
 
 
+def test_set_kreuzakt_id_refuses_a_stale_stamp_with_a_fresh_fence(store):
+    """`generation` and `only_if_generation` describe one moment or the write lies.
+
+    The fence said "the index is still generation 2" while the stamp said "record
+    this binding as generation 1". That combination returned True and left a row
+    holding a `delivered_generation` no backfill will ever match: the reference
+    resolved to nothing, never appeared as stale in a way the sweep could read as
+    "rebind me under 2", and reported success the whole time. A mismatch is a
+    caller bug, so it raises before anything is written rather than picking one of
+    the two numbers.
+    """
+    store.ledger_upsert_reference(papra_org_id="org-a", papra_document_id="doc-1",
+                                  file_hash=H, papra_original_name="doc-1.pdf")
+    store.bump_generation()
+    with pytest.raises(ValueError, match="generation"):
+        store.ledger_set_kreuzakt_id(papra_org_id="org-a", papra_document_id="doc-1",
+                                     kreuzakt_id=7, generation=1,
+                                     only_if_generation=store.get_generation())
+    ref = store.ledger_get("org-a", "doc-1")
+    assert (ref.kreuzakt_id, ref.delivered_generation) == (None, None)
+
+
 # -- deletion, reference counted ----------------------------------------------
 
 def test_delete_is_reference_counted(store):
@@ -173,10 +195,39 @@ def test_delete_is_reference_counted(store):
 def test_delete_counts_only_active_rows_of_the_current_generation(store):
     """`remaining` answers "may we delete upstream?", so it must count what would
     still resolve — a stale-generation sibling protects nothing and must not be
-    counted as a reason to keep the Kreuzakt document alive."""
+    counted as a reason to keep the Kreuzakt document alive.
+
+    The sibling is made stale the way a rebuild leaves it: the generation moves,
+    then the backfill rebinds one reference and not the other. Both rows going
+    stale would test the returned id instead (see
+    `test_delete_of_a_stale_binding_authorises_nothing`), which is a different rule.
+    """
     store = two_refs(store)
-    store.bump_generation()          # both rows are stale now
+    store.bump_generation()
+    store.ledger_set_kreuzakt_id(papra_org_id="org-a", papra_document_id="doc-1",
+                                 kreuzakt_id=7, generation=store.get_generation())
     assert store.ledger_mark_deleted(papra_org_id="org-a", papra_document_id="doc-1") == (7, 0)
+
+
+def test_delete_of_a_stale_binding_authorises_nothing(store):
+    """A stale id is not an authorization, so returning it must not look like one.
+
+    `remaining` was already counted over the current generation, which made a
+    stale row report `(7, 0)`: "this was the last live reference, go delete 7".
+    Task 9's revalidation cannot catch that, because the queued row carries the
+    generation it was queued under — current, after a bump — so the generation
+    check passes, and `ledger_resolve([7], current)` is empty only because the
+    backfill has not rebound anything yet. The delete then fires at a reused
+    integer that a volume restore has since given to unrelated content. When the
+    row's own `delivered_generation` is not current, the answer is `(-1, -1)`:
+    nothing upstream may be deleted on this row's word.
+    """
+    store = two_refs(store)
+    current = store.bump_generation()
+    assert store.ledger_mark_deleted(papra_org_id="org-a", papra_document_id="doc-1") == (-1, -1)
+    ref = store.ledger_get("org-a", "doc-1")
+    assert ref.deleted_at is not None                       # still a soft delete
+    assert (ref.kreuzakt_id, ref.delivered_generation) == (7, current - 1)   # still stale
 
 
 def test_delete_without_a_kreuzakt_id_reports_minus_one(store):
@@ -509,6 +560,50 @@ def test_bump_repair_on_unknown_reference_raises(store):
         store.ledger_bump_repair(papra_org_id="o", papra_document_id="missing")
 
 
+def test_bump_repair_holds_the_write_lock_while_it_counts(store, tmp_path, monkeypatch):
+    """The repair counter decides a suppression, so a lost increment is a missed one.
+
+    Same hazard the previous two commits fixed in `ledger_mark_deleted` and
+    `ledger_cleanup_result`: reading `repair_count`/`last_repair_at` before
+    pysqlite opens the transaction lets the daemon's verification pass and an
+    operator's forced repair both read 1 and both write 2. Task 7 suppresses on
+    "two repairs in 24 h", so the lost increment is a document that keeps
+    diverging while the counter says it is new. Proven the same way: the read
+    itself attempts an independent write from a second connection, which must be
+    refused.
+    """
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    assert store.ledger_bump_repair(papra_org_id="o", papra_document_id="d") == 1
+    other = Store(tmp_path / "state.db")
+    other._conn.execute("PRAGMA busy_timeout=50")
+    real_read = Store._read_repair_row
+    observed = []
+
+    def spy(self, papra_org_id, papra_document_id):
+        row = real_read(self, papra_org_id, papra_document_id)
+        try:
+            other._conn.execute("BEGIN IMMEDIATE")
+            other._conn.execute(
+                "UPDATE index_ledger SET repair_count = 99 WHERE papra_document_id = ?",
+                (papra_document_id,),
+            )
+            other._conn.commit()
+            observed.append("second connection wrote during the read")
+        except sqlite3.OperationalError:
+            observed.append("refused")        # the write lock is held: correct
+            other._conn.rollback()
+        return row
+
+    monkeypatch.setattr(Store, "_read_repair_row", spy)
+    try:
+        assert store.ledger_bump_repair(papra_org_id="o", papra_document_id="d") == 2
+        assert observed == ["refused"]
+        assert store.ledger_get("o", "d").repair_count == 2
+    finally:
+        other.close()
+
+
 # -- cleanup queue ------------------------------------------------------------
 
 def test_cleanup_due_ignores_done_and_future_rows(store):
@@ -610,6 +705,161 @@ def test_cleanup_due_is_ordered_by_due_time_and_capped(store):
                                    kreuzakt_id=7, generation=1)
     due = store.ledger_cleanup_due(now="2026-11-17T12:00:00+00:00", limit=2)
     assert [r.papra_document_id for r in due] == ["doc-0", "doc-1"]
+
+
+def test_cleanup_due_includes_a_pending_row_with_no_next_time(store):
+    """A `pending` row whose `cleanup_next_at` is NULL is owed, not scheduled away.
+
+    Not reachable through today's API — `ledger_queue_cleanup` always writes a
+    time and so does a recorded failure — but the comparison is `cleanup_next_at
+    <= ?`, and `NULL <= now` is NULL: a later edit, or an operator repairing the
+    queue with a plain `UPDATE`, would leave a queued delete permanently due
+    without it ever being reported. The guard costs nothing and keeps "pending"
+    meaning "someone still has to do this".
+    """
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-17T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1)
+    store._conn.execute("UPDATE index_ledger SET cleanup_next_at = NULL"
+                        " WHERE papra_document_id = 'd'")
+    store._conn.commit()
+    due = store.ledger_cleanup_due(now="2026-11-17T00:00:00+00:00")
+    assert [r.papra_document_id for r in due] == ["d"]
+
+
+def test_skip_cleanup_parks_a_row_without_retrying_or_failing_it(store, caplog):
+    """The state machine needs Task 9's third answer: owed, but not ours to do.
+
+    A queued delete can turn out to be unnecessary rather than failed — the Papra
+    document was restored, the generation moved so the id means something else
+    now, or a live sibling still resolves to it. Without a `skipped` outcome in
+    the machine that pass would have to hand-write SQL against the table the MCP
+    server authorizes from, so the machine gained the fourth state. Two properties
+    make it the right state rather than a fifth spelling of `done`: it is not due
+    again (nothing is waiting for a retry), and it is not counted as a failure
+    (nothing is failing).
+    """
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-17T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1)
+    with caplog.at_level("INFO"):
+        store.ledger_skip_cleanup(papra_org_id="o", papra_document_id="d",
+                                  reason="generation changed")
+    ref = store.ledger_get("o", "d")
+    assert ref.cleanup_state == "skipped"
+    assert ref.cleanup_next_at is None
+    assert ref.cleanup_attempts == 0            # skipping is not an attempt
+    assert store.ledger_cleanup_due(now="2999-01-01T00:00:00+00:00") == []
+    stats = store.ledger_stats()
+    assert stats["cleanup_pending"] == 0 and stats["cleanup_failed"] == 0
+    assert [r.message for r in caplog.records if "cleanup failed" in r.message] == []
+    assert any("cleanup skipped" in r.message for r in caplog.records)
+
+
+def test_skip_cleanup_on_unknown_reference_raises(store):
+    with pytest.raises(ValueError, match="unknown ledger reference"):
+        store.ledger_skip_cleanup(papra_org_id="o", papra_document_id="missing")
+
+
+def test_a_permanently_failed_delete_is_still_counted(store):
+    """`check` must not go quiet at the moment a delete stops happening by itself.
+
+    On the fifth failure the row leaves `pending`, so a counter that watches only
+    `pending` reports a clean queue exactly when automatic retry ends — the number
+    fell to 0 while the debt became permanent. `cleanup_pending` is now the total
+    that still owes an upstream delete, and `cleanup_failed` names the subset the
+    retries have stopped on, so an operator can tell "still trying" from "this one
+    is on you" without either one hiding the other.
+    """
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-17T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1)
+    for _ in range(store_module.CLEANUP_MAX_ATTEMPTS):
+        store.ledger_cleanup_result(papra_org_id="o", papra_document_id="d",
+                                    ok=False, reason="kreuzakt 503")
+    assert store.ledger_get("o", "d").cleanup_state == "failed"
+    stats = store.ledger_stats()
+    assert stats["cleanup_pending"] == 1
+    assert stats["cleanup_failed"] == 1
+
+
+def test_forced_cleanup_pass_can_give_a_failed_row_a_working_allowance(store):
+    """`papra-suite ledger --cleanup` re-queues on purpose, and says so in code.
+
+    With no way to reset, the operator's deliberate command got exactly one try:
+    the row was already at `CLEANUP_MAX_ATTEMPTS`, so the first failure after the
+    command wrote `failed` again even when the outage had ended. `reset_attempts`
+    exists so that pass can be explicit about refilling the allowance. The default
+    is False — and has to stay False — because a re-queue that refilled for free
+    would let an ingest-driven re-mark top the counter up on every delete and the
+    five-attempt cap would never bite.
+    """
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-17T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1)
+    for _ in range(store_module.CLEANUP_MAX_ATTEMPTS):
+        store.ledger_cleanup_result(papra_org_id="o", papra_document_id="d",
+                                    ok=False, reason="kreuzakt 503")
+    # the default: re-queueing changes the schedule, not the allowance
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-18T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1)
+    assert store.ledger_get("o", "d").cleanup_attempts == store_module.CLEANUP_MAX_ATTEMPTS
+    # the deliberate reset, then one full recovery pass
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-18T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1, reset_attempts=True)
+    ref = store.ledger_get("o", "d")
+    assert (ref.cleanup_state, ref.cleanup_attempts) == ("pending", 0)
+    assert [r.papra_document_id for r in
+            store.ledger_cleanup_due(now="2026-11-18T12:00:00+00:00")] == ["d"]
+    store.ledger_cleanup_result(papra_org_id="o", papra_document_id="d", ok=False,
+                                next_at="2026-11-18T13:00:00+00:00", reason="kreuzakt 503")
+    assert store.ledger_get("o", "d").cleanup_state == "pending"   # not failed again
+    store.ledger_cleanup_result(papra_org_id="o", papra_document_id="d", ok=True)
+    assert store.ledger_get("o", "d").cleanup_state == "done"
+
+
+@pytest.mark.parametrize("due_at", ["2026-11-17T00:00:00Z", "2026-11-17T00:00:00",
+                                    "2026-11-17T00:00:00+01:00", "2026-11-17 00:00:00+00:00",
+                                    "tomorrow"])
+def test_queue_cleanup_refuses_a_due_at_that_is_not_the_stores_utc_form(store, due_at):
+    """Backoffs are compared as text, so the write boundary is the only honest guard.
+
+    `cleanup_next_at <= now` is chronological only while every value carries the
+    same `+00:00` offset: a `Z` suffix sorts after every offset, a naive or a
+    `+01:00` value is silently hours early or late, and the result is a backoff
+    that mis-times with no error anywhere. Refusing the write is cheap; discovering
+    it from a delete that fired too early is not.
+    """
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    with pytest.raises(ValueError, match="due_at"):
+        store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                                   due_at=due_at, kreuzakt_id=7, generation=1)
+    ref = store.ledger_get("o", "d")
+    assert (ref.cleanup_state, ref.cleanup_next_at) == ("none", None)   # nothing written
+
+
+def test_cleanup_result_refuses_a_next_at_that_is_not_the_stores_utc_form(store):
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-17T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1)
+    with pytest.raises(ValueError, match="next_at"):
+        store.ledger_cleanup_result(papra_org_id="o", papra_document_id="d", ok=False,
+                                    next_at="2026-11-17T01:00:00Z", reason="kreuzakt 503")
+    ref = store.ledger_get("o", "d")
+    assert (ref.cleanup_state, ref.cleanup_attempts) == ("pending", 0)  # attempt not burned
 
 
 # -- generation ---------------------------------------------------------------
@@ -736,7 +986,7 @@ def test_stats_keys_and_counts(store):
     stats = store.ledger_stats()
     assert set(stats) == {"references", "indexed_current", "delivered", "extraction_empty",
                           "protected_name", "protected_date", "protected_notes",
-                          "repairs_24h", "cleanup_pending"}
+                          "repairs_24h", "cleanup_pending", "cleanup_failed"}
     assert stats["references"] == 2
     assert stats["indexed_current"] == 1
     assert stats["delivered"] == 1
@@ -745,6 +995,7 @@ def test_stats_keys_and_counts(store):
     assert stats["protected_notes"] == 0
     assert stats["repairs_24h"] == 1
     assert stats["cleanup_pending"] == 1
+    assert stats["cleanup_failed"] == 0        # queued, but still being retried
 
 
 def test_stats_scopes_to_the_requested_buckets(store):
