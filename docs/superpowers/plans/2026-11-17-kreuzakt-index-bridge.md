@@ -77,7 +77,7 @@ All live in `tests/conftest.py` unless a task says otherwise.
 | `seed_listing` | `seed_listing(fake_papra, *, count, mime="application/pdf", org_id="org-a") -> list[str]` — ids `doc-0…doc-N`, returns them |
 | `seed_deleted_in_papra` | `seed_deleted_in_papra(fake_papra, *, count, org_id="org-a") -> None` |
 | `FakePapra` | `get_document` returns a dict copy from `.documents`; `update_document` records into `.last_patch` and bumps `.patch_calls`; `list_documents` honours `page_index`/`page_size` and raises when `.raise_on_list`; `.raise_on_get` makes `get_document` raise `PapraError`; `.delete_calls`/`.get_calls` counted |
-| `FakeKreuzakt` | `.high_water` int, `.upload_calls`/`.high_water_calls`/`.calls` lists, `.document` (a `KzDocument`), `.hits`, `.raw_search`, `.never_completes`, `.missing_documents`, `.error`, `.health`, `.on_wait` (callable fired inside `wait_for_queue_row`), `fail_delete(id)` |
+| `FakeKreuzakt` | `.high_water` int, `.upload_calls`/`.high_water_calls`/`.calls` lists, `.document` (a `KzDocument`), `.hits`, `.raw_search`, `.never_completes`, `.missing_documents`, `.error`, `.health`, `.on_wait` (callable fired inside `wait_for_queue_row`), `fail_delete(id)`, `.queue_rows` (list of queue rows served newest-first, **capped at 100 like the real window**), `.fail_queue_status` (so `retry_queue` against a row that is not `failed` answers 400 the way the measured server does, and an unknown id answers 404) — built from `tests/fixtures/kreuzakt_queue_page.json`, which Task 3 wrote from a live `GET /api/queue?limit=100` |
 | fixtures `fake_papra` / `fake_kz` | the injected instances of `FakePapra` / `FakeKreuzakt` used by every test above; `caplog` is pytest's own fixture and needs no declaration here |
 | `_fill` / `papra_doc` | `_fill(n)` returns `n` placeholder rows so a page can be made "full" deliberately; `papra_doc(**over)` builds a Papra detail dict with `isDeleted=False` |
 | `make_client` / `queue_page` / `load` | Task 5's MockTransport rig; `queue_page(rows)` wraps rows in the envelope captured in Task 3; `load(name)` reads `tests/fixtures/<name>` |
@@ -461,6 +461,35 @@ git commit -m "feat(store): index_ledger with generation, ownership baselines, c
 
 ### Task 5: `KreuzaktClient` with correlation the probe proves
 
+> **Measured contract (Task 3, 2026-11-17).** The queue API is not what v2 of this plan assumed, and the
+> difference is load-bearing. `/api/queue` accepts **only `limit` (default 20, clamped to 100) and
+> `status`**; `page`, `offset`, `perPage`, `per_page`, `count`, `after` and `cursor` are **silently
+> ignored** — a page walk reads the same 100 rows forever. With 155 rows present, the default window
+> reached ids 155 down to 56; row 1 was unreachable except through `status=completed`. Ordering is strictly
+> **descending** by `(created_at DESC, id DESC)` while **ids ascend with insertion**, so the newest row is
+> always first. The correct high-water mark is therefore `entries[0].id` of `?limit=1` — one request, no
+> walk, and no claim of proven exhaustion, which is impossible on a newest-100 window.
+> `filename` is the **stored, sanitised** name, byte-identical to the upload response's `relativePath`, and
+> a repeated name comes back as `papra-doc0006-6f708192 (1).pdf`. The same filename can hold several
+> terminal rows. Evidence: `docs/superpowers/probes/2026-11-17-kreuzakt-contracts/README.md`, keys
+> `Q4_parameter_matrix`, `Q4_walk`, `Q4_status_window`, `Q5_retention`, `Q6_filename_shapes`,
+> `Q10_ordering` in `capture-queue.json`.
+>
+> **What replaces the soundness argument.** The old rule was "we scanned every row, so a name we cannot
+> find was never uploaded". That proof is unavailable. The new rule is **relative and fail-closed**: mark
+> `hwm` before uploading, then consider only rows with `id > hwm` inside the newest-100 window. Because the
+> window can saturate (a `reindex-all`, another writer, or our own retries), absence from the window is
+> **not** evidence of absence from the queue, so `wait_for_queue_row` distinguishes three outcomes instead
+> of two: matched, ambiguous, and **window-saturated** (`CorrelationWindowFull`, retryable). Ambiguity and
+> saturation are retried by re-uploading — Kreuzakt deduplicates identical bytes onto one document, so a
+> re-upload is idempotent and produces a row inside the window again.
+>
+> **Alphabet rule, which removes a whole class of bug.** Do not reimplement Kreuzakt's sanitiser. Upload
+> names are constrained to `[a-z0-9.-]` plus `.pdf`, which the probe shows pass through unchanged
+> (`papra-doc0004-4d5e6f70.pdf` came back byte-identical, while a name containing `:` and `<` returned as
+> `papra_doc0004_..._.pdf`). Correlation then matches on exact equality **or** the ` (N)` collision
+> suffix, and nothing else.
+
 **Files:** Create `papra_suite/kreuzakt_client.py`, `tests/test_kreuzakt_client.py`; Modify `papra_suite/config.py`, `tests/test_config.py`.
 
 **Interfaces:**
@@ -470,8 +499,29 @@ git commit -m "feat(store): index_ledger with generation, ownership baselines, c
   - `QueueEntry(id: int, filename: str, status: str, error: str | None, document_id: int | None, page_count: int | None)`
   - `KzDocument(id, title, description, content, document_date, original_filename, updated_at)` — **no link fields exist on this type**
   - `KzHit(id, title, document_date, added_at, mime_type, original_filename)` — no `content`, no `score`
-  - `KreuzaktClient(base_url, *, timeout_s=30.0, transport=None)` with `aclose()`, `health()`, `upload(filename, content) -> str`, `queue_high_water_mark() -> int`, `wait_for_queue_row(filename, *, after_id, poll_s, timeout_s) -> QueueEntry`, `queue_page(*, page, limit) -> list[QueueEntry]`, `get_document(int) -> KzDocument`, `search(query, *, page=1, limit=100, offset=0) -> tuple[list[KzHit], int]`, `list_documents(*, page=1, limit=100, since=None) -> list[dict]`, `delete_document(int) -> None`, `retry_queue(int) -> None`, `queue_counts() -> dict[str, int]`
-  - `Config.kreuzakt_base_url`, `Config.index_content_delivery`, `Config.index_metadata_delivery`, `Config.index_scan_pages`, `Config.index_max_scan_rows`, `Config.index_poll_interval_s`, `Config.index_wait_timeout_s`, `Config.index_query_max_chars`, `Config.mcp_url`, `Config.mcp_port`
+  - `KreuzaktClient(base_url, *, timeout_s=30.0, transport=None)` with `aclose()`, `health()`, `upload(filename, content) -> str` (field name `files`; a wrong field name is a 400 whose verbatim message is `Upload requests must include at least one file`), `queue_high_water_mark() -> int` (one `?limit=1` request; `entries[0].id`, else `0`), `wait_for_queue_row(filename, *, after_id, poll_s, timeout_s) -> QueueEntry`, `queue_page(*, limit=100, status=None) -> list[QueueEntry]` (**no** `page`/`offset` — they are ignored upstream, so exposing them would lie), `queue_counts() -> dict[str, int]`, `get_document(int) -> KzDocument`, `search(query, *, limit=100) -> tuple[list[KzHit], int]` (no `page`/`offset`: search pagination was never measured, and an unmeasured parameter must not appear in the interface), `list_documents(*, limit=100, since=None) -> list[dict]`, `delete_document(int) -> None`, `retry_queue(int) -> None` (raises `KreuzaktError` with the upstream 400/404 distinction intact: only `failed` rows are retryable, unknown ids are 404)
+  - `CorrelationWindowFull(Exception)` and `AmbiguousCorrelation(Exception)` — both retryable, neither "not found"
+  - Not exposed on purpose: `rescan` (creates **no** queue row, so it cannot be awaited) and `reindex-all` (its rows are created **with** `document_id` already set, which would make every completion test pass for the wrong reason)
+  - `Config.kreuzakt_base_url`, `Config.index_content_delivery`, `Config.index_metadata_delivery`, `Config.index_max_attempts`, `Config.index_poll_interval_s`, `Config.index_wait_timeout_s`, `Config.index_query_max_chars`, `Config.mcp_url`, `Config.mcp_port`
+
+- [ ] **Step 0: Measure the two endpoints no probe covered, before encoding them**
+
+Task 3 measured the queue and the upload response; it did **not** measure `/api/search` or
+`/api/documents` pagination, and there is no `tests/fixtures/kreuzakt_search_page.json`. Against the
+throwaway stack (`docker compose -f docker-compose.test.yml -p papra-ai-assistant stop`, then
+`-p kreuzakt-bridge up -d --wait`, and afterwards `-p kreuzakt-bridge down -v` followed by
+`-p papra-ai-assistant start` plus a `/api/health` check on `127.0.0.1:12210` — **never** `down -v` on
+project `papra-ai-assistant`), record into `docs/superpowers/probes/2026-11-17-kreuzakt-contracts/`:
+
+- one real `/api/search` response with hits and one with none, saved as `capture-search.json`, and
+  `tests/fixtures/kreuzakt_search_page.json` written from it by the probe (no hand-written payloads);
+- whether `page`, `offset` and `limit` do anything on `/api/search`, and whether a hit can carry a score;
+- whether `/api/documents?since=` is honoured, and the real row shape.
+
+Encode only what you observed. A parameter you could not demonstrate belongs nowhere in the client — that
+is why `search()` has no `page`/`offset` in the interface above. If the container cannot be started from
+this environment, say so in your report and leave `search()`/`list_documents()` unimplemented rather than
+guessing; Tasks 13 and 14 depend on those two methods and would otherwise inherit a fiction.
 
 - [ ] **Step 1: Write the failing tests against the captured fixtures**
 
@@ -497,20 +547,41 @@ async def test_upload_returns_relative_path_and_sends_files_field():
     assert calls[0][1].endswith("/api/upload")
     assert b'name="files"' in upload_bodies[0]        # the handler records request bodies
 
-async def test_high_water_mark_walks_pages_and_returns_max_id():
-    client, _ = make_client([("/api/queue?page=1", queue_page([{"id": 101}, ..._fill(99)],
-                                                              full=True)),
-                             ("/api/queue?page=2", queue_page([{"id": 150}])),
-                             ])
-    assert await client.queue_high_water_mark() == 150
+def test_high_water_mark_is_the_first_row_of_a_one_row_request():
+    """Measured: ordering is descending, ids ascend, and there is no pagination to walk.
+    One request is the whole algorithm; asserting the query string here is what keeps a
+    future 'optimisation' from re-introducing a page walk that cannot terminate."""
+    client, calls = make_client([("/api/queue", queue_page([{"id": 155, "status": "pending"}]))])
+    assert await client.queue_high_water_mark() == 155
+    assert any("limit=1" in url for _, url in calls)
 
 
-async def test_high_water_mark_refuses_to_return_an_unproven_scan():
-    """Every page full to the cap means we never proved exhaustion: fail closed."""
-    client, _ = make_client([("/api/queue", queue_page([{"id": i} for i in range(100)],
-                                                      full=True))])
-    with pytest.raises(KreuzaktError, match="scan incomplete"):
-        await client.queue_high_water_mark()
+async def test_high_water_mark_on_an_empty_queue_is_zero(store_free_client):
+    client, _ = make_client([("/api/queue", queue_page([]))])
+    assert await client.queue_high_water_mark() == 0
+
+
+async def test_a_full_window_is_reported_as_saturated_not_as_absent():
+    """100 rows newer than hwm, none of them ours: the window proves nothing, so this must
+    be retryable. Returning None here would make the job 'succeed' by silently skipping."""
+    rows = [{"id": 1000 + i, "filename": f"other{i}.pdf", "status": "completed"} for i in range(100)]
+    client, _ = make_client([("/api/queue", queue_page(rows))])
+    with pytest.raises(CorrelationWindowFull):
+        await client.wait_for_queue_row("papra-d1-a1b2.pdf", after_id=900,
+                                        poll_s=0, timeout_s=0.1)
+
+
+async def test_collision_suffix_matches_and_two_candidates_are_ambiguous():
+    ok = make_client([("/api/queue", queue_page([
+        {"id": 12, "filename": "papra-d1-a1b2 (1).pdf", "status": "completed",
+         "document_id": 9}]))])[0]
+    assert (await ok.wait_for_queue_row("papra-d1-a1b2.pdf", after_id=11,
+                                        poll_s=0, timeout_s=0.1)).document_id == 9
+    dup = make_client([("/api/queue", queue_page([
+        {"id": 13, "filename": "papra-d1-a1b2.pdf", "status": "completed", "document_id": 9},
+        {"id": 12, "filename": "papra-d1-a1b2.pdf", "status": "completed", "document_id": 9}]))])[0]
+    with pytest.raises(AmbiguousCorrelation):
+        await dup.wait_for_queue_row("papra-d1-a1b2.pdf", after_id=11, poll_s=0, timeout_s=0.1)
 
 async def test_wait_for_queue_row_requires_exact_filename_and_greater_id():
     """Suffix matching and 'newest row' are both guesses; neither is used."""
@@ -596,33 +667,29 @@ class KreuzaktClient:
             raise KreuzaktError(f"upload rejected: {payload.get('errors')!r}")
         return payload["files"][0]["relativePath"]
 
-    async def queue_page(self, *, page: int, limit: int = _QUEUE_PAGE_SIZE) -> list[QueueEntry]:
-        body = (await self._request("GET", "/api/queue",
-                                    params={"page": page, "limit": limit})).json()
+    async def queue_page(self, *, limit: int = 100, status: str | None = None) -> list[QueueEntry]:
+        params: dict[str, object] = {"limit": limit}
+        if status is not None:
+            params["status"] = status
+        body = (await self._request("GET", "/api/queue", params=params)).json()
         rows = body.get("entries") if "entries" in body else body.get("items", [])
         return [_to_queue_entry(row) for row in rows]
 
     async def queue_high_water_mark(self) -> int:
-        """Highest queue id right now, or a loud failure. Recorded BEFORE upload,
-        then our row is the one whose filename matches exactly and whose id
-        exceeds this. Newest-row guessing breaks the moment two uploads are in
-        flight, and a *partially scanned* mark is worse than none: it would let a
-        pre-existing row be mistaken for ours. So exhaustion is proven (a short
-        page) or the scan raises; the page cap is a fuse, not an exit.
+        """Newest queue id right now, or 0 for an empty queue. Recorded BEFORE upload.
+
+        Measured 2026-11-17: `/api/queue` has no pagination (only `limit`, clamped to 100,
+        and `status`; `page`/`offset`/`cursor` are ignored), it serves the newest 100 rows,
+        and it orders them `created_at DESC, id DESC` while ids ascend with insertion. So
+        the newest row is the first row of a one-row request — one round trip, and there is
+        no walk to get wrong. What this can no longer claim is *exhaustion*: a newest-100
+        window cannot be proven complete, which is why absence is reported by
+        `wait_for_queue_row` as `CorrelationWindowFull` rather than as "not uploaded".
         """
-        highest = 0
-        for page in range(1, _QUEUE_PAGES_MAX + 1):
-            rows = await self.queue_page(page=page)
-            if not rows:
-                return highest
-            highest = max([highest] + [row.id for row in rows])
-            if len(rows) < _QUEUE_PAGE_SIZE:
-                return highest
-        raise KreuzaktError(
-            f"queue scan incomplete after {_QUEUE_PAGES_MAX * _QUEUE_PAGE_SIZE} rows; "
-            "refusing to correlate on a partial high-water mark")
+        rows = await self.queue_page(limit=1)
+        return rows[0].id if rows else 0
 ```
-`wait_for_queue_row` loops: walk pages, collect rows with `row.filename == filename and row.id > after_id`, raise `KreuzaktError("ambiguous correlation: N rows")` if more than one is terminal, return the first `completed`/`failed`, and raise `KreuzaktError("no queue row for {filename} within {timeout_s}s")` on timeout. `delete_document` accepts 204 and 404 (already gone is gone); anything else raises.
+`wait_for_queue_row` loops over `queue_page(limit=100)` — one request per poll, no walk — collecting rows with `id > after_id` whose `filename` equals `filename` **or** `filename` with a ` (N)` collision suffix inserted before `.pdf` (measured: a repeat upload of the same name comes back as `papra-doc0006-6f708192 (1).pdf`). Then: exactly one candidate and terminal → return it; more than one terminal candidate → `AmbiguousCorrelation`; no candidate while the page was full of *other* rows newer than `after_id` → `CorrelationWindowFull` (retryable, because the window proves nothing about rows it cannot show); nothing else → keep polling until `timeout_s`, then raise `KreuzaktError("no queue row for {filename} within {timeout_s}s")`. `delete_document` accepts 204 and 404 (already gone is gone); anything else raises.
 
 - [ ] **Step 4: Config fields, all env-parsed**
 
@@ -632,10 +699,14 @@ index_content_delivery: bool    # PAPRA_INDEX_CONTENT_DELIVERY, default False
 index_metadata_delivery: bool   # PAPRA_INDEX_METADATA_DELIVERY, default False
 legacy_workers: bool            # PAPRA_LEGACY_WORKERS, default True; when False the ocr/title worker
                                 # loops never start and no legacy job is enqueued
-index_scan_pages: int           # PAPRA_INDEX_SCAN_PAGES, default 5
-index_max_scan_rows: int        # PAPRA_INDEX_MAX_SCAN_ROWS, default 500
-index_poll_interval_s: float    # PAPRA_INDEX_POLL_INTERVAL_S, default 2.0
+index_max_attempts: int         # PAPRA_INDEX_MAX_ATTEMPTS, default 3; bounds re-uploads after a
+                                # saturated/ambiguous window AND queue retries — measured fact: a
+                                # deterministic failure (corrupt PDF) re-fails with identical text every
+                                # time, so an unbounded retry spins forever on one bad file
+index_search_scan_rows: int     # PAPRA_INDEX_SEARCH_SCAN_ROWS, default 500; Task 13's fetch budget, used
+                                # only if Step 0 proves /api/search can be paged at all
 index_wait_timeout_s: int       # PAPRA_INDEX_WAIT_TIMEOUT_S, default 900
+index_poll_interval_s: float    # PAPRA_INDEX_POLL_INTERVAL_S, default 2.0
 index_query_max_chars: int      # PAPRA_INDEX_QUERY_MAX_CHARS, default 512
 mcp_url: str                    # PAPRA_MCP_URL  (Host/Origin allow-list, from the 11-16 spec)
 mcp_port: int                   # PAPRA_MCP_PORT, default 8765
@@ -654,6 +725,32 @@ git commit -m "feat(index): Kreuzakt client with high-water-mark correlation"
 
 ### Task 6: The `index` job kind — upload, correlate, record; write nothing to Papra
 
+> **Measured rules that bind this task (Task 3, 2026-11-17).** Four of them change behaviour, all four come
+> from `capture-queue.json`:
+>
+> 1. **Serial upload, immediate correlation.** One upload per Kreuzakt request, correlated before the next
+>    upload starts, because the correlation window is only the newest 100 rows. A worker that fires ten
+>    uploads and correlates afterwards is gambling that nothing else wrote 90 rows in between.
+> 2. **`CorrelationWindowFull` and `AmbiguousCorrelation` are retryable, and the retry is a re-upload.**
+>    Identical bytes deduplicate onto the same Kreuzakt document, so re-uploading costs nothing and puts a
+>    fresh row inside the window. Bound it (`index_max_attempts`), then fail the job with the reason. Never
+>    let either one fall through as "nothing to do".
+> 3. **`status == "completed"` is the only completion signal.** `document_id` being non-null proves
+>    nothing: `reindex-all` creates its rows **with** `document_id` already set, so a test that treats
+>    non-null as finished passes against a server that never processed anything. `rescan` produces no queue
+>    row at all, so it cannot be awaited and is not used here.
+> 4. **`completed` with `document_id: null` is a vanished document, not a retryable anomaly.** The probe
+>    produced it by deleting the Kreuzakt document a completed row pointed at (DELETE 204, the row stayed
+>    `completed`, its id went null). So the branch reads Papra's state: if Papra no longer has the
+>    document, hand it to Task 9's cleanup path; if Papra still has it, re-upload. Retrying the queue row
+>    is impossible, because `retry` accepts only `failed` rows (verbatim: `Queue entry 31 is not in failed
+>    status`).
+>
+> And one limit on retries: a deterministic failure re-fails identically (the probe's corrupt-PDF row came
+> back with the same `Parsing error: xberg_native_pdf: failed to load bytes: Invalid cross-reference table`
+> every time), so `retry_queue` needs a bounded attempt counter carried in the job, and once it is spent
+> the job fails permanently with Kreuzakt's own error text rather than spinning forever on a broken PDF.
+
 **Files:** Create `papra_suite/indexing.py`, `tests/test_index_job.py`; Modify `papra_suite/pipeline.py`, `tests/test_pipeline.py`; Create `tests/integration/test_index_pipeline.py`.
 
 **Interfaces:**
@@ -665,6 +762,7 @@ git commit -m "feat(index): Kreuzakt client with high-water-mark correlation"
   - `IndexFailed(Exception)`, `IndexTimeout(Exception)`
   - `enqueue_index_job(store, *, papra_org_id, document_id, file_hash, name, mime, ingested_via) -> str`
 - Eligibility rule that replaces v1's mistake: a document needs indexing when the ledger has **no current-generation id**, which is derived from the ledger, never from `document_seen` — `document_seen` records ingestion history, so a rebuild would have looked already-done.
+- Upload-name rule: `index_upload_name` emits only `[a-z0-9.-]` plus `.pdf`, because the probe showed names outside that alphabet come back sanitised (`papra:doc0005<…>.pdf` → `papra_doc0005_…_.pdf`) and a sanitised name breaks the exact-equality match the client relies on. Assert the alphabet in a test instead of trusting the generator.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -688,6 +786,31 @@ async def test_stale_job_hash_is_abandoned_not_delivered(store, fake_papra):
     with pytest.raises(IndexFailed, match="source hash changed"):
         await run_index_job(fake_kz, store, job, papra=fake_papra, poll_s=0, wait_timeout_s=5)
     assert store.ledger_get(job.papra_org_id, job.document_id).kreuzakt_id is None
+
+async def test_completed_row_with_null_document_id_checks_papra_instead_of_retrying(store, fake_papra, fake_kz):
+    """Measured: deleting the Kreuzakt document leaves the row 'completed' with a null id.
+    Retrying is impossible (retry accepts only 'failed'), so the branch must read Papra."""
+    fake_kz.queue_rows = [{"id": 8, "filename": "papra-doc-1-a1b2c3d4.pdf",
+                           "status": "completed", "document_id": None}]
+    with pytest.raises(IndexFailed, match="index document vanished"):
+        await run_index_job(fake_kz, store, job, papra=fake_papra, poll_s=0, wait_timeout_s=5)
+    assert store.ledger_get(job.papra_org_id, job.document_id).kreuzakt_id is None
+
+
+async def test_window_saturated_reuploads_then_succeeds(store, fake_papra, fake_kz):
+    """First attempt sees 100 unrelated rows newer than our mark; the retry must re-upload."""
+    fake_kz.window_saturated_once = True
+    outcome = await run_index_job(fake_kz, store, job, papra=fake_papra, poll_s=0, wait_timeout_s=5)
+    assert outcome.kreuzakt_id == 7 and len(fake_kz.upload_calls) == 2
+
+
+async def test_deterministic_failure_stops_retrying_after_the_budget(store, fake_papra, fake_kz):
+    fake_kz.queue_error = ("Parsing error: xberg_native_pdf: failed to load bytes: "
+                           "Invalid cross-reference table")
+    with pytest.raises(IndexFailed, match="xberg_native_pdf"):
+        await run_index_job(fake_kz, store, job, papra=fake_papra, poll_s=0, wait_timeout_s=5)
+    assert store.get_job(job.id).attempts <= 3          # bounded; no eternal spin on a broken PDF
+
 
 async def test_existing_current_id_skips_upload_entirely(store, fake_kz, fake_papra):
     seed_ledger(store, kreuzakt_id=7, generation=1)
@@ -1504,8 +1627,8 @@ git commit -m "feat(mcp): per-token bucket scopes and scoped index status"
   - `async def search_documents(ctx, store, papra, kz, query, *, page=1, page_size=20) -> SearchPage`
   - `async def list_recent_documents(ctx, store, papra, kz, *, limit=20) -> list[SearchItem]`
   - Bounds: `1 <= page_size <= 50`, `page >= 1`, `len(query.strip()) <= config.index_query_max_chars`; violations raise the tool's `invalid-request` error, they are never clamped silently.
-  - Stop condition: keep pulling Kreuzakt pages until **either** `len(items) >= page * page_size`, **or** upstream is exhausted (`len(hits) < limit` **or** `scanned >= total`), **or** the scan budget (`config.index_scan_pages × 100`, hard-capped by `index_max_scan_rows`) is spent.
-  - `partial = True` only when the budget ran out before the request was satisfied **or** exhaustion was proven. A full page that also exhausted upstream is `partial=False`.
+  - Stop condition, decided by Task 5 Step 0's measurement rather than by assumption: **if** `/api/search` demonstrably accepts an offset or page parameter, keep pulling until `len(items) >= page * page_size`, **or** upstream is exhausted (`len(hits) < limit` **or** `scanned >= total`), **or** the scan budget `config.index_search_scan_rows` is spent. **If it does not** — which is what the earlier probe suggested, having measured a hard `limit` cap of 100 and no score — then there is no second page to pull: one request is the whole universe, `page` slices only within the fetched window, `page > 1` beyond that window is answered `invalid-request`, and the tool must never imply it saw past 100 hits.
+  - `partial = True` whenever the answer could be missing results: the budget ran out, the single-window cap was reached, or hits were dropped by the ledger filter at the edge of the window. Completeness is never claimed from a window that cannot be proven complete — the same rule that governs queue correlation in Task 5. A full page that also exhausted upstream is `partial=False`.
   - A hit resolving to N authorized references produces N items, in Kreuzakt hit order, deduplicated by `(org_id, document_id)` — which is unique per reference by construction.
 
 - [ ] **Step 1: Write the failing tests**
