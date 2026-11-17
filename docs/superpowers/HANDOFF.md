@@ -211,3 +211,20 @@ Still open, unchanged by this branch:
   README states it as a limitation of recovery instead of promising restored OCR text.
 - `gamma` from the old search matrix still needs the GET-before-search method re-run
   before anyone states a cause.
+
+## Branch state — 2026-11-17, where the Kreuzakt work actually lives
+
+`ingest-visibility` @ `1327625` and `ocr-prompt-language` @ `d389d12` are merged
+(`--no-ff`, in that dependency order) into **`kreuzakt-index-bridge`** — merges
+`3706f87` and `f4a0627`. **Neither is merged into `simplify-ingest` yet**; that merge is
+the end of the plan, not its precondition, so do not look for this state on
+`simplify-ingest`. Both merges were clean — `spec.md` auto-merged, and the expected
+`titles.py`/`test_titles.py` conflict never appeared, because the OCR change moved out of
+that file.
+
+Gates at the merge, on this branch: ruff clean, **446** unit passed / 14 deselected,
+**14** integration passed against the scratch stack, `/api/health` ok afterwards. The
+stack's running image IDs equal the digests now pinned in `docker-compose.test.yml`
+(`papra d1f596a3…`, `greenmail 309ba544…`), so the integration run exercised the pinned
+set. Execution happens in the worktree `.worktrees/kreuzakt-index-bridge`; the plan is
+`plans/2026-11-17-kreuzakt-index-bridge.md`.
