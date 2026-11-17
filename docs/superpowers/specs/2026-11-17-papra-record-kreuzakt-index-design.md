@@ -148,6 +148,17 @@ Per document:
   sharing one filename**, the bridge names every upload uniquely and deterministically after its
   source, e.g. `papra-<documentId>-<hash8>.pdf`. That makes queue rows unambiguously ours and retries
   resolvable; uploading under a user-supplied filename is not safe.
+- **Correlating an upload to a queue row is a contract, not a lookup.** The upload response gives no
+  queue id, so the bridge records Kreuzakt's highest queue id *before* uploading and afterwards takes
+  the row whose filename matches **exactly** and whose id is greater than that high-water mark. "The
+  newest matching row" is not sufficient — it is a guess that survives only while nothing else is
+  uploading — and `/api/queue` must be walked page by page rather than trusting its first page.
+  Pagination depth, ordering guarantees and row retention on that endpoint are unmeasured and belong
+  to the contract probe alongside the lost-response case.
+- **A deterministic filename does not make retries idempotent on its own.** The same name re-uploaded
+  after a lost response creates a second queue row for the same bytes, so the high-water mark plus the
+  ledger's existing `kreuzakt_id` together decide whether to upload at all, and a job whose source hash
+  no longer matches the document's current hash is abandoned rather than delivered.
 - **Dedup is many-to-one, confirmed live:** identical bytes uploaded under two different filenames
   produced two queue rows and **one** `document_id`; `DELETE /api/documents/{id}` returned 204 and the
   id then 404'd for both names. Deleting one bucket's copy deletes the shared entry, which is why
@@ -204,10 +215,12 @@ enqueue call site becomes an index enqueue and those documents enter the same pi
 
 The bridge renames Papra documents with Kreuzakt's LLM title, and a rename you made is meant to
 survive. Before writing, read Papra's current `name` and rename only if it equals the name the ledger
-says we last wrote, or, when there is no ledger row for it, equals the original upload filename —
-checkable externally because Kreuzakt stores `original_filename`. Anything else is treated as a human
-edit: log once, set `name_protected`, and stop touching `name` for that document, while content
-updates continue.
+says we last wrote, or, when we have never written that document's name, equals the **Papra-side name
+Papra had when we first saw it** — which is why the ledger stores that baseline in
+`papra_original_name` at first sight. It cannot be taken from Kreuzakt: we upload under a synthetic
+`papra-<docId>-<hash8>.pdf` name, so Kreuzakt's `original_filename` describes our upload, not your
+filename, and proves nothing about ownership. Anything else is treated as a human edit: log once, set
+`name_protected`, and stop touching `name` for that document, while content updates continue.
 
 This is a **read-then-write heuristic, not a compare-and-swap**, and the spec should not call it
 one. Papra offers no conditional write on `name`, so a rename landing between our read and our write
@@ -218,18 +231,24 @@ than lost text. The same policy statement applies to `content` and is worth sayi
 manual edit to Papra's content will be overwritten** by the next delivery or verification pass.
 
 Two more fields join that list, both wanted by the operator because Papra's own date detection is poor
-and its notes field is empty. **`documentDate`**: written from Kreuzakt's `document_date` whenever
-Papra's value differs from what we last wrote, never over a value a human set — and Papra's PATCH does
-accept it, verified in the image (`{name, content, documentDate, notes}`, with `notes` capped at 2048
-and `documentDate` parsed from an ISO string). **`notes`**: written from Kreuzakt's `description`, same
-rule, which makes the archive self-describing in the management UI instead of only in the search
-results. Both inherit the honest limit above: ownership is a heuristic, not a transaction, and the
-ledger columns `written_date`, `written_notes` and their two `*_protected` flags are what make the
-heuristic reviewable. The escape hatch is one command, not four: `papra-suite names --restore-auto`
-becomes `papra-suite metadata --restore-auto`, and `--force-metadata` covers the bulk case.
+and its notes field is empty. **`documentDate`**: written from Kreuzakt's `document_date`, normalised
+to a single ISO form, and skipped entirely when the model returned nothing. **`notes`**: written from
+Kreuzakt's `description` after truncation, with the **truncated value recorded in the ledger** so the
+next comparison is against what Papra actually holds rather than what we intended to send.
+
+Their initial-ownership rule differs from `name`, because Papra's inferred date can be non-empty on a
+document we never touched and there is no baseline to compare it against: the **first** write of
+`documentDate` or `notes` happens only where Papra's current value is empty; a non-empty value we have
+no baseline for is protected on sight. That is deliberately conservative — it means some documents
+keep Papra's poor date forever rather than us guessing that a value we did not write was machine-made.
+Both fields inherit the honest limit above: ownership is a heuristic, not a transaction, and the ledger
+columns `written_date`, `written_notes`, `papra_original_name` and the three `*_protected` flags are
+what make the heuristic reviewable. Clearing protection and writing regardless are separate, explicit
+operations (`metadata --restore-auto`, `metadata --force`) with ledger support, not side effects of the
+delivery path. The escape hatch is one command, not four: `papra-suite metadata --restore-auto`, with
+`--force` for the bulk case.
 Per-reference rename state lives on the ledger row for each Papra document, so two buckets holding
-the same bytes protect their own names independently. `--force-names` re-titles deliberately and updates the ledger; a per-document
-`names --restore-auto` opts a protected name back in.
+the same bytes protect their own names independently.
 
 ### 4.4 Kreuzakt configuration
 
@@ -305,9 +324,12 @@ gates. Nothing about mail ingestion changes.
    so the document's current Papra state is checked on the way out and the reconciliation delay is
    documented rather than hidden.
 3. Papra writes `content` once, at upload; the bridge writes it only after Kreuzakt reports
-   `completed`, and never empty over non-empty. The column then **converges eventually** — repaired
-   from the current Kreuzakt content and version, on a six-hour cycle plus startup — which is a
-   cadence, not a bound: an outage or a suppressed repair extends it.
+   `completed`, and never empty over non-empty. The column then **converges eventually** — the
+   verification pass compares **Papra's current content against Kreuzakt's current content** and
+   repairs on difference, which is deliberately *not* the same test as "does the content match what we
+   last delivered": Papra overwriting us leaves the delivered hash perfectly intact and would be
+   invisible to that comparison. Repairs run on a six-hour cycle plus startup, which is a cadence, not
+   a bound: an outage or a suppressed repair extends it.
 4. A `name` you changed is protected on the ordinary path; the guarantee is best-effort, not atomic
    (§4.3).
 5. Deletes propagate Papra→Kreuzakt only, and only when no active reference to that Kreuzakt document
@@ -347,8 +369,10 @@ CREATE TABLE index_ledger (
     papra_document_id TEXT NOT NULL,
     kreuzakt_id       INTEGER,         -- many rows may share one value, by design
     file_hash         TEXT NOT NULL,
+    papra_original_name TEXT,          -- Papra's own name at first sight: the ownership baseline
     delivered_at      TEXT,            -- Kreuzakt updated_at we last PATCHed into Papra
     delivered_sha     TEXT,            -- sha of the delivered text, to skip no-op writes
+    delivered_generation INTEGER,      -- index generation this row was satisfied under
     written_name      TEXT,            -- the name we last wrote, for the rename heuristic
     name_protected    INTEGER NOT NULL DEFAULT 0,
     repair_count      INTEGER NOT NULL DEFAULT 0,
@@ -364,10 +388,17 @@ CREATE INDEX idx_index_ledger_hash ON index_ledger (file_hash);
 Three consequences of the reference model, all of them acceptance tests rather than notes. Deleting a
 reference excludes it from resolution immediately, and the upstream `DELETE` waits until no active
 reference remains. Rename protection and delivery state are per reference, so two buckets holding the
-same file can carry different titles and different repair histories. And **a rebuilt Kreuzakt can
-reuse integer ids**, so any rebuild or restore invalidates stored `kreuzakt_id` values before new
-results are accepted, and re-maps by `file_hash` without discarding `name_protected` or per-reference
-delivery state.
+same file can carry different titles and different repair histories.
+
+**Rebuilds are handled by re-indexing, not by guessing.** Integer ids are meaningless across a rebuild:
+a fresh Kreuzakt restarts at 1, and matching old mappings to new documents by an 8-character hash
+prefix or by our synthetic filename is unsafe — Kreuzakt dedupes, so a shared document may carry only
+one bucket's filename and still be referenced by several. So the ledger carries an **index generation**
+(a counter in `settings`), every delivered row records the generation it was satisfied under, and a
+rebuild bumps the generation, which makes every stale row ineligible for resolution and re-queues the
+document from Papra's authoritative bytes. Kreuzakt's own dedup then collapses the re-uploads back onto
+single documents. An unnoticed volume restore therefore cannot serve stale mappings, because the
+generation it was written under no longer exists.
 
 Numbering note: `ingest-visibility` already adds migration 002, so this is **003** and lands after
 that merge, or is renumbered if the operator prefers the other order. Same lesson as that branch:
@@ -500,13 +531,23 @@ Ordered so that each step's failure is reversible without touching the system of
 2. Ledger, and Kreuzakt deployed on its private network with no published port.
 3. **Index without modifying Papra.** The bridge uploads, waits, and records — it does not write.
    Prove retry, duplicate, deletion, restore, and rebuild behaviour while Papra is untouched, because
-   this is the last phase where a bridge bug cannot corrupt the record.
-4. Enable content delivery alone, and confirm Papra looks right.
-5. Enable title delivery separately, so a rename problem is separable from a text problem.
+   this is the last phase where a bridge bug cannot corrupt the record. "Untouched" means the new
+   writer is silent; the old OCR and title workers are still running during this phase, so Papra keeps
+   its existing text and titles rather than losing them early.
+4. **Content delivery, with the old writer drained first.** Stop feeding the `ocr` queue, wait until no
+   `ocr` job is pending or running (`papra-suite jobs --status pending` and `--status running` both
+   empty for that kind), then set `PAPRA_INDEX_CONTENT_DELIVERY=true`. Two writers must never own the
+   same column at the same moment; a flag flipped while old jobs are queued lets them land afterwards
+   and looks like the new writer is broken. Content and metadata handover are separate and
+   independently reversible.
+5. **Title delivery the same way**: drain `title` jobs, then enable metadata delivery, so a rename
+   problem is separable from a text problem.
 6. MCP authorization, the ledger filter, and bounded paging, with the isolation and fail-closed tests.
 7. Backfill bucket by bucket — which also re-extracts the corpus that currently holds Papra's
    mangled German text, so no mangle-survey heuristic is needed — then retire `ocr.py` and
-   `titles.py`, and only then.
+   `titles.py`, and only then. **Retirement ends the one-flag rollback**: after step 7, falling back
+   means restoring deleted code and re-indexing, so steps 4 and 5 are where a bad extractor decision
+   is cheap to reverse.
 8. The operator enables auto-tagging per bucket in the Papra UI and sets `deu,eng` in his `.env`; the
    test compose mirrors the language setting. Nothing in our code requests `organizations:update` or
    touches either setting.
