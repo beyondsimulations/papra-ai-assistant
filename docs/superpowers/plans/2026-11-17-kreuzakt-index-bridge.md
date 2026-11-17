@@ -51,7 +51,7 @@
 | `papra_suite/pipeline.py` (modify) | `enqueue_index_job`, verification and cleanup loops in `serve` |
 | `papra_suite/config.py` (modify) | Kreuzakt URL, delivery flags, scan caps, bounds |
 | `papra_suite/mcp_tokens.py`, `mcp_server.py`, `mcp_tools.py` (new) | tokens with per-token buckets; MCP app (auth/transport from the 2026-11-16 spec); the six tools |
-| `papra_suite/webhooks.py` (new, conditional on Task 3) | Papra event receiver that produces **reconciliation hints only** |
+| `papra_suite/webhooks.py` (dropped, see Task 10) | Papra event receiver — out of v1; the six-hour verification pass is the mechanism instead |
 | `papra_suite/metadata_cli.py`, `jobs_cli.py`, `backfill_cli.py`, `ledger_cli.py` (new) | operator surface |
 | `papra_suite/ocr.py`, `titles.py` (deleted in Task 16) | the workers Kreuzakt replaces |
 | `docker-compose.test.yml`, `Makefile`, `README.md` (modify) | pinned Kreuzakt, private network, runbooks |
@@ -89,7 +89,7 @@ All live in `tests/conftest.py` unless a task says otherwise.
 | `hit` / `hit_for` | `hit(kreuzakt_id) -> KzHit`, `hit_for(papra_document_id) -> KzHit` bound to a seeded reference |
 | `stats_of` | `stats_of(page) -> ResolveStats`, i.e. `page.stats` |
 | `describe` | `describe(page) -> str` — the human summary line MCP returns alongside the page |
-| `event_body` / `signed` / `sign_headers` / `post_event` | Task 10's webhook helpers, built from Task 3's measured payload shape |
+| `event_body` / `signed` / `sign_headers` / `post_event` | archived with Task 10; nothing builds them, so no later task may reference them |
 | `call_tool` | `call_tool(client, *, token, name, **args) -> pydantic model` — one MCP tool call over the SDK client |
 
 ---
@@ -266,7 +266,7 @@ Paste the two captured payloads into `tests/fixtures/kreuzakt_queue_page.json` a
 
 - [ ] **Step 4: Write the verdicts into the spec, both ways**
 
-Replace the §10 bullets with the measured answers. If queue correlation cannot be made unambiguous (#4, #6), Task 5's correlation stays as written but Task 6 gains "refuse to deliver when correlation is ambiguous" as a hard rule instead of a preference. If attribution (#3, step 3) is absent, Task 10 is limited to delete/restore hints and the plan says so; if webhook delivery is unusable, mark Task 10 **skipped** with the evidence, and Tasks 8/9 carry protection alone.
+Replace the §10 bullets with the measured answers. If queue correlation cannot be made unambiguous (#4, #6), Task 5's correlation stays as written but Task 6 gains "refuse to deliver when correlation is ambiguous" as a hard rule instead of a preference. Attribution (#3, step 3) no longer decides any task in this plan — Task 10 was dropped by the operator on 2026-11-17 — but record the answer anyway, because it is the one fact that decides whether a future receiver could distinguish our own PATCH from a human rename.
 
 - [ ] **Step 5: Commit**
 
@@ -789,7 +789,7 @@ async def run_index_job(kz, store, job, *, papra, poll_s=2.0, wait_timeout_s=900
 ```
 `ledger_set_kreuzakt_id` therefore becomes `-> bool`, performing `UPDATE … WHERE delivered_generation IS NULL OR delivered_generation = :expected` inside one transaction, and `Store.get_generation()` is read at job start only.
 
-The delivery call is also gated **inside** `deliver_content` (Task 7), not only here: a flag that is checked solely by the scheduler can be bypassed by the webhook path, the convergence pass, or a CLI invocation.
+The delivery call is also gated **inside** `deliver_content` (Task 7), not only here: a flag that is checked solely by the scheduler can be bypassed by an inbound trigger, the convergence pass, or a CLI invocation. (Task 10's webhook path was dropped, but the gate stays: it is what makes any future inbound path safe by construction rather than by review.)
 `_create` records `papra_original_name=document["name"]` at first sight — the baseline Task 8 needs, captured here because this is the first moment we hold the Papra document.
 
 - [ ] **Step 3: Enqueue and wire, preserving crash ordering**
@@ -1237,17 +1237,37 @@ git add -A && git commit -m "feat(index): crash-durable reference-counted delete
 
 ---
 
-### Task 10: Papra webhook receiver — reconciliation hints only (gate: Task 3)
+### Task 10: Papra webhook receiver — **DROPPED, do not implement** (operator decision 2026-11-17)
 
-A webhook that treats "an update happened" as "a human edited this field" would protect our own titles and silently disable renaming across the corpus. So the receiver never decides ownership: it triggers the ordinary re-fetch-and-compare path, and ownership stays exactly where Task 8 put it. If Task 3 showed delivery is unusable, mark this task **skipped** with the evidence and continue — Tasks 8 and 9 stand alone.
+> **Status: out of v1.** The operator accepted the cost of the six-hour `_verification_loop`
+> (Task 7, `interval_s=21600`) as the propagation window for human edits and deletions made in
+> Papra's own UI, in exchange for not standing up a new inbound HTTP listener with its own secret
+> and its own fight with `webhookUrlAllowedHostnames`. Nothing else in this plan depends on the
+> receiver: ownership is decided by Task 8's comparison, delete propagation by Task 9, and
+> convergence by Task 7. **Skip this task.** The design below is kept as an archive so a revival
+> does not have to be re-derived, and it is not free of defects: it originally claimed to mount on
+> "the existing loopback dashboard listener", and no such listener exists — `config.py` parses
+> `DASHBOARD_BIND` into `Config.dashboard_port` and nothing outside `config.py` reads that field,
+> because the M4 dashboard was never built (spec §12 milestone 4). A revived receiver needs its own
+> loopback bind inside `serve`, and must not be bolted onto the MCP server: that app is the
+> read-only trust boundary and should not also accept inbound pushes.
+>
+> **Revival conditions.** Revisit only if a human-edit-in-Papra-latency complaint actually happens,
+> and only with Task 3's measured answer to one question: does a `document.updated` payload name the
+> actor at all? Without an actor field the receiver can only ever be a nudge (which is still safe,
+> since it decides nothing); with one, it can stop re-fetching on our own writes.
+
+Historic rationale, still true and still the reason the design is shaped this way: a webhook that treats "an update happened" as "a human edited this field" would protect our own titles and silently disable renaming across the corpus. So the receiver never decides ownership: it triggers the ordinary re-fetch-and-compare path, and ownership stays exactly where Task 8 put it. If Task 3 showed delivery is unusable, mark this task **skipped** with the evidence and continue — Tasks 8 and 9 stand alone.
 
 **Files:** Create `papra_suite/webhooks.py`, `tests/test_webhooks.py`; Modify `papra_suite/pipeline.py`.
 
 **Interfaces:**
 - Consumes: the payload/signature measured in Task 3; `Store.dedup_exists/add_dedup` (existing) for replay suppression; `deliver_content`, `deliver_metadata`, `reconcile_deletions`.
-- Produces: `WebhookReceiver(store, papra, kz, *, secret) -> Starlette` with `POST /hooks/papra`, mounted on the existing loopback dashboard listener. `WEBHOOK_EVENTS = {"document.updated", "document.deleted", "document.restored"}`.
+- Produces (archived design, not built): `WebhookReceiver(store, papra, kz, *, secret) -> Starlette` with `POST /hooks/papra` on its own loopback bind. `WEBHOOK_EVENTS = {"document.updated", "document.deleted", "document.restored"}`.
 
 - [ ] **Step 1: Write the failing tests**
+
+(Not scheduled — no implementer runs the steps below.)
 
 ```python
 async def test_forged_or_missing_signature_is_rejected_401(store, client):
@@ -1857,7 +1877,7 @@ Then rewrite `HANDOFF.md`: the topology, the two delivery flags and their drain-
 | --- | --- |
 | §4.1 extraction stays on, `deu,eng`, convergence | Task 2 (compose mirror), Task 7 (convergence, suppression) |
 | §4.2 bridge steps 1–6, contract facts, unique filenames, correlation, blank-page rule | Tasks 3, 5, 6, 7 |
-| §4.3 name/date/notes ownership, Papra-side baselines, escape hatch | Task 8 (+ Task 10 as a trigger, never as proof) |
+| §4.3 name/date/notes ownership, Papra-side baselines, escape hatch | Task 8 (ownership lives there alone; the dropped Task 10 was only ever a trigger) |
 | §4.4 Kreuzakt config, no published port, Dokploy placement | Task 2 |
 | §4.5 six tools, Papra-only links, no pass-through | Tasks 12, 13, 14 |
 | §4.6 deletions from our codebase | Task 16 |
@@ -1866,7 +1886,7 @@ Then rewrite `HANDOFF.md`: the topology, the two delivery flags and their drain-
 | §7 data model, generation | Tasks 4, 11 |
 | §8 test plan | Tasks 4, 6, 7, 8, 9, 11, 13, 14; integration in 6, 7, 10, 12 |
 | §9 quality risk and the extraction-empty signal | Tasks 6 (counting), 7 (`check`), 16 (steps 1 and 3) |
-| §10 webhooks, date/notes quality | Tasks 3, 10, 16 |
+| §10 webhooks, date/notes quality | Tasks 3, 16 (Task 10 dropped 2026-11-17; webhooks measured for the record only) |
 | §11 sequencing incl. drain-before-flip | task order 1 → 16, with drains in 7, 8, 16 |
 | §14 tokens by CLI, no dashboard | Task 12 |
 
@@ -1891,7 +1911,7 @@ The review rejected v1 as executable and named six defects. Each is resolved abo
 | One impossible test, and undeclared fixture names | Task 13's dominant-bucket test now seeds five authorized references; `fake_papra`/`fake_kz`/`_fill`/`papra_doc` are declared in the scaffolding table |
 | `index_status` leaked corpus-wide counts to scoped tokens | Task 12 returns queue counts only to `--all-buckets` tokens |
 | Paging: `partial` misreported, many-to-one expansion unspecified, no input bounds | Task 13 states stop conditions, the definition of `partial`, expansion/dedup rules, bounds, and tests for exact multiples of 100 and pages past the end |
-| Webhooks could protect our own writes | Task 10 demotes events to reconciliation hints; ownership decisions stay in Task 8's comparison; replay suppression via `Store.add_dedup` |
+| Webhooks could protect our own writes | Task 10 demotes events to reconciliation hints; ownership decisions stay in Task 8's comparison; replay suppression via `Store.add_dedup` — the receiver itself was later dropped, and these three rules are the conditions any revival must keep |
 | House style: literal `...`, guessed payloads, mental mutation checks | Fixtures come from Task 3's captures instead of invented field names; every mutation check is a `sed` + `pytest` command pair; no placeholder test bodies remain — each named test has assertions in it |
 
 Still open, and honestly so: Kreuzakt's German quality against omlx (Task 16 Step 1 is the first real evidence, and rollback is cheap until Step 4); queue retention beyond a few thousand rows; Papra actor attribution if the probe cannot find it; and upstream durability — the exit is re-indexing from Papra, not swapping indexers in place.
