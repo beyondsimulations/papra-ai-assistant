@@ -112,10 +112,14 @@ nor enrichment: the two schedule sites are document creation and `POST /document
 write-back cannot loop and cannot re-tag.
 
 Convergence is the job of the verification pass rather than of ordering. Every six hours, and once at
-startup, read each document's detail and `PATCH` any whose content hash differs from the ledger's
-`delivered_sha`; count the repairs in `check`. If one document flip-flops more than twice in a day,
-stop repairing it and log at `ERROR` naming `/reprocess`, because that pattern means something is
-deliberately reclaiming the column and out-writing it forever is how an unexplainable bug gets made.
+startup, read each document's detail and `PATCH` any whose content differs from what the ledger says
+we delivered, repairing **from the current Kreuzakt content and version** rather than trusting a
+stale stored hash; count the repairs in `check`. Divergence is tracked per document
+(`repair_count`, `last_repair_at`) over a rolling window, with `papra-suite jobs --reset` as the
+operator path back. If one document diverges more than twice in a day, stop repairing it and log at
+`ERROR` naming the observable rather than a culprit: `/reprocess`, a manual content edit, a bridge
+bug, and a second writer are all consistent with that pattern, and naming the wrong one is how an
+unexplainable bug gets made.
 
 With extraction on, `DOCUMENTS_OCR_LANGUAGES` matters: at its default the instance reads German with
 English language data and produces `StraBe` and `GriiBe`, which is now not only wrong text in the box
@@ -133,47 +137,78 @@ workers go away.
 
 Per document:
 
-1. Upload the original bytes to Kreuzakt. Kreuzakt dedupes by hash during ingest, so a retry does not
-   create a second copy — the exact behaviour to confirm first in the spike (§9), because idempotent
-   retries are what the rest of this assumes.
-2. Resolve the Kreuzakt document id through the queue: `processing_queue.document_id` is populated on
-   success, so `hash → queue entry → document_id` works even if the upload response is lost. Record
-   the mapping in the ledger (§8).
-3. Wait for `status = 'completed'`. Emptiness is never the predicate: a blank page legitimately
-   completes with `content = ''`, and PATCHing that would wipe Papra. On `failed`, log the queue's
-   `error` and use `POST /api/queue/{id}/retry` under the job queue's own attempt ceiling.
+**Contract first.** Kreuzakt dedupes by hash, which this design initially treated as a convenience.
+It is a change of cardinality: the same bytes in two buckets become **one** Kreuzakt document, so
+Papra document → Kreuzakt document is many-to-one, not one-to-one (§7). Before any of this is
+planned into code, the upload contract gets measured, because the bridge's idempotency rests on it
+and the queue schema holds `filename` and `document_id` but **no hash** — so the obvious recovery
+for a lost upload response does not follow from the schema and must not be assumed:
+
+- duplicate upload while the first is still processing;
+- duplicate upload after completion, and whether the response carries the existing document id;
+- whether a lost upload response can be resolved to a document id through supported APIs at all, and
+  if not, whether the bridge must carry its own correlation handle;
+- queue retention, and what a `rescan` does to `document_id` and `updated_at`.
+
+Per document:
+
+1. Upload the original bytes, then resolve the Kreuzakt document id by whatever the contract test
+   proves is the supported route — the upload response if it carries one, otherwise a lookup that
+   exists — and record it in the ledger as a reference (§7).
+2. Wait for `status = 'completed'`. **Completion means the pipeline finished, not that the page has
+   no text**: an empty `content` may be a blank page, a failed-but-unreported extraction, or the
+   keyless mode that skips OCR. So empty text is never written over non-empty Papra text, and it is
+   reported as `extraction-empty`, a distinct category from `legitimately-blank`, which nothing can
+   actually establish from here. On `failed`, log the queue's `error` and use
+   `POST /api/queue/{id}/retry` under the job queue's own attempt ceiling.
 4. `PATCH` Papra with `content` when Kreuzakt's `updated_at` is newer than what the ledger says we
    last delivered — so a `rescan` or `reindex-all` propagates rather than being ignored — and skip
    when the text is empty and Papra's is not.
 5. Rename per §4.3, separately from content, because the two have different rules.
-6. Deletes go one way. Papra is the record: a Papra deletion (soft-delete is visible as
-   `isDeleted`/`deletedAt`, which probe E confirmed in both listing and detail) propagates to
-   `DELETE /api/documents/{id}`. A Kreuzakt deletion never propagates back; it makes the document
-   unfindable, which is honest, and the next sweep re-indexes it.
+6. Deletes are reference-counted, and still one-way. Papra is the record, so a Papra deletion
+   (`isDeleted`/`deletedAt`, which probe E confirmed in both listing and detail) removes that
+   document's **reference**: it stops resolving for every token immediately, and Kreuzakt's `DELETE
+   /api/documents/{id}` is issued only when no active reference remains. Deleting one bucket's copy
+   of a file that another bucket also holds must not remove the index entry the survivor depends on.
+   A Kreuzakt deletion never propagates back; it makes every referencing document unfindable, which
+   is honest, and the next sweep re-indexes it.
 
 Papra-native uploads — web UI, intake email — are covered without new machinery: `sweep_once`
 already exists to "record and enqueue OCR for externally-ingested documents", so its
 enqueue call site becomes an index enqueue and those documents enter the same pipeline.
 
-### 4.3 Titles, and never overwriting a rename
+### 4.3 Titles, and why your renames win in practice rather than by guarantee
 
-The bridge renames Papra documents with Kreuzakt's LLM title, but a human rename wins permanently.
-Before writing, read Papra's current `name` and rename only if it equals the name the ledger says we
-last wrote, or, when there is no ledger row for it, equals the original upload filename — checkable
-externally because Kreuzakt stores `original_filename`. Anything else is a human edit: log once and
-stop touching `name` for that document forever, while content updates continue.
+The bridge renames Papra documents with Kreuzakt's LLM title, and a rename you made is meant to
+survive. Before writing, read Papra's current `name` and rename only if it equals the name the ledger
+says we last wrote, or, when there is no ledger row for it, equals the original upload filename —
+checkable externally because Kreuzakt stores `original_filename`. Anything else is treated as a human
+edit: log once, set `name_protected`, and stop touching `name` for that document, while content
+updates continue.
 
-Papra offers no compare-and-set on `name`, so a rename landing between our read and our write can
-still be clobbered; that is a best-effort boundary, and its worst case is one lost rename rather
-than lost text. `--force-names` re-titles deliberately and updates the ledger; a per-document
+This is a **read-then-write heuristic, not a compare-and-swap**, and the spec should not call it
+one. Papra offers no conditional write on `name`, so a rename landing between our read and our write
+is overwritten, and a store rebuilt without ledger history cannot distinguish our last title from
+yours — which is why the original-filename rule exists as a fallback. The honest claim is: deliberate
+renames survive the ordinary path, the window is small, and the worst case is one lost rename rather
+than lost text. The same policy statement applies to `content` and is worth saying out loud: **a
+manual edit to Papra's content will be overwritten** by the next delivery or verification pass.
+Per-reference rename state lives on the ledger row for each Papra document, so two buckets holding
+the same bytes protect their own names independently. `--force-names` re-titles deliberately and updates the ledger; a per-document
 `names --restore-auto` opts a protected name back in.
 
 ### 4.4 Kreuzakt configuration
 
 One container, `DATA_DIR` on a real volume, `OCR_VLM_BASE_URL` and `METADATA_LLM_*` pointed at the
-operator's local OpenAI-compatible endpoint, so extraction and titling stay free, and bound to
-loopback with **its own UI never served** — an unauthenticated archive is not worth a nicer queue
-screen, which is why queue visibility arrives as `index_status` and a `check` line instead. Two
+operator's local OpenAI-compatible endpoint, so extraction and titling stay free, and **published on
+no host port at all**: Kreuzakt joins a private compose network shared only with the suite container,
+and the suite reaches it by service name. Publishing `127.0.0.1:port` would not work for this shape —
+the loopback of the published port is the host's, not the suite container's `localhost` — and it would
+also put an unauthenticated service on a host port for no benefit. The reachability list is therefore
+short and must be written down: the suite container, and nothing else, plus the host if someone
+`docker exec`s into the network by hand. Its own UI stays unserved — an unauthenticated archive is not
+worth a nicer queue screen, which is why queue visibility arrives as `index_status` and a `check` line
+instead. Two
 operational notes worth recording: nothing coordinates OCR concurrency across the queue, so a bulk
 import is a sustained load on one local VLM and backfills should go one bucket at a time; and
 Kreuzakt keeps its own copy of every original, so disk holds each document twice, once per system.
@@ -223,18 +258,26 @@ gates. Nothing about mail ingestion changes.
 
 ## 5. Invariants
 
-1. Kreuzakt is reachable from the host only. Any client-visible URL in any tool response points at
-   Papra.
-2. Every MCP handler resolves through the ledger and filters on the token's buckets; there is no
-   handler-local query path.
+1. Kreuzakt is reachable only from the private compose network the suite shares with it; no host port
+   is published. Any client-visible URL in any tool response points at Papra.
+2. Every MCP handler resolves through the ledger and filters on the token's buckets, and resolution
+   **fails closed**: an unknown, stale, deleted, or unreconciled Kreuzakt id yields nothing rather
+   than a best guess. The ledger is an authorization lookup, not a live copy of Papra's permissions,
+   so the document's current Papra state is checked on the way out and the reconciliation delay is
+   documented rather than hidden.
 3. Papra writes `content` once, at upload; the bridge writes it only after Kreuzakt reports
-   `completed`, never on emptiness; and the verification pass converges the column onto what the
-   bridge delivered, within six hours, without repairing a document that is flip-flopping.
-4. A `name` a human changed is never written again by us.
-5. Deletes propagate Papra→Kreuzakt only.
-6. Every uploaded file has exactly one Kreuzakt document, provable by hash, after retries.
-7. A search result the caller is not entitled to see cannot be returned by any tool, under any
-   query, in any bucket combination.
+   `completed`, and never empty over non-empty. The column then **converges eventually** — repaired
+   from the current Kreuzakt content and version, on a six-hour cycle plus startup — which is a
+   cadence, not a bound: an outage or a suppressed repair extends it.
+4. A `name` you changed is protected on the ordinary path; the guarantee is best-effort, not atomic
+   (§4.3).
+5. Deletes propagate Papra→Kreuzakt only, and only when no active reference to that Kreuzakt document
+   remains.
+6. One Kreuzakt document per distinct file hash; any number of Papra documents may reference it, in
+   one bucket or several.
+7. A search result the caller is not entitled to see cannot be returned by any tool, under any query,
+   in any bucket combination — and a hit is expanded into that caller's **authorized, active** Papra
+   references, not into whichever reference the bridge happened to index first.
 
 ## 6. Failure and reconciliation
 
@@ -255,23 +298,37 @@ gates. Nothing about mail ingestion changes.
 One new table, and it carries three jobs: Kreuzakt↔Papra mapping, delivered-text bookkeeping, and
 rename protection.
 
+One row per **Papra** document — a reference, not a pairing. Kreuzakt dedupes by hash, so the same
+bytes in two buckets yield one Kreuzakt document and two rows that share `kreuzakt_id`; that is why
+there is deliberately **no unique index on `kreuzakt_id`** and why resolution returns a set.
+
 ```sql
 CREATE TABLE index_ledger (
     papra_org_id      TEXT NOT NULL,
     papra_document_id TEXT NOT NULL,
-    kreuzakt_id       INTEGER,
+    kreuzakt_id       INTEGER,         -- many rows may share one value, by design
     file_hash         TEXT NOT NULL,
     delivered_at      TEXT,            -- Kreuzakt updated_at we last PATCHed into Papra
     delivered_sha     TEXT,            -- sha of the delivered text, to skip no-op writes
-    written_name      TEXT,            -- the name we last wrote, for rename CAS
+    written_name      TEXT,            -- the name we last wrote, for the rename heuristic
     name_protected    INTEGER NOT NULL DEFAULT 0,
+    repair_count      INTEGER NOT NULL DEFAULT 0,
+    last_repair_at    TEXT,
     deleted_at        TEXT,
     PRIMARY KEY (papra_org_id, papra_document_id)
 );
-CREATE UNIQUE INDEX idx_index_ledger_kreuzakt ON index_ledger (kreuzakt_id)
-    WHERE kreuzakt_id IS NOT NULL;   -- resolution by Kreuzakt id must be single-valued
+CREATE INDEX idx_index_ledger_kreuzakt ON index_ledger (kreuzakt_id)
+    WHERE kreuzakt_id IS NOT NULL AND deleted_at IS NULL;  -- hit -> active references
 CREATE INDEX idx_index_ledger_hash ON index_ledger (file_hash);
 ```
+
+Three consequences of the reference model, all of them acceptance tests rather than notes. Deleting a
+reference excludes it from resolution immediately, and the upstream `DELETE` waits until no active
+reference remains. Rename protection and delivery state are per reference, so two buckets holding the
+same file can carry different titles and different repair histories. And **a rebuilt Kreuzakt can
+reuse integer ids**, so any rebuild or restore invalidates stored `kreuzakt_id` values before new
+results are accepted, and re-maps by `file_hash` without discarding `name_protected` or per-reference
+delivery state.
 
 Numbering note: `ingest-visibility` already adds migration 002, so this is **003** and lands after
 that merge, or is renumbered if the operator prefers the other order. Same lesson as that branch:
@@ -296,6 +353,14 @@ Unit (fake Kreuzakt and fake Papra transports):
 - **bucket isolation, the one that matters**: four documents in four buckets, tokens scoped to one
   bucket each, every tool driven; assert no cross-bucket id, title, text, or URL appears in any
   response, including via `list_recent_documents` and search paging.
+- **dedup is many-to-one, and deletion is reference-counted**: upload identical bytes into two
+  buckets, query with separately scoped tokens so each sees only its own, then delete one copy and
+  assert the survivor is still searchable, readable, and correctly titled, and that Kreuzakt was not
+  asked to delete the document it still needs. Restore must reconcile the reference back in.
+- **unknown and stale ids fail closed**: a Kreuzakt hit whose ledger row is missing, deleted, or
+  points at a document Papra reports deleted resolves to nothing for every token.
+- **rebuild safety**: wipe Kreuzakt, re-index, and assert the old integer ids cannot resolve to the
+  wrong document, while `name_protected` and per-reference delivery state survive.
 - over-fetch: hits for other buckets crowding the first Kreuzakt pages still yield a full page for
   the caller; scan cap produces `partial` rather than a short list presented as complete.
 - link rewriting: no response contains a Kreuzakt hostname or a Kreuzakt integer id as its
@@ -306,9 +371,10 @@ Unit (fake Kreuzakt and fake Papra transports):
 Integration, real containers on the tailnet-free ports:
 
 - mail attachment → Papra document → Kreuzakt index → Papra `content` replaced by Kreuzakt's text.
-  Assertions here are structural rather than byte-exact, because Kreuzakt is pointed at the real
-  local model in tests: content non-empty, different from what Papra's own pass produced, ledger
-  advanced, name renamed.
+  The wording of the OCR is non-deterministic, so the assertion is that **Papra's content equals the
+  text captured from Kreuzakt for that document** — transport fidelity is exact even when the model is
+  not — plus ledger advanced and name renamed. Do not assert that the text differs from Papra's own
+  pass: with `deu,eng` both can legitimately produce the same correct sentence.
 - a simulated late Papra write (write our text, then overwrite it, then run the verification pass) ⇒
   the column converges back, and a document that flip-flops twice is left alone with one `ERROR`.
 - a German scan through the whole chain, then `/api/search` for `Straße` and for an inflected form
@@ -362,6 +428,16 @@ say it: `POST /api/upload` dedupes by hash on retry, and `/api/search` response 
 - Upstream durability: this makes a young single-maintainer project the extractor and the index. The
   exit is the ledger plus hashes — originals can be re-fed to any other extractor, and Papra keeps a
   copy of the text — but the exit is a re-index, not a switch.
+- Whether Kreuzakt's upload contract supports the bridge's assumptions at all: dedupe semantics while
+  a first upload is still processing, whether a duplicate response carries the existing document id,
+  whether a lost upload response is resolvable through supported APIs (the queue stores `filename` and
+  `document_id` but no hash), and queue retention across rescans. §4.2 makes this the first task
+  precisely because none of it is verified.
+- How many of the operator's 500 documents are the same file in more than one bucket, which decides
+  how often the many-to-one reference model actually bites.
+- `ghcr.io/anaisbetts/kreuzakt` on Apple Silicon: no `linux/arm64` manifest was offered for the
+  `latest` tag when this was checked, and Xberg ships native Node bindings, which is the class of
+  dependency emulation breaks. Where the integration stack runs is undecided.
 - German quality of Kreuzakt's extraction on the operator's corpus, which §9 leaves unmeasured on
   purpose. The backfill is the first real evidence and the old worker is deleted after it.
 - Any Kreuzakt version behaviour beyond the commit read here; it should be pinned by digest the same
@@ -369,19 +445,32 @@ say it: `POST /api/upload` dedupes by hash on retry, and `/api/search` response 
 
 ## 11. Sequencing
 
-1. Merge `ingest-visibility`, then `ocr-prompt-language`.
-2. Run Kreuzakt locally and feed it the existing Papra corpus bucket by bucket. That pass doubles as
-   the observation window §9 describes, and it also settles what the previous spec left as an
-   operator decision: the corpus already holding Papra's mangled German text gets re-extracted here
-   and the result written into Papra, so no mangle-survey heuristic is needed once the extractor is
-   replaced.
-3. Ledger and bridge on the job queue; `ocr.py` and `titles.py` deleted after that pass, not before
-   it.
-4. MCP server: auth and transport from the existing spec, five tools over Kreuzakt, bucket filter,
-   Papra link rewriting.
-5. The operator enables auto-tagging per bucket in the Papra UI and sets `deu,eng` in his `.env`;
-   the test compose mirrors the language setting. Nothing in our code requests
-   `organizations:update` or touches either setting.
+Ordered so that each step's failure is reversible without touching the system of record.
+
+1. **Contract test first** (§4.2): upload, dedupe, duplicate-while-processing, lost response, queue
+   retention, rescan behaviour. If resolution by anything other than the upload response turns out to
+   be unsupported, the reference model and the idempotency story change here, cheaply, rather than
+   after the bridge exists.
+2. Ledger, and Kreuzakt deployed on its private network with no published port.
+3. **Index without modifying Papra.** The bridge uploads, waits, and records — it does not write.
+   Prove retry, duplicate, deletion, restore, and rebuild behaviour while Papra is untouched, because
+   this is the last phase where a bridge bug cannot corrupt the record.
+4. Enable content delivery alone, and confirm Papra looks right.
+5. Enable title delivery separately, so a rename problem is separable from a text problem.
+6. MCP authorization, the ledger filter, and bounded paging, with the isolation and fail-closed tests.
+7. Backfill bucket by bucket — which also re-extracts the corpus that currently holds Papra's
+   mangled German text, so no mangle-survey heuristic is needed — then retire `ocr.py` and
+   `titles.py`, and only then.
+8. The operator enables auto-tagging per bucket in the Papra UI and sets `deu,eng` in his `.env`; the
+   test compose mirrors the language setting. Nothing in our code requests `organizations:update` or
+   touches either setting.
+
+A platform caveat that changes step 2 and the test stack: `ghcr.io/anaisbetts/kreuzakt` published no
+`linux/arm64` manifest when this was checked, so on Apple Silicon it runs only under emulation, and
+Xberg ships native Node bindings which are exactly the kind of dependency emulation breaks. Either
+the integration stack runs on the amd64 host that already runs the rest, or the pinned digest is
+checked for an arm64 variant before `make test-integration` is asked to depend on it. This is
+unresolved, not settled.
 
 ## 12. What this supersedes
 
