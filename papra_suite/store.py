@@ -1276,6 +1276,12 @@ class Store:
         current (a corrupt `index_generation`) this raises and writes nothing — a
         reference marked deleted against an unknown index would be dropped without
         anything being queued for it.
+
+        Scope of that guarantee: it makes the *count* correct at the moment the row
+        is marked, nothing more. The upstream delete that a `(id, 0)` answer
+        authorises happens later, in another pass, and has to revalidate against the
+        generation and any surviving reference for itself — being owed a delete is
+        not the same as being allowed to perform one.
         """
         with self._lock:
             # BEGIN IMMEDIATE: the reading below and the `deleted_at` write have to
@@ -1338,20 +1344,21 @@ class Store:
     def ledger_record_delivery(
         self, *, papra_org_id: str, papra_document_id: str, delivered_at: str,
         delivered_sha: str, generation: int,
-    ) -> bool:
-        """Record what we last wrote into Papra; report whether the row accepted it.
+    ) -> None:
+        """Record what we last wrote into Papra, for the generation bound now.
 
         `delivered_sha` is the hash of the text we delivered — the convergence pass
         compares Kreuzakt's current text against it, and `EMPTY_EXTRACTION_SHA` is
         how "extraction produced nothing" becomes countable.
 
         This is an authorization write, not a receipt, because it stamps
-        `delivered_generation` — the column that makes a binding resolve. So it is
-        conditional on the row being bound to `generation`: stamping the current
-        generation onto a row still bound to a destroyed index would make that stale
-        integer resolvable again, and a late worker restamping a rebound row would
-        retire a live one. A caller that ignores the return value gets a no-op it
-        can detect, which is why this does not return None.
+        `delivered_generation` — the column that makes a binding resolve. So the
+        write is conditional on the row being bound to `generation`: stamping the
+        current generation onto a row still bound to a destroyed index would make
+        that stale integer resolvable again, and a late worker restamping a rebound
+        row would retire a live one. A refused write logs, because a tripwire
+        nobody can see is a tripwire that will be stepped on: the return contract
+        is `None` either way, so the row's state and this line are the evidence.
         """
         with self._lock, self._conn:
             cursor = self._conn.execute(
@@ -1362,7 +1369,13 @@ class Store:
                 (delivered_at, delivered_sha, generation, papra_org_id, papra_document_id,
                  generation),
             )
-        return cursor.rowcount > 0
+            refused = cursor.rowcount == 0
+        if refused:
+            logger.warning(
+                "delivery refused papra=%s/%s: no reference is bound to generation %s,"
+                " so %s was not recorded",
+                papra_org_id, papra_document_id, generation, delivered_sha,
+            )
 
     def ledger_record_metadata(
         self, *, papra_org_id: str, papra_document_id: str, name: str | None = None,
@@ -1579,6 +1592,21 @@ class Store:
             ).fetchall()
         return [_row_to_ledger_ref(row) for row in rows]
 
+    def _read_cleanup_row(self, papra_org_id: str, papra_document_id: str) -> sqlite3.Row | None:
+        """The cleanup columns of one reference.
+
+        **Caller must already hold `self._lock` and the write transaction.** It is a
+        method rather than an inline statement so the transaction's scope is
+        testable: what makes the attempt counter correct is that this read happens
+        while the write lock is held, and that is not observable from the outside
+        unless the read is somewhere a test can stand.
+        """
+        return self._conn.execute(
+            "SELECT cleanup_state, cleanup_attempts, cleanup_kreuzakt_id FROM index_ledger"
+            " WHERE papra_org_id = ? AND papra_document_id = ?",
+            (papra_org_id, papra_document_id),
+        ).fetchone()
+
     def ledger_cleanup_result(
         self, *, papra_org_id: str, papra_document_id: str, ok: bool,
         next_at: str | None = None, reason: str | None = None,
@@ -1598,35 +1626,46 @@ class Store:
         was_failed = False
         cleanup_kreuzakt_id: int | None = None
         attempts = 0
-        with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT cleanup_state, cleanup_attempts, cleanup_kreuzakt_id"
-                " FROM index_ledger WHERE papra_org_id = ? AND papra_document_id = ?",
-                (papra_org_id, papra_document_id),
-            ).fetchone()
-            if row is None:
-                raise ValueError(
-                    f"unknown ledger reference: {papra_org_id}/{papra_document_id}"
-                )
-            if ok:
+        with self._lock:
+            # BEGIN IMMEDIATE: reading `cleanup_attempts` and `cleanup_state` and
+            # writing them back is one decision. Outside the write lock, the
+            # daemon's cleanup pass and an operator's forced `ledger --cleanup` can
+            # both read attempt 4, both write 5, lose an increment, and announce the
+            # permanent failure twice — which breaks the one thing that log line is
+            # for: being countable.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._read_cleanup_row(papra_org_id, papra_document_id)
+                if row is None:
+                    self._conn.rollback()
+                    raise ValueError(
+                        f"unknown ledger reference: {papra_org_id}/{papra_document_id}"
+                    )
+                if ok:
+                    self._conn.execute(
+                        "UPDATE index_ledger SET cleanup_state = 'done',"
+                        " cleanup_next_at = NULL"
+                        " WHERE papra_org_id = ? AND papra_document_id = ?",
+                        (papra_org_id, papra_document_id),
+                    )
+                    self._conn.commit()
+                    return
+                was_failed = row["cleanup_state"] == "failed"
+                attempts = row["cleanup_attempts"] + 1
+                permanent_now = attempts >= CLEANUP_MAX_ATTEMPTS
                 self._conn.execute(
-                    "UPDATE index_ledger SET cleanup_state = 'done', cleanup_next_at = NULL"
+                    "UPDATE index_ledger SET cleanup_state = ?, cleanup_attempts = ?,"
+                    " cleanup_next_at = ?"
                     " WHERE papra_org_id = ? AND papra_document_id = ?",
-                    (papra_org_id, papra_document_id),
+                    ("failed" if permanent_now else "pending", attempts,
+                     next_at if next_at is not None else _now(),
+                     papra_org_id, papra_document_id),
                 )
-                return
-            was_failed = row["cleanup_state"] == "failed"
-            attempts = row["cleanup_attempts"] + 1
-            permanent_now = attempts >= CLEANUP_MAX_ATTEMPTS
-            self._conn.execute(
-                "UPDATE index_ledger SET cleanup_state = ?, cleanup_attempts = ?,"
-                " cleanup_next_at = ?"
-                " WHERE papra_org_id = ? AND papra_document_id = ?",
-                ("failed" if permanent_now else "pending", attempts,
-                 next_at if next_at is not None else _now(),
-                 papra_org_id, papra_document_id),
-            )
-            cleanup_kreuzakt_id = row["cleanup_kreuzakt_id"]
+                cleanup_kreuzakt_id = row["cleanup_kreuzakt_id"]
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         # Success is silent: the caller logs its per-pass tally, and a completion
         # line written next to the failure lines would only make them harder to
         # read. The ERROR belongs to the transition into `failed`, not to every

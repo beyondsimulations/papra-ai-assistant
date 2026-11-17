@@ -329,45 +329,55 @@ def test_ledger_get_unknown_returns_none(store):
     assert store.ledger_get("org-a", "doc-1") is None
 
 
-def test_record_delivery_refuses_a_row_it_cannot_vouch_for(store):
+def test_record_delivery_refuses_a_row_it_cannot_vouch_for(store, caplog):
     """Recording a delivery also stamps `delivered_generation`, which is what makes
     a binding resolve — so it is an authorization write, not a receipt.
 
     Writing the current generation onto a row still bound to a destroyed index
     would make that stale integer resolvable again; writing an old generation onto
-    a freshly rebound row would retire a live one. Both are refusals, and the
-    return value has to say so (the same reason `ledger_set_kreuzakt_id` returns a
-    bool rather than None).
+    a freshly rebound row would retire a live one. Both are refusals.
+
+    The refusal is visible in the row and in the log, not in the return value:
+    this method's contract is `-> None`, and a caller that cannot see the refusal
+    in either of those two places would be the bug.
     """
     store = two_refs(store)
     stale = store.get_generation()
     store.bump_generation()
-    assert store.ledger_record_delivery(
-        papra_org_id="org-a", papra_document_id="doc-1", delivered_at="x",
-        delivered_sha="ca" * 32, generation=store.get_generation()) is False
+    with caplog.at_level("INFO"):
+        assert store.ledger_record_delivery(
+            papra_org_id="org-a", papra_document_id="doc-1", delivered_at="x",
+            delivered_sha="ca" * 32, generation=store.get_generation()) is None
+    assert "delivery refused" in caplog.text
     ref = store.ledger_get("org-a", "doc-1")
     assert ref.delivered_sha is None and ref.delivered_generation == stale
     # recording for the generation the row is actually bound to still works
     assert store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-1",
                                         delivered_at="x", delivered_sha="ca" * 32,
-                                        generation=stale) is True
+                                        generation=stale) is None
+    ref = store.ledger_get("org-a", "doc-1")
+    assert ref.delivered_sha == "ca" * 32
+    # an unknown reference is a no-op, not an error for a document nobody tracked
     assert store.ledger_record_delivery(papra_org_id="org-z", papra_document_id="doc-z",
                                         delivered_at="x", delivered_sha="ca" * 32,
-                                        generation=stale) is False
+                                        generation=stale) is None
 
 
-def test_a_late_delivery_cannot_restamp_a_rebound_row(store):
+def test_a_late_delivery_cannot_restamp_a_rebound_row(store, caplog):
     store = two_refs(store)
     old = store.get_generation()
     store.bump_generation()
     current = store.get_generation()
     store.ledger_set_kreuzakt_id(papra_org_id="org-a", papra_document_id="doc-1",
                                  kreuzakt_id=42, generation=current)
-    assert store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-1",
-                                        delivered_at="x", delivered_sha="ca" * 32,
-                                        generation=old) is False
+    with caplog.at_level("INFO"):
+        store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-1",
+                                     delivered_at="x", delivered_sha="ca" * 32,
+                                     generation=old)
     ref = store.ledger_get("org-a", "doc-1")
     assert (ref.kreuzakt_id, ref.delivered_generation) == (42, current)
+    assert ref.delivered_sha is None
+    assert "delivery refused" in caplog.text
 
 
 # -- protection ---------------------------------------------------------------
@@ -816,6 +826,51 @@ def test_permanent_cleanup_failure_is_announced_once(store, caplog):
     assert ref.cleanup_state == "failed"
     assert ref.cleanup_attempts > store_module.CLEANUP_MAX_ATTEMPTS
     assert sum("cleanup failed permanently" in r.message for r in caplog.records) == 1
+
+
+def test_cleanup_result_holds_the_write_lock_while_it_counts(store, tmp_path, monkeypatch):
+    """Same hazard as the delete count, one layer down.
+
+    The attempt counter and the "did this row just become permanently failed?"
+    judgement are a read-modify-write. Read outside the write lock, two migrators
+    — the daemon's cleanup pass and an operator's forced `ledger --cleanup` — both
+    see attempt 4, both write 5, and the operator hears "we have stopped trying"
+    twice about one delete while one increment is lost. Proven by having the read
+    itself attempt an independent write from a second connection.
+    """
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-17T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1)
+    other = Store(tmp_path / "state.db")
+    other._conn.execute("PRAGMA busy_timeout=50")
+    real_read = Store._read_cleanup_row
+    observed = []
+
+    def spy(self, papra_org_id, papra_document_id):
+        row = real_read(self, papra_org_id, papra_document_id)
+        try:
+            other._conn.execute("BEGIN IMMEDIATE")
+            other._conn.execute(
+                "UPDATE index_ledger SET cleanup_attempts = 99 WHERE papra_document_id = ?",
+                (papra_document_id,),
+            )
+            other._conn.commit()
+            observed.append("second connection wrote during the read")
+        except sqlite3.OperationalError:
+            observed.append("refused")        # the write lock is held: correct
+            other._conn.rollback()
+        return row
+
+    monkeypatch.setattr(Store, "_read_cleanup_row", spy)
+    try:
+        store.ledger_cleanup_result(papra_org_id="o", papra_document_id="d", ok=False,
+                                    reason="kreuzakt 503")
+        assert observed == ["refused"]
+        assert store.ledger_get("o", "d").cleanup_attempts == 1
+    finally:
+        other.close()
 
 
 def test_ledger_ref_exposes_the_contract_fields_in_order():
