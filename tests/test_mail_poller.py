@@ -1079,7 +1079,7 @@ def _events(store):
 
 
 async def test_an_unsupported_attachment_is_recorded_with_sender_and_name(store, monkeypatch):
-    """The message it rode in on is marked \Seen and, with delete_after_download,
+    r"""The message it rode in on is marked \Seen and, with delete_after_download,
     deleted — so this row is the only place the skipped .zip will ever appear."""
     raw = build_raw(attachments=[("a.pdf", b"%PDF-1"), ("invoice.zip", b"PK\x03\x04")])
     session = FakeSession(raws=[(1, raw)])
@@ -1235,7 +1235,7 @@ class ExplodingStore:
 
 
 async def test_an_event_write_that_fails_does_not_fail_the_poll(store, monkeypatch):
-    """The quiet-catch is the whole point: an evidence row is worth less than a
+    r"""The quiet-catch is the whole point: an evidence row is worth less than a
     mailbox that keeps ingesting. So the poll must still upload, still mark
     \Seen, and still advance the persisted cursor with nothing recorded."""
     org_id = store.create_org(papra_org_id="org_papra", name="Test")

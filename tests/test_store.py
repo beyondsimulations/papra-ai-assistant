@@ -743,6 +743,61 @@ def test_migration_002_adds_ingest_events(tmp_path):
     store.close()
 
 
+def test_upgrade_from_001_adds_ingest_events_and_keeps_rows(tmp_path):
+    """The upgrade a real operator's file goes through: only migration 001 has
+    ever been applied, the file holds rows, and the current code opens it. The
+    test above starts from an empty database, so it never runs 002 as an upgrade
+    and never asks whether 001's data survived it — and its user_version check
+    tracks len(MIGRATIONS), so nothing there pins the number 2."""
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    store_module._migration_001_initial(conn)
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute(
+        "INSERT INTO documents (papra_org_id, papra_document_id, name, mime,"
+        " ingested_via, first_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("org_1", "doc_1", "rechnung-2026-11.pdf", "application/pdf", "mail",
+         "2026-11-16T09:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO jobs (id, kind, papra_org_id, document_id, content_hash,"
+        " payload, status, attempts, next_attempt_at, error, created_at,"
+        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("job_1", "ocr", "org_1", "doc_1", "a" * 64, '{"pages": 3}', "running",
+         1, "2026-11-16T09:00:00+00:00", "upstream 502",
+         "2026-11-16T08:00:00+00:00", "2026-11-16T08:30:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(db_path)
+    store.migrate()
+    try:
+        # Adding a migration 003 must bump this expected value to 3: that is the intended signal.
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        tables = {row[0] for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "ingest_events" in tables
+        document = store._conn.execute(
+            "SELECT papra_org_id, papra_document_id, name, mime, ingested_via,"
+            " first_seen_at FROM documents").fetchone()
+        assert tuple(document) == (
+            "org_1", "doc_1", "rechnung-2026-11.pdf", "application/pdf",
+            "mail", "2026-11-16T09:00:00+00:00")
+        job = store.get_job("job_1")
+        assert job is not None
+        assert (job.kind, job.papra_org_id, job.document_id) == (
+            "ocr", "org_1", "doc_1")
+        assert job.content_hash == "a" * 64
+        assert job.payload == {"pages": 3}
+        assert (job.status, job.attempts, job.error) == ("running", 1, "upstream 502")
+        assert job.next_attempt_at == "2026-11-16T09:00:00+00:00"
+        assert job.created_at == "2026-11-16T08:00:00+00:00"
+        assert job.updated_at == "2026-11-16T08:30:00+00:00"
+    finally:
+        store.close()
+
+
 def test_record_and_list_roundtrip_every_kind(store):
     for kind in _event_kinds():
         store.record_ingest_event(

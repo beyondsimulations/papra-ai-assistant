@@ -6,6 +6,9 @@ __pycache__/
 data/
 *.db
 
+# Setuptools metadata from an editable `pip install -e .` — build output, not source.
+*.egg-info/
+
 # pi agent profile (local-only: model routing, agent personas, loop skill)
 .pi/
 
