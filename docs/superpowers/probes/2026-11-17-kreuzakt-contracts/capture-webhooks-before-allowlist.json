@@ -1,0 +1,417 @@
+{
+  "signup": {
+    "status": 200
+  },
+  "organization_id": "org_s08nmyx6n7cvxfkqeyvkp6e3",
+  "Q1_creation_with_dotted_event_and_no_name": {
+    "request": {
+      "url": "http://host.docker.internal:8099/hook",
+      "events": [
+        "document.updated"
+      ]
+    },
+    "status": 400,
+    "response": {
+      "error": {
+        "message": "Invalid request body",
+        "code": "server.invalid_request.body",
+        "details": [
+          {
+            "path": "name",
+            "message": "Invalid key: Expected \"name\" but received undefined"
+          },
+          {
+            "path": "events.0",
+            "message": "Invalid type: Expected (\"document:created\" | \"document:deleted\" | \"document:updated\" | \"document:tag:added\" | \"document:tag:removed\") but received \"document.updated\""
+          }
+        ]
+      }
+    }
+  },
+  "Q1_rejection_default_config": {
+    "request_url": "http://hook-not-allowlisted.invalid:8099/hook",
+    "status": 400,
+    "response": {
+      "error": {
+        "message": "The provided URL is not safe to perform requests to",
+        "code": "webhooks.ssrf_unsafe_url"
+      }
+    }
+  },
+  "Q1_creation_accepted": {
+    "request": {
+      "name": "probe",
+      "url": "http://host.docker.internal:8099/hook",
+      "events": [
+        "document:created",
+        "document:updated",
+        "document:deleted",
+        "document:tag:added",
+        "document:tag:removed"
+      ],
+      "secret": "<32-byte hex>"
+    },
+    "status": 200,
+    "response": {
+      "webhook": {
+        "id": "wbh_h9ad1fdwvqtk4zxr4w50xw2e",
+        "createdAt": "2026-11-17T18:47:39.603Z",
+        "updatedAt": "2026-11-17T18:47:39.603Z",
+        "name": "probe",
+        "url": "http://host.docker.internal:8099/hook",
+        "enabled": true,
+        "createdBy": "usr_jpd6j5cpxxnwzro4kdsufqzg",
+        "organizationId": "org_s08nmyx6n7cvxfkqeyvkp6e3"
+      }
+    }
+  },
+  "webhook_id": "wbh_h9ad1fdwvqtk4zxr4w50xw2e",
+  "document_create": {
+    "status": 200,
+    "body": {
+      "document": {
+        "id": "doc_lub66fbcd78t24zbi65morbp",
+        "createdAt": "2026-11-17T18:47:39.642Z",
+        "updatedAt": "2026-11-17T18:47:39.647Z",
+        "organizationId": "org_s08nmyx6n7cvxfkqeyvkp6e3",
+        "createdBy": "usr_jpd6j5cpxxnwzro4kdsufqzg",
+        "originalName": "hook-probe.pdf",
+        "originalSize": 695,
+        "originalSha256Hash": "6f2c87cafc0f461f694fcd0d6cbcae6166f042c8d47302c0d2ef59bc8fb9acee",
+        "name": "hook-probe.pdf",
+        "mimeType": "application/pdf",
+        "content": "",
+        "documentDate": null,
+        "notes": null,
+        "deletedAt": null,
+        "deletedBy": null,
+        "isDeleted": false
+      }
+    }
+  },
+  "api_key_rename": {
+    "status": 200
+  },
+  "session_rename": {
+    "status": 200
+  },
+  "tag_add": {
+    "status": 400
+  },
+  "document_delete": {
+    "status": 204
+  },
+  "Q2_api_key_rename_deliveries": [
+    {
+      "body": {
+        "data": {
+          "createdAt": "2026-11-17T18:47:39.642Z",
+          "documentId": "doc_lub66fbcd78t24zbi65morbp",
+          "name": "hook-probe.pdf",
+          "organizationId": "org_s08nmyx6n7cvxfkqeyvkp6e3",
+          "updatedAt": "2026-11-17T18:47:39.647Z"
+        },
+        "timestamp": "2026-11-17T18:47:39.656Z",
+        "type": "document:created"
+      },
+      "headers": {
+        "accept": "application/json",
+        "accept-encoding": "gzip, deflate",
+        "accept-language": "*",
+        "connection": "keep-alive",
+        "content-length": "269",
+        "content-type": "application/json",
+        "host": "host.docker.internal:8099",
+        "user-agent": "papra-webhook-client",
+        "webhook-id": "msg_shpwtwct65j23wsqczbs0itd",
+        "webhook-signature": "v1,8CcpDU68F28spVlv4miGh2x7UrEWsErXlIKF/ObpMSw=",
+        "webhook-timestamp": "1794941259"
+      },
+      "path": "/hook",
+      "received_at": "2026-11-17T18:47:39.703Z"
+    },
+    {
+      "body": {
+        "data": {
+          "documentId": "doc_lub66fbcd78t24zbi65morbp",
+          "name": "Renamed By API Key.pdf",
+          "organizationId": "org_s08nmyx6n7cvxfkqeyvkp6e3"
+        },
+        "timestamp": "2026-11-17T18:47:39.683Z",
+        "type": "document:updated"
+      },
+      "headers": {
+        "accept": "application/json",
+        "accept-encoding": "gzip, deflate",
+        "accept-language": "*",
+        "connection": "keep-alive",
+        "content-length": "199",
+        "content-type": "application/json",
+        "host": "host.docker.internal:8099",
+        "user-agent": "papra-webhook-client",
+        "webhook-id": "msg_js2vequ7d2usm420aqjhyp53",
+        "webhook-signature": "v1,kBG1OjEM11WUiR1zZTymKWs/D747Nt56QW9OtHbRcEQ=",
+        "webhook-timestamp": "1794941259"
+      },
+      "path": "/hook",
+      "received_at": "2026-11-17T18:47:39.742Z"
+    },
+    {
+      "body": {
+        "data": {
+          "content": "SEPA berweisung Miete Oktober 2025 Rechnung Nr. 4711 Ihre Strasse 12 in K ln",
+          "documentId": "doc_lub66fbcd78t24zbi65morbp",
+          "organizationId": "org_s08nmyx6n7cvxfkqeyvkp6e3"
+        },
+        "timestamp": "2026-11-17T18:47:39.742Z",
+        "type": "document:updated"
+      },
+      "headers": {
+        "accept": "application/json",
+        "accept-encoding": "gzip, deflate",
+        "accept-language": "*",
+        "connection": "keep-alive",
+        "content-length": "256",
+        "content-type": "application/json",
+        "host": "host.docker.internal:8099",
+        "user-agent": "papra-webhook-client",
+        "webhook-id": "msg_lk4szj66ntry8sx6npdd3h7k",
+        "webhook-signature": "v1,24XXIA5nJE73HIR8y7OjUtcIZiW2js8qh6pMBLwkeQM=",
+        "webhook-timestamp": "1794941259"
+      },
+      "path": "/hook",
+      "received_at": "2026-11-17T18:47:39.768Z"
+    }
+  ],
+  "Q3_session_rename_deliveries": [
+    {
+      "body": {
+        "data": {
+          "documentId": "doc_lub66fbcd78t24zbi65morbp",
+          "name": "Renamed By Human.pdf",
+          "organizationId": "org_s08nmyx6n7cvxfkqeyvkp6e3"
+        },
+        "timestamp": "2026-11-17T18:47:41.226Z",
+        "type": "document:updated"
+      },
+      "headers": {
+        "accept": "application/json",
+        "accept-encoding": "gzip, deflate",
+        "accept-language": "*",
+        "connection": "keep-alive",
+        "content-length": "197",
+        "content-type": "application/json",
+        "host": "host.docker.internal:8099",
+        "user-agent": "papra-webhook-client",
+        "webhook-id": "msg_xyvd1v6zxxlo5k9jittsbnmg",
+        "webhook-signature": "v1,/N/q/tT3/+Uk5BeiRriItrKCVMT3Mhiy9xpJdghSNNQ=",
+        "webhook-timestamp": "1794941261"
+      },
+      "path": "/hook",
+      "received_at": "2026-11-17T18:47:41.239Z"
+    }
+  ],
+  "tag_added_deliveries": [],
+  "deleted_deliveries": [
+    {
+      "body": {
+        "data": {
+          "documentId": "doc_lub66fbcd78t24zbi65morbp",
+          "organizationId": "org_s08nmyx6n7cvxfkqeyvkp6e3"
+        },
+        "timestamp": "2026-11-17T18:48:28.050Z",
+        "type": "document:deleted"
+      },
+      "headers": {
+        "accept": "application/json",
+        "accept-encoding": "gzip, deflate",
+        "accept-language": "*",
+        "connection": "keep-alive",
+        "content-length": "167",
+        "content-type": "application/json",
+        "host": "host.docker.internal:8099",
+        "user-agent": "papra-webhook-client",
+        "webhook-id": "msg_ptfbfb39g1l96y7kokw3j0o8",
+        "webhook-signature": "v1,JkkaniNfND/lfSCnpIKnBrN/+CGB9OeG4wtaym2khE4=",
+        "webhook-timestamp": "1794941308"
+      },
+      "path": "/hook",
+      "received_at": "2026-11-17T18:48:28.064Z"
+    }
+  ],
+  "delivery_summary": {
+    "api_key_rename": [
+      {
+        "event_field": null,
+        "top_level_keys": [
+          "data",
+          "timestamp",
+          "type"
+        ],
+        "path": "/hook",
+        "header_names": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "webhook-id",
+          "webhook-signature",
+          "webhook-timestamp"
+        ]
+      },
+      {
+        "event_field": null,
+        "top_level_keys": [
+          "data",
+          "timestamp",
+          "type"
+        ],
+        "path": "/hook",
+        "header_names": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "webhook-id",
+          "webhook-signature",
+          "webhook-timestamp"
+        ]
+      },
+      {
+        "event_field": null,
+        "top_level_keys": [
+          "data",
+          "timestamp",
+          "type"
+        ],
+        "path": "/hook",
+        "header_names": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "webhook-id",
+          "webhook-signature",
+          "webhook-timestamp"
+        ]
+      }
+    ],
+    "session_rename": [
+      {
+        "event_field": null,
+        "top_level_keys": [
+          "data",
+          "timestamp",
+          "type"
+        ],
+        "path": "/hook",
+        "header_names": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "webhook-id",
+          "webhook-signature",
+          "webhook-timestamp"
+        ]
+      }
+    ],
+    "tag_added": [],
+    "deleted": [
+      {
+        "event_field": null,
+        "top_level_keys": [
+          "data",
+          "timestamp",
+          "type"
+        ],
+        "path": "/hook",
+        "header_names": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "webhook-id",
+          "webhook-signature",
+          "webhook-timestamp"
+        ]
+      }
+    ]
+  },
+  "Q4_signature_checks": [
+    {
+      "signature_headers": {
+        "webhook-signature": "v1,8CcpDU68F28spVlv4miGh2x7UrEWsErXlIKF/ObpMSw="
+      },
+      "match": {
+        "webhook-signature vs hmac-sha256(body=json.compact)": false,
+        "webhook-signature vs hmac-sha256(body=json.compact.ensure_ascii_true)": false,
+        "webhook-signature vs hmac-sha256(body=json.default)": false
+      }
+    },
+    {
+      "signature_headers": {
+        "webhook-signature": "v1,kBG1OjEM11WUiR1zZTymKWs/D747Nt56QW9OtHbRcEQ="
+      },
+      "match": {
+        "webhook-signature vs hmac-sha256(body=json.compact)": false,
+        "webhook-signature vs hmac-sha256(body=json.compact.ensure_ascii_true)": false,
+        "webhook-signature vs hmac-sha256(body=json.default)": false
+      }
+    },
+    {
+      "signature_headers": {
+        "webhook-signature": "v1,24XXIA5nJE73HIR8y7OjUtcIZiW2js8qh6pMBLwkeQM="
+      },
+      "match": {
+        "webhook-signature vs hmac-sha256(body=json.compact)": false,
+        "webhook-signature vs hmac-sha256(body=json.compact.ensure_ascii_true)": false,
+        "webhook-signature vs hmac-sha256(body=json.default)": false
+      }
+    },
+    {
+      "signature_headers": {
+        "webhook-signature": "v1,/N/q/tT3/+Uk5BeiRriItrKCVMT3Mhiy9xpJdghSNNQ="
+      },
+      "match": {
+        "webhook-signature vs hmac-sha256(body=json.compact)": false,
+        "webhook-signature vs hmac-sha256(body=json.compact.ensure_ascii_true)": false,
+        "webhook-signature vs hmac-sha256(body=json.default)": false
+      }
+    },
+    {
+      "signature_headers": {
+        "webhook-signature": "v1,JkkaniNfND/lfSCnpIKnBrN/+CGB9OeG4wtaym2khE4="
+      },
+      "match": {
+        "webhook-signature vs hmac-sha256(body=json.compact)": false,
+        "webhook-signature vs hmac-sha256(body=json.compact.ensure_ascii_true)": false,
+        "webhook-signature vs hmac-sha256(body=json.default)": false
+      }
+    }
+  ],
+  "listener_raw_line_count": 5,
+  "webhook_delete": {
+    "status": 204
+  }
+}

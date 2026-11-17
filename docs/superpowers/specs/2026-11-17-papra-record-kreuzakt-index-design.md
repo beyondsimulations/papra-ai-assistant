@@ -493,36 +493,152 @@ What makes it survivable rather than reckless:
 What is also confirmed on the way, because the bridge depends on it and only the running system can
 say it: `POST /api/upload` dedupes by hash on retry, and `/api/search` response shapes.
 
-## 10. Not established
+## 10. What the containers actually do, and what is still not established
 
-- Papra webhook **delivery** is unverified end to end. The schema is there — `webhooks(url, secret,
-  enabled, name, organization_id)`, `webhook_events(webhook_id, event_name)`, and a delivery log
-  `webhook_deliveries(webhook_id, event_name, request_payload, response_payload, response_status)` —
-  and the emitted event names include `document.created`, `document.updated`, `document.deleted`,
-  `document.restored`, `document.tags.changed`. What is not measured is the payload shape, the signature
-  header, the retry policy, and whether `webhookUrlAllowedHostnames` will accept a compose-internal
-  URL. Task 0b.
-- The quality of Kreuzakt's `description` and `document_date` **against omlx**, which the keyless probe
-  could not exercise (it produced filename-derived titles and empty descriptions/dates). Date and note
-  write-back are specified in §4.3 on the assumption those fields are good; the write-nothing phase
-  falsifies that cheaply if they are not.
-- Kreuzakt's behaviour with a corpus of a few thousand documents and its paging depth once the
-  proxy's over-fetch starts costing round trips.
-- Upstream durability: this makes a young single-maintainer project the extractor and the index. The
-  exit is the ledger plus hashes — originals can be re-fed to any other extractor, and Papra keeps a
-  copy of the text — but the exit is a re-index, not a switch.
-- Queue retention and `rescan` semantics: uploads leave one queue row per attempt and rows accumulate,
-  which is fine for a 500-document archive and unexamined for a 50,000-document one.
-- How many of the operator's 500 documents are the same file in more than one bucket, which decides
-  how often the many-to-one reference model actually bites.
-- ~~Kreuzakt on Apple Silicon~~ **resolved**: atlas is `x86_64`, so the published amd64 image is the
-  deployment artefact and we build nothing. Upstream CI builds `linux/amd64` only, deliberately, so an
-  arm64 target would be our image to maintain. The probe ran here under Rosetta in two seconds, which
-  makes a laptop run possible for debugging but not authoritative — integration tests run on atlas.
-- German quality of Kreuzakt's extraction on the operator's corpus, which §9 leaves unmeasured on
-  purpose. The backfill is the first real evidence and the old worker is deleted after it.
-- Any Kreuzakt version behaviour beyond the commit read here; it should be pinned by digest the same
-  way Papra is, before it is trusted with the index.
+Measured 2026-11-17 against the pinned containers of the Task 2 stack —
+`docs/superpowers/probes/2026-11-17-kreuzakt-contracts/` holds the scripts, the
+raw captured payloads (`capture-queue.json`, `capture-webhooks.json`) and the
+per-question write-up. Two rules of this document were wrong; both are corrected
+below, and the plan is **not** rewritten here — the affected tasks are listed so
+the corrections land where they belong.
+
+### 10.1 Kreuzakt upload and queue: measured
+
+* **`POST /api/upload`** returns 201 `{files: [{originalFilename, relativePath,
+  storedFilename}], uploadedCount, failedCount, errors}` — no document id, no hash.
+  Two files in one request give one 201 and one queue row each. Correlation is
+  `relativePath` → a queue row whose `filename` equals it → `document_id` when the
+  row reaches a terminal status.
+* **`filename` is the stored name, not the sent name.** Identical to the upload
+  response's `relativePath`, which is sanitised (`papra:doc0005<…>.pdf` →
+  `papra_doc0005_…_.pdf`) and gains a ` (1)` suffix when a file of that name is
+  still sitting in the ingest dir. Match on `relativePath` with **exact**
+  equality — `reindex-all` rows end with the original filename, so a suffix match
+  correlates a reindex row as if it were our upload.
+* **Duplicates.** Identical bytes under a second filename, uploaded while the first
+  is still `processing`: two rows, both `completed`, **one `document_id`**. Same
+  again after completion: a new row, the same `document_id`. And re-uploading the
+  **same filename** after completion produces a second row with an identical
+  `filename` — so a filename can hold several terminal rows, which is what makes
+  `filename` + `id > high-water mark` the correlation key and two terminal rows for
+  one upload a genuine ambiguity rather than a nuisance.
+* **`/api/queue` has no pagination.** It accepts `limit` (default 20, **clamped to
+  100**, `0`/`-5`/`abc` → 400) and `status` (`pending|processing|completed|failed`,
+  anything else → 400), and **silently ignores `page`, `offset`, `perPage`,
+  `per_page`, `count`, `after`, `cursor`**. A page walk returns page 1 forever; an
+  offset walk likewise. With 155 rows in the table the endpoint served at most the
+  newest 100, the union of all four `status` windows reached 138, and the probe's
+  own first row (id 1) was unreachable in the default window while 17 rows were
+  unreachable by any request it offers. **So §4.2's "bounded paging" and Task 5's
+  page-walking `queue_high_water_mark()` cannot be built as written** — with more
+  than 100 rows in the queue that scan never proves exhaustion, it just burns its
+  fuse and refuses to correlate, forever, on exactly the corpus size that matters.
+* **Retention is reachability, not deletion.** Rows are never deleted (`counts`
+  grows monotonically); old rows simply leave the only window the API has. The
+  spec's earlier worry was the right shape and the wrong mechanism.
+* **`id` is monotonic; ordering is descending.** Five sequential uploads produced
+  ids `[11, 12, 13, 14, 15]` — strictly increasing, no reuse (`INTEGER PRIMARY KEY
+  AUTOINCREMENT`). Rows come back **newest first**, ordered `created_at DESC, id
+  DESC`; `created_at` is second-granularity so ties are the norm (three rows from
+  one multi-file request shared a `created_at`), and the tie-break is `id DESC`.
+  Ordering therefore equals a sort by `id DESC`, so correlation does **not** need a
+  `(created_at, id)` compound key — but it does need a different high-water mark:
+  `entries[0].id` of `GET /api/queue?limit=1` returned the true highest id (155)
+  while the table held 155 rows, so the mark is one request and needs no scan.
+* **`retry` reuses the row** and only accepts `failed`: a completed row → 400
+  `Queue entry 31 is not in failed status`, an unknown id → 404, a failed row → 200
+  `Re-queued for processing` with the same id and an unchanged row-id set. A
+  deterministic failure re-failed with the same message seconds later, so a retry
+  policy needs a bounded attempt count, not "retry until it is not failed".
+* **`rescan` touches nothing that matters**: same `id`, same `content` byte-for-byte,
+  same `title`, same `stored_filename` (the hash prefix survives), `updated_at`
+  bumped, **no queue row created**. **`reindex-all`** returns 202 and creates **one
+  new queue row per document**, named
+  `reindex-all:<batch>:<documentId>:<originalFilename>`, with **`document_id` set at
+  creation** — so a non-null `document_id` does not mean a finished row, and a
+  reindex consumes the same 100-row window correlation reads.
+* **A `completed` row can have `document_id: null`.** Deleting the document (204,
+  then 404 on read) left all four `completed` rows that pointed at it still
+  `completed`, with `document_id` and `page_count` nulled. Task 6 was written to
+  treat null-on-completed as a retryable anomaly; measured, it is what a **deleted**
+  Kreuzakt document looks like from the queue, and re-uploading on that is wrong in
+  the ordinary case where the Papra document is gone too. **Task 6 must distinguish
+  the two instead — see the plan-changes list.**
+* Not answerable keyless: `description`/`document_date` quality against omlx
+  (keyless yields empty description, null date, filename-derived title — unchanged
+  from the 2026-11-17 probe), and whether a *transient* OCR failure can leave a
+  `completed` row with a null `document_id`, because keyless extraction of a
+  text-layer PDF cannot fail transiently.
+
+### 10.2 Papra webhook delivery: measured for the record; the receiver is out of v1
+
+Operator decision 2026-11-17: **the webhook receiver is dropped from v1.** The
+six-hour verification and convergence pass of §4.1 is the mechanism that keeps
+Papra aligned with the index; a push path would only narrow the staleness window, it
+would not change correctness, and two of the three facts a receiver would have had
+to rely on do not exist. Delivery itself was measured once, end to end, so
+this is a decision made on evidence rather than on absence of it:
+
+* **Event names are colon-separated and there is no restore event.** A create with
+  `document.updated` → 400, verbatim: `Invalid type: Expected ("document:created" |
+  "document:deleted" | "document:updated" | "document:tag:added" |
+  "document:tag:removed") but received "document.updated"`. `name` is required on
+  create. The earlier claim that the emitted names are `document.created`,
+  `document.updated`, `document.restored`, `document.tags.changed` was wrong on both
+  separators and on `restored`: **no restore event exists**, so a restore hint could
+  never have been delivered.
+* **`document.updated` carries no `changes` list.** The envelope is
+  `{data, timestamp, type}`; `type` is the event name; `data` is
+  `documentId` + `organizationId` plus the changed value — `name` for a rename,
+  `content` for a content write, nothing extra for a delete. No field list, no
+  before/after, no version.
+* **The payload does not identify who made the change.** The same rename was made
+  with an API key and with a browser session; the two payloads were structurally
+  identical apart from the new name. No user id, no API key id, no actor field.
+  Papra's own logs carry `authType`/`apiKeyId`/`sessionId` and never put them on the
+  event, so **a receiver could never have told our `PATCH` from a human edit** —
+  which is exactly the distinction Task 10 needed to avoid disabling renaming across
+  the corpus, and no amount of receiver-side cleverness could have recovered it.
+* **Signature is Standard Webhooks, not a hex digest of the body.** Header
+  `webhook-signature`, value `v1,<base64>`, with `webhook-id: msg_…` and
+  `webhook-timestamp: <unix seconds>`. Reproduced for every captured delivery as
+  `base64(HMAC-SHA256(secret_as_supplied, "{webhook-id}.{webhook-timestamp}.{raw body}"))`
+  with the secret used verbatim; `hmac.new(secret.encode(), body, sha256).hexdigest()`
+  reproduces nothing.
+* **An in-network receiver is refused by default**: 400
+  `The provided URL is not safe to perform requests to` (`webhooks.ssrf_unsafe_url`)
+  for `http://host.docker.internal:8099/hook`. The delivery above was captured with
+  the narrow `WEBHOOK_URL_ALLOWED_HOSTNAMES` allowlist; the blanket SSRF switch was
+  not used. The retry ladder and the full `webhookUrlAllowedHostnames` matrix were
+  not measured — they gate nothing now.
+
+### 10.3 Still not established
+
+- The quality of Kreuzakt's `description` and `document_date` **against omlx**, which
+  the keyless probe could not exercise. Date and note write-back are specified in
+  §4.3 on the assumption those fields are good; the write-nothing phase falsifies
+  that cheaply if they are not.
+- Kreuzakt's behaviour on a corpus of a few thousand documents, and what the
+  newest-100 window costs once a backfill has more than 100 rows in flight — now a
+  concrete number to design against rather than a vague worry (10.1).
+- Upstream durability: this makes a young single-maintainer project the extractor and
+  the index. The exit is the ledger plus hashes — originals can be re-fed to any
+  other extractor, and Papra keeps a copy of the text — but the exit is a re-index,
+  not a switch.
+- How many of the operator's 500 documents are the same file in more than one bucket,
+  which decides how often the many-to-one reference model actually bites. Measured
+  here as *live and cheap to trigger*, not as a prevalence.
+- ~~Kreuzakt on Apple Silicon~~ **resolved**: atlas is `x86_64`, so the published
+  amd64 image is the deployment artefact and we build nothing. Upstream CI builds
+  `linux/amd64` only, deliberately, so an arm64 target would be our image to
+  maintain. The probe ran here under Rosetta in two seconds, which makes a laptop run
+  possible for debugging but not authoritative — integration tests run on atlas.
+- German quality of Kreuzakt's extraction on the operator's corpus, which §9 leaves
+  unmeasured on purpose. The backfill is the first real evidence and the old worker
+  is deleted after it.
+- Any Kreuzakt version behaviour beyond the pinned digest measured here; it is now
+  pinned by digest the way Papra is, which bounds the risk without pretending the
+  behaviour is stable upstream.
 
 ## 11. Sequencing
 

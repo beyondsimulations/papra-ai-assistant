@@ -1,0 +1,360 @@
+{
+  "entries": [
+    {
+      "id": 35,
+      "filename": "papra-doc0030-30303030.pdf",
+      "status": "failed",
+      "error": "Parsing error: xberg_native_pdf: failed to load bytes: Invalid cross-reference table",
+      "document_id": null,
+      "created_at": "2026-11-17 20:02:46",
+      "completed_at": "2026-11-17T20:02:48.542Z",
+      "page_count": null
+    },
+    {
+      "id": 34,
+      "filename": "papra-doc0020-20202020.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": null,
+      "created_at": "2026-11-17 20:02:43",
+      "completed_at": "2026-11-17T20:02:43.436Z",
+      "page_count": null
+    },
+    {
+      "id": 33,
+      "filename": "papra-doc0022-22222222.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": null,
+      "created_at": "2026-11-17 20:02:42",
+      "completed_at": "2026-11-17T20:02:42.982Z",
+      "page_count": null
+    },
+    {
+      "id": 32,
+      "filename": "papra-doc0021-21212121.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": null,
+      "created_at": "2026-11-17 20:02:42",
+      "completed_at": "2026-11-17T20:02:42.639Z",
+      "page_count": null
+    },
+    {
+      "id": 31,
+      "filename": "papra-doc0020-20202020.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": null,
+      "created_at": "2026-11-17 20:02:42",
+      "completed_at": "2026-11-17T20:02:42.636Z",
+      "page_count": null
+    },
+    {
+      "id": 30,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:15:papra-seq0004-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 15,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:42.297Z",
+      "page_count": 1
+    },
+    {
+      "id": 29,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:14:papra-seq0003-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 14,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:42.190Z",
+      "page_count": 1
+    },
+    {
+      "id": 28,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:13:papra-seq0002-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 13,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:42.064Z",
+      "page_count": 1
+    },
+    {
+      "id": 27,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:12:papra-seq0001-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 12,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:41.948Z",
+      "page_count": 1
+    },
+    {
+      "id": 26,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:11:papra-seq0000-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 11,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:41.848Z",
+      "page_count": 1
+    },
+    {
+      "id": 25,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:10:papra-doc0010-0a0a0a0a.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 10,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:41.734Z",
+      "page_count": 1
+    },
+    {
+      "id": 24,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:9:papra-doc0011-0b0b0b0b.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 9,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:41.619Z",
+      "page_count": 1
+    },
+    {
+      "id": 23,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:8:papra-doc0012-0c0c0c0c.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 8,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:41.494Z",
+      "page_count": 1
+    },
+    {
+      "id": 22,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:7:papra-doc0006-6f708192 (1).pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 7,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:41.317Z",
+      "page_count": 1
+    },
+    {
+      "id": 21,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:6:papra-doc0006-6f708192.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 6,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:41.193Z",
+      "page_count": 1
+    },
+    {
+      "id": 20,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:5:papra_doc0005_5e6f7081_.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 5,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:41.079Z",
+      "page_count": 1
+    },
+    {
+      "id": 19,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:4:papra-doc0004-4d5e6f70.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 4,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:40.958Z",
+      "page_count": 1
+    },
+    {
+      "id": 18,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:3:papra-doc0002-2b3c4d5e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 3,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:40.849Z",
+      "page_count": 1
+    },
+    {
+      "id": 17,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:2:papra-doc0003-3c4d5e6f.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 2,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:40.723Z",
+      "page_count": 1
+    },
+    {
+      "id": 16,
+      "filename": "reindex-all:37a7bc13-dfa0-417a-bda0-2aa108b3dec9:1:papra-doc0001-1a2b3c4d.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 1,
+      "created_at": "2026-11-17 20:02:40",
+      "completed_at": "2026-11-17T20:02:40.600Z",
+      "page_count": 1
+    },
+    {
+      "id": 15,
+      "filename": "papra-seq0004-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 15,
+      "created_at": "2026-11-17 20:02:35",
+      "completed_at": "2026-11-17T20:02:36.067Z",
+      "page_count": 1
+    },
+    {
+      "id": 14,
+      "filename": "papra-seq0003-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 14,
+      "created_at": "2026-11-17 20:02:34",
+      "completed_at": "2026-11-17T20:02:34.857Z",
+      "page_count": 1
+    },
+    {
+      "id": 13,
+      "filename": "papra-seq0002-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 13,
+      "created_at": "2026-11-17 20:02:33",
+      "completed_at": "2026-11-17T20:02:33.639Z",
+      "page_count": 1
+    },
+    {
+      "id": 12,
+      "filename": "papra-seq0001-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 12,
+      "created_at": "2026-11-17 20:02:32",
+      "completed_at": "2026-11-17T20:02:32.301Z",
+      "page_count": 1
+    },
+    {
+      "id": 11,
+      "filename": "papra-seq0000-9e9e9e9e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 11,
+      "created_at": "2026-11-17 20:02:30",
+      "completed_at": "2026-11-17T20:02:31.041Z",
+      "page_count": 1
+    },
+    {
+      "id": 10,
+      "filename": "papra-doc0010-0a0a0a0a.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 10,
+      "created_at": "2026-11-17 20:02:27",
+      "completed_at": "2026-11-17T20:02:28.259Z",
+      "page_count": 1
+    },
+    {
+      "id": 9,
+      "filename": "papra-doc0011-0b0b0b0b.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 9,
+      "created_at": "2026-11-17 20:02:27",
+      "completed_at": "2026-11-17T20:02:28.115Z",
+      "page_count": 1
+    },
+    {
+      "id": 8,
+      "filename": "papra-doc0012-0c0c0c0c.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 8,
+      "created_at": "2026-11-17 20:02:27",
+      "completed_at": "2026-11-17T20:02:28.000Z",
+      "page_count": 1
+    },
+    {
+      "id": 7,
+      "filename": "papra-doc0006-6f708192 (1).pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 7,
+      "created_at": "2026-11-17 20:02:21",
+      "completed_at": "2026-11-17T20:02:22.307Z",
+      "page_count": 1
+    },
+    {
+      "id": 6,
+      "filename": "papra-doc0006-6f708192.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 6,
+      "created_at": "2026-11-17 20:02:21",
+      "completed_at": "2026-11-17T20:02:22.176Z",
+      "page_count": 1
+    },
+    {
+      "id": 5,
+      "filename": "papra_doc0005_5e6f7081_.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 5,
+      "created_at": "2026-11-17 20:02:21",
+      "completed_at": "2026-11-17T20:02:22.044Z",
+      "page_count": 1
+    },
+    {
+      "id": 4,
+      "filename": "papra-doc0004-4d5e6f70.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 4,
+      "created_at": "2026-11-17 20:02:21",
+      "completed_at": "2026-11-17T20:02:21.900Z",
+      "page_count": 1
+    },
+    {
+      "id": 3,
+      "filename": "papra-doc0002-2b3c4d5e.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 3,
+      "created_at": "2026-11-17 20:02:20",
+      "completed_at": "2026-11-17T20:02:21.608Z",
+      "page_count": 1
+    },
+    {
+      "id": 2,
+      "filename": "papra-doc0003-3c4d5e6f.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 2,
+      "created_at": "2026-11-17 20:02:20",
+      "completed_at": "2026-11-17T20:02:21.436Z",
+      "page_count": 1
+    },
+    {
+      "id": 1,
+      "filename": "papra-doc0001-1a2b3c4d.pdf",
+      "status": "completed",
+      "error": null,
+      "document_id": 1,
+      "created_at": "2026-11-17 20:02:20",
+      "completed_at": "2026-11-17T20:02:21.227Z",
+      "page_count": 1
+    }
+  ],
+  "counts": {
+    "pending": 0,
+    "processing": 0,
+    "completed": 34,
+    "failed": 1
+  }
+}
