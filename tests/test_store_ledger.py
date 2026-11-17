@@ -15,6 +15,7 @@ cosmetic, and the tests below are organised around them:
 """
 
 import dataclasses
+import sqlite3
 
 import pytest
 
@@ -196,6 +197,45 @@ def test_delete_is_idempotent_and_does_not_double_count(store):
     assert again == (7, 1)             # the same answer, not (7, 0) twice
 
 
+def test_mark_deleted_holds_the_write_lock_while_it_counts(store, tmp_path, monkeypatch):
+    """The remaining count is an authorization to delete upstream, so nothing may
+    move the index between reading the generation and writing `deleted_at`.
+
+    Proven by attempting an independent write from a second connection while
+    `mark_deleted` is taking its reading: with the work inside a `BEGIN IMMEDIATE`
+    transaction that write is refused. If it were allowed, the count we just
+    computed would describe a generation that had already been superseded.
+    """
+    store = two_refs(store)
+    other = Store(tmp_path / "state.db")
+    other._conn.execute("PRAGMA busy_timeout=50")
+    real_read = Store._read_generation
+    observed = []
+
+    def spy(self):
+        value = real_read(self)
+        try:
+            other._conn.execute("BEGIN IMMEDIATE")
+            other._conn.execute(
+                "UPDATE settings SET value = '99' WHERE key = ?",
+                (store_module.INDEX_GENERATION_KEY,),
+            )
+            other._conn.commit()
+            observed.append("second connection wrote during the count")
+        except sqlite3.OperationalError:
+            observed.append("refused")        # the write lock is held: correct
+            other._conn.rollback()
+        return value
+
+    monkeypatch.setattr(Store, "_read_generation", spy)
+    try:
+        assert store.ledger_mark_deleted(papra_org_id="org-a",
+                                         papra_document_id="doc-1") == (7, 1)
+        assert observed == ["refused"]
+    finally:
+        other.close()
+
+
 # -- upsert keeps what it did not come to write --------------------------------
 
 def test_upsert_does_not_clobber_protection(store):
@@ -252,8 +292,82 @@ def test_upsert_follows_the_hash_when_the_bytes_change(store):
     assert store.ledger_get("org-a", "doc-1").file_hash == "cd" * 32
 
 
+def test_changed_bytes_drop_the_binding_and_the_row_becomes_reindexable(store):
+    """Kreuzakt indexed those bytes, not these.
+
+    Keeping the id would leave the row resolving to text extracted from a document
+    that no longer exists, AND keep it out of `ledger_needs_index` — so the sweep
+    would never correct it and search would keep answering with the old file's
+    text. Dropping the binding is the only state that is both honest and
+    self-healing. A human's protection survives: it is a decision about the
+    document, not about which bytes were indexed.
+    """
+    store = two_refs(store)
+    store.ledger_protect(papra_org_id="org-a", papra_document_id="doc-1", field="name")
+    store.ledger_upsert_reference(papra_org_id="org-a", papra_document_id="doc-1",
+                                  file_hash="cd" * 32, papra_original_name="doc-1.pdf")
+    ref = store.ledger_get("org-a", "doc-1")
+    assert (ref.file_hash, ref.kreuzakt_id, ref.delivered_generation) == (
+        "cd" * 32, None, None)
+    assert ref.name_protected is True
+    assert [r.papra_document_id for r in
+            store.ledger_needs_index(generation=1)] == ["doc-1"]
+    # the other bucket's reference to the same Kreuzakt document is untouched
+    assert [r.papra_document_id for r in store.ledger_resolve([7], generation=1)] == ["doc-2"]
+
+
+def test_unchanged_bytes_keep_the_binding(store):
+    """Re-ingesting the same file must not schedule a pointless re-index."""
+    store = two_refs(store)
+    store.ledger_upsert_reference(papra_org_id="org-a", papra_document_id="doc-1",
+                                  file_hash=H, papra_original_name="doc-1.pdf")
+    assert store.ledger_get("org-a", "doc-1").kreuzakt_id == 7
+    assert store.ledger_needs_index(generation=1) == []
+
+
 def test_ledger_get_unknown_returns_none(store):
     assert store.ledger_get("org-a", "doc-1") is None
+
+
+def test_record_delivery_refuses_a_row_it_cannot_vouch_for(store):
+    """Recording a delivery also stamps `delivered_generation`, which is what makes
+    a binding resolve — so it is an authorization write, not a receipt.
+
+    Writing the current generation onto a row still bound to a destroyed index
+    would make that stale integer resolvable again; writing an old generation onto
+    a freshly rebound row would retire a live one. Both are refusals, and the
+    return value has to say so (the same reason `ledger_set_kreuzakt_id` returns a
+    bool rather than None).
+    """
+    store = two_refs(store)
+    stale = store.get_generation()
+    store.bump_generation()
+    assert store.ledger_record_delivery(
+        papra_org_id="org-a", papra_document_id="doc-1", delivered_at="x",
+        delivered_sha="ca" * 32, generation=store.get_generation()) is False
+    ref = store.ledger_get("org-a", "doc-1")
+    assert ref.delivered_sha is None and ref.delivered_generation == stale
+    # recording for the generation the row is actually bound to still works
+    assert store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-1",
+                                        delivered_at="x", delivered_sha="ca" * 32,
+                                        generation=stale) is True
+    assert store.ledger_record_delivery(papra_org_id="org-z", papra_document_id="doc-z",
+                                        delivered_at="x", delivered_sha="ca" * 32,
+                                        generation=stale) is False
+
+
+def test_a_late_delivery_cannot_restamp_a_rebound_row(store):
+    store = two_refs(store)
+    old = store.get_generation()
+    store.bump_generation()
+    current = store.get_generation()
+    store.ledger_set_kreuzakt_id(papra_org_id="org-a", papra_document_id="doc-1",
+                                 kreuzakt_id=42, generation=current)
+    assert store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-1",
+                                        delivered_at="x", delivered_sha="ca" * 32,
+                                        generation=old) is False
+    ref = store.ledger_get("org-a", "doc-1")
+    assert (ref.kreuzakt_id, ref.delivered_generation) == (42, current)
 
 
 # -- protection ---------------------------------------------------------------
@@ -307,6 +421,22 @@ def test_protection_field_is_a_closed_set(store):
         store.ledger_protect(papra_org_id="org-a", papra_document_id="doc-1", field="tile")
     with pytest.raises(ValueError, match="field"):
         store.ledger_clear_protection(field="titel")
+
+
+def test_clear_protection_counts_only_references_that_were_protected(store):
+    """The number the CLI prints is "how many documents did this change?".
+
+    SQLite reports every row the WHERE matched, protection or not, so without a
+    flag predicate a second run of the same command would report the same count
+    again and an operator could not tell a real un-protect from a no-op.
+    """
+    store = two_refs(store)
+    store.ledger_protect(papra_org_id="org-a", papra_document_id="doc-1", field="date")
+    assert store.ledger_clear_protection(field="name") == 0     # nothing was name-protected
+    assert store.ledger_clear_protection(field="date") == 1
+    assert store.ledger_clear_protection(field="date") == 0
+    assert store.ledger_clear_protection() == 0
+    assert store.ledger_get("org-a", "doc-1").date_protected is False
 
 
 # -- ownership baselines ------------------------------------------------------
@@ -495,13 +625,38 @@ def test_generation_survives_reopening_the_store(tmp_path):
         reopened.close()
 
 
-def test_a_corrupt_generation_value_fails_to_the_default(store):
-    """Reading garbage as a generation would make every row stale forever, and
-    reading it as a crash would make `check` unrunnable — the operator's way out
-    is to set the value again, so default it and stay readable."""
-    store.set_setting("index_generation", "not-a-number")
-    assert store.get_generation() == 1
-    assert store.bump_generation() == 2
+def test_a_corrupt_generation_fails_closed_rather_than_reauthorising_epoch_one(store):
+    """Defaulting a corrupt value to 1 would be a fail-open.
+
+    Generation 1 is the namespace the very first index bound into, so a settings
+    row that became unreadable mid-life (an operator's note typed over the value,
+    a half-applied migration) would silently re-authorise every row that a rebuild
+    was supposed to retire. Refusing is the only reading that authorises nothing,
+    and the message names the key so the operator knows what to set.
+    """
+    two_refs(store)
+    store.set_setting("index_generation", "rebuild-2026-11-17")
+    with pytest.raises(ValueError, match="index_generation"):
+        store.get_generation()
+    with pytest.raises(ValueError, match="index_generation"):
+        store.ledger_stats()
+    with pytest.raises(ValueError, match="index_generation"):
+        store.ledger_mark_deleted(papra_org_id="org-a", papra_document_id="doc-1")
+    # nothing was written on the way to the refusal
+    assert store.ledger_get("org-a", "doc-1").deleted_at is None
+
+
+def test_bump_generation_repairs_a_corrupt_value_above_every_existing_epoch(store):
+    """The rebuild command has to work on a corrupt store, and its answer must not
+    be an epoch some existing row already carries — that is the same reauthorising
+    mistake in a different place. Deriving the next value from the ledger's highest
+    bound generation makes the repair strictly new."""
+    store.set_setting("index_generation", "5")
+    two_refs(store)                      # bound at generation 5
+    store.set_setting("index_generation", "rebuild-2026-11-17")
+    assert store.bump_generation() == 6
+    assert store.ledger_resolve([7], generation=store.get_generation()) == []
+    assert len(store.ledger_needs_index(generation=store.get_generation())) == 2
 
 
 # -- settings_flag ------------------------------------------------------------
@@ -607,13 +762,13 @@ def test_stats_counts_only_the_current_generation_as_indexed(store):
 
 
 def test_extraction_empty_counts_rows_whose_delivered_text_was_empty(store):
-    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
-                                  file_hash=H, papra_original_name="d.pdf")
+    store = two_refs(store)
     generation = store.get_generation()
-    store.ledger_record_delivery(papra_org_id="o", papra_document_id="d",
+    store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-1",
                                  delivered_at="2026-11-17T09:00:00+00:00",
                                  delivered_sha=EMPTY_EXTRACTION_SHA, generation=generation)
     assert store.ledger_stats()["extraction_empty"] == 1
+    assert store.ledger_stats()["delivered"] == 1      # the other row was never delivered
 
 
 def test_stats_repairs_window_ignores_old_repairs(store):
@@ -626,6 +781,42 @@ def test_stats_repairs_window_ignores_old_repairs(store):
 
 
 # -- the contract itself ------------------------------------------------------
+
+def test_cleanup_success_is_not_reported_as_a_failure(store, caplog):
+    """A completed delete must not write the failure line.
+
+    The one place an operator learns that an orphan is gone would otherwise be
+    indistinguishable from the place he learns the retry is still failing — the
+    state machine said `done` while the log said "will retry".
+    """
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-17T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1)
+    with caplog.at_level("INFO"):
+        store.ledger_cleanup_result(papra_org_id="o", papra_document_id="d", ok=True)
+    assert store.ledger_get("o", "d").cleanup_state == "done"
+    assert [r.message for r in caplog.records if "cleanup failed" in r.message] == []
+
+
+def test_permanent_cleanup_failure_is_announced_once(store, caplog):
+    """The transition into `failed` is the news; repeating it every forced retry is
+    noise, and "exactly one ERROR" is what a log-scraping operator counts on."""
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    store.ledger_queue_cleanup(papra_org_id="o", papra_document_id="d",
+                               due_at="2026-11-17T00:00:00+00:00",
+                               kreuzakt_id=7, generation=1)
+    with caplog.at_level("INFO"):
+        for _ in range(store_module.CLEANUP_MAX_ATTEMPTS + 2):
+            store.ledger_cleanup_result(papra_org_id="o", papra_document_id="d",
+                                        ok=False, reason="kreuzakt 503")
+    ref = store.ledger_get("o", "d")
+    assert ref.cleanup_state == "failed"
+    assert ref.cleanup_attempts > store_module.CLEANUP_MAX_ATTEMPTS
+    assert sum("cleanup failed permanently" in r.message for r in caplog.records) == 1
+
 
 def test_ledger_ref_exposes_the_contract_fields_in_order():
     """Task 8 builds a `LedgerRef` from a dict of defaults, so the field set is an

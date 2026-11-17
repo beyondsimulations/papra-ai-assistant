@@ -571,25 +571,47 @@ class Store:
         value = self.get_setting(name)
         return value is not None and value.strip().lower() in TRUTHY_SETTING_VALUES
 
-    def _read_generation(self) -> int:
-        """Current index generation, read from `settings`.
+    def _read_generation_or_none(self) -> int | None:
+        """The stored index generation, or None when the value cannot be trusted.
 
         **Caller must already hold `self._lock`** — `threading.Lock` is not
         reentrant, so `get_generation()` cannot be called from inside a locked
-        block. A value that is not a positive integer reads as
-        `DEFAULT_GENERATION`: raising here would make `check` unrunnable, and
-        silently reading a garbage value as, say, 0 would mark every row stale.
-        Defaulting keeps the store readable and the operator's way out (set the
-        key again) open.
+        block.
+
+        An absent key is `DEFAULT_GENERATION`. A value that is not a positive
+        integer is None, and the caller decides what refusing means; what it must
+        not mean is "1". Generation 1 is the namespace the very first index bound
+        into, so reading a corrupt value as the default would silently re-authorise
+        every row a rebuild was supposed to retire — a fail-open in the one place
+        whose whole job is to fail closed.
         """
         row = self._conn.execute(
             "SELECT value FROM settings WHERE key = ?", (INDEX_GENERATION_KEY,)
         ).fetchone()
+        if row is None:
+            return DEFAULT_GENERATION
         try:
             generation = int(row["value"])
         except (TypeError, ValueError):
-            return DEFAULT_GENERATION
-        return generation if generation >= DEFAULT_GENERATION else DEFAULT_GENERATION
+            return None
+        return generation if generation >= DEFAULT_GENERATION else None
+
+    def _read_generation(self) -> int:
+        """`_read_generation_or_none`, refusing loudly rather than returning None.
+
+        An uncaught ValueError out of a worker pass is the desired shape here: the
+        alternative is a service that confidently answers from an index whose epoch
+        nobody can identify.
+        """
+        generation = self._read_generation_or_none()
+        if generation is None:
+            raise ValueError(
+                f"{INDEX_GENERATION_KEY} is not a positive integer, so no generation "
+                "is current; refusing to resolve or bind index ids. Repair it with "
+                "`papra-suite ledger --invalidate`, which bumps the generation "
+                "above every epoch the ledger still carries."
+            )
+        return generation
 
     def get_generation(self) -> int:
         """The generation newly bound kreuzakt ids belong to (default 1)."""
@@ -612,7 +634,18 @@ class Store:
             # across processes.
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                next_generation = self._read_generation() + 1
+                current = self._read_generation_or_none()
+                if current is None:
+                    # The settings row is unusable and this command is how the
+                    # operator repairs it, so the next value comes from the ledger:
+                    # one above the highest generation any row still carries is
+                    # strictly new, which a blind `DEFAULT_GENERATION + 1` is not.
+                    bounds = self._conn.execute(
+                        "SELECT COALESCE(MAX(delivered_generation), 0) AS bound,"
+                        " COALESCE(MAX(cleanup_generation), 0) AS queued FROM index_ledger"
+                    ).fetchone()
+                    current = max(bounds["bound"], bounds["queued"], DEFAULT_GENERATION)
+                next_generation = current + 1
                 self._conn.execute(
                     "INSERT INTO settings (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1090,14 +1123,19 @@ class Store:
     ) -> None:
         """Record that this Papra document exists, without disturbing anything else.
 
-        `file_hash` follows the bytes (it is what Kreuzakt deduped on, so a stale
-        one would make a resolution vouch for content it never saw), while
-        `papra_original_name` keeps the first value it was given: that column is
-        the ownership baseline the metadata delivery compares Papra's current name
+        `file_hash` follows the bytes, and taking those bytes away from a bound row
+        takes the binding with it: Kreuzakt indexed the old content, so keeping
+        `kreuzakt_id` would leave the row resolving to text extracted from a file
+        that no longer exists *and* keep it out of `ledger_needs_index`, which is a
+        wrong answer the sweep could never repair. Protection flags, the written
+        values and the delivery columns are not mentioned in the UPDATE at all, so a
+        re-ingest cannot clear them by construction — a human's decision is about
+        the document, not about which bytes were indexed.
+
+        `papra_original_name` keeps the first value it was given: that column is the
+        ownership baseline the metadata delivery compares Papra's current name
         against, and moving it under the comparison would either protect a field
-        forever or authorise a rename we did not make. Protection flags, the
-        written values and the delivery columns are not mentioned in the UPDATE at
-        all, so a re-ingest cannot clear them by construction.
+        forever or authorise a rename we did not make.
         """
         with self._lock, self._conn:
             self._conn.execute(
@@ -1106,7 +1144,13 @@ class Store:
                 " ON CONFLICT(papra_org_id, papra_document_id) DO UPDATE SET"
                 " file_hash = excluded.file_hash,"
                 " papra_original_name = COALESCE(index_ledger.papra_original_name,"
-                " excluded.papra_original_name)",
+                " excluded.papra_original_name),"
+                " kreuzakt_id = CASE"
+                " WHEN index_ledger.file_hash = excluded.file_hash"
+                " THEN index_ledger.kreuzakt_id END,"
+                " delivered_generation = CASE"
+                " WHEN index_ledger.file_hash = excluded.file_hash"
+                " THEN index_ledger.delivered_generation END",
                 (papra_org_id, papra_document_id, file_hash, papra_original_name),
             )
 
@@ -1228,32 +1272,49 @@ class Store:
         concurrent deletes of the two shared references cannot both see "one left"
         and both skip the upstream delete, leaving an orphan in Kreuzakt. Only
         rows of the *current* generation count as remaining: a stale sibling
-        resolves to nothing and therefore protects nothing.
+        resolves to nothing and therefore protects nothing. When no generation is
+        current (a corrupt `index_generation`) this raises and writes nothing — a
+        reference marked deleted against an unknown index would be dropped without
+        anything being queued for it.
         """
-        with self._lock, self._conn:
-            # Read inside the transaction, not before it: the generation the count
-            # is scoped to has to be the generation that was current when the UPDATE
-            # took the write lock, or a `bump_generation()` landing in between would
-            # make "how many are left?" answer about an index that no longer exists.
-            generation = self._read_generation()
-            now = _now()
-            row = self._conn.execute(
-                "SELECT kreuzakt_id FROM index_ledger"
-                " WHERE papra_org_id = ? AND papra_document_id = ?",
-                (papra_org_id, papra_document_id),
-            ).fetchone()
-            self._conn.execute(
-                "UPDATE index_ledger SET deleted_at = ?"
-                " WHERE papra_org_id = ? AND papra_document_id = ?",
-                (now, papra_org_id, papra_document_id),
-            )
-            if row is None or row["kreuzakt_id"] is None:
-                return (-1, -1)
-            remaining = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM index_ledger WHERE kreuzakt_id = ?"
-                " AND deleted_at IS NULL AND delivered_generation = ?",
-                (row["kreuzakt_id"], generation),
-            ).fetchone()["n"]
+        with self._lock:
+            # BEGIN IMMEDIATE: the reading below and the `deleted_at` write have to
+            # be one atomic step. `with self._conn` alone does not open a
+            # transaction until the first DML, so the generation and the existing
+            # binding would be read outside it — and a `bump_generation()` from
+            # another process landing in that gap makes the returned count describe
+            # an index that had already been superseded. The caller acts on that
+            # count by deleting a Kreuzakt document, so "stale but confident" is
+            # the one answer it must not get.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                generation = self._read_generation()
+                now = _now()
+                row = self._conn.execute(
+                    "SELECT kreuzakt_id FROM index_ledger"
+                    " WHERE papra_org_id = ? AND papra_document_id = ?",
+                    (papra_org_id, papra_document_id),
+                ).fetchone()
+                self._conn.execute(
+                    "UPDATE index_ledger SET deleted_at = ?"
+                    " WHERE papra_org_id = ? AND papra_document_id = ?",
+                    (now, papra_org_id, papra_document_id),
+                )
+                if row is None or row["kreuzakt_id"] is None:
+                    self._conn.commit()
+                    return (-1, -1)
+                remaining = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM index_ledger WHERE kreuzakt_id = ?"
+                    " AND deleted_at IS NULL AND delivered_generation = ?",
+                    (row["kreuzakt_id"], generation),
+                ).fetchone()["n"]
+                self._conn.commit()
+            except BaseException:
+                # A refusal (an unusable generation, a locked database) leaves the
+                # row untouched: a half-applied delete would report "marked, nothing
+                # left to delete" and lose the reference without queueing anything.
+                self._conn.rollback()
+                raise
         return (row["kreuzakt_id"], remaining)
 
     def ledger_mark_restored(self, *, papra_org_id: str, papra_document_id: str) -> None:
@@ -1277,20 +1338,31 @@ class Store:
     def ledger_record_delivery(
         self, *, papra_org_id: str, papra_document_id: str, delivered_at: str,
         delivered_sha: str, generation: int,
-    ) -> None:
-        """Record what we last wrote into Papra, and under which generation.
+    ) -> bool:
+        """Record what we last wrote into Papra; report whether the row accepted it.
 
         `delivered_sha` is the hash of the text we delivered — the convergence pass
         compares Kreuzakt's current text against it, and `EMPTY_EXTRACTION_SHA` is
         how "extraction produced nothing" becomes countable.
+
+        This is an authorization write, not a receipt, because it stamps
+        `delivered_generation` — the column that makes a binding resolve. So it is
+        conditional on the row being bound to `generation`: stamping the current
+        generation onto a row still bound to a destroyed index would make that stale
+        integer resolvable again, and a late worker restamping a rebound row would
+        retire a live one. A caller that ignores the return value gets a no-op it
+        can detect, which is why this does not return None.
         """
         with self._lock, self._conn:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE index_ledger SET delivered_at = ?, delivered_sha = ?,"
                 " delivered_generation = ?"
-                " WHERE papra_org_id = ? AND papra_document_id = ?",
-                (delivered_at, delivered_sha, generation, papra_org_id, papra_document_id),
+                " WHERE papra_org_id = ? AND papra_document_id = ?"
+                " AND kreuzakt_id IS NOT NULL AND delivered_generation = ?",
+                (delivered_at, delivered_sha, generation, papra_org_id, papra_document_id,
+                 generation),
             )
+        return cursor.rowcount > 0
 
     def ledger_record_metadata(
         self, *, papra_org_id: str, papra_document_id: str, name: str | None = None,
@@ -1368,8 +1440,11 @@ class Store:
         if document_id is not None:
             clauses.append("papra_document_id = ?")
             params.append(document_id)
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
+        # SQLite counts every row the WHERE matched, protection or not, so without
+        # this the return value would be "references in scope", and a repeat of the
+        # command would report the same number while changing nothing.
+        clauses.append("(" + " OR ".join(f"{f}_protected = 1" for f in fields) + ")")
+        sql += " WHERE " + " AND ".join(clauses)
         with self._lock, self._conn:
             cursor = self._conn.execute(sql, params)
         return cursor.rowcount
@@ -1510,20 +1585,23 @@ class Store:
     ) -> None:
         """Record one upstream delete attempt and move the state machine.
 
-        Success closes the row (`done`, no next time). Failure keeps it `pending`
-        with the caller's backoff — or, after `CLEANUP_MAX_ATTEMPTS`, marks it
-        `failed` and logs one ERROR, because "we are still trying" repeated every
-        pass is noise while "we have stopped trying" is the fact an operator has
-        to hear exactly once. There is no reason column in the schema, so the
-        upstream error travels in that log line.
+        Success closes the row (`done`, no next time) and says nothing: the caller
+        logs its per-pass tally, and a completion line written in the same voice as
+        the failure lines only makes them harder to read. Failure keeps the row
+        `pending` with the caller's backoff — or, once `CLEANUP_MAX_ATTEMPTS` is
+        reached, marks it `failed` and logs one ERROR at that transition, because
+        "we are still trying" repeated every pass is noise while "we have stopped
+        trying" is the fact an operator has to hear exactly once. There is no reason
+        column in the schema, so the upstream error travels in that log line.
         """
-        permanent = False
+        permanent_now = False
+        was_failed = False
         cleanup_kreuzakt_id: int | None = None
         attempts = 0
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT cleanup_attempts, cleanup_kreuzakt_id FROM index_ledger"
-                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                "SELECT cleanup_state, cleanup_attempts, cleanup_kreuzakt_id"
+                " FROM index_ledger WHERE papra_org_id = ? AND papra_document_id = ?",
                 (papra_org_id, papra_document_id),
             ).fetchone()
             if row is None:
@@ -1536,21 +1614,33 @@ class Store:
                     " WHERE papra_org_id = ? AND papra_document_id = ?",
                     (papra_org_id, papra_document_id),
                 )
-            else:
-                attempts = row["cleanup_attempts"] + 1
-                permanent = attempts >= CLEANUP_MAX_ATTEMPTS
-                self._conn.execute(
-                    "UPDATE index_ledger SET cleanup_state = ?, cleanup_attempts = ?,"
-                    " cleanup_next_at = ?"
-                    " WHERE papra_org_id = ? AND papra_document_id = ?",
-                    ("failed" if permanent else "pending", attempts,
-                     next_at if next_at is not None else _now(),
-                     papra_org_id, papra_document_id),
-                )
-                cleanup_kreuzakt_id = row["cleanup_kreuzakt_id"]
-        if permanent:
+                return
+            was_failed = row["cleanup_state"] == "failed"
+            attempts = row["cleanup_attempts"] + 1
+            permanent_now = attempts >= CLEANUP_MAX_ATTEMPTS
+            self._conn.execute(
+                "UPDATE index_ledger SET cleanup_state = ?, cleanup_attempts = ?,"
+                " cleanup_next_at = ?"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                ("failed" if permanent_now else "pending", attempts,
+                 next_at if next_at is not None else _now(),
+                 papra_org_id, papra_document_id),
+            )
+            cleanup_kreuzakt_id = row["cleanup_kreuzakt_id"]
+        # Success is silent: the caller logs its per-pass tally, and a completion
+        # line written next to the failure lines would only make them harder to
+        # read. The ERROR belongs to the transition into `failed`, not to every
+        # later report about a row that already is — an operator scraping logs for
+        # "we have stopped trying" has to be able to count the times it happened.
+        if permanent_now and not was_failed:
             logger.error(
                 "cleanup failed permanently papra=%s/%s kreuzakt=%s after %s attempts: %s",
+                papra_org_id, papra_document_id, cleanup_kreuzakt_id, attempts, reason,
+            )
+        elif was_failed:
+            logger.warning(
+                "cleanup still failing after permanent failure papra=%s/%s"
+                " kreuzakt=%s attempt=%s: %s",
                 papra_org_id, papra_document_id, cleanup_kreuzakt_id, attempts, reason,
             )
         else:
