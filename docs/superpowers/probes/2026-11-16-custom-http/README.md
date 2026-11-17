@@ -194,3 +194,45 @@ Not supported, and needing measurement or a decision before a spec:
 - The recovery gap in §4, which is a code change and needs the failure cases
   (crash-before-enqueue, PATCH failure, PATCH-response-lost, worker death, exhausted job,
   409-replay) enumerated and tested against a restart.
+
+## 6. German was a configuration default, not a ceiling (added after review)
+
+Section 1 measured what the shipped configuration does, and a reader could reasonably conclude
+Papra cannot transcribe German. It can. `DOCUMENTS_OCR_LANGUAGES` is the lever, and one container
+started with it set to `deu` produced correct German from the same fixtures section 1 mangled:
+
+```bash
+docker run -d --name papra-probe-deu -p 127.0.0.1:12213:1221 \
+  -e AUTH_SECRET='probe-secret-0123456789abcdef0123456789abcdef' \
+  -e AUTH_IS_EMAIL_VERIFICATION_REQUIRED=false -e AUTH_IS_REGISTRATION_ENABLED=true \
+  -e DOCUMENTS_OCR_LANGUAGES=deu \
+  ghcr.io/papra-hq/papra@sha256:d1f596a35332ad04d8a69d88a5e19bc82acd47f2bc2fe687dd2145b1ef5a8b19
+```
+
+Running `probe_a2_harder_inputs.py` against it, unchanged except the base URL:
+
+| fixture | extracted | `Straße` | `Grüße` | `Köln` |
+| --- | --- | --- | --- | --- |
+| clean 200 dpi, `Die Wäsche Straße Grüße Café Köln` | `Die Wäsche Straße Grüße Cafe Köln` | **hit** | **hit** | **hit** |
+| degraded, `Die Wäsche geht durch die Straße.` | `Die Wäsche geht durch die Straße.` | **hit** | n/a | n/a |
+
+Umlauts and `ß` survive; only the acute in `Café` was dropped, and `Café` still hits because
+query-time folding covers it. Nothing else changed between this run and section 1 — same image
+digest, same fixtures, same per-document assertions.
+
+Two operational facts came out of the same run:
+
+- **The language file is fetched on first use.** `/app/deu.traineddata` (2.0 MB, owned by
+  `nonroot`) did not exist when the container started and appeared after the first OCR. So the
+  container needs outbound internet once per language, and the cache lives in the container
+  filesystem — recreate the container and it downloads again. A host bind mount over
+  `/app/deu.traineddata` is the offline answer.
+- **English is not included when `deu` is set alone.** The variable replaces the default rather
+  than extending it, so an archive holding both English and German documents wants
+  `DOCUMENTS_OCR_LANGUAGES=deu,eng`; that combination was not measured here, and the honest
+  expectation is that more languages means more traineddata fetched and slower extraction, not
+  better extraction on either language.
+
+What section 1 still establishes: the *shipped default* mangles German unrecoverably, so an
+instance left at its defaults silently produces unfindable documents. What section 6 corrects:
+that is a default to change, not a limit of the software.
