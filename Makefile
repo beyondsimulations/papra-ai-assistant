@@ -48,9 +48,10 @@ test-integration:
 ci: lint test-unit test-integration
 
 # CI-shaped run: bring the stack up, run everything, then destroy it. Destructive
-# by design. Papra's data does not survive `down` either way — the compose file
-# declares no named volumes, so its database is container filesystem — so treat
-# both targets here as "this scratch stack is disposable".
+# by design. Papra's data does not survive `down` either way — no volume is declared
+# for it, so its database is the container filesystem — and `down -v` additionally
+# deletes Kreuzakt's `kreuzakt-data`, which plain `down` leaves alone. Treat both
+# targets here as "this scratch stack is disposable".
 test test-ci:
 	$(COMPOSE) up -d --wait
 	PAPRA_REQUIRE_STACK=1 $(PYTEST); status=$$?; $(COMPOSE) down -v; exit $$status
@@ -68,6 +69,9 @@ stack-down:
 # upstream moved. After updating a pin: `make test-ci` before committing it.
 stack-digests:
 	@grep -E '^[[:space:]]+image:' docker-compose.test.yml | sed 's/^[[:space:]]*/  pinned: /'
+	@echo "  pulled locally now:"
+	@docker images --digests --format '{{.Repository}} {{.Digest}}' | grep -E 'papra|greenmail|kreuzakt' | sed 's/^/    /' || echo "    (nothing pulled locally yet)"
 	@echo "  newest upstream now:"
 	@docker pull --quiet ghcr.io/papra-hq/papra:latest | sed 's/^/    papra     /'
 	@docker pull --quiet greenmail/standalone:latest | sed 's/^/    greenmail /'
+	@docker pull --quiet ghcr.io/anaisbetts/kreuzakt:latest | sed 's/^/    kreuzakt  /'

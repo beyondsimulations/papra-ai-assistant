@@ -3,7 +3,7 @@
 # search semantics or did we?", an unpinned answer makes every run of the
 # integration tests a coin flip that blames our code. Refresh deliberately:
 #   docker compose -f docker-compose.test.yml pull
-#   docker images --digests --format '{{.Repository}} {{.Digest}}' | grep -E 'papra|greenmail'
+#   docker images --digests --format '{{.Repository}} {{.Digest}}' | grep -E 'papra|greenmail|kreuzakt'
 # then re-run `make test-integration` before committing the new digest.
 services:
   papra:
@@ -13,6 +13,8 @@ services:
       AUTH_SECRET: "papra-suite-test-secret-not-for-prod-0123456789"
       AUTH_IS_EMAIL_VERIFICATION_REQUIRED: "false"
       AUTH_IS_REGISTRATION_ENABLED: "true"
+      # German corpus: the deployed Papra sets the same value, so the tested topology matches the deployed one.
+      DOCUMENTS_OCR_LANGUAGES: "deu,eng"
     ports:
       - "127.0.0.1:12210:1221"
 
@@ -33,3 +35,105 @@ services:
       timeout: 3s
       retries: 30
       start_period: 5s
+
+  # Kreuzakt is the extractor and the only search authority. It has NO
+  # authentication, so PRODUCTION publishes no port: the suite container is its
+  # only client, over a network nothing else joins.
+  #
+  # The one deliberate deviation in the test stack: integration tests run as a
+  # process on the test host, so the test compose publishes 127.0.0.1:12400 to
+  # give that process a path in. Everything about Kreuzakt's *behaviour* under
+  # test is the production behaviour; only this listener differs, and the
+  # production snippet below has no ports: key at all.
+  #
+  # Not `internal: true` — Kreuzakt must reach omlx on the Mac Studio over the
+  # tailnet, and an internal network has no route out. Isolation here comes from
+  # publishing no port and joining no other network, not from a flag.
+  #
+  # Both properties measured 2026-11-17 on this file, in a throwaway project
+  # (`-p kreuzakt-bridge`, destroyed afterwards). Real container name:
+  # kreuzakt-bridge-kreuzakt-1. Exactly one network, and it is indexnet:
+  #
+  #   $ docker inspect kreuzakt-bridge-kreuzakt-1 \
+  #       --format '{{json .NetworkSettings.Networks}}' | python3 -m json.tool
+  #   {
+  #       "kreuzakt-bridge_indexnet": {
+  #           "IPAMConfig": null,
+  #           "Links": null,
+  #           "Aliases": [
+  #               "kreuzakt-bridge-kreuzakt-1",
+  #               "kreuzakt"
+  #           ],
+  #           "DriverOpts": null,
+  #           "GwPriority": 0,
+  #           "NetworkID": "4642c5cea991cde12c313e73286d325302f1e42c1da6bc7b554cf06d3b84631e",
+  #           "EndpointID": "e129f01d10dfacae3d95e853818ad1364a3a5abb504ea25d9dd1d060b63f4092",
+  #           "Gateway": "192.168.147.1",
+  #           "IPAddress": "192.168.147.2",
+  #           "MacAddress": "d2:42:23:a4:02:d5",
+  #           "IPPrefixLen": 24,
+  #           "IPv6Gateway": "",
+  #           "GlobalIPv6Address": "",
+  #           "GlobalIPv6PrefixLen": 0,
+  #           "DNSNames": [
+  #               "kreuzakt-bridge-kreuzakt-1",
+  #               "kreuzakt",
+  #               "71a4173afd88"
+  #           ]
+  #       }
+  #   }
+  #
+  # And Papra's service name does not resolve from Kreuzakt (the image has no
+  # curl, so this is bash's /dev/tcp; the two error lines are part of the observed
+  # output):
+  #
+  #   $ docker compose -f docker-compose.test.yml -p kreuzakt-bridge \
+  #       exec kreuzakt bash -c 'exec 3<>/dev/tcp/papra/1221 && echo FAIL-reachable || echo PASS-unreachable'
+  #   bash: line 1: papra: Name or service not known
+  #   bash: line 1: /dev/tcp/papra/1221: Invalid argument
+  #   PASS-unreachable
+  #
+  # What that second proof does and does not buy. `PASS-unreachable` here comes
+  # from a failed *name lookup*, not from a refused or filtered connection, so it
+  # shows the service name is gone. It is not evidence of IP-level isolation: the
+  # same container then reached Papra by its container IP on the other bridge
+  # (`/dev/tcp/192.168.148.3/1221` returned `HTTP/1.1 200 OK`). Why that routing
+  # works on this host was not measured; that it works was. So "publishing no port
+  # and joining no other network" above describes configuration, not a control —
+  # what the topology buys is that Kreuzakt is not *addressable* (no published host
+  # port, no name on any other network), and nothing here shows a container that
+  # already holds an IP being stopped. Production isolation on atlas is outside
+  # what this proof covers.
+  #
+  # Digest as of 2026-11-17. Upstream CI builds linux/amd64 only, deliberately;
+  # atlas is x86_64. Refresh like papra below, then re-run the suite.
+  kreuzakt:
+    image: ghcr.io/anaisbetts/kreuzakt@sha256:4a0109d03d663338fd967662aa0151ec7684d2ba31cdfd12f1bf4f3901b1cd8d
+    # Upstream publishes linux/amd64 only; this dev box is Apple Silicon (runs it
+    # under Rosetta) and atlas is x86_64, so naming the platform explicitly is
+    # correct on both and rules out a silent platform mismatch.
+    platform: linux/amd64
+    environment:
+      DATA_DIR: /data
+      OCR_VLM_BASE_URL: "${OMLX_BASE_URL:-}"
+      OCR_VLM_API_KEY: "${OMLX_API_KEY:-}"
+      OCR_VLM_MODEL: "${OMLX_OCR_MODEL:-}"
+      OPENAI_BASE_URL: "${OMLX_BASE_URL:-}"
+      OPENAI_API_KEY: "${OMLX_API_KEY:-}"
+      METADATA_LLM_MODEL: "${OMLX_TEXT_MODEL:-}"
+    volumes:
+      - kreuzakt-data:/data
+    ports:
+      - "127.0.0.1:12400:3000"          # TEST ONLY; absent in production
+    networks: [indexnet]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/3000'"]
+      interval: 3s
+      timeout: 2s
+      retries: 40
+
+volumes:
+  kreuzakt-data:
+
+networks:
+  indexnet:

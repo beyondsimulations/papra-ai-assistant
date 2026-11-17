@@ -237,7 +237,7 @@ addendum,
 make install-uv       # deps into .venv (uv); `make install` is the pip variant
 make lint             # ruff over the tree (measurement probes are excluded)
 make test-unit        # 447 tests, no Docker, ~18 s
-make stack-up         # scratch Papra + GreenMail, images pinned by digest
+make stack-up         # scratch Papra + GreenMail + Kreuzakt, images pinned by digest
 make ci               # lint + unit + integration against the running stack
 make test-ci          # CI shape: up -> run everything -> down -v   (DESTRUCTIVE)
 make stack-digests    # pinned digests vs what upstream serves now
@@ -249,8 +249,10 @@ Three things about these targets that are worth knowing before you trust one:
   brings it up or takes it down. `make test`/`make test-ci` end in `down -v` because
   that is right in CI, and on a machine where this is also the scratch stack someone
   is measuring against, it is a way to lose work mid-investigation. Papra's data does
-  not survive `stack-down` either — the compose file declares no named volumes — so
-  every one of these stacks is disposable.
+  not survive `stack-down` either — no volume is declared for it, so its database is
+  the container filesystem — so every one of these stacks is disposable. Kreuzakt is
+  the one exception: `kreuzakt-data` is a named volume, so it survives `stack-down`
+  and `down -v` is what erases it.
 - **`PAPRA_REQUIRE_STACK=1` is what makes a green suite mean something.** Without it
   the integration tests *skip* when the stack is absent and the run still exits 0.
   With it, an unreachable stack fails. Verified against the shipped helpers: a dead
@@ -264,3 +266,95 @@ Three things about these targets that are worth knowing before you trust one:
 Integration tests run a real IMAP server and a real Papra (the LLM is an injected
 stub, so no model container is needed); they are deselected from the default run by
 the `integration` marker and required by `PAPRA_REQUIRE_STACK=1`.
+
+### The test stack, and where the tests actually run
+
+The stack is three containers now: Papra, GreenMail, and Kreuzakt — the extractor and
+the only search authority
+(`docs/superpowers/specs/2026-11-17-papra-record-kreuzakt-index-design.md`). Kreuzakt
+ships no authentication, so it lives on a network of its own (`indexnet`) and, in
+production, publishes no port at all. The reachability list is therefore short, and it
+is written down rather than implied: **Kreuzakt is reachable from the suite container,
+and nothing else** — that is the intended production reachability, and it is a statement
+about configuration: no published port, and a network with exactly one other member.
+What it does not mean is "isolated at the IP layer". Measured on this compose file
+(the output is pasted in the comment on the `kreuzakt` service): Papra's service name
+does not resolve from the Kreuzakt container, but Kreuzakt could still reach Papra's
+*container IP* on the other bridge and got `HTTP/1.1 200 OK`. So nothing here should be
+treated as a boundary that stops a container which already holds an address; the real
+protection is that no outside process is ever handed one.
+
+Integration tests run on atlas as a process on that host — `ssh atlas`, then
+`PAPRA_REQUIRE_STACK=1 make test-integration` from the checkout there — because
+`DOCKER_HOST=ssh://atlas` does not move the test process's network namespace. With it
+set, `docker compose ps` reports the atlas stack while the pytest process still dials
+`127.0.0.1` on the laptop it is running on, and every connection test then fails (or,
+worse, passes against some other local container). A test process reaches containers by
+being on the host that runs them, so that is how the suite is run:
+
+```bash
+# The whole command has to execute on atlas. `ssh atlas && make test-integration`
+# is not it: that opens and closes an ssh session, then runs make on the laptop.
+ssh atlas 'cd ~/papra-ai-assistant && PAPRA_REQUIRE_STACK=1 make test-integration'
+```
+
+### Deploying Kreuzakt alongside the suite
+
+Kreuzakt joins the operator's Dokploy stack for `papra-suite`, not Papra's stack, so
+restarting the archive does not restart the index. This repo ships only
+`docker-compose.test.yml`, so the production shape is this snippet — the same service
+block the test compose uses, with the `ports:` key removed and nothing else changed:
+
+```yaml
+  # The suite container joins the same network, so it reaches the index by service
+  # name, and nothing outside this network has a name or a port to aim at.
+  papra-suite:
+    # ...
+    networks: [indexnet]
+
+  kreuzakt:
+    image: ghcr.io/anaisbetts/kreuzakt@sha256:4a0109d03d663338fd967662aa0151ec7684d2ba31cdfd12f1bf4f3901b1cd8d
+    platform: linux/amd64          # upstream publishes amd64 only; atlas is x86_64
+    environment:
+      DATA_DIR: /data
+      OCR_VLM_BASE_URL: "${OMLX_BASE_URL:-}"
+      OCR_VLM_API_KEY: "${OMLX_API_KEY:-}"
+      OCR_VLM_MODEL: "${OMLX_OCR_MODEL:-}"
+      OPENAI_BASE_URL: "${OMLX_BASE_URL:-}"
+      OPENAI_API_KEY: "${OMLX_API_KEY:-}"
+      METADATA_LLM_MODEL: "${OMLX_TEXT_MODEL:-}"
+    volumes:
+      - kreuzakt-data:/data
+    networks: [indexnet]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/3000'"]
+      interval: 3s
+      timeout: 2s
+      retries: 40
+
+volumes:
+  kreuzakt-data:
+
+networks:
+  indexnet:
+```
+
+And in that same stack, the suite is told where its index lives:
+
+```bash
+PAPRA_KREUZAKT_URL=http://kreuzakt:3000
+```
+
+Three things this shape depends on, all of them cheap to get wrong:
+
+- **`indexnet` is what makes `http://kreuzakt:3000` resolve**, and it resolves for the
+  suite only. The test compose adds one thing the snippet above does not have —
+  `127.0.0.1:12400` — solely because the test client is a host process; production has
+  no listener, so its behaviour is the tested behaviour except for that socket.
+- **The `OMLX_*` variables must be set** to the Mac Studio's tailnet address (an IP or
+  an explicit host entry: container DNS will not resolve a MagicDNS name). Left empty,
+  Kreuzakt still starts and still answers, keyless — it just extracts text layers and
+  titles from filenames, which looks like a working index and is not one.
+- **`kreuzakt-data` is disposable, by decision.** It holds Kreuzakt's copy of every
+  original and its own queue; the documents and the index ledger live in Papra and in
+  `state.db`. Losing the volume costs VLM minutes to rebuild, nothing else.
