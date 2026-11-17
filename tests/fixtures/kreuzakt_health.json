@@ -1,0 +1,11 @@
+{
+  "status": "ok",
+  "documents": 0,
+  "database": true,
+  "originals_dir": true,
+  "ingest_dir": true,
+  "ocr_model": "qwen/qwen3.7-flash",
+  "metadata_model": "openai/gpt-5.4",
+  "openai_base_url": "https://openrouter.ai/api/v1",
+  "ocr_base_url": "https://openrouter.ai/api/v1"
+}

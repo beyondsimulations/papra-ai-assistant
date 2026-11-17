@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "id": 1,
+      "title": "Papra Search0001 11111111",
+      "description": "",
+      "document_date": null,
+      "added_at": "2026-11-17T22:28:04.906Z",
+      "original_filename": "papra-search0001-11111111.pdf",
+      "mime_type": "application/pdf",
+      "content": "PAPRA-CONTRACT-PROBE Ziphoid\nRechnung Nr. 4711\nMiete Oktober 2025",
+      "thumbnail_url": "/api/documents/1/thumbnail",
+      "snippet": "PAPRA-CONTRACT-PROBE <mark>Ziphoid</mark>\nRechnung Nr. 4711\nMiete Oktober 2025"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "limit": 20,
+  "query": "Ziphoid"
+}

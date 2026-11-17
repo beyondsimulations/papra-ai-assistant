@@ -465,3 +465,136 @@ def test_query_stripped_from_echo():
         load_config({**BASE_ENV, "PAPRA_BASE_URL": "ftp://papra:1221?tok=xyz"})
 
     assert "xyz" not in str(excinfo.value)
+
+
+# --- the index bridge's own settings (plan Task 5 Step 4) --------------------
+#
+# Everything here is parsed at load time on purpose: a typo in PAPRA_KREUZAKT_URL or a
+# zero poll interval must stop `papra-suite check`, not surface as a transport error
+# during the first upload weeks later.
+
+
+def test_index_defaults_are_write_nothing():
+    config = load_config(BASE_ENV)
+
+    assert config.kreuzakt_base_url == "http://kreuzakt:3000"
+    assert config.index_content_delivery is False
+    assert config.index_metadata_delivery is False
+    assert config.index_max_attempts == 3
+    assert config.index_search_scan_rows == 500
+    assert config.index_poll_interval_s == 2.0
+    assert config.index_wait_timeout_s == 900
+    assert config.index_query_max_chars == 512
+    assert config.mcp_url == ""
+    assert config.mcp_port == 8765
+    assert config.legacy_workers is True
+
+
+def test_kreuzakt_url_is_read_and_normalised():
+    config = load_config({**BASE_ENV, "PAPRA_KREUZAKT_URL": "http://kz:3000/"})
+
+    assert config.kreuzakt_base_url == "http://kz:3000"
+
+
+def test_kreuzakt_url_with_credentials_fails_at_check_time():
+    # Same rule as PAPRA_BASE_URL: httpx derives Basic auth from URL userinfo and
+    # logs the credentialed URL, so a value carrying a password must be rejected by
+    # name and must not be echoed.
+    with pytest.raises(ConfigError, match="PAPRA_KREUZAKT_URL") as excinfo:
+        load_config({**BASE_ENV, "PAPRA_KREUZAKT_URL": "http://u:secretpw@kz:3000"})
+
+    assert "secretpw" not in str(excinfo.value)
+
+
+def test_kreuzakt_url_with_a_path_fails_at_check_time():
+    with pytest.raises(ConfigError, match="PAPRA_KREUZAKT_URL"):
+        load_config({**BASE_ENV, "PAPRA_KREUZAKT_URL": "http://kz:3000/api"})
+
+
+def test_kreuzakt_url_must_be_a_url():
+    with pytest.raises(ConfigError, match="PAPRA_KREUZAKT_URL"):
+        load_config({**BASE_ENV, "PAPRA_KREUZAKT_URL": "kz:3000"})
+
+
+def test_mcp_url_is_validated_by_the_same_rule_but_may_be_absent():
+    config = load_config({**BASE_ENV, "PAPRA_MCP_URL": "https://papra-mcp.ts.net/"})
+    assert config.mcp_url == "https://papra-mcp.ts.net"
+
+    with pytest.raises(ConfigError, match="PAPRA_MCP_URL"):
+        load_config({**BASE_ENV, "PAPRA_MCP_URL": "papra-mcp.ts.net"})
+
+    with pytest.raises(ConfigError, match="PAPRA_MCP_URL") as excinfo:
+        load_config({**BASE_ENV, "PAPRA_MCP_URL": "https://u:secretpw@papra-mcp.ts.net"})
+    assert "secretpw" not in str(excinfo.value)
+
+
+def test_mcp_port_must_be_a_port():
+    config = load_config({**BASE_ENV, "PAPRA_MCP_PORT": "9999"})
+    assert config.mcp_port == 9999
+
+    with pytest.raises(ConfigError, match="PAPRA_MCP_PORT"):
+        load_config({**BASE_ENV, "PAPRA_MCP_PORT": "0"})
+
+    with pytest.raises(ConfigError, match="PAPRA_MCP_PORT"):
+        load_config({**BASE_ENV, "PAPRA_MCP_PORT": "nope"})
+
+
+def test_index_delivery_flags_parse_true():
+    config = load_config({**BASE_ENV, "PAPRA_INDEX_CONTENT_DELIVERY": "true",
+                          "PAPRA_INDEX_METADATA_DELIVERY": "1"})
+
+    assert config.index_content_delivery is True
+    assert config.index_metadata_delivery is True
+
+
+def test_index_delivery_flag_with_a_non_boolean_value_is_rejected():
+    with pytest.raises(ConfigError, match="PAPRA_INDEX_CONTENT_DELIVERY"):
+        load_config({**BASE_ENV, "PAPRA_INDEX_CONTENT_DELIVERY": "maybe"})
+
+
+def test_legacy_workers_can_be_turned_off_for_the_handover():
+    config = load_config({**BASE_ENV, "PAPRA_LEGACY_WORKERS": "false"})
+
+    assert config.legacy_workers is False
+
+
+def test_index_poll_interval_must_be_positive():
+    # A zero poll interval is a hot loop against Kreuzakt; it must not load.
+    with pytest.raises(ConfigError, match="PAPRA_INDEX_POLL_INTERVAL_S"):
+        load_config({**BASE_ENV, "PAPRA_INDEX_POLL_INTERVAL_S": "0"})
+
+    with pytest.raises(ConfigError, match="PAPRA_INDEX_POLL_INTERVAL_S"):
+        load_config({**BASE_ENV, "PAPRA_INDEX_POLL_INTERVAL_S": "-1"})
+
+    config = load_config({**BASE_ENV, "PAPRA_INDEX_POLL_INTERVAL_S": "0.25"})
+    assert config.index_poll_interval_s == 0.25
+
+
+def test_index_poll_interval_with_text_is_rejected_by_name():
+    with pytest.raises(ConfigError, match="PAPRA_INDEX_POLL_INTERVAL_S"):
+        load_config({**BASE_ENV, "PAPRA_INDEX_POLL_INTERVAL_S": "two"})
+
+
+def test_index_counters_must_be_positive():
+    for name in ("PAPRA_INDEX_MAX_ATTEMPTS", "PAPRA_INDEX_SEARCH_SCAN_ROWS",
+                 "PAPRA_INDEX_WAIT_TIMEOUT_S", "PAPRA_INDEX_QUERY_MAX_CHARS"):
+        with pytest.raises(ConfigError, match=name):
+            load_config({**BASE_ENV, name: "0"})
+
+    for name in ("PAPRA_INDEX_MAX_ATTEMPTS", "PAPRA_INDEX_SEARCH_SCAN_ROWS",
+                 "PAPRA_INDEX_WAIT_TIMEOUT_S", "PAPRA_INDEX_QUERY_MAX_CHARS"):
+        with pytest.raises(ConfigError, match=name):
+            load_config({**BASE_ENV, name: "-3"})
+
+
+def test_index_integer_env_with_text_is_rejected_by_name():
+    with pytest.raises(ConfigError, match="PAPRA_INDEX_MAX_ATTEMPTS"):
+        load_config({**BASE_ENV, "PAPRA_INDEX_MAX_ATTEMPTS": "three"})
+
+
+def test_index_whitespace_only_env_falls_back_to_the_default():
+    config = load_config({**BASE_ENV, "PAPRA_INDEX_WAIT_TIMEOUT_S": "  ",
+                          "PAPRA_KREUZAKT_URL": ""})
+
+    assert config.index_wait_timeout_s == 900
+    assert config.kreuzakt_base_url == "http://kreuzakt:3000"

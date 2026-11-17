@@ -31,6 +31,19 @@ class AppConfig:
     ocr_concurrency: int
     sweep_interval_s: int
     allowed_senders: "AllowList"
+    # The index bridge. Both delivery flags default False: the bridge lands write-nothing,
+    # and content/metadata write-back are switched on deliberately, per flag.
+    kreuzakt_base_url: str
+    index_content_delivery: bool
+    index_metadata_delivery: bool
+    legacy_workers: bool
+    index_max_attempts: int
+    index_search_scan_rows: int
+    index_poll_interval_s: float
+    index_wait_timeout_s: int
+    index_query_max_chars: int
+    mcp_url: str
+    mcp_port: int
 
 
 DEFAULT_BIND = "127.0.0.1:8080"
@@ -181,6 +194,65 @@ def _int_env(env: Mapping[str, str], name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer, got: {raw!r}") from None
 
 
+def _positive_int_env(env: Mapping[str, str], name: str, default: int) -> int:
+    """Counters and budgets: a zero is not 'unlimited' and not 'off', it is a loop that
+    does nothing or a scan that reads nothing, so it is refused rather than obeyed."""
+    value = _int_env(env, name, default)
+    if value < 1:
+        raise ConfigError(f"{name} must be at least 1, got: {value}")
+    return value
+
+
+def _float_env(env: Mapping[str, str], name: str, default: float) -> float:
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be a number, got: {raw!r}") from None
+
+
+def _positive_float_env(env: Mapping[str, str], name: str, default: float) -> float:
+    value = _float_env(env, name, default)
+    if value <= 0:
+        raise ConfigError(f"{name} must be greater than 0, got: {value}")
+    return value
+
+
+def _bool_env(env: Mapping[str, str], name: str, default: bool) -> bool:
+    """Strict: a flag that silently falls back on a typo would turn a disabled delivery
+    switch into an enabled one (or the reverse) with no message."""
+    raw = env.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name} must be true or false, got: {raw!r}")
+
+
+def _optional_base_url(env: Mapping[str, str], name: str, default: str) -> str:
+    """`_require_base_url` for a value the operator may leave unset.
+
+    The point of routing these two through the same validator is that a bad URL is a
+    `papra-suite check` failure, not a transport error during the first upload: the
+    userinfo, path, query and bad-port rejections in `_require_base_url` all describe
+    values that would fail on every single request.
+    """
+    if not env.get(name, "").strip():
+        return default
+    return _require_base_url(env, name)
+
+
+def _port_env(env: Mapping[str, str], name: str, default: int) -> int:
+    value = _int_env(env, name, default)
+    if not 1 <= value <= 65535:
+        raise ConfigError(f"{name} must be a port between 1 and 65535, got: {value}")
+    return value
+
+
 def _parse_bind(raw: str) -> tuple[str, int]:
     try:
         parsed = urlparse(f"//{raw}")
@@ -242,4 +314,20 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
         ocr_concurrency=min(_int_env(env, "OCR_CONCURRENCY", 3), 3),
         sweep_interval_s=_int_env(env, "SWEEP_INTERVAL_S", 300),
         allowed_senders=allowed_senders,
+        kreuzakt_base_url=_optional_base_url(env, "PAPRA_KREUZAKT_URL",
+                                             "http://kreuzakt:3000"),
+        index_content_delivery=_bool_env(env, "PAPRA_INDEX_CONTENT_DELIVERY", False),
+        index_metadata_delivery=_bool_env(env, "PAPRA_INDEX_METADATA_DELIVERY", False),
+        # True keeps today's behaviour (the ocr/title loops run and the legacy index job
+        # is enqueued); the handover sets it false to stop those producers for good.
+        legacy_workers=_bool_env(env, "PAPRA_LEGACY_WORKERS", True),
+        index_max_attempts=_positive_int_env(env, "PAPRA_INDEX_MAX_ATTEMPTS", 3),
+        index_search_scan_rows=_positive_int_env(env, "PAPRA_INDEX_SEARCH_SCAN_ROWS", 500),
+        index_poll_interval_s=_positive_float_env(env, "PAPRA_INDEX_POLL_INTERVAL_S", 2.0),
+        index_wait_timeout_s=_positive_int_env(env, "PAPRA_INDEX_WAIT_TIMEOUT_S", 900),
+        index_query_max_chars=_positive_int_env(env, "PAPRA_INDEX_QUERY_MAX_CHARS", 512),
+        # Empty is legal here and means "no MCP listener"; the MCP app is what refuses to
+        # build without it. What is not legal is a URL that cannot be used as given.
+        mcp_url=_optional_base_url(env, "PAPRA_MCP_URL", ""),
+        mcp_port=_port_env(env, "PAPRA_MCP_PORT", 8765),
     )

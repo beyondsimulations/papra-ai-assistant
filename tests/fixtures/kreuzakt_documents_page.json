@@ -1,0 +1,47 @@
+{
+  "documents": [
+    {
+      "id": 4,
+      "title": "Papra Search0004 44444444",
+      "description": "",
+      "document_date": null,
+      "added_at": "2026-11-17T22:28:05.723Z",
+      "original_filename": "papra-search0004-44444444.pdf",
+      "mime_type": "application/pdf",
+      "thumbnail_url": "/api/documents/4/thumbnail"
+    },
+    {
+      "id": 3,
+      "title": "Papra Search0003 33333333",
+      "description": "",
+      "document_date": null,
+      "added_at": "2026-11-17T22:28:05.549Z",
+      "original_filename": "papra-search0003-33333333.pdf",
+      "mime_type": "application/pdf",
+      "thumbnail_url": "/api/documents/3/thumbnail"
+    },
+    {
+      "id": 2,
+      "title": "Papra Search0002 22222222",
+      "description": "",
+      "document_date": null,
+      "added_at": "2026-11-17T22:28:05.290Z",
+      "original_filename": "papra-search0002-22222222.pdf",
+      "mime_type": "application/pdf",
+      "thumbnail_url": "/api/documents/2/thumbnail"
+    },
+    {
+      "id": 1,
+      "title": "Papra Search0001 11111111",
+      "description": "",
+      "document_date": null,
+      "added_at": "2026-11-17T22:28:04.906Z",
+      "original_filename": "papra-search0001-11111111.pdf",
+      "mime_type": "application/pdf",
+      "thumbnail_url": "/api/documents/1/thumbnail"
+    }
+  ],
+  "total": 4,
+  "page": 1,
+  "limit": 20
+}

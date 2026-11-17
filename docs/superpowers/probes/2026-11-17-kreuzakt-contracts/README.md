@@ -287,6 +287,84 @@ not tested). `hmac.new(secret.encode(), body,
 hashlib.sha256).hexdigest()` **does not reproduce it** — `false` on every delivery:
 the value is not hex, and the body alone is not the signed string.
 
+## Part D — `/api/search` and `/api/documents` (Task 5 Step 0, 2026-11-17)
+
+Run against a fresh throwaway container (project `kreuzakt-bridge`, the pinned digest,
+keyless, empty database), four hand-built PDFs uploaded first — all four contain
+`Rechnung` and `Miete`, each carries one unique token (`Ziphoid`, `Quorlund`,
+`Vexbold`, `Trumnik`) — so a multi-hit set and a single-hit set were both reachable.
+Raw payloads: `capture-search.json`, keys `S0…`/`S1…S7`/`D1…D4`. Script:
+`probe_search.py`, which also wrote the fixtures. Afterwards the project was destroyed
+with `down -v` and the operator's `papra-ai-assistant` stack was `start`ed again
+(`/api/health` → `{"isDatabaseHealthy":true,"isEverythingOk":true,"status":"ok"}`).
+
+### S1–S3 — the two bodies, verbatim
+
+`GET /api/search?q=Ziphoid` → 200:
+
+```json
+{"results": [{"id": 1, "title": "Papra Search0001 11111111", "description": "",
+  "document_date": null, "added_at": "2026-11-17T22:28:04.906Z",
+  "original_filename": "papra-search0001-11111111.pdf", "mime_type": "application/pdf",
+  "content": "PAPRA-CONTRACT-PROBE Ziphoid\nRechnung Nr. 4711\nMiete Oktober 2025",
+  "thumbnail_url": "/api/documents/1/thumbnail",
+  "snippet": "PAPRA-CONTRACT-PROBE <mark>Ziphoid</mark>\nRechnung Nr. 4711\nMiete Oktober 2025"}],
+ "total": 1, "page": 1, "limit": 20, "query": "Ziphoid"}
+```
+
+`GET /api/search?q=zzqxvbnmt-not-a-word-anywhere` → 200
+`{"results": [], "total": 0, "page": 1, "limit": 20, "query": "…"}` — an empty result is
+a 200 with `total: 0`, not an error. A search hit therefore carries **`content` and
+`snippet`**, and the client strips both.
+
+### S4–S7 — which search parameters do something (`S4_search_parameter_matrix`)
+
+With four matching documents (ids `[4, 3, 2, 1]` at the default `limit` of 20):
+
+| parameter | verdict |
+|---|---|
+| `q` | the query; the response echoes it as `query` |
+| `limit` | **honoured**: `limit=1` → `[4]`, `limit=2` → `[4, 3]`; **clamped to 100**: `limit=101` and `limit=1000` both echoed `"limit": 100`; `limit=0`, `limit=-5`, `limit=abc` → **400** `Pagination parameters must be positive integers` |
+| `page` | **honoured** (1-based): `page=2` at `limit=20` → 200 with `results: []` and `total: 4`; `page=2&limit=1` → `[3]`, i.e. the second row; `page=3&limit=2` → `[]`; `page=0`, `page=abc` → the same 400 as above |
+| `offset` | **ignored silently**: `offset=1` and `offset=2` each returned `[4, 3, 2, 1]` with the envelope still `page: 1, limit: 20` |
+| `pageIndex`, `pageSize` | ignored (Papra's names do not work here): `pageIndex=1&pageSize=1` → `[4, 3, 2, 1]` |
+
+So, unlike `/api/queue`, search **is** pageable — by `page`, not by `offset`. A hit
+carries **no score** in any of these responses (`score_field_present: false`), and
+`limit` does not change `total`.
+
+### D1–D4 — `/api/documents` (`D2_documents_parameter_matrix`, `D3_…`, `D4_…`)
+
+Envelope `{"documents": […], "total": 4, "page": 1, "limit": 20}`; a row carries
+`id, title, description, document_date, added_at, original_filename, mime_type,
+thumbnail_url` — **no `content`**, no `stored_filename`, no `created_at`/`updated_at`
+(the row cannot show the value `since` filters on). Ordering is newest first.
+
+`limit` honoured and clamped to 100 (`101`/`1000` echo `100`), `0`/`-5`/`abc` → 400
+`Pagination parameters must be positive integers`. `page` honoured (`page=2` → 200,
+`[]`, `total: 4`). `offset` ignored.
+
+`since` **is** honoured, and this is the trap: `since=2000-01-01T00:00:00Z` → all four
+rows, `since=2030-01-01T00:00:00Z` → none, `since=2026-11-17` → all four, and
+`since=2026-11-17 22:28:05` → all four. But `since=2026-11-17T22:28:05Z` — the same
+instant in ISO-8601, documents included at `22:28:04.906Z`–`22:28:05.723Z` — returned
+**200 with zero rows**, as did `since=not-a-date`, while `since=1700000000` returned
+all four. The pattern is a lexical string comparison against a `YYYY-MM-DD HH:MM:SS`
+column: a value containing `T`, or any string sorting after the stored stamp ("n" >
+"2"), silently matches nothing, and a string sorting before it ("1" < "2") matches
+everything. **Which column
+it filters was not determined** — all four documents were written inside two seconds,
+so no value separates them, and the row does not expose the field. Safe reading:
+`since` is a coarse gate in the server's own timestamp format, never a watermark, and
+an ISO-8601 value must be refused rather than sent.
+
+### What Task 5 encoded from this
+
+`search(query, *, page=1, limit=100)` and `list_documents(*, page=1, limit=100,
+since=None)` — `page`/`limit` because they demonstrably work, `offset` because it
+demonstrably does not; `limit` clamped client-side to 1..100; a `since` containing `T`
+refused with `KreuzaktError` instead of being sent.
+
 ## Fixtures (Part B)
 
 `tests/fixtures/kreuzakt_queue_page.json` — the verbatim body of
@@ -304,11 +382,28 @@ page_count, created_at, updated_at, download_url, link_for_user`.
 a guessed field name cannot survive into the suite. Tasks 5, 6 and 13 build their
 fakes from them.
 
+Part D added four more, all written by `probe_search.py` from the live bodies it
+captured, and four extracted by a one-line script from `capture-queue.json` (never
+retyped):
+
+| fixture | source |
+|---|---|
+| `tests/fixtures/kreuzakt_search_page.json` | `S1_search_one_hit` — a real one-hit search body, `total: 1` |
+| `tests/fixtures/kreuzakt_search_empty.json` | `S2_search_no_hits` — a real zero-hit search body |
+| `tests/fixtures/kreuzakt_documents_page.json` | `D1_documents_default` — four list rows |
+| `tests/fixtures/kreuzakt_upload_response.json` | `S3_upload_response_verbatim` |
+| `tests/fixtures/kreuzakt_upload_rejected.json` | `capture-queue.json` → `Q1c_upload_wrong_field_name.body` |
+| `tests/fixtures/kreuzakt_retry_not_failed.json` | `capture-queue.json` → `Q7a_retry_a_completed_row.response.body` |
+| `tests/fixtures/kreuzakt_retry_unknown.json` | `capture-queue.json` → `Q7c_retry_unknown_id.body` |
+| `tests/fixtures/kreuzakt_retry_requeued.json` | `capture-queue.json` → `Q7b_retry_a_failed_row.response.body` |
+| `tests/fixtures/kreuzakt_health.json` | `capture-queue.json` → `Q0_health` |
+
 ## Files
 
 | file | what it is |
 |---|---|
 | `probe_queue.py` | the Kreuzakt probe; writes `capture-queue.json` and the two fixtures |
+| `probe_search.py` | the Task 5 Step 0 probe (`/api/search`, `/api/documents`); writes `capture-search.json` and the four Part D fixtures |
 | `probe_webhooks.py` | the Papra probe; starts `listener.py` itself if nothing answers on `:8099` |
 | `listener.py` | stdlib receiver, one JSON object per line in `listener.jsonl` (`path`, `headers`, `body`, `raw_body`) |
 | `make_pdf.py` | hand-built one-page PDFs with a text layer, distinct bytes per marker so dedupe cannot collapse the sample |

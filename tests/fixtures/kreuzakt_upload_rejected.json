@@ -1,0 +1,4 @@
+{
+  "error": "bad_request",
+  "message": "Upload requests must include at least one file"
+}
