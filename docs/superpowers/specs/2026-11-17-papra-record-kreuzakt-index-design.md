@@ -20,7 +20,7 @@ carries the file it came from).
                       └── bridge ──► upload ──► KREUZAKT (extract +      │
                                      poll queue ◄──  index, loopback     │
                                      fetch content ──► PATCH back ───────┤
-                                                      only writer        │
+                                                      converging       │
  MCP client ──(tailnet)──► our MCP server ──(loopback)──► Kreuzakt REST  │
                              token → bucket filter → Papra links         │
                       └──────────────────────────────────────────────────┘
@@ -94,15 +94,36 @@ another instance and point that token's route at it" — nothing else in the des
 
 ## 4. Components
 
-### 4.1 Papra: extraction off, one writer
+### 4.1 Papra: extraction stays on, and the write converges instead of winning
 
-`DOCUMENTS_CONTENT_EXTRACTION_ENABLED=false`, set in production and in `docker-compose.test.yml` so
-tests exercise the deployed topology. An integration test asserts the behaviour rather than the
-variable — upload, do not `PATCH`, poll 15 s, assert `content` stayed empty — because a renamed
-variable, a typo, or an upstream default flip all leave the racing writer silently back in place.
+**Papra's extraction is left enabled.** Turning it off was the plan until the reason not to turned
+up in the bundle: auto-tagging (`enrich-document`) is scheduled from exactly one site, inside the
+content-extraction job's handler, and its prompt is built from `Document name:` and
+`Document content:`. Disabling extraction therefore removes the only thing that ever schedules the
+tagging model, and there is no API route to re-run enrichment afterwards — the tagging endpoints are
+tag CRUD and `/tagging-rules/:id/apply`, which is the deterministic rule engine. The operator
+management model keeps its auto-tags, so the flag stays unset.
 
-Our bridge is then the only writer of `content`, which is the property that made the race a bug in
-the first place. `PATCH` lands whatever Kreuzakt produced.
+What that means for the column, stated plainly: there are two writers. Papra writes its own Tesseract
+pass once, at upload; the bridge writes Kreuzakt's text afterwards. They race, and the race no longer
+controls findability, because search lives in Kreuzakt now — what it controls is what Papra's own
+search box shows, and which text the tagger saw once at upload. `PATCH` triggers neither extraction
+nor enrichment: the two schedule sites are document creation and `POST /documents/:id/reprocess`, so
+write-back cannot loop and cannot re-tag.
+
+Convergence is the job of the verification pass rather than of ordering. Every six hours, and once at
+startup, read each document's detail and `PATCH` any whose content hash differs from the ledger's
+`delivered_sha`; count the repairs in `check`. If one document flip-flops more than twice in a day,
+stop repairing it and log at `ERROR` naming `/reprocess`, because that pattern means something is
+deliberately reclaiming the column and out-writing it forever is how an unexplainable bug gets made.
+
+With extraction on, `DOCUMENTS_OCR_LANGUAGES` matters: at its default the instance reads German with
+English language data and produces `StraBe` and `GriiBe`, which is now not only wrong text in the box
+but wrong text fed to the tagger. The operator sets `deu,eng` in his `.env`; the test compose mirrors
+it so the tested topology is the deployed one. Note that the variable replaces the default rather than
+extending it, and that each language's traineddata is fetched on first use into the container
+filesystem — so a recreated container needs outbound internet once per language, unless the file is
+bind-mounted.
 
 ### 4.2 The bridge
 
@@ -151,10 +172,17 @@ than lost text. `--force-names` re-titles deliberately and updates the ledger; a
 
 One container, `DATA_DIR` on a real volume, `OCR_VLM_BASE_URL` and `METADATA_LLM_*` pointed at the
 operator's local OpenAI-compatible endpoint, so extraction and titling stay free, and bound to
-loopback. Two operational notes worth recording: nothing coordinates OCR concurrency across the
-queue, so a bulk import is a sustained load on one local VLM and backfills should go one bucket at a
-time; and Kreuzakt keeps its own copy of every original, so disk holds each document twice, once per
-system.
+loopback with **its own UI never served** — an unauthenticated archive is not worth a nicer queue
+screen, which is why queue visibility arrives as `index_status` and a `check` line instead. Two
+operational notes worth recording: nothing coordinates OCR concurrency across the queue, so a bulk
+import is a sustained load on one local VLM and backfills should go one bucket at a time; and
+Kreuzakt keeps its own copy of every original, so disk holds each document twice, once per system.
+
+Placement: it joins the operator's Dokploy stack for `papra-suite`, not Papra's stack, so a change to
+the archive does not restart the index and vice versa. This repo carries only
+`docker-compose.test.yml`, so the production shape is a documented service snippet — pinned by
+digest, same discipline as the Papra pin — mirrored by a pinned Kreuzakt service in the test compose
+so the tested topology and the deployed one stay the same set of truths.
 
 ### 4.5 MCP server
 
@@ -178,6 +206,7 @@ token's allowed buckets and return Papra-side identities and links:
 | `get_document_content` | same resolution, text from Kreuzakt, size-capped as the existing spec prescribes |
 | `list_recent_documents` | Kreuzakt ordering, ledger-filtered |
 | `open_document` | a **Papra** viewer and download URL, built by us |
+| `index_status` | Kreuzakt queue counts by status, so an agent can say "still being indexed" instead of "not in your archive" |
 
 That last row is not decoration. Kreuzakt's own tools hand back absolute URLs into Kreuzakt, which is
 loopback-only and unauthenticated: a client that followed one would either fail or reach a host it
@@ -198,8 +227,9 @@ gates. Nothing about mail ingestion changes.
    Papra.
 2. Every MCP handler resolves through the ledger and filters on the token's buckets; there is no
    handler-local query path.
-3. Exactly one writer of Papra's `content`, and its writes are gated on Kreuzakt queue completion,
-   never on text emptiness.
+3. Papra writes `content` once, at upload; the bridge writes it only after Kreuzakt reports
+   `completed`, never on emptiness; and the verification pass converges the column onto what the
+   bridge delivered, within six hours, without repairing a document that is flip-flopping.
 4. A `name` a human changed is never written again by us.
 5. Deletes propagate Papra→Kreuzakt only.
 6. Every uploaded file has exactly one Kreuzakt document, provable by hash, after retries.
@@ -216,6 +246,7 @@ gates. Nothing about mail ingestion changes.
 | `rescan`/`reindex-all` in Kreuzakt | text changes there | `updated_at` comparison re-delivers |
 | Document deleted in Papra | Kreuzakt keeps an orphan, search would hit a missing file | propagate `DELETE`, and the ledger row goes `deleted` so its id can never resolve for any token |
 | Document deleted in Kreuzakt | unfindable, Papra unaffected | sweep re-indexes it |
+| `POST /documents/:id/reprocess` pressed in Papra | Papra's Tesseract text replaces ours and the tagger re-runs on it; auto-tags refresh, the better text is lost | the six-hour verification pass restores the text; tags stay as the re-run left them, because nothing re-tags on our write |
 | Ledger lost | mapping Kreuzakt→Papra gone | rebuild by hash: Papra's listing carries `originalSha256Hash` and Kreuzakt stores `file_hash`, and the bridge knows the hash of everything it uploaded; rename protection degrades to the original-filename rule, which is why that rule exists |
 | MCP token leaked | that token's buckets readable, no others | rotate the `settings` row; no Kreuzakt access is gained, because Kreuzakt is loopback-only |
 
@@ -274,9 +305,12 @@ Unit (fake Kreuzakt and fake Papra transports):
 
 Integration, real containers on the tailnet-free ports:
 
-- mail attachment → Papra document → Kreuzakt index → Papra `content` non-empty and equal to
-  Kreuzakt's, `PATCH`-time ordering irrelevant because Papra's extraction is off (the 15 s
-  no-`PATCH` assertion stays as the flag's proof).
+- mail attachment → Papra document → Kreuzakt index → Papra `content` replaced by Kreuzakt's text.
+  Assertions here are structural rather than byte-exact, because Kreuzakt is pointed at the real
+  local model in tests: content non-empty, different from what Papra's own pass produced, ledger
+  advanced, name renamed.
+- a simulated late Papra write (write our text, then overwrite it, then run the verification pass) ⇒
+  the column converges back, and a document that flip-flops twice is left alone with one `ERROR`.
 - a German scan through the whole chain, then `/api/search` for `Straße` and for an inflected form
   (`Rechnungen`-class), asserting the document is found — the exact query class Papra's index could
   not serve, now asserted end to end.
@@ -345,14 +379,16 @@ say it: `POST /api/upload` dedupes by hash on retry, and `/api/search` response 
    it.
 4. MCP server: auth and transport from the existing spec, five tools over Kreuzakt, bucket filter,
    Papra link rewriting.
-5. Papra's extraction flag last, on both compose files, with its integration assertion — by then
-   Papra's `content` has a writer that does not depend on Papra.
+5. The operator enables auto-tagging per bucket in the Papra UI and sets `deu,eng` in his `.env`;
+   the test compose mirrors the language setting. Nothing in our code requests
+   `organizations:update` or touches either setting.
 
 ## 12. What this supersedes
 
-- `2026-11-17-content-single-writer-design.md`: **superseded**, except §5.1 (the flag, the test that
-  asserts the behaviour, and setting it in the test compose) and the measurements in §7, which stay
-  as evidence. Its recovery pass is not built: the failure mode it was written for — a permanently
+- `2026-11-17-content-single-writer-design.md`: **superseded outright, including its central
+  recommendation to disable Papra's extraction** — see §4.1 for why that flag is now a bad trade.
+  Its measurements in §7 stay as evidence, and its `jobs` CLI idea is carried into this plan, because
+  `Store.reset_job` having no caller is a property of our store either way. Its recovery pass is not built: the failure mode it was written for — a permanently
   failed OCR job with no rediscovery path — moves into Kreuzakt's queue, which has statuses, an
   error, and a retry endpoint. `Store.reset_job` still has no caller; the `jobs` CLI proposed there is
   worth keeping from that document, because a failed job with no operator repair path is a property
@@ -364,3 +400,25 @@ say it: `POST /api/upload` dedupes by hash on retry, and `/api/search` response 
   correctness depended on Papra's search grammar.
 - The Papra search-grammar probes keep their value as the *reason* for this document; none of them
   describes code we still intend to write.
+
+## 13. Decisions taken in the review round
+
+Recorded because each one was a live choice, and the plan inherits all of them.
+
+| # | decision | settled |
+| --- | --- | --- |
+| 1 | bridge and MCP listener run inside `serve` | one store writer, one restart; a second process means WAL and lock discipline we never needed |
+| 2 | Papra extraction stays **on** | auto-tagging is chained to it and cannot be re-triggered (§4.1); race demoted to cosmetic, repaired by convergence |
+| 3 | tags are hand-applied by the operator, auto-tagging enabled by him in the UI | our API keys keep no `organizations:update` |
+| 4 | corpus is ~500 documents | a full verification pass is seconds, which is what makes option (b) affordable |
+| 5 | two tokens, `pi` and `hermes`, both all buckets | the mechanism stays so a scoped token is a `settings` row; the real boundary is the tailnet ACL plus file permissions |
+| 6 | read-only tools, no upload path | Kreuzakt cannot say which bucket an upload belongs to; intake stays mail plus Papra's UI |
+| 7 | PDFs only, everywhere | `_is_pdf` gate unchanged |
+| 8 | Kreuzakt `/data` disposable, rebuild runbook written and timed | originals and ledger live in Papra and our store, so a rebuild costs VLM minutes |
+| 9 | hard error when the index is down, no Papra-backed search fallback | one search authority; "found nothing" must keep meaning "not in your archive" |
+| 10 | integration tests use the real local model | assertions become structural; the blank-page rule stays provable only through fake transports |
+| 11 | Kreuzakt joins the operator's Dokploy stack for `papra-suite`, not Papra's | documented snippet in this repo, pinned by digest, mirrored in the test compose |
+| 12 | `deu,eng` OCR languages, set by the operator | fixes Papra's German outright (probes §6); replaces rather than extends the default |
+| 13 | `papra-suite jobs --status/--reset` kept, last task | the one failure mode Kreuzakt did not gain a repair path for |
+| 14 | `papra-suite backfill [--org-id] [--limit] [--dry-run]` | the sweep would get there eventually; eventually is a day, and `--dry-run` prices the afternoon |
+| 15 | Kreuzakt strictly loopback, its UI never served | an unauthenticated archive is not worth a nicer queue screen; queue counts go in `index_status` and `check` instead |
