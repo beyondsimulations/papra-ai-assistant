@@ -527,32 +527,40 @@ the corrections land where they belong.
   anything else → 400), and **silently ignores `page`, `offset`, `perPage`,
   `per_page`, `count`, `after`, `cursor`**. A page walk returns page 1 forever; an
   offset walk likewise. With 155 rows in the table the endpoint served at most the
-  newest 100, the union of all four `status` windows reached 138, and the probe's
-  own first row (id 1) was unreachable in the default window while 17 rows were
-  unreachable by any request it offers. **So §4.2's "bounded paging" and Task 5's
+  newest 100, the four `status` requests together surfaced 138 of 155 distinct ids
+  (statuses were still changing, so that is an observation rather than a quiescent
+  snapshot), and the probe's own first row (id 1) was unreachable in the default
+  window while reachable via `status=completed`. **So §4.2's "bounded paging" and
+  Task 5's
   page-walking `queue_high_water_mark()` cannot be built as written** — with more
   than 100 rows in the queue that scan never proves exhaustion, it just burns its
   fuse and refuses to correlate, forever, on exactly the corpus size that matters.
-* **Retention is reachability, not deletion.** Rows are never deleted (`counts`
-  grows monotonically); old rows simply leave the only window the API has. The
-  spec's earlier worry was the right shape and the wrong mechanism.
+* **Retention is reachability, not deletion.** No pruning was observed during the
+  probe (`counts` grew monotonically) — which is weaker than "never deleted", and a
+  run this long cannot settle that. Either way old rows leave the only window the API
+  has, and that is what breaks correlation. The earlier worry was the right shape and
+  the wrong mechanism.
 * **`id` is monotonic; ordering is descending.** Five sequential uploads produced
   ids `[11, 12, 13, 14, 15]` — strictly increasing, no reuse (`INTEGER PRIMARY KEY
   AUTOINCREMENT`). Rows come back **newest first**, ordered `created_at DESC, id
   DESC`; `created_at` is second-granularity so ties are the norm (three rows from
   one multi-file request shared a `created_at`), and the tie-break is `id DESC`.
-  Ordering therefore equals a sort by `id DESC`, so correlation does **not** need a
-  `(created_at, id)` compound key — but it does need a different high-water mark:
-  `entries[0].id` of `GET /api/queue?limit=1` returned the true highest id (155)
-  while the table held 155 rows, so the mark is one request and needs no scan.
+  Under the observed non-decreasing `created_at` that order equals a sort by `id DESC`,
+  so correlation does **not** need a `(created_at, id)` compound key — but it does need
+  a different high-water mark: `entries[0].id` of `GET /api/queue?limit=1` returned the
+  highest id (155) while the table held 155 rows, so the mark is one request, no scan.
+  That equivalence is the assumption to keep in view: a clock step backwards breaks it,
+  so a test fake should model `(created_at DESC, id DESC)`, not `id DESC`.
 * **`retry` reuses the row** and only accepts `failed`: a completed row → 400
   `Queue entry 31 is not in failed status`, an unknown id → 404, a failed row → 200
   `Re-queued for processing` with the same id and an unchanged row-id set. A
   deterministic failure re-failed with the same message seconds later, so a retry
   policy needs a bounded attempt count, not "retry until it is not failed".
-* **`rescan` touches nothing that matters**: same `id`, same `content` byte-for-byte,
-  same `title`, same `stored_filename` (the hash prefix survives), `updated_at`
-  bumped, **no queue row created**. **`reindex-all`** returns 202 and creates **one
+* **`rescan` changed nothing observable here**: same `id`, same `content`
+  byte-for-byte, same `title`, same `stored_filename`, `updated_at` bumped, **no queue
+  row created** — one keyless text-layer document, so not a general promise (under an
+  OCR model `content` is what a rescan rewrites). **`reindex-all`** returns 202 and
+  creates **one
   new queue row per document**, named
   `reindex-all:<batch>:<documentId>:<originalFilename>`, with **`document_id` set at
   creation** — so a non-null `document_id` does not mean a finished row, and a
@@ -560,10 +568,11 @@ the corrections land where they belong.
 * **A `completed` row can have `document_id: null`.** Deleting the document (204,
   then 404 on read) left all four `completed` rows that pointed at it still
   `completed`, with `document_id` and `page_count` nulled. Task 6 was written to
-  treat null-on-completed as a retryable anomaly; measured, it is what a **deleted**
-  Kreuzakt document looks like from the queue, and re-uploading on that is wrong in
-  the ordinary case where the Papra document is gone too. **Task 6 must distinguish
-  the two instead — see the plan-changes list.**
+  treat null-on-completed as a retryable anomaly. Measured, deletion **can produce**
+  that shape; the converse is unmeasured, so the honest reading is *consistent with
+  deletion, cause unresolved* — and the row alone does not license a re-upload, since
+  in the ordinary case the Papra document is gone too and there is nothing to
+  re-index. **Task 6 must branch on Papra state instead of the shape of this row.**
 * Not answerable keyless: `description`/`document_date` quality against omlx
   (keyless yields empty description, null date, filename-derived title — unchanged
   from the 2026-11-17 probe), and whether a *transient* OCR failure can leave a
@@ -572,21 +581,27 @@ the corrections land where they belong.
 
 ### 10.2 Papra webhook delivery: measured for the record; the receiver is out of v1
 
-Operator decision 2026-11-17: **the webhook receiver is dropped from v1.** The
-six-hour verification and convergence pass of §4.1 is the mechanism that keeps
-Papra aligned with the index; a push path would only narrow the staleness window, it
-would not change correctness, and two of the three facts a receiver would have had
-to rely on do not exist. Delivery itself was measured once, end to end, so
-this is a decision made on evidence rather than on absence of it:
+Operator decision 2026-11-17: **the webhook receiver is dropped from v1**, on scope
+grounds rather than on measurement. The six-hour verification and convergence pass of
+§4.1 is the mechanism that keeps Papra aligned with the index; a push path would narrow
+the staleness window without changing correctness. Delivery was nevertheless measured
+once, end to end, so the record is complete and a future receiver can be designed
+against facts rather than guesses. Not measured, and **not measured: no longer gates
+any task**: the 500-retry attempt count and interval series; the
+`webhookUrlAllowedHostnames` matrix beyond the single hostname the probe needed; and
+listener robustness (payload sizes around 64 KiB, malformed input, slow-client
+behaviour).
 
-* **Event names are colon-separated and there is no restore event.** A create with
+* **Event names are colon-separated, and the create API accepts no restore event.**
+  A create with
   `document.updated` → 400, verbatim: `Invalid type: Expected ("document:created" |
   "document:deleted" | "document:updated" | "document:tag:added" |
   "document:tag:removed") but received "document.updated"`. `name` is required on
   create. The earlier claim that the emitted names are `document.created`,
   `document.updated`, `document.restored`, `document.tags.changed` was wrong on both
-  separators and on `restored`: **no restore event exists**, so a restore hint could
-  never have been delivered.
+  separators and on `restored`: **the accepted enum has no restore event**, so a
+  restore hint could not be subscribed to — what a restore emits internally was not
+  measured.
 * **`document.updated` carries no `changes` list.** The envelope is
   `{data, timestamp, type}`; `type` is the event name; `data` is
   `documentId` + `organizationId` plus the changed value — `name` for a rename,
@@ -596,21 +611,21 @@ this is a decision made on evidence rather than on absence of it:
   with an API key and with a browser session; the two payloads were structurally
   identical apart from the new name. No user id, no API key id, no actor field.
   Papra's own logs carry `authType`/`apiKeyId`/`sessionId` and never put them on the
-  event, so **a receiver could never have told our `PATCH` from a human edit** —
-  which is exactly the distinction Task 10 needed to avoid disabling renaming across
-  the corpus, and no amount of receiver-side cleverness could have recovered it.
+  event, so **a receiver could not tell our `PATCH` from a human edit from the event
+  alone**. That is a standing constraint on any future receiver, not the reason the
+  receiver was dropped.
 * **Signature is Standard Webhooks, not a hex digest of the body.** Header
   `webhook-signature`, value `v1,<base64>`, with `webhook-id: msg_…` and
   `webhook-timestamp: <unix seconds>`. Reproduced for every captured delivery as
   `base64(HMAC-SHA256(secret_as_supplied, "{webhook-id}.{webhook-timestamp}.{raw body}"))`
-  with the secret used verbatim; `hmac.new(secret.encode(), body, sha256).hexdigest()`
+  with a caller-supplied `whsec_…` secret used verbatim as the key (a server-generated
+  secret was not tested); `hmac.new(secret.encode(), body, sha256).hexdigest()`
   reproduces nothing.
 * **An in-network receiver is refused by default**: 400
   `The provided URL is not safe to perform requests to` (`webhooks.ssrf_unsafe_url`)
   for `http://host.docker.internal:8099/hook`. The delivery above was captured with
   the narrow `WEBHOOK_URL_ALLOWED_HOSTNAMES` allowlist; the blanket SSRF switch was
-  not used. The retry ladder and the full `webhookUrlAllowedHostnames` matrix were
-  not measured — they gate nothing now.
+  not used.
 
 ### 10.3 Still not established
 

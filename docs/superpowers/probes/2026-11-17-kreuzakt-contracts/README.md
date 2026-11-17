@@ -74,19 +74,23 @@ per accepted upload, plus one row per document per `reindex-all` batch; nothing
 extra, nothing missing.
 
 `status` is the only second filter and it partitions the same 100-row window: the
-union of all four status windows was **138 of 155** rows, so **17 rows were
-unreachable by any combination** the endpoint offers. Correlation consequence
+four status requests together surfaced **138 of 155** distinct ids, and the rest sat
+outside every window at that moment — statuses were still changing, so that is an
+observation, not a quiescent proof of permanent unreachability. Correlation consequence
 (`Q4_correlation_window`): the probe's own first row (id 1) was **not** reachable
 in the default window once 154 newer rows existed, but **was** reachable via
-`status=completed`; and `GET /api/queue?limit=1` returned id 155, the true highest
-id, while 155 rows existed.
+`status=completed`; and `GET /api/queue?limit=1` returned id 155, the highest id,
+while 155 rows existed. The trade-off, not a fix: each status window is *itself* capped
+at its newest 100, so `status` improves visibility and does not remove the bound.
 
 ## Q5 — maximum limit and retention
 
-Cap is 100. Rows are **not deleted** (`counts` only grows and every status window
-still shows old ids) but they are **unreachable**: newest-100 per status filter is
-all there is. The spec's retention worry is therefore not "rows get pruned", it is
-"the row you still need has scrolled out of the only window the API has".
+Cap is 100. **No pruning was observed** during this probe — `counts` grew monotonically
+and every status window still showed old ids — which is not the same claim as
+indefinite retention; a run this long cannot establish that. What is established is the
+mechanism that matters: old rows leave the only window the API has, deleted or not. The
+spec's retention worry is therefore not "rows get pruned", it is "the row you still
+need has scrolled out of the only window the API has".
 
 ## Q6 — what `filename` holds (`Q6_filename_shapes`)
 
@@ -127,9 +131,11 @@ not "retry until it is not failed".
 
 `POST /api/documents/4/rescan` → 200 with the document: same `id`, `updated_at`
 `20:02:21 → 20:02:37`, `content` byte-identical (66 chars both), same `title`, same
-`stored_filename` (`53c562326a2a_papra-…` — the hash prefix survives a rescan, so a
-rescan cannot re-key a document). **No queue row was created** (counts and visible
-row count identical before and after).
+`stored_filename` (`53c562326a2a_papra-…`). **No queue row was created** (counts and
+visible row count identical before and after). In this sample a rescan changed no field
+that correlation or write-back depends on — one text-layer document, keyless, so it is
+not a guarantee that a rescan rewrites nothing: under an OCR model `content` is exactly
+what a rescan rewrites.
 
 `POST /api/reindex-all` → **202** with
 `{status: {batchId, total, pending, processing, completed, failed, processed, active, percentComplete}}`,
@@ -146,12 +152,16 @@ reindex rows consume the same 100-row window our correlation reads.
 that pointed at it (31, 32, 33, 34) still read `status: "completed"` with
 `document_id: null` and `page_count: null`. Source agrees: the delete nulls
 `document_id` on every queue row that referenced the document instead of removing
-the rows.
+the rows. Mind the direction: deletion **can produce** `completed` +
+`document_id: null`; the probe does not show every such row came from a deletion. The
+converse is unmeasured, and keyless extraction cannot exercise a transient failure that
+might do it too. Safe reading: **consistent with deletion, cause unresolved.**
 
 This is the answer Task 6 asked for, and it cuts against the assumption in the
-plan: `completed` + `document_id: null` is not a processing anomaly to retry, it is
-what a **deleted** Kreuzakt document looks like from the queue. Re-uploading on it
-is wrong whenever the Papra document is gone too, which is the normal case.
+plan: `completed` + `document_id: null` is not a processing anomaly that authorises a
+retry. The row alone does not license re-uploading: branch on Papra-side state first —
+if the Papra document is gone too there is nothing to re-index, and if it is alive a
+re-index is a decision we took, not one the queue row made.
 
 ## Q10 — is `id` monotonic, and is the default ordering by id? (`Q10_ordering`, `Q10b_…`)
 
@@ -172,8 +182,11 @@ So, because this decides the correlation rule:
 * `id` is monotonic and never reused in a live DB — **sound**;
 * ordering is **descending**, so there is no ascending walk, and with Q4 (no
   `offset`) a high-water mark cannot be produced by paging at all;
-* the high-water mark is `entries[0].id` of `GET /api/queue?limit=1`, proven with
-  155 rows in the table while only the newest 100 are reachable;
+* the high-water mark is `entries[0].id` of `GET /api/queue?limit=1` — it returned the
+  highest id with 155 rows present, newest-100 window or not. That holds because the
+  order equals `id DESC` **given non-decreasing `created_at`**; the server's real key is
+  `(created_at DESC, id DESC)` and a clock step backwards breaks the equivalence, so
+  the `limit=1` mark is sound under observed behaviour, not unconditionally;
 * ordering is **not** "`created_at` with unresolved ties", so correlation does not
   need a `(created_at, id)` compound key — the tie-break is `id DESC`.
 
@@ -214,8 +227,9 @@ policy and was not needed.
  {"path":"events.0","message":"Invalid type: Expected (\"document:created\" | \"document:deleted\" | \"document:updated\" | \"document:tag:added\" | \"document:tag:removed\") but received \"document.updated\""}]}}
 ```
 
-`name` is required, event names are colon-separated, and there is **no
-`document:restored` event in the enum at all**. A valid create returns 200 with
+`name` is required, the create API accepts colon-separated event names only, and **the
+accepted enum has no `document:restored` event** (what a restore emits internally was
+not measured). A valid create returns 200 with
 `{webhook: {id, createdAt, updatedAt, name, url, enabled, createdBy, organizationId}}`.
 An unallowlisted receiver hostname → **400**
 `{"error":{"message":"The provided URL is not safe to perform requests to","code":"webhooks.ssrf_unsafe_url"}}`
@@ -267,8 +281,9 @@ base64(HMAC_SHA256(secret_as_supplied_bytes,
                    f"{webhook-id}.{webhook-timestamp}.{raw body bytes}"))  ->  "v1," + that
 ```
 
-with the secret used **verbatim as supplied** (`whsec_`-prefixed string; the
-base64-decoded variant did **not** match). `hmac.new(secret.encode(), body,
+with the secret used **verbatim as supplied** (a caller-generated `whsec_`-prefixed
+string; the base64-decoded variant did **not** match, and a server-generated secret was
+not tested). `hmac.new(secret.encode(), body,
 hashlib.sha256).hexdigest()` **does not reproduce it** — `false` on every delivery:
 the value is not hex, and the body alone is not the signed string.
 
