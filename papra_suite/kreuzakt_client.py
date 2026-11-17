@@ -25,6 +25,16 @@ do" reports success while having indexed nothing.
 `limit` (measured 2026-11-17: `page=2&limit=1` returned the second row, `limit=1000`
 came back with `limit: 100`), so those two are exposed, and `offset` is not, because
 it demonstrably did nothing on either endpoint.
+
+**The rule that governs the parsing below.** This module is the only code that speaks
+Kreuzakt HTTP, so a server surprise has to stop here rather than travel onward as data.
+Every response is decoded through one guard, every body is required to be the shape its
+type claims, and the fields the bridge writes back into Papra (`title`, `content`) or
+matches queue rows on (`id`, `filename`, `status`, `relativePath`) are required to be
+present rather than defaulted: `.get(key) or ""` turns "the server stopped sending this"
+into a plausible empty value, and the next write then blanks a user's document with
+nothing recorded anywhere. An unrecognised value is a `KreuzaktError` naming the keys the
+server did send — never `""`, never `None`, never a `KeyError` from inside a poll loop.
 """
 
 from __future__ import annotations
@@ -47,6 +57,21 @@ _SEARCH_LIMIT_MAX = 100
 _LIMIT_MAX = 100
 _TERMINAL_STATUSES = ("completed", "failed")
 
+# The closed set of statuses `GET /api/queue` was measured to produce (2026-11-17:
+# `pending`, `processing`, `completed`, `failed`, across every row of
+# `capture-queue.json` and every `status=` filter). A status outside it is a server
+# behaviour we have no evidence about, and the failure mode of guessing is specific and
+# bad: an unrecognised status is not terminal, so a row carrying one would be polled for
+# `index_wait_timeout_s` (900 s by default) and then reported as *absence* — which is the
+# one answer this design forbids. Better to stop on the first read.
+_QUEUE_STATUSES = ("pending", "processing", "completed", "failed")
+
+# Kreuzakt-side paths and links. `KzDocument`/`KzHit` exist so that none of these reach a
+# caller (the plan forbids `/api/documents/…`, `/original` or `/thumbnail` leaving the
+# proxy as an identifier), so the one method that returns server dicts has to remove them
+# itself rather than be the exception.
+_LINK_KEYS = ("thumbnail_url", "download_url", "link_for_user", "stored_filename")
+
 
 class KreuzaktError(Exception):
     def __init__(self, message: str, status: int | None = None) -> None:
@@ -55,10 +80,14 @@ class KreuzaktError(Exception):
 
 
 class CorrelationWindowFull(KreuzaktError):
-    """The newest-100 window was full of other rows newer than our mark.
+    """Every row the queue returned was newer than our mark and none of them was ours.
 
-    Our row may well exist one row further down the table, where this API cannot show
-    it. Retryable by re-uploading; never report it as "no such row".
+    Our row may well exist one row further down the table, where this API cannot show it:
+    the window's own lower edge is above the mark, so nothing below that edge is provable.
+    Judged from the rows actually returned rather than from `_QUEUE_WINDOW`, so a server
+    cap that drops below 100 makes this fire earlier, never later — the old
+    `len(newer) >= 100` would have downgraded a 5-row saturated window to "no queue row".
+    Retryable by re-uploading; never report it as "no such row".
     """
 
 
@@ -95,6 +124,12 @@ class KzDocument:
     Deliberately absent: `stored_filename`, `thumbnail_url`, `download_url`,
     `link_for_user`. Kreuzakt has no tenancy, so a path into its storage is not
     something a caller of this client should ever be handed.
+
+    `title` and `content` are the two fields the bridge writes back into Papra, so they
+    are required rather than defaulted: a body that stopped carrying them must not be
+    turned into `""` and written over the user's text. `description`, `document_date` and
+    `updated_at` stay optional because the bridge reads them but never overwrites Papra
+    with an empty value on their account.
     """
 
     id: int
@@ -110,7 +145,13 @@ class KzDocument:
 class KzHit:
     """One row of `/api/search`. No `content` (the caller fetches the document when it
     needs the text, so a page of hits cannot blow up the response) and no `score`,
-    which the measured response never carried."""
+    which the measured response never carried.
+
+    Every field declared `str` here is required on the wire: `or ""` did not make a
+    missing value legal, it invented one the server never sent, and Task 13 orders its
+    result list by `added_at` — where `""` reads as 'older than everything'.
+    `document_date` is the only nullable one, and the capture shows it null.
+    """
 
     id: int
     title: str
@@ -120,15 +161,125 @@ class KzHit:
     original_filename: str
 
 
-def _to_queue_entry(row: Mapping[str, Any]) -> QueueEntry:
+def _body_keys(body: Mapping[str, Any]) -> str:
+    """The keys the server actually sent, for an error someone can act on."""
+    return ", ".join(sorted(str(key) for key in body)) or "(no keys)"
+
+
+def _require_json_object(body: Any, where: str) -> dict:
+    """A JSON object, or a `KreuzaktError` a caller can classify.
+
+    An HTML proxy page or a bare array answering 200 is a server surprise, not data;
+    letting it through as `AttributeError: 'list' object has no attribute 'get'` makes it
+    look like a bug in the caller.
+    """
+    if not isinstance(body, dict):
+        raise KreuzaktError(
+            f"unexpected {where}: {type(body).__name__}, expected a JSON object "
+            f"(body starts: {str(body)[:120]!r})"
+        )
+    return body
+
+
+def _require_str(body: Mapping[str, Any], key: str, where: str, why: str) -> str:
+    """A present, non-null string — absent, null and wrong-typed are one failure."""
+    value = body.get(key)
+    if not isinstance(value, str):
+        raise KreuzaktError(
+            f"unexpected {where}: missing {key} (absent, null, or "
+            f"{type(value).__name__}) — {why} "
+            f"(body keys: {_body_keys(body)})"
+        )
+    return value
+
+
+def _require_int(body: Mapping[str, Any], key: str, where: str, why: str) -> int:
+    value = body.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise KreuzaktError(
+            f"unexpected {where}: missing {key} — {value!r} is not an integer; {why} "
+            f"(body keys: {_body_keys(body)})"
+        )
+    return value
+
+
+def _require_int_or_none(body: Mapping[str, Any], key: str, where: str) -> int | None:
+    value = body.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise KreuzaktError(
+            f"unexpected {where}: {key} is {value!r}, expected an integer or null "
+            f"(body keys: {_body_keys(body)})"
+        )
+    return value
+
+
+def _to_queue_entry(row: Any) -> QueueEntry:
+    """One queue row, with the types `QueueEntry` claims.
+
+    The keys are required and the status is validated here rather than in one call site,
+    so `queue_page`, `queue_high_water_mark` and correlation all meet a malformed row the
+    same way: as a `KreuzaktError`, not a bare `KeyError`/`TypeError` from inside a
+    polling loop.
+    """
+    where = "/api/queue row"
+    body = _require_json_object(row, where)
+    entry_id = _require_int(body, "id", where,
+                            "the id is the high-water mark and the correlation comparison")
+    filename = _require_str(body, "filename", where,
+                            "correlation matches queue rows on this value")
+    status = _require_str(body, "status", where,
+                          "terminal and non-terminal are read from it")
+    if status not in _QUEUE_STATUSES:
+        raise KreuzaktError(
+            f"unknown queue status {status!r} on row {entry_id}: the measured statuses are "
+            f"{', '.join(_QUEUE_STATUSES)} and anything else is a server behaviour this "
+            "client would only be guessing about — treating an unrecognised status as "
+            "non-terminal would poll it to the timeout and then report our upload as "
+            "absent, which is the one conclusion that must never be drawn"
+        )
     return QueueEntry(
-        id=row["id"],
-        filename=row["filename"],
-        status=row["status"],
-        error=row.get("error"),
-        document_id=row.get("document_id"),
-        page_count=row.get("page_count"),
+        id=entry_id,
+        filename=filename,
+        status=status,
+        error=body.get("error"),
+        document_id=_require_int_or_none(body, "document_id", where),
+        page_count=_require_int_or_none(body, "page_count", where),
     )
+
+
+def _decode_json(response: httpx.Response, path: str) -> Any:
+    """`response.json()` with nothing leaking past it.
+
+    A 200 that is an HTML proxy page raises `json.JSONDecodeError` (a `ValueError`) from
+    `httpx`, and a 200 whose body is an array raises `AttributeError` one line later.
+    Neither is a `KreuzaktError`, so a caller that catches `KreuzaktError` — which is all
+    Task 6 does — would die on a message it cannot classify as a Kreuzakt failure.
+    """
+    try:
+        return response.json()
+    except ValueError as error:
+        raise KreuzaktError(
+            f"{path} returned a body that is not JSON "
+            f"(starts: {response.text[:120]!r}, content-type: "
+            f"{response.headers.get('content-type')!r})"
+        ) from error
+
+
+def _window_summary(rows: list[QueueEntry], after_id: int) -> str:
+    """What the last window actually held, for a timeout message a person will read.
+
+    Deliberately does not call `max(ids)` "the newest id above the mark": for a window
+    that reaches below the mark — the usual case once the queue is quiet — the newest row
+    in it can be *below* the mark, and that phrasing sent readers to a table with no rows.
+    """
+    if not rows:
+        return "the queue window came back empty, no row of any name"
+    ids = [row.id for row in rows]
+    newer_count = sum(1 for entry_id in ids if entry_id > after_id)
+    return (f"the window held {len(rows)} rows (ids {max(ids)}..{min(ids)}), "
+            f"{newer_count} of them newer than id {after_id}")
 
 
 def _is_our_row(stored: str, uploaded: str) -> bool:
@@ -153,7 +304,12 @@ def _is_our_row(stored: str, uploaded: str) -> bool:
     if not (stored.startswith(prefix) and stored.endswith(suffix)):
         return False
     counter = stored[len(prefix):len(stored) - len(suffix)]
-    return counter.isdigit()
+    # ASCII digits only. `str.isdigit()` is also True for `\u0663` (Arabic-Indic three) and
+    # `\u00b2`, so in an index another writer shares with us `papra-d1-a1b2 (\u0663).pdf` would
+    # have been matched as our `papra-d1-a1b2.pdf` and its `document_id` attributed to our
+    # job — a wrong document indexed under the wrong id, silently. Kreuzakt's own counter
+    # is an ASCII integer, so anything else cannot be its collision suffix.
+    return counter.isascii() and counter.isdigit()
 
 
 class KreuzaktClient:
@@ -193,22 +349,43 @@ class KreuzaktClient:
 
     async def _get_json(self, path: str, **params: Any) -> Any:
         response = await self._request("GET", path, params=params or None)
-        try:
-            return response.json()
-        except ValueError as error:
-            raise KreuzaktError(f"{path} returned a body that is not JSON") from error
+        return _decode_json(response, path)
 
     async def health(self) -> dict:
-        return await self._get_json("/api/health")
+        """`GET /api/health` as the object it is, and only if it says whether it is ok.
+
+        The plan's rebuild safety (Task 11, `ledger --invalidate`) refuses to run unless
+        `health()["status"] == "ok"`, so this returns a JSON object that carries `status`.
+        A body that is a list, a string, or an object without `status` used to be handed
+        back verbatim and reach that check as a `TypeError`/`KeyError` — indistinguishable,
+        in a log, from a dead index.
+        """
+        body = _require_json_object(await self._get_json("/api/health"), "/api/health body")
+        _require_str(body, "status", "/api/health body",
+                     "readiness is decided by this field, so a body without it cannot be "
+                     "reported as healthy or unhealthy")
+        return body
 
     async def queue_counts(self) -> dict[str, int]:
         """Queue depth by status. `counts` is a global aggregate of the envelope, so
-        the one-row request that also carries it costs nothing extra."""
+        the one-row request that also carries it costs nothing extra.
+
+        Every value must already be an integer: `int(value)` raised a bare `ValueError` on
+        `"many"` and silently accepted `"3"`, and a count this client had to guess at is a
+        changed envelope, not a zero.
+        """
         body = await self._get_json("/api/queue", limit=1)
         counts = body.get("counts") if isinstance(body, dict) else None
         if not isinstance(counts, dict):
             raise KreuzaktError("unexpected /api/queue envelope: no counts block")
-        return {str(key): int(value) for key, value in counts.items()}
+        result: dict[str, int] = {}
+        for key, value in counts.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise KreuzaktError(
+                    f"unexpected /api/queue counts.{key}: {value!r} is not an integer count"
+                )
+            result[str(key)] = value
+        return result
 
     async def queue_page(self, *, limit: int = _QUEUE_WINDOW,
                          status: str | None = None) -> list[QueueEntry]:
@@ -241,6 +418,19 @@ class KreuzaktClient:
         What this can no longer claim is *exhaustion* — a newest-100 window cannot be
         proven complete — which is why `wait_for_queue_row` reports a saturated window
         as `CorrelationWindowFull` rather than as "never uploaded".
+
+        **Clock caveat, stated because it is the only thing that breaks this.** Reading
+        `entries[0].id` as the newest id is sound only while `created_at DESC, id DESC`
+        coincides with `id DESC`, i.e. while the Kreuzakt host clock never runs backwards.
+        If it jumps back (NTP correction, a VM resumed with a stale clock, a restored
+        volume), a row inserted later can sort below a row inserted earlier, and then
+        `entries[0].id` is *lower* than the true newest id. The mark is then too low, and
+        a row that already existed before our upload — another writer's, or one of our own
+        earlier attempts — sits above it and can be correlated as if it were ours. Nothing
+        here can detect that from a newest-100 window; a host whose clock moves is visible
+        only as a document indexed under the wrong attempt, so this is an operator
+        assumption, not a check. `id` itself is monotonic (measured: ids ascend with
+        insertion), which is why the mark is an id and not a timestamp.
         """
         rows = await self.queue_page(limit=1)
         return rows[0].id if rows else 0
@@ -254,10 +444,15 @@ class KreuzaktClient:
         * a `QueueEntry` in `completed` or `failed` — the matched row;
         * `AmbiguousCorrelation` — more than one terminal row matches, so no row can be
           picked honestly;
-        * `CorrelationWindowFull` — the window held 100 rows newer than `after_id` and
-          none of them was ours, which says nothing about whether our row exists;
+        * `CorrelationWindowFull` — every row the request returned was newer than
+          `after_id` and none of them was ours, which says nothing about whether our row
+          exists (the rule is read off the returned window, not off `_QUEUE_WINDOW`, so it
+          still holds if the server's cap ever drops);
+        * `KreuzaktError("no terminal queue row …")` once `timeout_s` has passed while our
+          row sat in the window unfinished — the row exists, the answer does not yet;
         * `KreuzaktError("no queue row …")` once `timeout_s` has passed with the window
-          readable and no candidate.
+          readable, our row not in it, and its lower edge at or below the mark — the only
+          case where absence is actually observable.
 
         `filename` must be the `relativePath` the upload response returned, not the name
         we constructed. Matching is exact plus the ` (N)` collision suffix, and the id
@@ -288,17 +483,33 @@ class KreuzaktClient:
                     )
                 return row
             newer = [row for row in rows if row.id > after_id]
-            if not candidates and len(newer) >= _QUEUE_WINDOW:
+            # Saturation is read off the window, not off `_QUEUE_WINDOW`: if every row the
+            # request returned is newer than the mark, the window's own lower edge is
+            # above the mark, so rows between the mark and that edge exist in a region
+            # this endpoint cannot show us — whatever the server's current cap happens to
+            # be. `len(newer) >= 100` was a claim about our constant, and if the cap ever
+            # dropped it would silently downgrade saturation to "no queue row".
+            if not candidates and newer and len(newer) == len(rows):
                 raise CorrelationWindowFull(
-                    f"correlation window full: {len(newer)} other queue rows newer than "
-                    f"id {after_id} and none named {filename}; the newest-{_QUEUE_WINDOW} "
-                    "window cannot show older rows, so this is not evidence of absence"
+                    f"correlation window full: all {len(rows)} rows this request returned "
+                    f"are newer than id {after_id} and none is named {filename}; the oldest "
+                    f"row this API will show is id {min(row.id for row in rows)}, so rows "
+                    "between the mark and there are invisible and this is not evidence of "
+                    "absence"
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if candidates:
+                    detail = ", ".join(f"id {row.id} is {row.status}"
+                                       for row in candidates)
+                    raise KreuzaktError(
+                        f"no terminal queue row for {filename} within {timeout_s}s: "
+                        f"our row is in the window but has not finished — {detail}; "
+                        f"{_window_summary(rows, after_id)}"
+                    )
                 raise KreuzaktError(
-                    f"no queue row for {filename} within {timeout_s}s (newest id above "
-                    f"the mark: {max((row.id for row in rows), default=after_id)})"
+                    f"no queue row for {filename} within {timeout_s}s: "
+                    f"{_window_summary(rows, after_id)}"
                 )
             await asyncio.sleep(min(poll_s, remaining) if poll_s > 0 else min(0.01, remaining))
 
@@ -319,20 +530,52 @@ class KreuzaktClient:
             "POST", "/api/upload",
             files={"files": (filename, content, "application/pdf")},
         )
-        payload = response.json()
+        payload = _require_json_object(_decode_json(response, "/api/upload"),
+                                       "/api/upload body")
         if payload.get("failedCount") or not payload.get("files"):
             raise KreuzaktError(f"upload rejected: {payload.get('errors')!r}")
-        return payload["files"][0]["relativePath"]
+        first = payload["files"][0] if isinstance(payload["files"], list) else None
+        if not isinstance(first, dict):
+            raise KreuzaktError(
+                f"upload response has no usable relativePath: files[0] is "
+                f"{type(first).__name__}, expected a JSON object with a `relativePath` "
+                f"(files: {str(payload['files'])[:200]!r})"
+            )
+        relative_path = first.get("relativePath")
+        if not isinstance(relative_path, str) or not relative_path:
+            raise KreuzaktError(
+                f"upload response has no usable relativePath: it is "
+                f"{relative_path!r}, and it is the exact value correlation matches queue "
+                f"rows against, so it cannot be guessed "
+                f"(files[0] keys: {_body_keys(first)})"
+            )
+        return relative_path
 
     async def get_document(self, document_id: int) -> KzDocument:
-        body = await self._get_json(f"/api/documents/{document_id}")
-        if not isinstance(body, dict) or "id" not in body:
-            raise KreuzaktError(f"unexpected /api/documents/{document_id} body")
+        """One document, narrowed to `KzDocument`.
+
+        `title` and `content` are required on the wire because the bridge writes both back
+        into Papra: `body.get("content") or ""` turned a dropped or null key into an empty
+        document, and the next write would blank the user's text with nothing recorded
+        anywhere that the server had stopped answering in full. A value the server really
+        did send as `""` is kept as `""` — that is the truth, not a gap.
+        """
+        where = f"/api/documents/{document_id} body"
+        body = _require_json_object(await self._get_json(f"/api/documents/{document_id}"),
+                                    where)
+        entry_id = _require_int(body, "id", where,
+                                "it is the id the ledger stores next to the Papra document")
+        title = _require_str(body, "title", where,
+                             "it is written back into Papra's title, so an absent one must "
+                             "not become an empty one")
+        content = _require_str(body, "content", where,
+                               "it is written back into Papra's document text, so an absent "
+                               "one must not blank it")
         return KzDocument(
-            id=body["id"],
-            title=body.get("title") or "",
+            id=entry_id,
+            title=title,
             description=body.get("description") or "",
-            content=body.get("content") or "",
+            content=content,
             document_date=body.get("document_date"),
             original_filename=body.get("original_filename") or "",
             updated_at=body.get("updated_at"),
@@ -379,12 +622,7 @@ class KreuzaktClient:
                 "unexpected /api/search envelope: need `results` and `total` "
                 f"(body keys: {sorted(body) if isinstance(body, dict) else type(body).__name__})"
             )
-        hits = [KzHit(id=row["id"], title=row.get("title") or "",
-                      document_date=row.get("document_date"),
-                      added_at=row.get("added_at") or "",
-                      mime_type=row.get("mime_type") or "",
-                      original_filename=row.get("original_filename") or "")
-                for row in rows]
+        hits = [_hit_from_row(row) for row in rows]
         return hits, total
 
     async def list_documents(self, *, page: int = 1, limit: int = _LIMIT_MAX,
@@ -395,6 +633,17 @@ class KreuzaktClient:
         `id, title, description, document_date, added_at, original_filename,
         mime_type, thumbnail_url` — no `content`. `limit` is honoured and clamped to
         100; `page` is honoured; `offset` is ignored and so is not offered.
+
+        **Which keys are removed, and why.** `thumbnail_url`, `download_url`,
+        `link_for_user` and `stored_filename` are stripped from every row
+        (`_LINK_KEYS`). This is the one method that hands out the server's own dicts
+        instead of a narrowed type, so it has to do by hand the narrowing `KzDocument` and
+        `KzHit` do by construction: the plan's rule is that no Kreuzakt-side path
+        (`/api/documents/…`, `/thumbnail`, `/original`) or Kreuzakt storage name may leave
+        the proxy as an identifier, and a measured row carries
+        `"thumbnail_url": "/api/documents/4/thumbnail"`. `stored_filename` is stripped too
+        although the list endpoint did not send it, so that a future row cannot smuggle it
+        out through here. Every other key is passed through unchanged.
 
         `since` is honoured but has one trap: Kreuzakt compares it against a
         `YYYY-MM-DD HH:MM:SS` column, so `"2026-11-17 22:28:05"` filters while the same
@@ -415,7 +664,12 @@ class KreuzaktClient:
                 "unexpected /api/documents envelope: no documents list "
                 f"(body keys: {sorted(body) if isinstance(body, dict) else type(body).__name__})"
             )
-        return list(rows)
+        cleaned: list[dict] = []
+        for row in rows:
+            body = _require_json_object(row, "/api/documents row")
+            cleaned.append({key: value for key, value in body.items()
+                            if key not in _LINK_KEYS})
+        return cleaned
 
     async def retry_queue(self, entry_id: int) -> None:
         """Re-queue a `failed` row.
@@ -433,6 +687,28 @@ class KreuzaktClient:
 
 
 _DOCUMENTS_SINCE = re.compile(r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?$")
+
+
+def _hit_from_row(row: Any) -> KzHit:
+    """One search hit, with the fields `KzHit` declares actually present.
+
+    A missing or null `added_at` used to become `""`, which the declared `str` cannot
+    express and which sorts as the oldest document in Task 13's result list — a wrong
+    order presented as a ranking.
+    """
+    where = "/api/search row"
+    body = _require_json_object(row, where)
+    return KzHit(
+        id=_require_int(body, "id", where, "it is the Kreuzakt id the ledger resolves"),
+        title=_require_str(body, "title", where, "it is shown to the user as the hit title"),
+        document_date=body.get("document_date"),
+        added_at=_require_str(body, "added_at", where,
+                              "results are ordered by it, so a gap would reorder them"),
+        mime_type=_require_str(body, "mime_type", where,
+                               "it decides whether the caller may open the file as a PDF"),
+        original_filename=_require_str(body, "original_filename", where,
+                                       "it is shown as the file name"),
+    )
 
 
 def _require_documents_since(since: str) -> str:

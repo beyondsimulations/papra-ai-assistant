@@ -1,11 +1,22 @@
-"""`KreuzaktClient` against captured payloads.
+"""`KreuzaktClient` against captured payloads — and against bodies no server sent.
 
-Every body here is a file under `tests/fixtures/` that a probe wrote from a live
-container (`docs/superpowers/probes/2026-11-17-kreuzakt-contracts/`):
-`kreuzakt_queue_page.json`, `kreuzakt_document.json` from Task 3's `probe_queue.py`;
-`kreuzakt_search_page.json`, `kreuzakt_search_empty.json`,
-`kreuzakt_documents_page.json`, `kreuzakt_upload_response.json` from Task 5's
-`probe_search.py`. No payload in this file was written by hand.
+Three kinds of body appear here, and which kind a test uses decides what its verdict is
+evidence of:
+
+1. **Captured.** Every *well-formed* body is a file under `tests/fixtures/` that a probe
+   wrote from a live container
+   (`docs/superpowers/probes/2026-11-17-kreuzakt-contracts/`):
+   `kreuzakt_queue_page.json`, `kreuzakt_document.json` from Task 3's `probe_queue.py`;
+   `kreuzakt_search_page.json`, `kreuzakt_search_empty.json`,
+   `kreuzakt_documents_page.json`, `kreuzakt_upload_response.json` from Task 5's
+   `probe_search.py`. A test that passes on one of these says something about Kreuzakt.
+2. **Derived.** The fail-loud tests take a captured payload and remove or null one key
+   (`without(...)`, `patched(...)`). The surrounding payload is real; the defect is
+   invented, because no probe could make the server drop a column. Their verdict is about
+   this client's behaviour under a surprise we have not observed.
+3. **Hand-built.** `queue_row(...)` rows, the `failedCount: 1` upload rejection, and the
+   non-object/HTML bodies are assembled from captured *field names* only. They pin policy,
+   not server behaviour, and each says so where it matters.
 
 The parameters the client refuses to send are asserted as deliberately as the ones it
 sends: `/api/queue` ignores `page`/`offset` entirely (walking it re-reads one page
@@ -116,7 +127,15 @@ async def test_upload_reports_the_upstream_refusal_verbatim_with_its_status():
 
 async def test_upload_fails_closed_when_no_file_was_accepted():
     """`failedCount` set / `files` empty is a rejection, not an empty success: a silent
-    `None` here would leave the job to correlate against a row that will never exist."""
+    `None` here would leave the job to correlate against a row that will never exist.
+
+    NOT CAPTURED EVIDENCE: the body below is hand-built from the field names of
+    `kreuzakt_upload_response.json` (`files`, `uploadedCount`, `failedCount`, `errors`).
+    The probe captured a *400* rejection (`kreuzakt_upload_rejected.json`) but never a
+    200 with `failedCount: 1`, so this pins the client's policy for an inferred shape —
+    it is not an observation of what Kreuzakt answers. The field names are the only
+    measured part; do not cite this test as server behaviour.
+    """
     client, _ = make_client([("/api/upload", ok({
         "files": [], "uploadedCount": 0, "failedCount": 1,
         "errors": ["file is not a PDF"],
@@ -286,10 +305,14 @@ async def test_wait_for_queue_row_times_out_loudly_not_as_none():
 
 async def test_a_pending_row_is_waited_for_rather_than_returned():
     """`status == "completed"` is the only completion signal: `reindex-all` rows are
-    created with `document_id` already set, so a non-null id proves nothing."""
+    created with `document_id` already set, so a non-null id proves nothing. The timeout
+    text says `no terminal queue row`, not `no queue row`: the row exists, it is the
+    answer that does not exist yet (see
+    `test_the_timeout_diagnostic_says_which_row_is_stuck_instead_of_denying_it_exists`).
+    """
     client, calls = make_client([("/api/queue", ok(queue_body(
         [queue_row(102, status="pending", document_id=None)])))])
-    with pytest.raises(KreuzaktError, match="no queue row"):
+    with pytest.raises(KreuzaktError, match="no terminal queue row"):
         await client.wait_for_queue_row(UPLOAD_NAME, after_id=101,
                                         poll_s=0, timeout_s=0.05)
     assert len(calls) > 1                       # it kept polling, it did not give up early
@@ -414,7 +437,9 @@ async def test_search_clamps_a_non_positive_limit_rather_than_being_rejected():
     """Measured: `limit=0` is a 400 'Pagination parameters must be positive integers'."""
     client, calls = make_client([("/api/search", ok(load("kreuzakt_search_empty.json")))])
     await client.search("Rechnung", limit=0)
-    assert "limit=1" in calls[0][1]
+    # Parsed, not substring-matched: `"limit=1" in url` is satisfied by `limit=100` too,
+    # which is the same flaw this file criticises in the plan's own sketch.
+    assert httpx.URL(calls[0][1]).params.get("limit") == "1"
     await client.aclose()
 
 
@@ -612,4 +637,381 @@ async def test_list_documents_accepts_both_measured_since_forms():
     await client.list_documents(since="2026-11-17 22:28:05")
     assert len(calls) == 2
     assert all("since=" in url for _, url, _ in calls)
+    await client.aclose()
+
+
+# --------------------------------------------------- fail-loud typing (review pass)
+#
+# This client is the only code that speaks Kreuzakt HTTP, and Task 6 is its first
+# consumer. Every test in this section asks the same question of one call site: when the
+# server surprises us, does the caller get an error it can classify, or a plausible
+# value that will be written into an index? The second answer is always worse than a
+# crash, because it is indistinguishable from success afterwards.
+
+
+def without(body, *keys):
+    """A copy of a captured body with `keys` removed — a server that stopped sending them."""
+    return {key: value for key, value in body.items() if key not in keys}
+
+
+def patched(body, **values):
+    """A copy of a captured body with `values` overwritten (including set-to-null)."""
+    return {**body, **values}
+
+
+def text_client(body_text):
+    """A client whose every 200 answers `body_text` — what an HTML proxy page looks like."""
+    def handler(request):
+        return httpx.Response(200, text=body_text,
+                              headers={"content-type": "text/html"})
+
+    return KreuzaktClient("http://kreuzakt:3000", transport=httpx.MockTransport(handler))
+
+
+def json_client(payload):
+    """A client that answers 200 with arbitrary JSON, for the bodies `make_client` cannot
+    express because they are not objects."""
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    return KreuzaktClient("http://kreuzakt:3000", transport=httpx.MockTransport(handler))
+
+
+# ---- 1. the fields the bridge writes back must not be guessed
+
+
+async def test_get_document_refuses_a_body_without_content_rather_than_blanking_the_text():
+    """`content` and `title` are written back into Papra. `body.get("content") or ""`
+    turned a dropped key into an empty document, so the next write erases the user's
+    text and nothing anywhere records that the server stopped answering in full."""
+    body = without(load("kreuzakt_document.json"), "content")
+    client, _ = make_client([("/api/documents/15", ok(body))])
+    with pytest.raises(KreuzaktError) as excinfo:
+        await client.get_document(15)
+    assert "content" in str(excinfo.value)
+    assert "title" in str(excinfo.value)          # the keys actually present are named
+    await client.aclose()
+
+
+async def test_get_document_refuses_an_absent_title_rather_than_writing_back_an_empty_one():
+    body = without(load("kreuzakt_document.json"), "title")
+    client, _ = make_client([("/api/documents/15", ok(body))])
+    with pytest.raises(KreuzaktError, match="missing title"):
+        await client.get_document(15)
+    await client.aclose()
+
+
+async def test_get_document_refuses_a_null_title_rather_than_writing_back_an_empty_one():
+    """A null is the same blanking risk as an absent key, so it is refused the same way."""
+    client, _ = make_client(
+        [("/api/documents/15", ok(patched(load("kreuzakt_document.json"), title=None)))])
+    with pytest.raises(KreuzaktError, match="title"):
+        await client.get_document(15)
+    await client.aclose()
+
+
+async def test_get_document_refuses_a_null_content_even_though_the_key_is_present():
+    """The `or ""` form could not tell `content` absent from `content` null from `content`
+    empty; only the third one is something Kreuzakt actually said about the document."""
+    client, _ = make_client(
+        [("/api/documents/15", ok(patched(load("kreuzakt_document.json"), content=None)))])
+    with pytest.raises(KreuzaktError, match="missing content"):
+        await client.get_document(15)
+    await client.aclose()
+
+
+async def test_get_document_keeps_a_value_the_server_actually_sent_as_empty():
+    """The requirement is about keys that are *gone*, not about empty strings: a document
+    Kreuzakt itself reports as empty is empty, and refusing it would be its own lie."""
+    client, _ = make_client([("/api/documents/15", ok(
+        patched(load("kreuzakt_document.json"), content="", title="")))]
+    )
+    doc = await client.get_document(15)
+    assert doc.content == "" and doc.title == ""
+    await client.aclose()
+
+
+async def test_search_refuses_a_hit_missing_a_field_the_row_type_declares():
+    """`KzHit` declares these as `str`; `or ""` handed out a value the type says cannot
+    happen. Task 13 sorts by `added_at`, so `""` reads as 'the oldest document there is'."""
+    page = load("kreuzakt_search_page.json")
+    for key in ("id", "title", "added_at", "mime_type", "original_filename"):
+        broken = dict(page, results=[without(page["results"][0], key)])
+        client, _ = make_client([("/api/search", ok(broken))])
+        with pytest.raises(KreuzaktError, match=f"missing {key}"):
+            await client.search("Rechnung")
+        await client.aclose()
+
+
+async def test_search_refuses_a_null_added_at_instead_of_typing_it_as_a_str():
+    page = load("kreuzakt_search_page.json")
+    broken = dict(page, results=[patched(page["results"][0], added_at=None)])
+    client, _ = make_client([("/api/search", ok(broken))])
+    with pytest.raises(KreuzaktError, match="added_at"):
+        await client.search("Rechnung")
+    await client.aclose()
+
+
+# ---- 2. an unknown queue status is a fact we do not have
+
+
+async def test_an_unknown_queue_status_fails_immediately_rather_than_being_polled():
+    """A future `cancelled` row is not 'still pending'. Read as pending it would be
+    polled for `index_wait_timeout_s` (900 s by default) and then reported as *absence* —
+    the one outcome this design forbids. Measured set: pending, processing, completed,
+    failed, and nothing else appeared in any capture."""
+    client, calls = make_client([("/api/queue", ok(queue_body(
+        [queue_row(102, status="cancelled", document_id=None)])))])
+    with pytest.raises(KreuzaktError, match="unknown queue status") as excinfo:
+        await client.wait_for_queue_row(UPLOAD_NAME, after_id=101,
+                                        poll_s=0, timeout_s=30)
+    assert "cancelled" in str(excinfo.value)
+    assert len(calls) == 1                    # refused on the first read, not polled out
+    await client.aclose()
+
+
+async def test_an_unknown_status_is_rejected_by_queue_page_itself():
+    """The validation belongs in the row parser, so no caller — `queue_page` for an
+    operator view, `queue_high_water_mark`, or correlation — can meet it first."""
+    client, _ = make_client([("/api/queue", ok(queue_body(
+        [queue_row(102, status="queued", document_id=None)])))])
+    with pytest.raises(KreuzaktError, match="unknown queue status"):
+        await client.queue_page()
+    await client.aclose()
+
+
+async def test_the_four_measured_queue_statuses_still_parse():
+    rows = [queue_row(4, status="completed"), queue_row(3, status="failed"),
+            queue_row(2, status="processing"), queue_row(1, status="pending")]
+    client, _ = make_client([("/api/queue", ok(queue_body(rows)))])
+    assert [row.status for row in await client.queue_page()] == [
+        "completed", "failed", "processing", "pending"]
+    await client.aclose()
+
+
+# ---- 3. saturation is what the window shows, not what our constant says
+
+
+async def test_a_saturated_window_is_judged_by_the_window_itself_not_by_our_constant():
+    """If the server's cap ever drops to 5, five rows whose oldest is still above our
+    mark prove exactly as little as a hundred. `len(newer) >= 100` called that 'no queue
+    row' — an absence claim the window cannot support, and the failure this branch exists
+    to prevent."""
+    rows = [queue_row(1000 + i, f"other{i}.pdf") for i in range(5)]
+    client, calls = make_client([("/api/queue", ok(queue_body(rows)))])
+    with pytest.raises(CorrelationWindowFull):
+        await client.wait_for_queue_row(UPLOAD_NAME, after_id=900,
+                                        poll_s=0, timeout_s=30)
+    assert len(calls) == 1                    # decided on the first read, not the timeout
+    await client.aclose()
+
+
+async def test_a_window_that_reaches_below_the_mark_is_still_an_absence_answer():
+    """The conservative rule must not become 'always retryable': once a row at or below
+    the mark is visible, every row newer than it was inside the window, so absence is
+    provable and the caller waits instead of re-uploading forever.
+
+    The window here is mixed — two rows above the mark, one sitting on it — because a
+    window of only-older rows would pass without ever testing the boundary.
+    """
+    rows = [queue_row(104, "other1.pdf"), queue_row(103, "other2.pdf"),
+            queue_row(100, "older.pdf")]
+    client, _ = make_client([("/api/queue", ok(queue_body(rows)))])
+    with pytest.raises(KreuzaktError, match="no queue row"):
+        await client.wait_for_queue_row(UPLOAD_NAME, after_id=100,
+                                        poll_s=0, timeout_s=0.05)
+    await client.aclose()
+
+
+# ---- 4. every call site decodes, or nothing does
+
+
+async def test_upload_rejects_an_html_proxy_page_as_a_typed_error():
+    """`upload` was the one call site with no decode guard: a 200 that is not JSON raised
+    `json.JSONDecodeError`, which Task 6 cannot classify as a Kreuzakt failure."""
+    client = text_client("<html><body>502 Bad Gateway</body></html>")
+    with pytest.raises(KreuzaktError, match="not JSON"):
+        await client.upload(UPLOAD_NAME, b"%PDF")
+    await client.aclose()
+
+
+async def test_upload_rejects_a_json_array_where_an_object_is_expected():
+    client = json_client([])
+    with pytest.raises(KreuzaktError, match="expected a JSON object"):
+        await client.upload(UPLOAD_NAME, b"%PDF")
+    await client.aclose()
+
+
+async def test_upload_rejects_a_file_entry_it_cannot_read_rather_than_raising_typeerror():
+    """`payload["files"][0]["relativePath"]` is the stored name correlation depends on;
+    `["papra.pdf"]` or `[{}]` used to be a `TypeError`/`KeyError`."""
+    for files in (["papra.pdf"], [{}], [{"relativePath": None}]):
+        client = json_client({"files": files, "uploadedCount": 1,
+                              "failedCount": 0, "errors": []})
+        with pytest.raises(KreuzaktError, match="relativePath"):
+            await client.upload(UPLOAD_NAME, b"%PDF")
+        await client.aclose()
+
+
+async def test_queue_page_refuses_a_row_that_is_not_an_object():
+    client, _ = make_client([("/api/queue", ok(queue_body(["35"])))])
+    with pytest.raises(KreuzaktError, match="expected a JSON object"):
+        await client.queue_page()
+    await client.aclose()
+
+
+async def test_queue_page_refuses_a_row_without_the_keys_the_row_type_requires():
+    for key in ("id", "filename", "status"):
+        row = without(queue_row(7), key)
+        client, _ = make_client([("/api/queue", ok(queue_body([row])))])
+        with pytest.raises(KreuzaktError, match=f"missing {key}"):
+            await client.queue_page()
+        await client.aclose()
+
+
+async def test_queue_page_refuses_an_id_that_is_not_an_integer():
+    """`id` is the high-water mark and the correlation comparison; `"35"` would compare
+    against an int with a `TypeError` deep inside `wait_for_queue_row`."""
+    client, _ = make_client([("/api/queue", ok(queue_body(
+        [patched(queue_row(35), id="35")])))])
+    with pytest.raises(KreuzaktError, match="not an integer"):
+        await client.queue_page()
+    await client.aclose()
+
+
+async def test_queue_counts_refuses_a_value_that_is_not_an_integer_count():
+    """`int(value)` raised a bare `ValueError` for `"many"` and quietly accepted `"3"`;
+    a caller reading queue depth should not have to guess which non-int slipped through."""
+    for bad in ("many", "3", None, 1.5):
+        client, _ = make_client([("/api/queue", ok(queue_body([], {"pending": bad})))])
+        with pytest.raises(KreuzaktError, match="counts.pending"):
+            await client.queue_counts()
+        await client.aclose()
+
+
+async def test_health_refuses_a_body_that_is_not_an_object():
+    client = json_client(["ok"])
+    with pytest.raises(KreuzaktError, match="expected a JSON object"):
+        await client.health()
+    await client.aclose()
+
+
+async def test_health_requires_the_status_the_bridge_checks():
+    """Task 11's `ledger --invalidate` reads `health()["status"] == "ok"` before it will
+    invalidate an index; an object without `status` used to arrive as a bare `KeyError`
+    at the worst possible moment."""
+    client, _ = make_client([("/api/health", ok({"database": True}))])
+    with pytest.raises(KreuzaktError, match="missing status"):
+        await client.health()
+    await client.aclose()
+
+
+# ---- 5. the timeout diagnostic has to survive being read
+
+
+async def test_the_timeout_diagnostic_says_which_row_is_stuck_instead_of_denying_it_exists():
+    """The old text was 'no queue row' for a window that contained our row in
+    `processing`. Whoever pages on this message goes looking for a missing upload while
+    the upload is sitting in front of them."""
+    client, _ = make_client([("/api/queue", ok(queue_body(
+        [queue_row(102, status="processing", document_id=None)])))])
+    with pytest.raises(KreuzaktError) as excinfo:
+        await client.wait_for_queue_row(UPLOAD_NAME, after_id=101,
+                                        poll_s=0, timeout_s=0.05)
+    message = str(excinfo.value)
+    assert "102" in message and "processing" in message
+    assert "no queue row for" not in message
+    assert "no terminal queue row" in message
+
+
+async def test_the_timeout_diagnostic_stops_calling_the_window_edge_the_newest_row_above_the_mark():
+    """For a window of ids 100/50/20 with the mark at 1000, the old parenthetical reported
+    `newest id above the mark: 100` while nothing in the window was above the mark."""
+    rows = [queue_row(100, "a.pdf"), queue_row(50, "b.pdf"), queue_row(20, "c.pdf")]
+    client, _ = make_client([("/api/queue", ok(queue_body(rows)))])
+    with pytest.raises(KreuzaktError, match="no queue row") as excinfo:
+        await client.wait_for_queue_row(UPLOAD_NAME, after_id=1000,
+                                        poll_s=0, timeout_s=0.05)
+    message = str(excinfo.value)
+    assert "above the mark" not in message
+    assert "0 of them newer than id 1000" in message
+    assert "100..20" in message                    # the window's own edges, honestly
+
+
+# ---- 6. the collision counter is ASCII digits or it is a different file
+
+
+async def test_a_non_ascii_collision_suffix_is_not_one_of_ours():
+    """`str.isdigit()` is True for `٣` and `²`, so in an index another writer also uses,
+    `file (٣).pdf` could be matched as our `file.pdf` and its `document_id` attributed to
+    our job — a wrong document indexed under the wrong id, with no error anywhere.
+    Kreuzakt's own counter is an ASCII integer, so anything else is not ours.
+
+    The window also carries one row sitting at the mark, so its lower edge is not above
+    the mark: that makes absence observable, and 'no queue row' then really means 'the
+    non-ASCII name was not matched as ours' rather than 'the window proved nothing'.
+    """
+    for counter in ("\u0663", "\u00b2", "1\u0663"):
+        name = f"papra-d1-a1b2 ({counter}).pdf"
+        client, _ = make_client([("/api/queue", ok(queue_body(
+            [queue_row(12, name, document_id=9), queue_row(11, "older.pdf")])))])
+        with pytest.raises(KreuzaktError, match="no queue row"):
+            await client.wait_for_queue_row("papra-d1-a1b2.pdf", after_id=11,
+                                            poll_s=0, timeout_s=0.05)
+        await client.aclose()
+
+
+# ---- 8. `list_documents` must not be the one leak in the narrowing
+
+
+async def test_list_documents_drops_the_links_that_would_escape_the_narrowing():
+    """`KzDocument`/`KzHit` exist so no Kreuzakt-side path reaches a caller, and the plan
+    forbids `/thumbnail` leaving the proxy — but `list_documents` returned the server's
+    dicts verbatim, `thumbnail_url` included."""
+    page = load("kreuzakt_documents_page.json")
+    client, _ = make_client([("/api/documents", ok(page))])
+    rows = await client.list_documents()
+    assert "thumbnail_url" in page["documents"][0]      # the captured row really had it
+    assert not any(key in row for row in rows for key in
+                   ("thumbnail_url", "download_url", "link_for_user", "stored_filename"))
+    assert "/documents/" not in json.dumps(rows)
+    assert set(rows[0]) == set(page["documents"][0]) - {"thumbnail_url"}
+    assert rows[0]["id"] == 4 and rows[0]["title"]
+    await client.aclose()
+
+
+async def test_list_documents_refuses_a_row_that_is_not_an_object():
+    client, _ = make_client([("/api/documents", ok({"documents": ["4"]}))])
+    with pytest.raises(KreuzaktError, match="expected a JSON object"):
+        await client.list_documents()
+    await client.aclose()
+
+
+async def test_list_documents_drops_the_link_keys_a_row_does_not_yet_carry():
+    """The captured list row only ever had `thumbnail_url`, so the three other link keys
+    are asserted here against synthetic rows: the filter is a rule about the field names,
+    not a special case for the one key today's build happens to send. If a future Kreuzakt
+    serves `download_url` on this endpoint it must not become the leak.
+
+    SYNTHETIC: `download_url`, `link_for_user` and `stored_filename` were added to a
+    captured row by this test; the document endpoint (not the list) is where the probe
+    observed them, so their exact spelling here is inference from
+    `kreuzakt_document.json`, not a captured list row.
+    """
+    page = load("kreuzakt_documents_page.json")
+    page["documents"] = [patched(row,
+                                 download_url="/api/documents/4/original",
+                                 link_for_user="http://kreuzakt:3000/documents/4",
+                                 stored_filename="originals/4/papra-search0004-44444444.pdf")
+                         for row in page["documents"]]
+    client, _ = make_client([("/api/documents", ok(page))])
+    rows = await client.list_documents()
+    # Spelled out, not imported from `_LINK_KEYS`: a test that subtracts the client's own
+    # constant would keep passing if an entry were dropped from it.
+    assert set(rows[0]) == set(page["documents"][0]) - {
+        "thumbnail_url", "download_url", "link_for_user", "stored_filename"}
+    assert "/documents/" not in json.dumps(rows)
+    assert "originals/" not in json.dumps(rows)
+    assert "kreuzakt" not in json.dumps(rows)
+    assert rows[0]["original_filename"] == "papra-search0004-44444444.pdf"   # real fields survive
     await client.aclose()
