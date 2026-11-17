@@ -8,3 +8,6 @@ data/
 
 # pi agent profile (local-only: model routing, agent personas, loop skill)
 .pi/
+
+# Isolated git worktrees for plan execution
+.worktrees/
