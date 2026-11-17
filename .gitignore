@@ -14,3 +14,7 @@ data/
 
 # Isolated git worktrees for plan execution
 .worktrees/
+
+# Per-run SDD scratch (briefs, reports, review packages). The tracked
+# .superpowers/m3-review-loop-state.md is a different thing and stays tracked.
+.superpowers/sdd/
