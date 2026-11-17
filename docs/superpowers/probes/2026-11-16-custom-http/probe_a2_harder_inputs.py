@@ -29,9 +29,10 @@ BASE = "http://127.0.0.1:12210"
 UMlaut_TOKEN = "QRZ7UMWAESCHE"
 DEGRADED_TOKEN = "QRZ7DEGRADED"
 
+# No ASCII renderings of the tested words anywhere on the page: with a control line saying
+# "Strasse", a hit on "Strasse" would stop meaning the extraction preserved "Straße".
 GERMAN_LINES = [
     "Rechnung {token}",
-    "Waesche und Strasse und Gruesse",      # written out, deliberately, as a control
     "Die Wäsche Straße Grüße Café Köln",
     "Betrag: 1.234,56 EUR",
 ]
@@ -107,18 +108,27 @@ def settle(client: httpx.Client, org_id: str, document_id: str, *, window_s: flo
     return float("nan"), previous
 
 
-def hits(client: httpx.Client, org_id: str, query: str) -> int:
+def hits(client: httpx.Client, org_id: str, document_id: str, query: str) -> str:
+    """'hit'/'miss' for one named document, in an org holding only that document.
+
+    The first run counted org-wide results while two fixtures shared one org, and the page
+    carried ASCII control words for the very words under test. Both confounds are removed
+    here: one org per fixture, and the assertion is on this document's id.
+    """
     response = client.get(f"/api/organizations/{org_id}/documents",
                           params={"pageIndex": 0, "pageSize": 10, "searchQuery": query},
                           timeout=30)
     response.raise_for_status()
-    return response.json().get("documentsCount")
+    payload = response.json()
+    assert payload.get("documentsCount", 0) <= 1, "org is not single-document"
+    ids = [document.get("id") for document in payload.get("documents", [])]
+    return "hit" if document_id in ids else "miss"
 
 
 def main() -> None:
     umlaut_text = "\n".join(GERMAN_LINES).format(token=UMlaut_TOKEN)
     degraded_text = (f"Rechnung {DEGRADED_TOKEN}\n"
-                     "Die Waesche geht durch die Strasse.\nBetrag 99,95 EUR")
+                     "Die Wäsche geht durch die Straße.\nBetrag 99,95 EUR")
 
     fixtures = [
         ("umlauts-200dpi.pdf", image_only_pdf(render(umlaut_text, dpi=200)),
@@ -127,26 +137,31 @@ def main() -> None:
          DEGRADED_TOKEN, degraded_text),
     ]
 
-    with httpx.Client(base_url=BASE) as admin:
-        org_id, token = sign_up(admin)
-    with httpx.Client(base_url=BASE, headers={"Authorization": f"Bearer {token}"}) as api:
-        for name, data, token_text, source in fixtures:
+    for name, data, token_text, source in fixtures:
+        with httpx.Client(base_url=BASE) as admin:
+            org_id, token = sign_up(admin)
+        with httpx.Client(base_url=BASE,
+                          headers={"Authorization": f"Bearer {token}"}) as api:
             response = api.post(f"/api/organizations/{org_id}/documents",
                                 files={"file": (name, data, "application/pdf")}, timeout=60)
             response.raise_for_status()
             document_id = response.json()["document"]["id"]
             elapsed, content = settle(api, org_id, document_id)
-            print(f"\n=== {name} ({len(data)} bytes) — settled {elapsed:.1f}s ===")
+            print(f"\n=== {name} ({len(data)} bytes) — stable by {elapsed:.1f}s "
+                  f"(includes a 2 s stability confirmation, so this is an upper bound "
+                  f"on detection, not an OCR runtime) ===")
             print(f"  extracted: {content!r}")
             print(f"  own token found in text   : {token_text in content}")
-            print(f"  own token search hit      : {hits(api, org_id, token_text)}")
+            print(f"  own token search hit      : "
+                  f"{hits(api, org_id, document_id, token_text)}")
             # Each word is asked in both the printed form and the ASCII form the
             # extractor might have substituted. A hit on the ASCII form and a miss on
             # the printed one is precisely the failure that makes a document
             # unfindable: Papra does not fold diacritics at query time either.
             for word in ("Wäsche", "Waesche", "Wasche", "Straße", "Strasse",
                          "Grüße", "Grusse", "Café", "Cafe", "Köln", "Koln"):
-                print(f"  search {word!r:12} -> {hits(api, org_id, word)}")
+                print(f"  search {word!r:12} -> "
+                      f"{hits(api, org_id, document_id, word)}")
 
 
 if __name__ == "__main__":

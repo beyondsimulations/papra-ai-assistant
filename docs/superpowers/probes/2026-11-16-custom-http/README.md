@@ -1,89 +1,101 @@
-# Papra content extraction: defaults, quality, and the `custom-http` contract (2026-11-16)
+# Papra content extraction: defaults, quality, the write race, and `custom-http` (2026-11-16)
 
-These measurements settle whether Papra's own content extraction can be allowed to be the
-final writer of the `content` column, which is what the open content-write-race decision
-turned on. Run with the scratch stack (`docker compose -f docker-compose.test.yml up -d`)
-plus one throwaway container per arm; nothing here writes to the project's own state.
+These measurements settle whether Papra's own content extraction may be the final writer of
+the `content` column — the open content-write-race decision. Measured against the pinned
+image `ghcr.io/papra-hq/papra@sha256:d1f596a35332ad04d8a69d88a5e19bc82acd47f2bc2fe687dd2145b1ef5a8b19`
+(the digest `docker-compose.test.yml` pins). The scratch stack stays on port 12210; every
+other arm runs in its own throwaway container, so no measurement here depends on wiping
+anything.
 
-Everything below is measured against the pinned image
-`ghcr.io/papra-hq/papra@sha256:d1f596a35332ad04d8a69d88a5e19bc82acd47f2bc2fe687dd2145b1ef5a8b19`
-(the digest `docker-compose.test.yml` pins). Readiness: `/api/health`, ~3 s from `docker run`.
+## Corrections to claims made earlier in this directory
 
-## Correction to the earlier probes in this directory
+Both were produced by this author and both changed a conclusion, so they are recorded rather
+than quietly dropped:
 
-Two claims from `../2026-11-16/README.md` were produced by this author and were wrong in
-ways that mattered, so they are corrected here rather than left standing:
+1. **The scans in `../2026-11-16/` had a text layer.** They were built with `insert_text`, so
+   nothing in them could say anything about image-only input. Every fixture here asserts
+   `page.get_text().strip() == ""` before uploading.
+2. **`CONTENT_EXTRACTION_ENABLED` does not exist.** It came out of
+   `grep -o "CONTENT_EXTRACTION[A-Z_]*"`, which matched the tail of a longer identifier. The
+   real variable is `DOCUMENTS_CONTENT_EXTRACTION_ENABLED`, found by whole-identifier
+   matching and then confirmed behaviourally in probe C2. The `CONTENT_EXTRACTION_CUSTOM_HTTP_*`
+   names are real and were additionally observed on the wire (probe B).
+3. **A first run of probe C patched the document at +5 s** — after Papra's extraction had
+   already settled — and both arms looked healthy. That run proved nothing and is superseded
+   by `probe_c2_exact.py`.
 
-1. **The "scans" had a text layer.** They were built with `insert_text` into a page, so
-   every conclusion drawn from them about *image-only* input was unsupported. The scripts
-   here assert `page.get_text().strip() == ""` before uploading, and the assertion is the
-   point: without it, a fixture is a text-layer PDF wearing a costume.
-2. **The `custom-http` env names were mis-transcribed from a substring grep.**
-   `grep -o "CONTENT_EXTRACTION[A-Z_]*"` matched the *tail* of a longer identifier, so
-   `CONTENT_EXTRACTION_ENABLED` was reported as an env var that does not exist. The real
-   switch is `DOCUMENTS_CONTENT_EXTRACTION_ENABLED`. Whole-identifier matching
-   (`grep -oa "[A-Z][A-Z0-9_]*CONTENT_EXTRACTION[A-Z0-9_]*"`) was used here instead, and
-   the `CUSTOM_HTTP` names below were then confirmed on the wire by probe B.
+## 1. Papra's default strategy is real OCR, configured with English language data only
 
-## 1. Papra's default extraction is real OCR, and it is English-only
+`probe_a_defaults.py` (upload, touch nothing, read what Papra wrote): a 200 dpi image-only
+scan and a text-layer PDF both came back with the exact text, detected stable within 3.1 s
+(that number includes a deliberate 2 s stability confirmation, so it bounds detection, not
+OCR runtime), and content search found a token that exists only inside the image. The image
+ships `/app/eng.traineddata`, so `internal` includes Tesseract.
 
-`probe_a_defaults.py` — upload, touch nothing, read what Papra wrote:
+`probe_a2_harder_inputs.py` is the measurement that matters, because the corpus is German.
+One org per fixture, assertions on the fixture's own document id, and no ASCII rendering of
+any tested word on the page (an earlier version planted control lines, and those control
+lines were what the "hit" counts were actually matching).
 
-| input | Papra's `content` | settled | content search for a token only in the image |
-| --- | --- | --- | --- |
-| image-only scan, 200 dpi | 53 chars, exact text | 3.1 s | hit (`documentsCount=1`) |
-| text-layer PDF | 53 chars, exact text | 3.1 s | hit |
-
-So the default `internal` strategy OCRs: the image ships `eng.traineddata` (Tesseract).
-A clean rendered page is transcribed perfectly in about three seconds. That is the easiest
-input an OCR ever sees, which is why it is not the measurement that decides anything.
-
-`probe_a2_harder_inputs.py` — same strategy, harder input. Page printed with
-`Die Wäsche Straße Grüße Café Köln`, image-only, 200 dpi:
+Page printed with `Die Wäsche Straße Grüße Café Köln`, image-only, 200 dpi. Extracted:
 
 ```
-extracted: '...Die Wasche StraBe GriiBe Café Koln...'
-search 'Wäsche' -> 1   search 'Straße' -> 0   search 'Grüße' -> 0
-search 'Wasche' -> 1   search 'Strasse' -> 1  search 'Grusse' -> 0
-search 'Café'   -> 1   search 'Köln'   -> 1
+Rechnung QRZ7UMWAESCHE / Die Wasche StraBe GriiBe Café Kdln / Betrag: 1.234,56 EUR
 ```
 
-Three things, all relevant to a German corpus:
+| query | this document | why |
+| --- | --- | --- |
+| `Wäsche` | **hit** | content says `Wasche`; query-time folding covers the umlaut |
+| `Wasche` | hit | literal |
+| `Waesche` | miss | `ae` is not expanded |
+| `Straße` | **miss** | content says `StraBe` |
+| `Strasse` | **miss** | ditto |
+| `Grüße` / `Grusse` | **miss** | content says `GriiBe` |
+| `Café` / `Cafe` | hit | `é` survived and folds |
+| `Köln` / `Koln` | **miss** | content says `Kdln` — `ö` misread as `d`, so folding cannot rescue it |
 
-- The English model drops umlauts (`Wäsche`→`Wasche`), misreads `ß` as `B`
-  (`Straße`→`StraBe`), and produces garbage on `ü`+`ß` (`Grüße`→`GriiBe`).
-- Papra's query-time normalisation **does** fold umlauts (`Wäsche` finds `Wasche`) but
-  **does not** fold `ß` and does not expand `ae`/`ue`. So `Straße` and `Grüße` return
-  **zero documents**: the mangle is not recoverable at query time.
-- A degraded fixture (JPEG q45, halved resolution) still extracted correctly, so the
-  failure is the language model, not image quality. No rotation/perspective test was
-  possible without a new dependency, and that limitation is in the script's docstring.
+Degraded fixture (JPEG q45 plus halved resolution), page printed with `Die Wäsche geht durch
+die Straße`: extracted `Die Wasche geht durch die StraB3e`; `Wäsche`/`Wasche` hit, `Straße`
+and `Strasse` both **miss**.
 
-Consequence: letting Papra's extraction be the final writer is not a neutral choice for
-this corpus. It is a choice to make `Straße` unfindable.
+Three things follow, scoped to what was actually measured:
 
-## 2. `DOCUMENTS_CONTENT_EXTRACTION_ENABLED=false` makes our write durable
+- Umlauts are folded at query time (`ä`→`a`, `é` survives), but `ß` is not folded and `ae`/`ue`
+  are not expanded. So the failure is unrecoverable exactly where the letter was `ß`.
+- The `ß` mangle is **not stable**: across three runs the same word came out `StraBe`,
+  `StraB3e`, and `StraBBe`. A fixed search-time substitution is therefore not a workaround.
+- Image quality was not the cause — the degraded page extracted fine apart from the same
+  German characters. No rotation/perspective fixture was possible without a new dependency,
+  and that limitation is in the script's docstring.
 
-`probe_c_disabled.py`, run against two arms that differ in one environment variable,
-uploading the same image-only scan and patching our own text immediately after upload
-(the timing the OCR worker actually produces, and the timing that loses the race):
+Scope limit, stated rather than glossed: `DOCUMENTS_OCR_LANGUAGES` exists and only
+`eng.traineddata` is in the image, so German quality is probably improvable by mounting
+`deu.traineddata`. Untested here, and either way it does not remove the write race in §2 —
+it only changes which text loses.
 
-| arm | content right after upload | content timeline after our PATCH | our text survives | search `Straße` |
+## 2. Disabling Papra's extraction makes our write durable — one variable apart
+
+`probe_c2_exact.py`, run against two containers. Both upload the same image-only scan and
+`PATCH(content)` immediately after upload (the timing the OCR worker really produces). The
+image carries `QRZ7IMAGEONLY`; our text carries `QRZ7PATCHONLY`, which exists on no pixel of
+the page — so a hit on it can only mean our text is what is indexed. Comparison is exact
+text, not length.
+
+| arm | exact-text-equal-to-ours at t+0,2,5,10,20,30,45,60,90 s | `QRZ7PATCHONLY` | `QRZ7IMAGEONLY` | `Straße` |
 | --- | --- | --- | --- | --- |
-| `DOCUMENTS_CONTENT_EXTRACTION_ENABLED=false` (port 12211) | `0 chars` | `60,60,60,60,60,60,60,60` over 60 s | **yes** | **1** |
-| default, extraction on (port 12210) | `0 chars` | `60,63,63,63,63,63,63,63` | **no** | **0** |
+| `DOCUMENTS_CONTENT_EXTRACTION_ENABLED=false` (12211) | True at all 9 samples | **hit** | miss | **hit** |
+| default, extraction on (12210) | True at t+0, **False** from t+2 on | **miss** | hit | **miss** |
 
-`63` is Papra's own extraction landing on top of our `60`. It arrives within ~2 s of the
-upload, once, and it wins. Under the disabled arm Papra never writes the column at all, so
-our `PATCH` is the only write and search reflects exactly the text our model produced —
-including a correct `ß`.
+In the control arm Papra's extraction lands between t+0 and t+2, once, and it wins: the
+final content is Papra's own OCR text and our text is gone. The disabled arm stores our text
+byte-exact for the whole 90 s window, `QRZ7IMAGEONLY` never becomes findable (Papra extracted
+nothing), and `Straße` stays findable because our model spelled it correctly.
 
-Note the trap in the control arm: the content search for the token still returned 1 there,
-because Papra's OCR read the token off the image itself. **A content-search hit is not
-evidence that our text survived** — the first run of this probe was patched at +5 s, after
-extraction had already settled, and both arms looked fine. Timing is the variable.
+The control arm also shows why the token split was necessary: there, content search for
+`Wäsche` returned a **hit** even though our text was gone — Papra's own OCR wrote `Wasche`
+and the query folds. **A content-search hit is not evidence that our text survived.**
 
-Reproduce an arm with:
+Reproduce an arm:
 
 ```bash
 docker run -d --name papra-probe-c -p 127.0.0.1:12211:1221 \
@@ -93,11 +105,12 @@ docker run -d --name papra-probe-c -p 127.0.0.1:12211:1221 \
   ghcr.io/papra-hq/papra@sha256:d1f596a35332ad04d8a69d88a5e19bc82acd47f2bc2fe687dd2145b1ef5a8b19
 ```
 
-## 3. The `custom-http` contract, read off the wire
+## 3. The `custom-http` contract, and what happens when we are the slow component
 
-`probe_b_custom_http.py` ran a catch server on the host (port 12399) and a container with
-`CONTENT_EXTRACTION_STRATEGY=custom-http`, `..._CUSTOM_HTTP_URL=http://host.docker.internal:12399/extract`,
-`..._RESPONSE_FORMAT=text`, `..._UPLOAD_FORMAT=form-data`, `..._REQUEST_TIMEOUT_MS=5000`.
+Container env: `CONTENT_EXTRACTION_STRATEGY=custom-http`,
+`..._CUSTOM_HTTP_URL=http://host.docker.internal:12399/extract`,
+`..._RESPONSE_FORMAT=text`, `..._UPLOAD_FORMAT=form-data`,
+`..._REQUEST_TIMEOUT_MS=5000`. Catch server on the host (`probe_b_custom_http.py`).
 
 What Papra sends, for every upload:
 
@@ -108,35 +121,76 @@ headers: accept, accept-encoding, accept-language, connection, content-type, hos
 body: name="file"; filename="text-ok.pdf"; Content-Type: application/pdf; 11,600,080 bytes
 ```
 
-- **Asynchronous**: the upload returned in **0.1 s**, so extraction latency never delays
-  intake — our VLM can be slow without the mail poller noticing.
-- **No credential is sent by default.** The only auth is
-  `CONTENT_EXTRACTION_CUSTOM_HTTP_HEADERS`, which must carry a shared secret, and the
-  listener must be reachable from the container (tailnet-bound in production, never Funnel).
-- **Plain-text response body becomes `content` verbatim** (42 chars returned → 42 chars stored).
+- **Extraction is asynchronous**: the upload returned in **0.1 s**, so a slow local VLM does
+  not slow down intake.
+- **No credential is sent.** Authentication has to come from
+  `CONTENT_EXTRACTION_CUSTOM_HTTP_HEADERS`, and the listener has to be reachable from the
+  container (tailnet-bound in production, never Funnel).
+- **A plain-text response body becomes `content` verbatim** (42 chars returned, 42 stored).
 
-Failure behaviour, and this is the reason `custom-http` is the fallback and not the answer:
+`probe_b2_retry.py` then watched each failing case for a full 180 s, sampling at
+t+0,5,15,30,60,120,180 and reporting the end of the window explicitly:
 
-| our endpoint | requests received | final `content` |
+| our endpoint | extraction requests over 180 s | content at end of window |
 | --- | --- | --- |
-| `500` | **1**, no retry | `''` — empty, permanently |
-| hangs past the 5 s timeout | **1**, no retry | `''` — empty, permanently |
+| `HTTP 500` | **1** | `''` |
+| answers at 12 s, past the 5 s timeout | **1** | `''` |
 
-No retry, no error surfaced on the document, no extraction-status field to poll. A document
-uploaded while our suite is down, restarting, or queue-saturated silently keeps no content
-forever, and nothing in Papra says so. Any design built on `custom-http` therefore needs a
-sweeper that patches documents still empty after a bounded window — which is only safe
-*because* there is no retry, so "empty at T+window" is a final state rather than a race.
+So within a 3-minute window there is no retry, and **a response that lands after the client
+timeout is discarded rather than stored**. Whether a retry exists at some longer interval was
+not measured, and nothing here says the document ever gets its text back on its own.
 
-## What these measurements support
+The consequence for design: with a local VLM, "slow" is the normal failure mode, not a
+corner case — and `custom-http` turns it into a document with no content and no signal. Any
+`custom-http` design needs our own sweeper for documents still empty after a bounded window.
+That is only safe *because* a late answer is discarded and no retry arrived in 180 s; it is
+not a proof of a bounded extraction lifetime, and the spec would have to say what window it
+assumes and why.
 
-- **Disabling Papra's extraction** (`DOCUMENTS_CONTENT_EXTRACTION_ENABLED=false`) removes
-  the race outright: one env var, no fork, no new listener, no reconciliation, and the
-  stored text is the text our model produced. Cost: extraction stops for documents that
-  reach Papra by any *other* route (their intake email, the web UI), because our pipeline
-  becomes the only extractor in the instance.
-- **`custom-http`** is the option to choose if Papra-native intake has to keep producing
-  content, at the price of an authenticated tailnet listener plus a bounded-window sweeper
-  for the silent-permanent-failure case measured above.
-- **Reconciliation alone** (keep both writers, re-patch) stays the weakest option: it
-  accepts a writer that measurably lands ~2 s after upload and wins.
+## 4. What our own code cannot currently recover (this is the real gate)
+
+Read from `papra_suite/pipeline.py` and `papra_suite/store.py` while checking whether
+"disable Papra's extraction" is self-sufficient. It is not, on today's code:
+
+- `enqueue_ocr_job` deliberately enqueues **before** recording the document as seen, so a
+  crash before the enqueue is recovered by the sweep. ✓
+- A job claimed and abandoned by a crash is rewound to pending at startup. ✓
+- `worker_loop` fails a job **permanently** on any 4xx except 429, or on
+  `error.permanent` (a truncated completion), and otherwise backs off for 3 attempts. After
+  that the job is `failed`.
+- **`sweep_once` skips documents already in the seen table**, and the seen row is written as
+  soon as intake succeeds — long before content is confirmed. So a document whose OCR job
+  failed permanently has no content, and nothing re-discovers it. The only path back is the
+  manual `reset_job`.
+- A 409 "already ingested" from upload does not enqueue OCR, so mail replay cannot repair it
+  either.
+
+Today Papra's own extraction silently papers over that hole (badly, per §1). Turning it off
+removes the papering-over, which is the point of the option — so the option has to arrive
+with a recovery path for "document exists, content empty", or it converts a wrong-text bug
+into a no-text bug.
+
+## 5. What these measurements support, and what they do not
+
+Supported:
+
+- `DOCUMENTS_CONTENT_EXTRACTION_ENABLED=false` eliminates the second writer outright — one
+  environment variable, no fork, no new listener, no reconciliation — and the stored text is
+  then exactly what our model produced (§2).
+- Letting Papra's extraction win is not neutral for a German corpus: `Straße`, `Grüße` and
+  `Köln` are all unfindable afterwards, and the mangle varies run to run (§1).
+- `custom-http` is the option for keeping Papra-native intake working, and its price is an
+  authenticated tailnet listener plus a bounded-window sweeper (§3).
+
+Not supported, and needing measurement or a decision before a spec:
+
+- Whether `deu.traineddata` + `DOCUMENTS_OCR_LANGUAGES` makes Papra's own text good enough
+  (untested; still leaves the race).
+- What else `DOCUMENTS_CONTENT_EXTRACTION_ENABLED=false` changes in the product — only
+  `content` and content-search were verified.
+- Any claim about extraction behaviour beyond 180 s.
+- A real photograph: no rotation/perspective/skew fixture exists, because building one would
+  add a dependency to a probe.
+- The recovery gap in §4, which is a code change and needs the failure cases
+  (crash-before-enqueue, PATCH failure, PATCH-response-lost, worker death, exhausted job,
+  409-replay) enumerated and tested against a restart.
