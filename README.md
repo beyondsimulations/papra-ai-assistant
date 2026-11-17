@@ -234,10 +234,33 @@ addendum,
 ## Development
 
 ```bash
-make lint          # ruff
-make test-unit     # unit tests only
-make test          # full suite; needs Docker (compose stack + PAPRA_REQUIRE_STACK=1)
+make install-uv       # deps into .venv (uv); `make install` is the pip variant
+make lint             # ruff over the tree (measurement probes are excluded)
+make test-unit        # 445 tests, no Docker, ~18 s
+make stack-up         # scratch Papra + GreenMail, images pinned by digest
+make ci               # lint + unit + integration against the running stack
+make test-ci          # CI shape: up -> run everything -> down -v   (DESTRUCTIVE)
+make stack-digests    # pinned digests vs what upstream serves now
 ```
 
-Integration tests run a real IMAP server, Papra and an LLM stub; they are
-deselected unless `PAPRA_REQUIRE_STACK=1` is set.
+Three things about these targets that are worth knowing before you trust one:
+
+- **`make ci` assumes the stack is already up**, and `make test-integration` never
+  brings it up or takes it down. `make test`/`make test-ci` end in `down -v` because
+  that is right in CI, and on a machine where this is also the scratch stack someone
+  is measuring against, it is a way to lose work mid-investigation. Papra's data does
+  not survive `stack-down` either — the compose file declares no named volumes — so
+  every one of these stacks is disposable.
+- **`PAPRA_REQUIRE_STACK=1` is what makes a green suite mean something.** Without it
+  the integration tests *skip* when the stack is absent and the run still exits 0.
+  With it, an unreachable stack fails. Verified against the shipped helpers: a dead
+  port is not reported ready, the flag turns that into a failure, and without the
+  flag it skips.
+- **Tools come from `.venv/bin/` by default**, so `make lint` cannot silently check
+  against some other project's ruff — and `make install`'s pip does not exist on a
+  `uv`-bootstrapped venv, which is why `install-uv` is there. Use a system
+  environment with `make lint VENV=`.
+
+Integration tests run a real IMAP server and a real Papra (the LLM is an injected
+stub, so no model container is needed); they are deselected from the default run by
+the `integration` marker and required by `PAPRA_REQUIRE_STACK=1`.
