@@ -1,6 +1,14 @@
+# Images are pinned by digest, not by tag. `:latest` lets the upstream move under
+# a passing suite, and when the question on the table is "did Papra change its
+# search semantics or did we?", an unpinned answer makes every run of the
+# integration tests a coin flip that blames our code. Refresh deliberately:
+#   docker compose -f docker-compose.test.yml pull
+#   docker images --digests --format '{{.Repository}} {{.Digest}}' | grep -E 'papra|greenmail'
+# then re-run `make test-integration` before committing the new digest.
 services:
   papra:
-    image: ghcr.io/papra-hq/papra:latest
+    # digest as of 2026-11-16
+    image: ghcr.io/papra-hq/papra@sha256:d1f596a35332ad04d8a69d88a5e19bc82acd47f2bc2fe687dd2145b1ef5a8b19
     environment:
       AUTH_SECRET: "papra-suite-test-secret-not-for-prod-0123456789"
       AUTH_IS_EMAIL_VERIFICATION_REQUIRED: "false"
@@ -9,7 +17,8 @@ services:
       - "127.0.0.1:12210:1221"
 
   greenmail:
-    image: greenmail/standalone:latest
+    # digest as of 2026-11-16
+    image: greenmail/standalone@sha256:309ba544ea482e5d4265d09921cdab07c8dad2cc4481d715c9b8ff5d3f0a149f
     environment:
       GREENMAIL_OPTS: >-
         -Dgreenmail.setup.test.smtp -Dgreenmail.setup.test.imap

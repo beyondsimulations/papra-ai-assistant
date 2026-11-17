@@ -16,7 +16,13 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import Message
 
-from papra_suite.allowlist import AMBIGUOUS_FROM, DENY_MALFORMED, PERMISSION, AllowList
+from papra_suite.allowlist import (
+    AMBIGUOUS_FROM,
+    DENY_MALFORMED,
+    PERMISSION,
+    AllowList,
+    extract_from_field,
+)
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.papra_client import PapraClient, PapraError
 from papra_suite.pipeline import enqueue_ocr_job
@@ -58,10 +64,17 @@ class FetchBatch:
     """
     messages: list[tuple[int, bytes]] = field(default_factory=list)
     oversized_uids: list[int] = field(default_factory=list)
-    # (uid, verdict) for messages refused on their headers alone: the body was
-    # never requested, so a refused sender costs a header read, not a download
-    # plus a MIME parse.
-    denied: list[tuple[int, str]] = field(default_factory=list)
+    # (uid, verdict, from_field) for messages refused on their headers alone: the
+    # body was never requested, so a refused sender costs a header read, not a
+    # download plus a MIME parse. The From: text travels with the verdict because
+    # the refusal happens in the header stage and `parse_message`, which normally
+    # extracts it, never runs for a refused message. This is the only moment the
+    # refused address is in hand, and a record of "whom did we refuse" written
+    # later could only be written by re-fetching the header — so the row would go
+    # out without the one fact the operator asks for. It is the raw field text
+    # rather than a parsed address because for the malformed verdict there IS no
+    # address, and the unparseable text is the evidence.
+    denied: list[tuple[int, str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -290,7 +303,7 @@ class MailboxSession:
                 if verdict != PERMISSION:
                     logger.info("message uid=%s refused on its headers; body not"
                                 " requested", uid)
-                    batch.denied.append((uid, verdict))
+                    batch.denied.append((uid, verdict, extract_from_field(header)))
                     continue
             raw = self._fetch_literal(uid, "[]")
             if raw is None:
@@ -520,31 +533,47 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
     prefix_failed = False
 
     try:
-        # merge messages and oversized uids back into uid order so the
-        # freeze-on-failure semantics stay position-correct
         # merge messages, oversized uids and header-stage refusals back into uid
-        # order so the freeze-on-failure semantics stay position-correct
+        # order so the freeze-on-failure semantics stay position-correct. The sort
+        # key ignores the payload: sorting the raw tuples would compare a bytes
+        # payload against None for two entries with the same uid and kind, which
+        # is a TypeError in the middle of a poll.
         entries = sorted(
             [(uid, 0, raw) for uid, raw in batch.messages]
             + [(uid, 1, None) for uid in batch.oversized_uids]
-            + [(uid, 2, verdict) for uid, verdict in batch.denied]
+            + [(uid, 2, (verdict, from_field))
+               for uid, verdict, from_field in batch.denied],
+            key=lambda entry: (entry[0], entry[1]),
         )
 
-        def retire_refused(refused_uid: int, verdict: str) -> None:
+        def retire_refused(refused_uid: int, refusal: tuple[str, str]) -> None:
             # A rejected sender is a NORMAL outcome, not a fault. The message is
             # retired and the cursor advances, so a busy junk folder cannot
             # re-fetch and re-reject the same uids on every poll — and the poll
             # itself must not fail, because three consecutive failures disable a
             # mailbox and unsolicited mail must never be able to do that.
+            verdict, from_field = refusal
             nonlocal candidate_last_seen
             if verdict == DENY_MALFORMED:
                 result.malformed_senders += 1
+                event_kind = "sender_malformed"
                 logger.warning("message uid=%s ignored: its From: header does not "
                                "resolve to exactly one sender", refused_uid)
             else:
                 result.senders_denied += 1
+                event_kind = "sender_denied"
                 logger.info("message uid=%s ignored: sender is not on the allow-list",
                             refused_uid)
+            # Recorded BEFORE the \Seen mark is attempted: a refused message we
+            # then fail to retire is still a message we decided about, and this row
+            # is the record of that decision. Counters say "a sender was refused";
+            # the operator's question is "whose mail", and the address is in hand
+            # here and nowhere later.
+            _record_event_quietly(
+                store, mailbox_id=mailbox.id, uid=refused_uid, kind=event_kind,
+                uidvalidity=uidvalidity, papra_org_id=org.papra_org_id,
+                sender=from_field,
+            )
             seen_uids.append(refused_uid)
             if not prefix_failed:
                 candidate_last_seen = refused_uid
@@ -566,6 +595,14 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
                 seen_uids.append(uid)
                 if not prefix_failed:
                     candidate_last_seen = uid
+                # No filename and no sender on this row: the size gate fires
+                # before the body is read, so the message was never parsed. The
+                # row says what it can honestly say — that a message this mailbox
+                # cannot take was skipped at uid N.
+                _record_event_quietly(
+                    store, mailbox_id=mailbox.id, uid=uid, kind="message_oversized",
+                    uidvalidity=uidvalidity, papra_org_id=org.papra_org_id,
+                )
                 continue
             # parse_message on a crafted 22MB multipart measured a 238ms
             # event-loop block: MIME parsing must run off the loop like every
@@ -577,7 +614,7 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
                 # reaching here means a caller handed this loop a body that was
                 # never admitted, or a header that reads differently once parsed.
                 # Either way the answer is the same refusal, not a new path.
-                retire_refused(uid, verdict)
+                retire_refused(uid, (verdict, parsed.from_header or ""))
                 continue
             uploads_ok = True
             had_pdfs = False
@@ -609,6 +646,12 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
                     uploads_ok = False
                     result.messages_failed += 1
                     logger.error("upload failed for %s: %s", attachment.filename, error)
+                    _record_event_quietly(
+                        store, mailbox_id=mailbox.id, uid=uid, kind="upload_failed",
+                        uidvalidity=uidvalidity, papra_org_id=org.papra_org_id,
+                        filename=attachment.filename,
+                        detail=_upload_failure_detail(error),
+                    )
                     continue
                 file_hash = compute_file_hash(attachment.content)
                 enqueue_ocr_job(
@@ -621,6 +664,17 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
             for name in parsed.skipped_attachments:
                 result.attachments_skipped += 1
                 logger.info("skipped non-pdf attachment %s", name)
+                # This is the only durable place a skipped attachment will appear:
+                # the message it rode in on is marked \Seen and, with
+                # delete_after_download, deleted, so the operator cannot go and
+                # look for it afterwards. The sender is recorded alongside it
+                # because "who sent me a .zip" is the next question.
+                _record_event_quietly(
+                    store, mailbox_id=mailbox.id, uid=uid,
+                    kind="attachment_unsupported", uidvalidity=uidvalidity,
+                    papra_org_id=org.papra_org_id, filename=name,
+                    sender=parsed.from_header,
+                )
             if uploads_ok:
                 seen_uids.append(uid)
                 if mailbox.delete_after_download and had_pdfs:
@@ -665,6 +719,57 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
                     result.messages_scanned, result.documents_uploaded,
                     result.senders_denied, result.malformed_senders)
     return result
+
+
+def _upload_failure_detail(error: BaseException) -> str:
+    """A storable reason for a failed upload that cannot leak the upstream body.
+
+    `PapraError.__str__` deliberately embeds the first 200 characters of the
+    response body — right for a log line, wrong for a durable table an operator
+    dumps to a terminal. So the row records the type and the status
+    ("PapraError(status=500)"), which is what identifies the failure, and never
+    the response text.
+    """
+    status = getattr(error, "status", None)
+    if status is None:
+        return type(error).__name__
+    return f"{type(error).__name__}(status={status})"
+
+
+def _record_event_quietly(
+    store: Store, *, mailbox_id: str, uid: int, kind: str,
+    uidvalidity: str | None = None, papra_org_id: str | None = None,
+    filename: str | None = None, sender: str | None = None, detail: str | None = None,
+) -> None:
+    """Record one decision NOT to ingest something, and never let that write cost
+    the poll.
+
+    The catch is `(ValueError, sqlite3.Error)` — the same pair
+    `_record_success_quietly` uses — because this boundary ranks ingestion above
+    its own audit trail. An unknown `kind` raises `ValueError` from the store, and
+    swallowing it here is deliberate: the alternative is a frozen cursor, a
+    `last_error` nobody can act on and, after three polls, a disabled mailbox —
+    consequences that a message someone else sent would then be able to cause
+    through a bug in this program. The closed set is still enforced, just not
+    here: `store.record_ingest_event` refuses an unknown kind (test_store), and
+    every kind has a test asserting its ROW appears, so a call-site typo that
+    reaches this catch fails a test instead of reaching an operator.
+
+    So the split is: the store raises, the tests fail, the poller survives. A
+    logged ERROR with a traceback is what an operator gets, and that is the right
+    trade — losing an evidence row is not worth a stalled mailbox, and a programming
+    error is not worth a mailbox that an outsider can switch off.
+    """
+    try:
+        store.record_ingest_event(
+            mailbox_id=mailbox_id, uid=uid, kind=kind, uidvalidity=uidvalidity,
+            papra_org_id=papra_org_id, filename=filename, sender=sender, detail=detail,
+        )
+    except (ValueError, sqlite3.Error):
+        logger.error(
+            "could not record ingest event %s for uid=%s (mailbox %s)",
+            kind, uid, mailbox_id, exc_info=True,
+        )
 
 
 def _record_success_quietly(store: Store, mailbox_id: str, *, last_seen_uid: int,

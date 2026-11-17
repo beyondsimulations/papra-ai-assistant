@@ -589,7 +589,7 @@ def test_a_refused_sender_never_has_its_body_requested():
 
     assert imap.header_calls == [1, 2]
     assert imap.fetch_calls == [2]          # uid 1 was refused before its body
-    assert [uid for uid, _ in batch.denied] == [1]
+    assert [uid for uid, _, _ in batch.denied] == [1]
     assert [uid for uid, _ in batch.messages] == [2]
 
 

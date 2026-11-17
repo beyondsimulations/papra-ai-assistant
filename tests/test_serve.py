@@ -7,6 +7,8 @@ closed — the tests keep using their store handle after serve returns).
 """
 
 import asyncio
+import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -709,4 +711,95 @@ async def test_serve_with_sweep_disabled_spawns_no_sweep_task(tmp_path, monkeypa
 
     assert sweeps == []  # the sweep task never spawned
     assert not _dangling_serve_tasks()
+    store.close()
+
+
+async def test_serve_prunes_old_ingest_events_at_startup(tmp_path):
+    """Retention is enforced where the store is opened, not by an operator
+    remembering to run a vacuum. The assertion is that serve itself removed the
+    old row and kept the fresh one — not that the method exists."""
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    _seed_aged_event(store, days=91)
+    store.record_ingest_event(mailbox_id="mb1", uid=2, kind="sender_denied")
+
+    stop = asyncio.Event()
+    stop.set()   # startup work runs before serve waits, so this still exercises it
+    await serve(config, stop=stop, store=store)
+
+    assert [event.uid for event in store.list_ingest_events()] == [2]
+    store.close()
+
+
+class _StubSweepPapra:
+    """One empty listing, then the stop seam. `KeyboardInterrupt` is a
+    BaseException, so it passes the loop's guard and ends the test — reaching it
+    proves the previous pass completed."""
+
+    def __init__(self):
+        self.listings = 0
+
+    async def list_documents(self, org_id, **kwargs):
+        self.listings += 1
+        if self.listings >= 2:
+            raise KeyboardInterrupt()
+        return [], 0
+
+
+def _seed_aged_event(store, days):
+    store._conn.execute(
+        "INSERT INTO ingest_events (ts, mailbox_id, uid, kind) VALUES (?, 'mb1', 1,"
+        " 'sender_denied')", ((datetime.now(UTC) - timedelta(days=days)).isoformat(),))
+    store._conn.commit()
+
+
+async def test_a_sweep_pass_prunes_expired_events(tmp_path):
+    """Retention runs on the sweep's heartbeat, not only at startup, so a long
+    uptime cannot grow the table past its window."""
+    from papra_suite.pipeline import _sweep_loop
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.create_org(papra_org_id="org_1", name="Org")
+    _seed_aged_event(store, days=91)
+    _seed_aged_event(store, days=89)
+    papra = _StubSweepPapra()
+
+    with pytest.raises(KeyboardInterrupt):
+        await _sweep_loop(store, papra, interval_s=0)
+
+    assert papra.listings == 2
+    assert len(store.list_ingest_events()) == 1
+    store.close()
+
+
+async def test_a_prune_that_fails_does_not_stop_the_sweep(tmp_path, caplog):
+    """Retention is the least important write here; a locked database must cost a
+    stale listing, never a pipeline that stops discovering documents."""
+    import logging
+
+    from papra_suite.pipeline import _sweep_loop
+
+    class PruneHostile:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def prune_ingest_events(self, retention_days=90):
+            raise sqlite3.OperationalError("database is locked")
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.create_org(papra_org_id="org_1", name="Org")
+    papra = _StubSweepPapra()
+
+    with caplog.at_level(logging.WARNING), pytest.raises(KeyboardInterrupt):
+        await _sweep_loop(PruneHostile(store), papra, interval_s=0)
+
+    assert papra.listings == 2       # the sweep kept going
+    assert any("could not prune ingest events" in record.getMessage()
+               for record in caplog.records)
     store.close()

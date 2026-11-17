@@ -10,6 +10,7 @@ import sys
 
 import pytest
 
+import papra_suite.store as store_module
 from papra_suite.__main__ import main
 from tests.test_config import BASE_ENV
 
@@ -39,7 +40,7 @@ def test_check_success_migrates_and_exits_zero(monkeypatch, tmp_path):
         user_version = conn.execute("PRAGMA user_version").fetchone()[0]
     finally:
         conn.close()
-    assert user_version == 1
+    assert user_version == len(store_module.MIGRATIONS)
 
 
 def test_check_config_error_exits_two(monkeypatch, capsys, tmp_path):
@@ -200,6 +201,11 @@ def test_replay_can_resume_after_a_given_uid(monkeypatch, tmp_path, capsys):
 
     assert main() == 0
     store = Store(tmp_path / "state.db")
+    # The cursor IS the last uid seen, so uid 10 itself will not be read again.
+    # `papra-suite events` prints uids, and its help and README both tell the reader
+    # to pass one LESS than the uid they want — an off-by-one here means the message
+    # an operator came for is the one message that stays behind. Pinned end-to-end
+    # against a real IMAP server in tests/integration/test_mail_ingestion.py.
     assert store.get_mailbox(mailbox_id).last_seen_uid == 10
     store.close()
 
@@ -214,3 +220,308 @@ def test_replay_names_the_known_mailboxes_for_a_typo(monkeypatch, tmp_path, caps
     assert main() == 2
     err = capsys.readouterr().err
     assert "unknown mailbox nope" in err and "known mailboxes:" in err
+
+
+# -- papra-suite events ------------------------------------------------------
+
+def _events_env(monkeypatch, tmp_path):
+    _replay_env(monkeypatch, tmp_path, None)
+
+
+def _event_columns():
+    from papra_suite.__main__ import EVENT_COLUMNS
+
+    return EVENT_COLUMNS
+
+
+def _seed_events(tmp_path, rows):
+    """Rows written straight through the store, so the CLI is tested against
+    realistic content rather than against a hand-written fixture."""
+    from papra_suite.store import Store
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    for row in rows:
+        store.record_ingest_event(**row)
+    store.close()
+
+
+def _data_lines(output):
+    lines = [line for line in output.strip().splitlines() if line]
+    return lines[1:] if lines else []
+
+
+def test_events_prints_the_recorded_disposition(monkeypatch, tmp_path, capsys):
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(
+        mailbox_id="mb_7", uid=512, kind="sender_denied", uidvalidity="8813",
+        papra_org_id="org_abc", sender="Stranger <spam@other.net>")])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "kind" in out.splitlines()[0]      # a header, so columns are decidable
+    line = _data_lines(out)[0]
+    for expected in ("mb_7", "512", "8813", "sender_denied", "org_abc",
+                     "spam@other.net"):
+        assert expected in line
+
+
+def test_events_prints_a_dash_for_an_absent_value(monkeypatch, tmp_path, capsys):
+    """Absent must not print as nothing: an empty field in a tab-separated row
+    shifts every column after it, and "no sender" would look like a parse error."""
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=9, kind="message_oversized")])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
+
+    assert main() == 0
+    fields = _data_lines(capsys.readouterr().out)[0].split("\t")
+    assert len(fields) == len(_event_columns())
+    assert fields.count("-") == 5   # uidvalidity, org, sender, filename, detail
+    assert '""' not in fields
+
+
+def test_events_quotes_a_value_that_could_forge_a_row(monkeypatch, tmp_path, capsys):
+    """Defence in depth: the store sanitises on write, but rows written before
+    that rule existed are still in old databases, and a filename with a newline
+    in it must not become a second row on the way to a terminal."""
+    import sqlite3
+
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied")])
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute("UPDATE ingest_events SET filename = ?", ("R\u00f6ntgen\nname.pdf",))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert len(_data_lines(out)) == 1
+    assert "\\n" in out            # escaped, so the byte is visible and inert
+    assert "R\u00f6ntgen" in out   # readable, not escaped into \u00f6: reading is
+                                    # the only job this line has
+
+
+def test_events_clamps_the_limit(monkeypatch, tmp_path, capsys):
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=uid, kind="sender_denied")
+                            for uid in range(3)])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--limit", "0"])
+
+    assert main() == 0
+    assert len(_data_lines(capsys.readouterr().out)) == 1
+
+
+def test_events_filters_by_kind_and_mailbox(monkeypatch, tmp_path, capsys):
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [
+        dict(mailbox_id="mb_7", uid=1, kind="sender_denied"),
+        dict(mailbox_id="mb_8", uid=2, kind="upload_failed"),
+    ])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--kind",
+                                      "upload_failed", "--mailbox-id", "mb_8"])
+
+    assert main() == 0
+    lines = _data_lines(capsys.readouterr().out)
+    assert len(lines) == 1 and "upload_failed" in lines[0] and "mb_8" in lines[0]
+
+
+def test_events_empty_answer_says_what_was_asked(monkeypatch, tmp_path, capsys):
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied")])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--kind",
+                                      "upload_failed", "--since", "2099-01-01"])
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "no matching ingest events" in out
+    assert "upload_failed" in out and "since 2099-01-01" in out
+    assert "90 days" in out       # says what the window is, so empty is readable
+
+
+def test_events_rejects_a_malformed_since_date(monkeypatch, tmp_path, capsys):
+    """`--since` is a date, not a number of days: "7" would silently mean the year
+    7 AD to a lexical timestamp comparison, which reads as an empty inbox."""
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied")])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--since", "7"])
+
+    assert main() == 2
+    assert "2026-11-09" in capsys.readouterr().err   # names the expected shape
+
+
+def test_events_since_is_a_utc_date_boundary(monkeypatch, tmp_path, capsys):
+    """The cutoff is midnight UTC of the given day, and a row from that day is
+    inside the window: an off-by-one here silently hides a day of refusals."""
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    _events_env(monkeypatch, tmp_path)
+    yesterday = datetime.now(UTC) - timedelta(days=1)
+    _seed_events(tmp_path, [
+        dict(mailbox_id="mb_7", uid=1, kind="sender_denied"),
+        dict(mailbox_id="mb_7", uid=2, kind="upload_failed"),
+    ])
+    # age one row to just before midnight UTC of yesterday, leave the other now
+    midnight = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+    boundary = midnight - timedelta(seconds=1)
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute("UPDATE ingest_events SET ts = ? WHERE uid = 2",
+                 (boundary.isoformat(),))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--since",
+                                      yesterday.date().isoformat()])
+
+    assert main() == 0
+    lines = _data_lines(capsys.readouterr().out)
+    assert len(lines) == 1 and "\t2\t" not in lines[0]   # only uid 1 survives
+
+
+def test_events_rejects_an_unknown_kind(monkeypatch, tmp_path, capsys):
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied")])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--kind", "denied"])
+
+    assert main() == 2
+    err = capsys.readouterr().err
+    assert "unknown kind" in err and "sender_denied" in err
+
+
+def test_events_refuses_a_missing_database_without_creating_one(
+        monkeypatch, tmp_path, capsys):
+    """Store.__init__ creates the parent directory AND the file, so checking for a
+    missing database after opening one is impossible: the symptom the operator came
+    to read would have been replaced by an empty store that answers "no events".
+    The file must not exist afterwards, in any size."""
+    _events_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
+
+    assert main() == 2
+    err = capsys.readouterr().err
+    assert "no database at" in err and "papra-suite check" in err
+    assert not (tmp_path / "state.db").exists()
+
+
+def test_events_on_an_unmigrated_store_says_so_instead_of_tracing_back(
+        monkeypatch, tmp_path, capsys):
+    """`events` never migrates — a curiosity query must not perform a schema
+    change — so a store that predates the table is a stated condition with the fix
+    in the message, and the distinction from "no database at all" is preserved."""
+    _events_env(monkeypatch, tmp_path)
+    (tmp_path / "state.db").touch()      # a database file with no tables
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
+
+    assert main() == 2
+    err = capsys.readouterr().err
+    assert "no ingest_events table" in err and "papra-suite check" in err
+
+
+def test_events_json_emits_the_record_fields(monkeypatch, tmp_path, capsys):
+    """`--json` is the record, not the display: `-` for absent is a rendering
+    convention, and a script reading null as "-" is a bug waiting for a quiet
+    day."""
+    import dataclasses
+    import json
+
+    from papra_suite.store import IngestEvent
+
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=512, kind="sender_denied",
+                                 sender="Stranger <spam@other.net>")])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--json"])
+
+    assert main() == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["uid"] for row in rows] == [512]
+    assert rows[0]["uidvalidity"] is None
+    assert set(rows[0]) == {field.name for field in dataclasses.fields(IngestEvent)}
+
+
+def test_check_counts_yesterday_and_today_apart(monkeypatch, tmp_path, capsys):
+    """`check` is the command an operator already runs, so the counts live there:
+    "polling fine, nothing arrives" should be one command, not two."""
+    from datetime import UTC, datetime, timedelta
+
+    from papra_suite.store import Store
+
+    _events_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "config ok" in out and "events (last 24h): none" in out
+
+    store = Store(tmp_path / "state.db")
+    store.record_ingest_event(mailbox_id="mb_7", uid=1, kind="sender_denied")
+    store.record_ingest_event(mailbox_id="mb_7", uid=2, kind="sender_denied")
+    old = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+    store._conn.execute(
+        "INSERT INTO ingest_events (ts, mailbox_id, uid, kind) VALUES (?, 'mb_7', 3,"
+        " 'upload_failed')", (old,))
+    store._conn.commit()
+    store.close()
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "events (last 24h): sender_denied=2" in out
+    assert "upload_failed" not in out.split("events (last 24h)")[1]
+
+
+def test_events_escapes_bytes_a_terminal_would_act_on(monkeypatch, tmp_path, capsys):
+    """The threat is not a newline, it is an escape sequence.
+
+    These rows are written straight into the table, bypassing the store's writer,
+    because that is exactly the case the renderer exists for: a database written by
+    an older build, or by hand while debugging, still contains what the messages
+    contained. `\\x1b[2J` clears a screen and C1 CSI (`\\x9b`) starts a control
+    sequence; neither contains whitespace, so a quoting rule keyed on whitespace
+    alone prints them raw and lets the filename format the terminal showing it.
+    """
+    import sqlite3
+
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied")])
+    hostile = ["\x1b[2Jevil.pdf", "a\x9bQ", "line\u2028break", "zero\u200bwidth"]
+    conn = sqlite3.connect(tmp_path / "state.db")
+    for index, value in enumerate(hostile):
+        conn.execute("INSERT INTO ingest_events (ts, mailbox_id, uid, kind, filename)"
+                     " VALUES ('2026-11-16T00:00:00+00:00', 'mb_7', ?, 'sender_denied',"
+                     " ?)", (index + 2, value))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events"])
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert len(_data_lines(out)) == len(hostile) + 1
+    for raw in ("\x1b", "\x9b", "\u2028", "\u200b"):
+        assert raw not in out                 # never raw
+    for escaped in ("\\u001b", "\\u009b", "\\u2028", "\\u200b"):
+        assert escaped in out                 # and visible as what it was
+
+
+def test_events_json_leaves_no_terminal_control_bytes(monkeypatch, tmp_path, capsys):
+    """`--json` is machine output, but machine output is piped into `less` and
+    pasted into terminals. json.dumps escapes C0 and leaves C1 and U+2028 raw; the
+    escaping stays inside the JSON string, so the document is still valid."""
+    import json
+    import sqlite3
+
+    _events_env(monkeypatch, tmp_path)
+    _seed_events(tmp_path, [dict(mailbox_id="mb_7", uid=1, kind="sender_denied",
+                                 filename="R\u00f6ntgen.pdf")])
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute("INSERT INTO ingest_events (ts, mailbox_id, uid, kind, filename)"
+                 " VALUES ('2026-11-16T00:00:00+00:00', 'mb_7', 2, 'sender_denied',"
+                 " 'a\x9bb\u2028')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "events", "--json"])
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "\x9b" not in out and "\u2028" not in out
+    rows = json.loads(out)                     # still parseable
+    assert rows[0]["filename"] == "R\u00f6ntgen.pdf"   # readable, not \\u00f6
+    assert any(row["filename"] == "a\x9bb\u2028" for row in rows)  # value preserved

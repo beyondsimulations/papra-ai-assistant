@@ -110,10 +110,7 @@ Tables: `orgs` (id, papra_org_id, name), `mailboxes` (id, org_id, host, port, us
 - Auth: `ADMIN_PASSWORD` env var; POST login sets a signed session cookie (itsdangerous-style, no dependency on a framework session plugin); every page and JSON route behind it. No rate limiting needed on a tailnet-only port, but enforce a constant-time compare and a 1 s sleep on failed login.
 - Pages (server-rendered, minimal CSS, no JS framework):
   1. Status: queue depth, running/failed jobs, per-mailbox last poll and error state, LLM endpoint health (ping `GET /v1/models`), Papra reachability.
-  2. Mailboxes: CRUD per org, test-connection button (IMAP login + one LIST).
-     No subject-filter field: admission is the global sender allow-list
-     (`PAPRA_ALLOWED_SENDERS`, env), decided on the message headers, and the
-     `mailboxes.subject_filter` column is unread legacy that must not gain UI.
+  2. Mailboxes: CRUD per org, test-connection button (IMAP login + one LIST), subject filter field.
   3. Documents: recent 50 with title, org, OCR status; per-document buttons: retry OCR, regenerate title, view last error.
   4. Logs: last 500 log lines, plain text.
 

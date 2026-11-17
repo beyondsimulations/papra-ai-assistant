@@ -7,6 +7,7 @@ from papra_suite.store import Store
 from tests.integration.conftest import (
     GREENMAIL_HOST,
     GREENMAIL_IMAP_PORT,
+    GREENMAIL_PASSWORD,
     inject_message,
     purge_greenmail_inbox,
 )
@@ -271,3 +272,116 @@ async def test_an_empty_allow_list_pauses_without_touching_the_inbox(
         assert len(unseen[0].split()) == 1          # not fetched, not marked read
     finally:
         imap.logout()
+
+
+async def test_every_skipped_outcome_is_recorded_against_a_real_server(
+        ingestion_stack):
+    """The event rows are only worth having if they are ACTIONABLE: they quote a
+    uid and a sender from a real server, not from a fake double built to agree.
+
+    So the assertion is not "a row exists". It is that the uid in the
+    sender_denied row still names the refused message on the IMAP server — the
+    exact lookup an operator would perform — and that the address in the row is
+    the address that was refused.
+    """
+    import imaplib
+
+    store, mailbox, org, client, _ = ingestion_stack
+    inject_message(
+        subject="invoice with a zip", to="ingest@localhost",
+        sender="sender@example.com",
+        attachments=[("invoice.pdf", PDF_BYTES, ("application", "pdf")),
+                     ("detail.zip", b"PK\x03\x04zip-bytes", ("application", "zip"))],
+    )
+    inject_message(
+        subject="newsletter nobody asked for", to="ingest@localhost",
+        sender="stranger@notallowed.test",
+        attachments=[("issue.pdf", PDF_BYTES + b"-other", ("application", "pdf"))],
+    )
+
+    await poll_mailbox_once(store, client, mailbox, org, allowlist=ALLOW)
+
+    by_kind = {event.kind: event for event in store.list_ingest_events()}
+    assert set(by_kind) == {"attachment_unsupported", "sender_denied"}
+
+    skipped = by_kind["attachment_unsupported"]
+    assert skipped.filename == "detail.zip"
+    assert "sender@example.com" in (skipped.sender or "")
+
+    denied = by_kind["sender_denied"]
+    assert "stranger@notallowed.test" in (denied.sender or "")
+    assert denied.uidvalidity == store.get_mailbox(mailbox.id).uidvalidity
+
+    # the row's uid must still name that message on the server
+    imap = imaplib.IMAP4(GREENMAIL_HOST, GREENMAIL_IMAP_PORT, timeout=5)
+    try:
+        imap.login("ingest@localhost", GREENMAIL_PASSWORD)
+        imap.select("INBOX")
+        status, data = imap.uid("FETCH", str(denied.uid), "(BODY.PEEK[HEADER])")
+        assert status == "OK"
+        # Same shape rule the production client uses: the literal rides in a
+        # tuple item, and servers differ about the items around it. Joining the
+        # literals is what keeps this assertion about the message, not about
+        # GreenMail's response layout.
+        header = b"".join(
+            item[1] for item in data
+            if isinstance(item, tuple) and len(item) >= 2
+            and isinstance(item[1], bytes)
+        )
+        assert b"stranger@notallowed.test" in header
+        assert b"newsletter nobody asked for" in header
+    finally:
+        imap.logout()
+
+
+async def test_a_refused_sender_records_one_row_and_is_not_refused_again(
+        ingestion_stack):
+    """Cursor semantics for the new rows, against a real server: one row, and the
+    second poll decides nothing new. A second row would mean the refused uid is
+    being re-fetched every poll — the bug the header-stage refusal exists to
+    prevent, now visible in the table instead of only in the log."""
+    store, mailbox, org, client, _ = ingestion_stack
+    inject_message(
+        subject="junk", to="ingest@localhost", sender="stranger@notallowed.test",
+        attachments=[("junk.pdf", PDF_BYTES + b"-junk", ("application", "pdf"))],
+    )
+
+    first = await poll_mailbox_once(store, client, mailbox, org, allowlist=ALLOW)
+    second = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id),
+                                     org, allowlist=ALLOW)
+
+    assert first.senders_denied == 1 and second.messages_scanned == 0
+    assert len(store.list_ingest_events()) == 1
+
+
+async def test_an_event_rows_uid_replays_the_message_it_named(ingestion_stack):
+    """`--from-uid N` re-reads mail strictly AFTER N, so the uid printed beside a
+    refused message is one past the number an operator has to pass.
+
+    Written as the operator reads it — look at the row, rewind, expect the document
+    back — because the off-by-one is otherwise invisible: `replay --from-uid <uid>`
+    is accepted, reports a rewind, and leaves the one message they came for behind.
+    """
+    store, mailbox, org, client, _ = ingestion_stack
+    inject_message(
+        subject="refused invoice", to="ingest@localhost",
+        sender="stranger@notallowed.test",
+        attachments=[("inv.pdf", PDF_BYTES + b"-uid-boundary", ("application", "pdf"))],
+    )
+    first = await poll_mailbox_once(store, client, mailbox, org, allowlist=ALLOW)
+    assert first.senders_denied == 1
+    row, = store.list_ingest_events()
+
+    widened = parse_allowlist("sender@example.com, notallowed.test")
+
+    store.reset_mailbox_cursor(mailbox.id, from_uid=row.uid)
+    same_cursor = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id),
+                                          org, allowlist=widened)
+    assert same_cursor.messages_scanned == 0    # the uid itself stays behind
+    assert same_cursor.documents_uploaded == 0
+
+    store.reset_mailbox_cursor(mailbox.id, from_uid=row.uid - 1)
+    replayed = await poll_mailbox_once(store, client, store.get_mailbox(mailbox.id),
+                                       org, allowlist=widened)
+    assert replayed.messages_scanned == 1
+    assert replayed.documents_uploaded == 1

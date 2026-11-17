@@ -139,3 +139,24 @@ async def test_generate_title_falls_back_on_a_permanent_completion():
 
     assert title == "rechnung-42.pdf"   # the filename, not the truncated title
     assert calls["n"] == 1              # and asked exactly once: permanent
+
+
+def test_the_title_prompt_nominates_no_language():
+    """Nothing in the pipeline knows what language a forwarded document is in, so
+    naming two in the prompt tells the model the third one is a mistake to correct.
+
+    A German invoice that comes back titled "Invoice" is a document nobody finds by
+    looking for the word they remember. The instruction that replaces the list —
+    "in the document's own language; never translate" — is the whole of it.
+
+    The OCR prompt carries the same assumption and is changed on its own branch, not
+    this one: the plan's review gate for ingest-visibility excludes `ocr.py`, and a
+    transcription prompt is a better place to argue about behaviour than inside a
+    branch about ingest visibility.
+    """
+    from papra_suite.titles import TITLE_SYSTEM_PROMPT
+
+    lowered = TITLE_SYSTEM_PROMPT.lower()
+    assert "german" not in lowered and "english" not in lowered
+    assert "own language" in lowered
+    assert "never translate" in lowered

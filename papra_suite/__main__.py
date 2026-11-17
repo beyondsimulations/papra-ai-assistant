@@ -1,14 +1,234 @@
+"""The `papra-suite` entry point.
+
+Commands are deliberately boring: `check` proves the deployment can start,
+`serve` runs it, `replay` rewinds a cursor, `events` answers "why did nothing
+arrive?" from the durable record. Nothing here decides policy; the store and the
+pipeline do, and this file turns arguments into calls and rows into text.
+"""
+
 import argparse
 import contextlib
+import dataclasses
+import json
 import signal
+import sqlite3
 import sys
+import unicodedata
+from datetime import UTC, datetime, timedelta
 
 from papra_suite import __version__
 from papra_suite.config import ConfigError, load_config
+from papra_suite.store import INGEST_EVENT_KINDS
 
 # Signals that must stop the service cleanly. SIGTERM is what `docker stop`
 # sends; SIGINT is Ctrl-C.
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+def _recent_event_counts(store) -> str:
+    """One line for `check`: what the poller decided against in the last day.
+
+    This is the line that turns "the mailbox is polling but nothing arrives" into
+    a one-command answer, because `check` is the command an operator already runs
+    when something is wrong — and the counts say "three senders refused today"
+    without anyone having to open a second command.
+
+    It never fails `check`. A fresh or empty store has no events, which is not a
+    configuration error, and a check that exited non-zero for an empty table would
+    train people to stop running check; so an unreadable table degrades to a
+    stated reason on the same line rather than a new exit code.
+    """
+    try:
+        counts = store.count_ingest_events_by_kind(
+            since=(datetime.now(UTC) - timedelta(days=1)).isoformat()
+        )
+    except sqlite3.Error as error:
+        return f"events (last 24h): unavailable ({type(error).__name__})"
+    if not counts:
+        return "events (last 24h): none"
+    summary = ", ".join(f"{kind}={counts[kind]}" for kind in sorted(counts))
+    return f"events (last 24h): {summary}"
+
+
+def _run_events(config, args) -> int:
+    """`papra-suite events`: read the durable answer to "why did nothing arrive?"
+
+    Read-only: it never migrates. A command that migrated on read would let a
+    curiosity query perform a schema change, and the schema belongs to `check`
+    and `serve`. An unmigrated store is therefore a stated condition, not a
+    traceback and not a silent empty table.
+    """
+    from papra_suite.store import INGEST_EVENT_RETENTION_DAYS, Store
+    unknown = [kind for kind in (args.kind or []) if kind not in INGEST_EVENT_KINDS]
+    if unknown:
+        print(f"unknown kind: {', '.join(unknown)}",
+              file=sys.stderr)
+        print(f"known kinds: {', '.join(INGEST_EVENT_KINDS)}", file=sys.stderr)
+        return 2
+    since = None
+    if args.since is not None:
+        try:
+            since = datetime.strptime(args.since, "%Y-%m-%d").replace(
+                tzinfo=UTC).isoformat()
+        except ValueError:
+            print(f"--since wants a date like 2026-11-09, got {args.since!r}",
+                  file=sys.stderr)
+            return 2
+
+    # A missing database is refused BEFORE the store is opened: Store.__init__
+    # creates the parent directory and the file, so by the time a Store exists
+    # there is never a "missing database" left to report — the symptom an
+    # operator came to read would have been replaced by an empty one.
+    db_path = config.data_dir / "state.db"
+    if not db_path.exists():
+        print(f"no database at {db_path}", file=sys.stderr)
+        print("run `papra-suite check` first; nothing to list", file=sys.stderr)
+        return 2
+
+    store = Store(db_path)
+    try:
+        known = store.table_columns("ingest_events")
+        if not known:
+            print("no ingest_events table in this store yet",
+                  file=sys.stderr)
+            print("run `papra-suite check` to migrate it; nothing to list",
+                  file=sys.stderr)
+            return 2
+        rows = store.list_ingest_events(
+            mailbox_id=args.mailbox_id, kinds=args.kind, since=since,
+            limit=args.limit,
+        )
+        columns = [name for name in EVENT_COLUMNS if name in known]
+    except sqlite3.Error as error:
+        print(f"could not read ingest events: {error}", file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+
+    if args.json:
+        # Exactly the dataclass fields, no formatting decisions smuggled in: a
+        # script should not have to re-derive what a record is from column order,
+        # and `-` for absent is a display convention that would be a lie as JSON.
+        print(_dump_json([dataclasses.asdict(row) for row in rows]))
+        return 0
+
+    if not rows:
+        # An empty answer still says what was asked, because "no rows" and "no
+        # rows for mailbox mb_7 since 2026-11-09" are different answers.
+        print(f"no matching ingest events{_describe_event_scope(args)}")
+        print(f"note: this table holds the last {INGEST_EVENT_RETENTION_DAYS} days. "
+              "A successful ingestion is never recorded, but a message can still "
+              "appear here for the attachment it skipped while another one "
+              "uploaded, so no rows means no skipped or failed part — not that "
+              "nothing arrived")
+        return 0
+
+    print("\t".join(columns))
+    for row in rows:
+        print("\t".join(_render_event_value(getattr(row, name)) for name in columns))
+    return 0
+
+
+# Printed in this order; anything the store does not have is skipped rather than
+# printed empty, so an older database read by a newer CLI still says what it
+# actually knows instead of inventing a column of dashes.
+EVENT_COLUMNS = (
+    "ts", "mailbox_id", "uid", "uidvalidity", "kind", "papra_org_id",
+    "sender", "filename", "detail",
+)
+
+
+# Categories that must never reach a terminal raw: C0 and C1 controls (including
+# ESC 0x1b and C1 CSI 0x9b, which are active escape sequences), format characters
+# (zero-width space, which splices two values into one visually), surrogates and
+# unassigned code points, and the Unicode line separators U+2028 / U+2029, which
+# some renderers treat as a line break and so can still forge a row.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+
+# Short escapes for the controls an operator actually meets, so a quoted value
+# reads as "line\nbreak" rather than as a wall of \u000a.
+_SHORT_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t",
+                  "\b": "\\b", "\f": "\\f"}
+
+# The same characters json.dumps leaves alone (it escapes only <0x20 plus " and \),
+# listed explicitly because escaping them inside a JSON string literal is always
+# legal and they can appear nowhere in JSON's structural syntax.
+_JSON_UNSAFE = {chr(cp): f"\\u{cp:04x}"
+                for cp in [*range(0x80, 0xA0), 0x2028, 0x2029]}
+
+
+def _quote_untrusted(value: str) -> str:
+    """Wrap a value in quotes and escape everything a terminal could act on."""
+    chars: list[str] = []
+    for char in value:
+        if char in ('"', "\\"):
+            chars.append("\\" + char)
+        elif char in _SHORT_ESCAPES:
+            chars.append(_SHORT_ESCAPES[char])
+        elif unicodedata.category(char) in _UNSAFE_CATEGORIES:
+            chars.append(f"\\u{ord(char):04x}")
+        else:
+            chars.append(char)
+    return '"' + "".join(chars) + '"'
+
+
+def _render_event_value(value) -> str:
+    """One field, one line, whatever it contains.
+
+    Absent renders as `-`, never as an empty field: "no sender was recorded" and
+    "a sender was recorded that renders as nothing" have to be distinguishable, and
+    a zero-width field in a tab-separated row shifts every column after it.
+
+    Quoting rule: quote when the value is not printable, contains whitespace, or
+    contains a quote or a backslash; leave everything else bare so `cut -f` and
+    `grep` work on ordinary days. The trigger is `isprintable()` plus the character
+    categories above rather than "contains whitespace", because the thing to fear in
+    a terminal is not a newline but an **escape sequence**: a stored
+    `\x1b[2Jevil.pdf` contains no whitespace at all, and printed raw its bytes drive
+    the terminal that is supposed to be displaying them.
+
+    This is deliberately the renderer's job and not the store's. The store turns
+    control characters into spaces on write, but rows written before that rule
+    existed are still sitting in old databases, and a reader must not assume its own
+    write path produced the bytes it is about to print. Printable non-ASCII stays as
+    typed: escaping `ä` as `\u00e4` would be no safer here, and reading the line is
+    the only job this output has.
+    """
+    if value is None:
+        return "-"
+    if not isinstance(value, str):
+        return str(value)
+    if value == "":
+        return '""'
+    needs_quoting = (not value.isprintable()
+                     or any(char.isspace() for char in value)
+                     or '"' in value or "\\" in value)
+    return _quote_untrusted(value) if needs_quoting else value
+
+
+def _dump_json(payload) -> str:
+    """JSON for scripts, with the characters a terminal could act on escaped.
+
+    `--json` is machine output, but machine output gets piped into `less` and
+    pasted into terminals, and json.dumps leaves C1 controls and U+2028/U+2029 as
+    raw bytes. Escaping them after serialising keeps non-ASCII readable (which
+    `ensure_ascii=True` would destroy) and the document valid.
+    """
+    text = json.dumps(payload, ensure_ascii=False)
+    for char, escaped in _JSON_UNSAFE.items():
+        text = text.replace(char, escaped)
+    return text
+
+
+def _describe_event_scope(args) -> str:
+    parts = []
+    if args.mailbox_id:
+        parts.append(f"for mailbox {args.mailbox_id}")
+    if args.kind:
+        parts.append("of kind " + ", ".join(args.kind))
+    if args.since is not None:
+        parts.append(f"since {args.since}")
+    return (" " + " ".join(parts)) if parts else ""
 
 
 async def run_serve(config, **kwargs) -> None:
@@ -63,10 +283,28 @@ def main() -> int:
     replay.add_argument("--mailbox-id", required=True)
     replay.add_argument(
         "--from-uid", type=int, default=None,
-        help="resume after this UID; the default re-reads the whole mailbox",
+        help="rewind so that mail strictly AFTER this UID is re-read; to re-read a "
+             "UID shown by `events`, pass one LESS than that UID. The default "
+             "re-reads the whole mailbox",
     )
     replay.add_argument("--dry-run", action="store_true",
                         help="report what would change and change nothing")
+
+    events = sub.add_parser(
+        "events",
+        help="list recorded reasons why a message or attachment was NOT ingested",
+    )
+    events.add_argument("--limit", type=int, default=200,
+                        help="most recent rows to show (clamped to 1..1000)")
+    events.add_argument("--mailbox-id", default=None, help="only this mailbox")
+    events.add_argument(
+        "--kind", action="append", default=None,
+        help="only this outcome; repeatable (" + ", ".join(INGEST_EVENT_KINDS) + ")",
+    )
+    events.add_argument("--since", default=None, metavar="YYYY-MM-DD",
+                        help="only rows at or after that UTC date")
+    events.add_argument("--json", action="store_true",
+                        help="emit the records as JSON instead of one line each")
 
     args = parser.parse_args()
 
@@ -83,12 +321,18 @@ def main() -> int:
         store = Store(config.data_dir / "state.db")
         try:
             store.migrate()
+            # Read while the store is still open: `check` closes it in a finally,
+            # and querying a closed store raises — which the helper would report
+            # as "unavailable" instead of the counts that are the point of the
+            # line.
+            recent_events = _recent_event_counts(store)
         finally:
             store.close()
         print(f"config ok; store migrated; data dir: {config.data_dir}")
         # Printed last because it is the line that answers "why is nothing
         # arriving?": an empty allow-list denies every sender by design.
         print(f"senders: {config.allowed_senders.describe()}")
+        print(recent_events)
         return 0
 
     if args.command == "replay":
@@ -127,6 +371,9 @@ def main() -> int:
         finally:
             store.close()
         return 0
+
+    if args.command == "events":
+        return _run_events(config, args)
 
     if args.command == "serve":
         import asyncio

@@ -11,8 +11,8 @@ EXCERPT_CHARS = 2000
 
 TITLE_SYSTEM_PROMPT = (
     "You generate concise titles for archived documents. Output only the "
-    "title: one line, no quotes, maximum 80 characters, in the document's "
-    "language (German or English)."
+    "title: one line, no quotes, maximum 80 characters, in the document's own "
+    "language; never translate it."
 )
 
 
