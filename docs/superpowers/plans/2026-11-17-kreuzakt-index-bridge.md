@@ -982,6 +982,16 @@ v1's `deliver_content` returned early when Kreuzakt's hash equalled `delivered_s
 
 **Interfaces:**
 - Consumes: `PapraClient.get_document/update_document`, `KreuzaktClient.get_document`, `Store.ledger_record_delivery/ledger_bump_repair/ledger_stats/get_generation`.
+- **Also owns (added after Task 6, tracked by a strict xfail at
+  `tests/integration/test_index_pipeline.py:314`): the mail-intake handover.** Today `mail.py` still enqueues
+  through `enqueue_ocr_job`, which marks the document seen in the same call, and the sweep skips documents it
+  has already seen — so a PDF that arrives by email gets **no ledger row and no index job at all**, and the
+  corpus would only ever be indexed by `backfill`. Switch intake to `ledger_upsert_reference` +
+  `enqueue_index_job`, with `legacy_workers` selecting which path enqueues (both must be reachable, because
+  the handover is `PAPRA_LEGACY_WORKERS=false` first, quiescence proven twice via `jobs --drain`, and only
+  then the delivery flags). Remove the xfail marker in the same commit that flips it; a strict xfail that
+  starts passing is a failing build, by design.
+
 - Also produces (added after Task 4, which found the gap): `Store.ledger_delivered_refs(*, org_ids=None, limit=100) -> list[LedgerRef]` for the verification walk, and **this** is the task that writes `EMPTY_EXTRACTION_SHA` into `delivered_sha` — until it does, `ledger_stats()["extraction_empty"]` is a convincing `0` that means nothing, so a test must assert the counter moves.
 - Produces:
   - `async def deliver_content(papra, store, ref, kz_doc, *, generation) -> str` → `"delivered" | "skipped-empty" | "skipped-current"`
@@ -1497,6 +1507,18 @@ v1 proposed matching stale ids to fresh documents via `file_hash` prefixes and o
 **Files:** Create `papra_suite/ledger_cli.py`, `tests/test_ledger_rebuild.py`; Modify `papra_suite/indexing.py`, `README.md`.
 
 **Interfaces:**
+- **Also owns (added after Task 6, tracked by a strict xfail at
+  `tests/integration/test_index_pipeline.py:345`): migration 004, which makes the jobs queue re-schedulable.**
+  Jobs are idempotent on `(kind, org, document, content_hash)` via a unique index, so enqueuing a backfill
+  item whose index job already **finished** returns the finished row's id and nothing is claimable — this
+  blocks both this task's rebuild re-index and Task 15's `backfill --all-stale`. Replace that unique index
+  with a **partial** one, `WHERE status IN ('pending','running')`, so "no two live jobs for the same input"
+  still holds while a completed or failed job no longer blocks a fresh request. Drop the old index and create
+  the new one inside migration 004; remember the pattern Task 1 and Task 4 established — the literal
+  `user_version == 3` assertion and its "bump me when a migration lands" comment both move to 4 in the same
+  commit, and the migration must use per-statement `conn.execute` (see the Critical that Task 4's review
+  found in `executescript`). Remove the xfail marker in the commit that fixes it.
+
 - Consumes: `Store.get_generation/bump_generation/ledger_needs_index`, `KreuzaktClient.health`, `enqueue_index_job`.
 - Produces: `async def reconcile_generation(store, kz) -> RebuildResult(generation: int, stale: int, requeued: int)`, CLI `papra-suite ledger (--status | --invalidate | --cleanup)`, where `--cleanup` forces one immediate pass over rows in `cleanup_state='failed'` **and passes `reset_attempts=True` to `ledger_queue_cleanup`** — that parameter exists precisely for this deliberate operator reset, and without it a forced pass gets one attempt before re-failing (Task 4 left the wiring here on purpose).
 
@@ -1885,6 +1907,9 @@ git commit -m "feat(mcp): document tools with Papra-only identities and untruste
 ### Task 15: `backfill` and `jobs` CLIs
 
 **Files:** Create `papra_suite/jobs_cli.py`, `papra_suite/backfill_cli.py`, `tests/test_jobs_cli.py`, `tests/test_backfill_cli.py`; Modify `papra_suite/__main__.py`, `papra_suite/store.py` (`count_jobs`).
+- **Also owns (found by Task 6 while escaping an xfail): `Store.list_jobs(..., document_id=None)`** — there is
+  no document filter today, which is exactly why a typo nearly hid the re-scheduling gap behind a passing
+  `xfailed`. The `jobs` CLI needs it to answer "what is happening to this document?".
 
 **Interfaces:**
 - Consumes: `Store.list_jobs/count_jobs/reset_job/enqueue_job`, `ledger_needs_index`, `PapraClient.list_documents`, `_is_pdf`.
