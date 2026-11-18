@@ -157,6 +157,55 @@ async def test_poll_uploads_pdf_and_enqueues_ocr(store, monkeypatch):
     assert session.deleted == []
 
 
+async def test_mail_intake_takes_the_index_path_once_the_legacy_writers_are_off(store,
+                                                                                monkeypatch):
+    """The mail-intake handover, which is the reason a mailed PDF was never indexed.
+
+    `enqueue_ocr_job` records the document as seen in the same call that enqueues, and
+    the sweep skips documents it has already seen. While intake went through it, a PDF
+    that arrived at the intake address got no ledger row and no index job at all — the
+    corpus could only ever have been indexed by `backfill`, and only the part of it that
+    Papra's own UI happened to touch. With `legacy_workers` off, intake takes the index
+    path: the reference exists before the job is visible, and nothing new enters the OCR
+    queue the drained workers used to claim, which is what makes quiescence provable.
+    """
+    store.set_setting("legacy_workers", "false")
+    session = FakeSession(raws=[(1, build_raw())])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
+
+    assert result.documents_uploaded == 1 and result.error is None
+    ref = store.ledger_get("org_papra", "doc_0")
+    assert ref is not None and ref.papra_original_name == "a.pdf"
+    assert [job.kind for job in store.list_jobs()] == ["index"]
+    assert store.document_seen("org_papra", "doc_0")
+
+
+async def test_mail_intake_keeps_the_legacy_enqueue_while_the_writers_are_on(store,
+                                                                             monkeypatch):
+    """Both paths stay reachable, because the handover is a sequence rather than a flip.
+
+    `PAPRA_LEGACY_WORKERS=false` has to be set first and quiescence proven before the
+    delivery flags go on, so until that happens the OCR job still has to be enqueued —
+    otherwise the flag's default would stop Papra's text writer on the day this ships
+    and put nothing in its place. What is deliberately NOT here is a ledger row: with
+    the legacy writer in charge of the text, intake keeps today's behaviour exactly, and
+    the row arrives with the handover. That is the state the strict-xfail integration
+    test used to track, and `test_mail_intake_itself_creates_the_ledger_row_and_the_index_job`
+    is now the handover side of it.
+    """
+    session = FakeSession(raws=[(1, build_raw())])
+    monkeypatch.setattr("papra_suite.mail.MailboxSession", lambda **kw: session)
+
+    result = await poll_with_allow_list(store, StubClient(), make_mailbox(), ORG)
+
+    assert result.documents_uploaded == 1
+    assert [job.kind for job in store.list_jobs()] == ["ocr"]
+    assert store.ledger_get("org_papra", "doc_0") is None
+    assert store.document_seen("org_papra", "doc_0")
+
+
 async def test_poll_skips_non_pdf_and_marks_seen(store, monkeypatch, caplog):
     raw = build_raw(attachments=[("photo.jpg", b"\xff\xd8jpeg")])
     session = FakeSession(raws=[(1, raw)])

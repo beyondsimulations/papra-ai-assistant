@@ -964,6 +964,101 @@ def test_needs_index_scopes_to_one_bucket_and_honours_the_limit(store):
     assert len(store.ledger_needs_index(generation=2, limit=1)) == 1
 
 
+# -- delivered_refs: Task 7's verification walk ------------------------------------
+
+def many_bound(store, *, count: int, org: str = "org-a", generation: int = 1) -> None:
+    for index in range(count):
+        document_id = f"doc-{index:03d}"
+        store.ledger_upsert_reference(papra_org_id=org, papra_document_id=document_id,
+                                      file_hash=H, papra_original_name=f"{document_id}.pdf")
+        store.ledger_set_kreuzakt_id(papra_org_id=org, papra_document_id=document_id,
+                                     kreuzakt_id=7, generation=generation)
+
+
+def test_delivered_refs_walks_rows_bound_to_the_generation(store):
+    """The filter is "indexed in this generation", not "we have written this one".
+
+    The name says *delivered*, and the rows that matter most after the handover are the
+    ones that were never delivered: five hundred documents indexed while content
+    delivery was off, holding Papra's own extraction. A walk that filtered on
+    `delivered_at` would converge nothing on the first pass after the flag flip and
+    report a healthy corpus the whole time.
+    """
+    many_bound(store, count=2)
+    store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-000",
+                                 delivered_at="2026-11-17 10:00:00",
+                                 delivered_sha=H, generation=1)
+
+    refs = store.ledger_delivered_refs(generation=1)
+
+    assert [ref.papra_document_id for ref in refs] == ["doc-000", "doc-001"]
+    assert refs[1].delivered_at is None and refs[1].delivered_sha is None
+
+
+def test_delivered_refs_skips_stale_unbound_and_deleted(store):
+    """Three rows that must not be written into, for three different reasons.
+
+    A stale generation names an index that no longer exists, an unbound row has no text
+    to deliver, and a soft-deleted row is a document the user took away. All three are
+    exclusion by the same filter the MCP resolver uses, because the reason a stale
+    integer must not resolve is the reason it must not be PATCHed over.
+    """
+    many_bound(store, count=1)                                        # doc-000, gen 1
+    many_bound(store, count=1, org="org-stale", generation=2)         # doc-000, gen 2
+    store.ledger_upsert_reference(papra_org_id="org-b", papra_document_id="doc-new",
+                                  file_hash=H, papra_original_name="doc-new.pdf")
+    store.ledger_mark_deleted(papra_org_id="org-a", papra_document_id="doc-000")
+
+    refs = store.ledger_delivered_refs(generation=1)
+
+    assert [(ref.papra_org_id, ref.papra_document_id) for ref in refs] == []
+    # and with the deletion undone the row is back, so the exclusion is `deleted_at`
+    # rather than the row having been touched by anything else.
+    store.ledger_mark_restored(papra_org_id="org-a", papra_document_id="doc-000")
+    assert [ref.papra_document_id for ref in store.ledger_delivered_refs(generation=1)] == [
+        "doc-000"]
+    assert [ref.papra_document_id
+            for ref in store.ledger_delivered_refs(generation=2,
+                                                  org_ids=["org-stale"])] == ["doc-000"]
+
+
+def test_delivered_refs_pages_by_keyset_without_repeating(store):
+    many_bound(store, count=5)
+
+    first = store.ledger_delivered_refs(generation=1, limit=2)
+    second = store.ledger_delivered_refs(generation=1, limit=2,
+                                         after=(first[-1].papra_org_id,
+                                                first[-1].papra_document_id))
+    third = store.ledger_delivered_refs(generation=1, limit=2,
+                                        after=(second[-1].papra_org_id,
+                                               second[-1].papra_document_id))
+
+    seen = [ref.papra_document_id for page in (first, second, third) for ref in page]
+    assert seen == ["doc-000", "doc-001", "doc-002", "doc-003", "doc-004"]
+    assert len(third) == 1                       # a short page says "that is the end"
+
+
+def test_delivered_refs_scopes_to_buckets_and_reads_an_empty_list_as_nothing(store):
+    """`org_ids=[]` is "no buckets", matching `ledger_stats` and `ledger_resolve`.
+
+    A token with nothing granted must not receive a corpus-wide walk it can write to.
+    """
+    many_bound(store, count=1)
+    many_bound(store, count=1, org="org-b")
+
+    assert store.ledger_delivered_refs(generation=1, org_ids=[]) == []
+    assert [ref.papra_org_id
+            for ref in store.ledger_delivered_refs(generation=1, org_ids=["org-b"])] == ["org-b"]
+
+
+def test_delivered_refs_limit_is_bounded_and_never_zero(store):
+    """A limit of 0 would end the walk on its first page, silently and successfully."""
+    many_bound(store, count=3)
+
+    assert len(store.ledger_delivered_refs(generation=1, limit=0)) == 1
+    assert len(store.ledger_delivered_refs(generation=1, limit=10 ** 6)) == 3
+
+
 # -- stats --------------------------------------------------------------------
 
 def test_stats_keys_and_counts(store):

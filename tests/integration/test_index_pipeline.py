@@ -19,6 +19,7 @@ then an absent index is a failure, not a green run that tested nothing.
 """
 
 import asyncio
+import hashlib
 import os
 import time
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ import httpx
 import pytest
 
 from papra_suite.allowlist import parse_allowlist
-from papra_suite.indexing import index_upload_name, run_index_job
+from papra_suite.indexing import index_upload_name, run_index_job, verify_once
 from papra_suite.kreuzakt_client import KreuzaktClient
 from papra_suite.mail import poll_mailbox_once
 from papra_suite.papra_client import PapraClient
@@ -59,18 +60,22 @@ class CountingPapra(PapraClient):
     stronger and independent of Papra's timing: that we never asked for a change. Both
     are needed, because Papra fills a PDF's text layer in by itself and a changed
     record is therefore not by itself evidence of a write by us.
+
+    From Task 7 the stack suite has a writer, so the record is also the evidence for the
+    opposite claim — that the ONLY thing a content delivery sends is `content`. Fields
+    left as None are not recorded as patches, because the client omits them from the body:
+    what is asserted is the body, which is the thing Papra acts on.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.patches: list[tuple[str, dict]] = []
 
-    async def update_document(self, org_id, document_id, *, name=None, content=None,
-                              tag_ids=None):
-        self.patches.append((document_id, {"name": name, "content": content,
-                                           "tag_ids": tag_ids}))
-        return await super().update_document(org_id, document_id, name=name,
-                                             content=content, tag_ids=tag_ids)
+    async def update_document(self, org_id, document_id, *, name=None, content=None):
+        given = {"name": name, "content": content}
+        self.patches.append((document_id, {k: v for k, v in given.items()
+                                          if v is not None}))
+        return await super().update_document(org_id, document_id, name=name, content=content)
 
 
 @dataclass
@@ -270,9 +275,10 @@ async def mail_stack(tmp_path, papra_stack, greenmail):
 async def test_mail_attachment_is_indexed_without_touching_papra_content(mail_stack):
     """An attachment that arrives by mail is indexed with the same code and the same silence.
 
-    `enqueue_index_job` is called here rather than by `mail.py`: no task in the plan
-    switches the mail intake's call site, so this is the intake path exercised
-    directly instead of wired implicitly.
+    The gate is shut here, which is the pre-handover configuration, so indexing runs and
+    Papra's record stays byte-for-byte as Papra left it. The call site is exercised
+    directly because the writer switch decides which path intake takes; the switched path
+    is the test below it.
     """
     stack, mailbox, org = mail_stack
     inject_message(to=mailbox.username, subject="Rechnung 4711",
@@ -304,32 +310,29 @@ async def test_mail_attachment_is_indexed_without_touching_papra_content(mail_st
 
 
 # --------------------------------------------------------------------------------
-# Two tracked regressions, written as the requirement rather than as today's behaviour.
+# One tracked regression, written as the requirement rather than as today's behaviour.
 #
-# `strict=True` is what makes them tracked rather than decorative: the suite FAILS when
-# either starts passing, so a fix cannot land quietly and a marker cannot outlive its
-# reason. Both are the acceptance edges the plan says this pipeline must reach, and the
-# plan assigns each one an owner: Task 7 for the mail-intake handover, Task 11 for
-# migration 004. Each reason names that owner because the reason is the text a fixer
-# greps for.
+# `strict=True` is what makes it tracked rather than decorative: the suite FAILS when it
+# starts passing, so a fix cannot land quietly and a marker cannot outlive its reason. The
+# mail-intake handover that used to sit here was tracked the same way and was fixed by
+# Task 7, which removed the marker in the same commit that flipped it and left
+# `test_mail_intake_itself_creates_the_ledger_row_and_the_index_job` as the live proof.
 # --------------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="mail intake still enqueues through enqueue_ocr_job, which marks the document "
-           "seen in the same call; the sweep skips seen documents, so a mail-ingested PDF "
-           "gets no ledger row and no index job. Owner: Task 7, which owns the "
-           "mail-intake handover (switch mail.py to ledger_upsert_reference + "
-           "enqueue_index_job behind the legacy-workers switch) and removes this marker "
-           "in the commit that flips it; report §6.1.",
-)
 async def test_mail_intake_itself_creates_the_ledger_row_and_the_index_job(mail_stack):
     """Spec §4.2's claim about intake email, driven the way mail actually arrives.
 
     The point is that nothing here calls `enqueue_index_job`: the requirement is about
-    `poll_mailbox_once`, which is the only thing the intake address runs.
+    `poll_mailbox_once`, which is the only thing the intake address runs. The one thing the
+    test does set is the writer switch, because intake's path is chosen by it: with
+    `legacy_workers` off — the handover state, and the only state in which Papra's text is
+    ours to write — a mailed PDF must produce the ledger reference and the index job.
+    Before the flip it still enqueues OCR and stays out of the ledger, which
+    `test_mail_intake_keeps_the_legacy_enqueue_while_the_writers_are_on` holds in place so
+    the handover cannot be made by deleting the old path.
     """
     stack, mailbox, org = mail_stack
+    stack.store.set_setting("legacy_workers", "false")
     inject_message(to=mailbox.username, subject="Rechnung 5000",
                    attachments=[("rechnung-5000.pdf", make_pdf(),
                                  ("application", "pdf"))])
@@ -343,8 +346,133 @@ async def test_mail_intake_itself_creates_the_ledger_row_and_the_index_job(mail_
     kinds = [job.kind for job in stack.store.list_jobs()
              if job.document_id == document_id]
     assert "index" in kinds, kinds
+    assert "ocr" not in kinds, kinds        # nothing new enters the drained queue
     assert stack.store.ledger_get(stack.org_id, document_id) is not None
     assert stack.papra.patches == []
+
+
+# --------------------------------------------------------------------------------
+# Task 7: content delivery against the real Papra and the real index.
+#
+# Assertions stay structural. What Kreuzakt's model writes for a given scan is its own
+# business — the marker in the PDF's text layer is here because a test may assert that a
+# document is findable, never that a sentence was phrased a particular way — so every
+# content claim below is "Papra's column equals what the index holds for that document",
+# which is the transport property the design actually promises.
+#
+# One requirement is deliberately NOT tested here: the blank-page rule. Driving it needs a
+# page this Kreuzakt configuration extracts to nothing, and that behaviour has never been
+# measured on the pinned image — an integration test for it would fail or pass depending on
+# what a model does with a blank scan, which is the opposite of what a stack test is for. It
+# is pinned in `tests/test_content_delivery.py` (four tests) and survives mutation by
+# deleting the guard.
+# --------------------------------------------------------------------------------
+
+@pytest.fixture
+async def delivered(stack):
+    """One document Papra holds, the index holds, and the bridge has delivered once."""
+    pdf = make_pdf()
+    document = await stack.papra.create_document(stack.org_id, "rechnung-4711.pdf", pdf)
+    document_id = document["id"]
+    # Papra's own extraction has to have landed first: delivering into a column that is
+    # still empty would prove nothing about overwriting anyone.
+    before = await _papra_record_after_extraction(stack, document_id)
+    assert (before["content"] or "").strip()
+
+    stack.store.set_setting("index_content_delivery", "true")
+    # Hashed from the bytes we uploaded rather than read back from the record: Papra's
+    # `originalSha256Hash` is the sha256 of the file, and `run_index_job`'s download check
+    # verifies that independently, so a disagreement here fails the job loudly.
+    enqueue_index_job(stack.store, papra_org_id=stack.org_id, document_id=document_id,
+                      file_hash=hashlib.sha256(pdf).hexdigest(),
+                      name=document["name"], mime="application/pdf",
+                      ingested_via="sweep")
+    job = stack.store.claim_next_job("index")
+    outcome = await run_index_job(stack.kreuzakt, stack.store, job, papra=stack.papra,
+                                 poll_s=0.5, wait_timeout_s=90)
+    stack.store.mark_job_done(job.id)
+    ref = stack.store.ledger_get(stack.org_id, document_id)
+    kz_doc = await stack.kreuzakt.get_document(ref.kreuzakt_id)
+    # The delivery's own writes, handed out before the list is cleared: what a test asserts
+    # afterwards is then unambiguously "what this pass did", not "what anyone did".
+    delivery_patches = list(stack.papra.patches)
+    stack.papra.patches.clear()
+    return {"document_id": document_id, "ref": ref, "outcome": outcome,
+            "kz_content": kz_doc.content, "papra_text": before["content"],
+            "delivery_patches": delivery_patches}
+
+
+async def test_a_delivery_replaces_papras_text_with_the_indexs(delivered, stack):
+    """The phase-two promise, end to end: Papra's `content` becomes the index's text.
+
+    `TEXT_LAYER_MARKER` is in both texts, so this is not a test that Papra's extraction is
+    good; it is a test that the bytes Kreuzakt holds travelled into Papra intact, and that
+    the ledger's `delivered_sha` describes exactly those bytes rather than something else
+    the bridge happens to know.
+    """
+    assert delivered["outcome"].delivered is True
+    document = await stack.papra.get_document(stack.org_id, delivered["document_id"])
+    assert document["content"] == delivered["kz_content"]
+    assert delivered["ref"].delivered_sha == hashlib.sha256(
+        delivered["kz_content"].encode()).hexdigest()
+    assert delivered["ref"].delivered_generation == stack.store.get_generation()
+    # Content only: a delivery that also renamed the document would be Task 8's failure
+    # mode, arriving as a surprise in Task 7.
+    assert delivered["delivery_patches"] == [(delivered["document_id"],
+                                              {"content": delivered["kz_content"]})]
+
+
+async def test_a_late_papra_write_converges_back_on_the_next_pass(delivered, stack):
+    """The one failure the pass exists for, against a Papra that really did overwrite us.
+
+    Papra's OCR worker writes this column on upload and on `organizations:update`, so
+    "we delivered it" and "Papra still holds it" are different facts and only one of them
+    is observable from the ledger. The simulated late write is a PATCH of our own: what it
+    has to prove is that a column we did not write is detected and re-converged.
+    """
+    sentinel = "Papra wrote this after our delivery"
+    await stack.papra.update_document(stack.org_id, delivered["document_id"],
+                                      content=sentinel)
+    stack.papra.patches.clear()
+
+    result = await verify_once(stack.store, stack.papra, stack.kreuzakt)
+
+    assert (result.scanned, result.diverged, result.repaired) == (1, 1, 1)
+    document = await stack.papra.get_document(stack.org_id, delivered["document_id"])
+    assert document["content"] == delivered["kz_content"]
+    repaired = list(stack.papra.patches)
+    assert repaired == [(delivered["document_id"],
+                         {"content": delivered["kz_content"]})]
+
+    again = await verify_once(stack.store, stack.papra, stack.kreuzakt)
+    assert (again.scanned, again.diverged, again.repaired) == (1, 0, 0)
+    assert stack.papra.patches == repaired, "the second pass asked for nothing"
+
+
+async def test_a_document_that_flip_flops_twice_is_left_alone_with_one_error(delivered,
+                                                                            stack, caplog):
+    """Two losses and the pass stops fighting, at ERROR, naming no culprit.
+
+    Spec §8's integration edge. The flip-flop is driven by writing Papra's column from
+    here, which is the only way to make a second Papra writer on demand; the property under
+    test is our restraint, not Papra's behaviour.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO, logger="papra_suite.indexing")
+    sentinel = "Papra wrote this after our delivery"
+    for _ in range(3):
+        await stack.papra.update_document(stack.org_id, delivered["document_id"],
+                                          content=sentinel)
+        result = await verify_once(stack.store, stack.papra, stack.kreuzakt)
+
+    assert (result.diverged, result.repaired, result.suppressed) == (1, 0, 1)
+    document = await stack.papra.get_document(stack.org_id, delivered["document_id"])
+    assert document["content"] == sentinel        # left alone, not overwritten again
+    errors = [record.getMessage() for record in caplog.records
+              if record.levelno >= logging.ERROR]
+    assert any("diverged more than twice in 24h" in message for message in errors), errors
+    assert "reprocess" not in caplog.text
 
 
 @pytest.mark.xfail(

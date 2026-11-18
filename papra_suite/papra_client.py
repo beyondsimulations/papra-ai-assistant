@@ -78,6 +78,21 @@ class PapraClient:
         )
         return response.json()["document"]
 
+    async def update_content(self, org_id: str, document_id: str, content: str) -> None:
+        """Write the text column and nothing else.
+
+        `update_document` is the general write and takes whatever it is handed, which is
+        exactly the hazard once this bridge owns Papra's text: one extra argument in a
+        delivery and a content update renames a document a human titled, or clears a note
+        nobody meant to touch. Naming the field in the method name is the narrow version
+        of the capability, and it is what Task 7's content writer is allowed to use.
+
+        Returns nothing on purpose. The response body is Papra's document, and a caller
+        that receives it will be tempted to read `content` back from it; the ledger records
+        what we sent, and the next verification pass reads Papra's own answer.
+        """
+        await self.update_document(org_id, document_id, content=content)
+
     async def list_documents(self, org_id: str, *, page_index: int = 0, page_size: int = 100,
                              search_query: str | None = None, sort_field: str = "createdAt",
                              sort_order: str = "desc") -> tuple[list[dict], int]:

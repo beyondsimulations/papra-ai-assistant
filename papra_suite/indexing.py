@@ -1,10 +1,12 @@
 """The `index` job kind: put Papra's bytes into Kreuzakt, correlate, record the id.
 
-This module is the whole of phase one, and phase one deliberately writes nothing
-back into Papra. The upload, the correlation and the ledger binding are exercised
-for a full phase before a single `PATCH` exists, so a bug here can only cost a
-wasted upload — never a corrupted record. Content delivery arrives in Task 7
-(behind a gate inside `deliver_content`, not only here) and metadata in Task 8.
+Phase one was upload, correlate, record, and write nothing back into Papra. Task 7 adds
+the second half: `deliver_content`, which puts Kreuzakt's text into Papra's `content`, and
+`verify_once`, the pass that notices when Papra has overwritten it. Both sit behind the
+`index_content_delivery` gate read from the store, checked HERE as well as in the
+scheduler, because the convergence pass, an inbound trigger and a CLI call all reach this
+module without passing a loop that was told to be careful. Metadata — title, date, note —
+arrives in Task 8 and stays a separate, independently reversible switch.
 
 Three measured rules shape the code below; all three come from
 `docs/superpowers/probes/2026-11-17-kreuzakt-contracts/capture-queue.json`, and
@@ -42,7 +44,8 @@ from papra_suite.kreuzakt_client import (
     KreuzaktError,
     KzDocument,
 )
-from papra_suite.store import Job, LedgerRef, Store
+from papra_suite.papra_client import PapraError
+from papra_suite.store import EMPTY_EXTRACTION_SHA, Job, LedgerRef, Store
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +91,14 @@ def index_upload_name(job: Job) -> str:
 
 # --- the handler ------------------------------------------------------------------
 
-# Whether THIS build can write Kreuzakt's content into Papra. Task 7 writes
-# `deliver_content` and sets this True; until that function exists, a build that
-# claimed the flag would stop the one component producing Papra's text today and
-# put nothing in its place. `serve` reads this when it seeds the setting, so the
-# flag cannot be turned on ahead of the code that honours it.
-CONTENT_DELIVERY_IMPLEMENTED = False
+# Whether THIS build can write Kreuzakt's content into Papra. Task 7 wrote
+# `deliver_content` and set this True; had it stayed False, a build that claimed the flag
+# would stop the one component producing Papra's text today and put nothing in its place.
+# It is a fact about the build rather than about the operator, which is why `serve` reads
+# it when it seeds the setting — and why it is read as an attribute OF THIS MODULE (never
+# `from papra_suite.indexing import CONTENT_DELIVERY_IMPLEMENTED`), so the documented way
+# of exercising a build without the path still works from a test.
+CONTENT_DELIVERY_IMPLEMENTED = True
 
 DEFAULT_POLL_S = 2.0
 DEFAULT_WAIT_TIMEOUT_S = 900.0
@@ -171,6 +176,21 @@ class IndexTimeout(Exception):
     """
 
 
+class DeliveryDisabled(Exception):
+    """The `index_content_delivery` gate is shut, so this write is refused.
+
+    An exception rather than a `False`: the callers that reach this with the gate shut are
+    the ones that were not told to check it — the convergence pass, an inbound trigger, a
+    CLI call — and for those, being refused is news. A returned `False` is a value a
+    caller can drop on the floor, and the failure it would hide is the silent kind: an
+    operator who switched the writer on and got text nowhere.
+
+    The index worker is the one caller that does not raise, and it does not need to: for a
+    worker a shut gate is the normal configuration rather than an incident, so it reports
+    `delivered=False` instead of failing a job nobody asked to have failed.
+    """
+
+
 def _clock() -> float:
     """Monotonic time behind a name, so the wall-clock budget is testable without waiting."""
     return time.monotonic()
@@ -203,24 +223,280 @@ async def _read_binding(kz, document_id: int) -> KzDocument | None:
         return None
 
 
-def _outcome(store: Store, job: Job, kreuzakt_id: int, kz_doc: KzDocument) -> IndexOutcome:
-    """Report what the index holds, and refuse out loud when a switch has no code."""
-    empty = not kz_doc.content.strip()
-    if empty:
+# --- the content writer -----------------------------------------------------------
+
+#: Page size for the verification walk. The corpus is a few hundred documents, so this is
+#: two to five queries; the number bounds memory and, more usefully, bounds how many
+#: references can change between two pages of one walk. It is not a tuning knob.
+VERIFY_PAGE_SIZE = 100
+#: How many repairs one reference may lose inside `store.REPAIR_WINDOW_H` before the pass
+#: stops joining the fight and says so at ERROR. Two writers on one column cannot be won
+#: by writing harder; the third attempt costs a PATCH and a VLM round trip to lose the
+#: text again.
+MAX_REPAIRS_IN_WINDOW = 2
+#: Papra's own ceiling on the `notes` field. Asking for more does not produce a longer
+#: note, it produces a 4xx and a failed job.
+PAPRA_NOTES_CAP = 2048
+DEFAULT_NOTES_LIMIT = 2000
+TRUNCATION_MARKER = "…"
+
+#: What `deliver_content` did. Strings rather than booleans because "it wrote" and "it
+#: correctly refused" have to be told apart by three callers, and `False` cannot say which.
+DELIVERED = "delivered"
+SKIPPED_EMPTY = "skipped-empty"
+SKIPPED_CURRENT = "skipped-current"
+
+
+def sha_of(text: str) -> str:
+    """The hash of a piece of text, the way the ledger stores it in `delivered_sha`."""
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def extraction_is_empty(text: str) -> bool:
+    """One definition of "the index has no text for this document".
+
+    It lives here, named, because two decisions read it: whether to refuse a write, and
+    whether a reference counts as extraction-empty in `check`. Two definitions of empty
+    is how a document ends up empty to one of them and not to the other, and the
+    whitespace-only page is the common case rather than the exotic one.
+    """
+    return not (text or "").strip()
+
+
+def truncate_notes(text: str, limit: int = DEFAULT_NOTES_LIMIT) -> str:
+    """Shorten `text` for Papra's `notes`, cutting at a boundary a reader can live with.
+
+    Task 8 writes the field; the cap ships with the content writer because both are the
+    same question — how much of Kreuzakt's text may be put into Papra — and because a
+    delivery that exceeded Papra's own bound would fail the job rather than shorten the
+    note. Three rules, in order: cut at the last newline below the limit, because a note
+    is prose; otherwise cut at the last space, because "1.234,5" is not a truncated
+    amount, it is a wrong one; and mark the cut with an ellipsis, so a reader knows the
+    sentence went on rather than ending there.
+    """
+    cap = max(1, min(int(limit), PAPRA_NOTES_CAP - len(TRUNCATION_MARKER)))
+    if len(text) <= cap:
+        return text
+    head = text[:cap]
+    cut = max(head.rfind("\n"), head.rfind(" "))
+    if cut > 0:
+        head = head[:cut]
+    return head.rstrip() + TRUNCATION_MARKER
+
+
+def _record_extraction_empty(store: Store, ref: LedgerRef, kz_doc: KzDocument,
+                             generation: int) -> None:
+    """Stamp "the extraction produced nothing" onto the reference, and write nothing else.
+
+    `EMPTY_EXTRACTION_SHA` in `delivered_sha` is the only thing that makes
+    `ledger_stats()["extraction_empty"]` count anything, and that count is the cheap
+    signal during a backfill that separates "a few odd pages" from "this extractor is
+    wrong for this corpus". Until Task 7 nothing wrote it, so the number sat at a
+    convincing zero.
+
+    It is written by both the worker and the verification pass through this one function:
+    an emptiness fact recorded two different ways is a corpus where the count depends on
+    which pass happened to look first.
+    """
+    if ref.delivered_sha == EMPTY_EXTRACTION_SHA:
+        return                      # already recorded; a six-hourly pass need not rewrite it
+    store.ledger_record_delivery(papra_org_id=ref.papra_org_id,
+                                 papra_document_id=ref.papra_document_id,
+                                 delivered_at=kz_doc.updated_at or "",
+                                 delivered_sha=EMPTY_EXTRACTION_SHA,
+                                 generation=generation)
+
+
+async def deliver_content(papra, store: Store, ref: LedgerRef, kz_doc: KzDocument, *,
+                          generation: int) -> str:
+    """Write Kreuzakt's text into Papra, unless doing so would lose text.
+
+    The flag is checked here as well as in the scheduler: convergence, an inbound trigger
+    and the CLI all reach this function, and a gate that lives only in the loop can be
+    bypassed by the paths that matter most during an incident.
+
+    Order also matters within the body, and it is load-bearing rather than stylistic. The
+    emptiness guard runs BEFORE the Papra read and before any equality shortcut, because a
+    guard placed after a cheap comparison can be reordered into a wipe by someone
+    optimising this function later — and the thing it prevents is the one unrecoverable
+    act available here: overwriting a year of a document's text with a blank page.
+
+    `delivered_sha` records what we sent, not what Papra holds: Papra's OCR worker can and
+    does overwrite us afterwards, which is what `verify_once` is for. The write and the
+    record are deliberately in that order — a refusal from Papra must leave the ledger
+    claiming nothing.
+    """
+    if not store.settings_flag("index_content_delivery"):
+        raise DeliveryDisabled(
+            f"content delivery is off, so papra://{ref.papra_org_id}/"
+            f"{ref.papra_document_id} was not written")
+
+    if extraction_is_empty(kz_doc.content):
+        logger.info("extraction-empty, not writing papra=%s kreuzakt=%s",
+                    ref.papra_document_id, kz_doc.id)
+        _record_extraction_empty(store, ref, kz_doc, generation)
+        return SKIPPED_EMPTY
+
+    sha = sha_of(kz_doc.content)
+    current = await papra.get_document(ref.papra_org_id, ref.papra_document_id)
+    papra_content = current.get("content") or ""
+    if sha == sha_of(papra_content):
+        if ref.delivered_sha != sha:
+            # Someone else — Papra's own pass, an earlier run of this very function — put
+            # our text there. The column is converged and only the ledger's memory is
+            # behind, so record it without a PATCH: rewriting the archive on the strength
+            # of a null column is how a flag flip rewrites five hundred documents.
+            store.ledger_record_delivery(papra_org_id=ref.papra_org_id,
+                                         papra_document_id=ref.papra_document_id,
+                                         delivered_at=kz_doc.updated_at or "",
+                                         delivered_sha=sha, generation=generation)
+        return SKIPPED_CURRENT
+
+    try:
+        await papra.update_content(ref.papra_org_id, ref.papra_document_id, kz_doc.content)
+    except Exception as error:  # noqa: BLE001 - re-raised; this line is the operator's record
+        # The write is not recorded, so nothing claims a delivery: the row stays as it was,
+        # the exception travels with its status so `worker_loop` can tell a retry from a
+        # permanent no, and this is the line that says which document to go and look at.
+        logger.error("content delivery to papra=%s failed: %s", ref.papra_document_id, error)
+        raise
+    store.ledger_record_delivery(papra_org_id=ref.papra_org_id,
+                                 papra_document_id=ref.papra_document_id,
+                                 delivered_at=kz_doc.updated_at or "",
+                                 delivered_sha=sha, generation=generation)
+    logger.info("content delivered papra=%s kreuzakt=%s chars=%d",
+                ref.papra_document_id, kz_doc.id, len(kz_doc.content))
+    return DELIVERED
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    """What one convergence pass did, counted in references rather than in queries.
+
+    `diverged` counts references where the two sides disagreed AND the index had text to
+    give: a blank extraction that differs from Papra's text is reported in `empty`, not
+    as a divergence we cannot repair. `suppressed` is the subset we deliberately left
+    alone, and it is the number that says "go and find out who else is writing".
+    """
+
+    scanned: int = 0
+    diverged: int = 0
+    repaired: int = 0
+    suppressed: int = 0
+    empty: int = 0
+    lookup_errors: int = 0
+
+
+async def verify_once(store: Store, papra, kz) -> VerifyResult:
+    """Compare Papra's current text with the index's, and repair what disagrees.
+
+    This is the second half of the fix for v1's blind spot. v1 compared Papra's text
+    against `delivered_sha` — what we last sent — so after Papra's own OCR worker
+    overwrote a document we had delivered, the pass still reported it converged. The
+    ledger's memory is a fact about us; the only fact worth asking about is what the two
+    services hold now, so both sides are read fresh on every pass and `delivered_sha` is
+    written, never consulted.
+
+    Reads cost one GET per side per reference, which at a few hundred documents is seconds
+    every six hours — the design's whole reason a full pass is affordable. `deliver_content`
+    re-reads Papra on the repair path rather than trusting the value read here, because it
+    is the shared write boundary and a caller's read is not its read; one extra GET on a
+    document that already diverged is the cheaper side of that.
+    """
+    if not store.settings_flag("index_content_delivery"):
+        # Not an error, and not a read either: a gate that queries first and refuses second
+        # still puts load on the record it is not allowed to touch.
+        return VerifyResult()
+
+    generation = store.get_generation()
+    counts = {"scanned": 0, "diverged": 0, "repaired": 0, "suppressed": 0, "empty": 0,
+              "lookup_errors": 0}
+    after: tuple[str, str] | None = None
+    while True:
+        refs = store.ledger_delivered_refs(generation=generation, after=after,
+                                           limit=VERIFY_PAGE_SIZE)
+        if not refs:
+            break
+        for ref in refs:
+            counts["scanned"] += 1
+            try:
+                papra_document = await papra.get_document(ref.papra_org_id,
+                                                          ref.papra_document_id)
+                kz_doc = await kz.get_document(ref.kreuzakt_id)
+            except (PapraError, KreuzaktError) as error:
+                # Either side can be unreachable, and "it did not answer" is not evidence
+                # that its text is wrong: no write, and no repair spent.
+                logger.warning("verification could not read papra=%s kreuzakt=%s: %s",
+                               ref.papra_document_id, ref.kreuzakt_id, error)
+                counts["lookup_errors"] += 1
+                continue
+
+            if extraction_is_empty(kz_doc.content):
+                counts["empty"] += 1
+                # Refused, not failed: spending the suppression budget here would mean a
+                # document that was blank for a day meets a pass that has already decided
+                # to leave it alone, on the day its extraction finally arrives.
+                _record_extraction_empty(store, ref, kz_doc, generation)
+                continue
+
+            papra_content = papra_document.get("content") or ""
+            kz_sha = sha_of(kz_doc.content)
+            if kz_sha == sha_of(papra_content):
+                if ref.delivered_sha != kz_sha:
+                    store.ledger_record_delivery(
+                        papra_org_id=ref.papra_org_id, papra_document_id=ref.papra_document_id,
+                        delivered_at=kz_doc.updated_at or "",
+                        delivered_sha=kz_sha, generation=generation)
+                continue
+
+            counts["diverged"] += 1
+            # Bumped and READ before the repair, because the ceiling is about attempts
+            # rather than successes: a repair that diverged again an hour later is the
+            # second loss whether or not the PATCH came back 200.
+            repairs = store.ledger_bump_repair(papra_org_id=ref.papra_org_id,
+                                               papra_document_id=ref.papra_document_id)
+            if repairs > MAX_REPAIRS_IN_WINDOW:
+                counts["suppressed"] += 1
+                logger.error(
+                    "content diverged more than twice in 24h, leaving papra=%s alone "
+                    "(%d repairs this window); two writers are competing for this column",
+                    ref.papra_document_id, repairs)
+                continue
+
+            outcome = await deliver_content(papra, store, ref, kz_doc,
+                                            generation=generation)
+            if outcome == DELIVERED:
+                counts["repaired"] += 1
+            elif outcome == SKIPPED_EMPTY:
+                # Unreachable under the check above, kept because the two definitions of
+                # empty must not be able to combine into a write.
+                counts["empty"] += 1
+            elif outcome == SKIPPED_CURRENT:
+                pass    # raced: Papra holds our text now, which is the wanted end state
+        after = (refs[-1].papra_org_id, refs[-1].papra_document_id)
+        if len(refs) < VERIFY_PAGE_SIZE:
+            break
+
+    return VerifyResult(**counts)
+
+
+async def _outcome(papra, store: Store, job: Job, ref: LedgerRef, kreuzakt_id: int,
+                   kz_doc: KzDocument, generation: int) -> IndexOutcome:
+    """Report what the index holds, and hand the text to Papra when the gate is open."""
+    empty = extraction_is_empty(kz_doc.content)
+    delivering = store.settings_flag("index_content_delivery")
+    if empty and not delivering:
         # Reported, not interpreted: "extraction-empty" is a fact about the index,
         # "legitimately blank" is a fact about the document, and nothing here can
-        # establish the second one.
+        # establish the second one. While the gate is open `deliver_content` logs the
+        # same fact as the reason it wrote nothing, and two lines per document is noise.
         logger.info("extraction-empty papra=%s kreuzakt=%s", job.document_id, kreuzakt_id)
     delivered = False
-    if store.settings_flag("index_content_delivery"):
-        # Task 7 writes `deliver_content`, gate included. Until that function
-        # exists the honest answer to an enabled flag is a loud refusal: saying
-        # nothing and returning `delivered=True` would report a write we did not
-        # make, and saying nothing silently would leave an operator believing the
-        # switch had been thrown.
-        logger.warning(
-            "content delivery is enabled but this build has no delivery path yet: "
-            "papra=%s kreuzakt=%s left untouched", job.document_id, kreuzakt_id)
+    if delivering:
+        outcome = await deliver_content(papra, store, ref, kz_doc, generation=generation)
+        # "delivered" is a claim about Papra's column, which is why a refusal to write an
+        # empty extraction is not one: `check` reads this on the index worker's output.
+        delivered = outcome in (DELIVERED, SKIPPED_CURRENT)
     return IndexOutcome(kreuzakt_id=kreuzakt_id, content_len=len(kz_doc.content),
                         empty_content=empty, delivered=delivered)
 
@@ -360,7 +636,8 @@ async def run_index_job(kz, store: Store, job: Job, *, papra,
         kreuzakt_id = ref.kreuzakt_id
         bound = await _read_binding(kz, kreuzakt_id)
         if bound is not None:
-            return _outcome(store, job, kreuzakt_id, bound)     # nothing to upload
+            # nothing to upload
+            return await _outcome(papra, store, job, ref, kreuzakt_id, bound, generation)
         # A binding that answers 404 is not a finished document, and stopping here
         # would say it was: the row stays bound under the current generation, which is
         # the state `ledger_needs_index` excludes, so the sweep would never look again
@@ -397,7 +674,7 @@ async def run_index_job(kz, store: Store, job: Job, *, papra,
             f"kreuzakt document {kreuzakt_id} answers 404 for {job.document_id} right "
             "after being bound: the binding is kept and the job retries, because either "
             "answer about the index makes a retry useful")
-    return _outcome(store, job, kreuzakt_id, bound)
+    return await _outcome(papra, store, job, ref, kreuzakt_id, bound, generation)
 
 
 async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation: int,

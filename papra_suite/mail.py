@@ -25,7 +25,11 @@ from papra_suite.allowlist import (
 )
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.papra_client import PapraClient, PapraError
-from papra_suite.pipeline import enqueue_ocr_job
+from papra_suite.pipeline import (
+    enqueue_index_job,
+    enqueue_ocr_job,
+    legacy_writers_enabled,
+)
 from papra_suite.store import Mailbox, Org, Store
 
 logger = logging.getLogger(__name__)
@@ -635,8 +639,9 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
                         # Papra dedups by content hash per org: a re-sent
                         # document 409s with document.already_exists. That is
                         # an already-ingested SUCCESS, not a failure — record
-                        # the dedup hash (no re-upload on later polls), no OCR
-                        # job (the M3 sweep covers pre-existing documents).
+                        # the dedup hash (no re-upload on later polls) and no
+                        # ingest job: the sweep finds documents that already
+                        # exist in Papra and were never ingested here.
                         store.add_dedup(attachment_hash)
                         logger.info(
                             "attachment %s already ingested in papra (409)",
@@ -654,11 +659,35 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
                     )
                     continue
                 file_hash = compute_file_hash(attachment.content)
-                enqueue_ocr_job(
-                    store, papra_org_id=org.papra_org_id, document_id=document["id"],
-                    file_hash=file_hash, name=document["name"],
-                    mime="application/pdf", ingested_via="mail",
-                )
+                # Which queue an intake document enters is the writer handover, and
+                # `legacy_workers` selects it so that both remain reachable: the handover
+                # is `PAPRA_LEGACY_WORKERS=false` first, quiescence proven twice through
+                # `jobs --drain`, and only then the delivery flags.
+                #
+                # With the legacy writers on, nothing changes: the OCR job is enqueued and
+                # Papra keeps writing its own text. Note what that still costs, because it
+                # is the defect this branch preserves rather than fixes —
+                # `enqueue_ocr_job` records the document as seen in the same call, and the
+                # sweep skips documents it has seen, so a mailed PDF has no ledger row while
+                # the legacy writer is in charge.
+                #
+                # With them off, intake goes through `enqueue_index_job`, which writes the
+                # ledger reference BEFORE the job becomes visible (a queued job with no row
+                # behind it is work no sweep, backfill or rebuild can see), enqueues the
+                # index job, and enqueues nothing legacy — which is what lets the drain
+                # finish at all.
+                if legacy_writers_enabled(store):
+                    enqueue_ocr_job(
+                        store, papra_org_id=org.papra_org_id, document_id=document["id"],
+                        file_hash=file_hash, name=document["name"],
+                        mime="application/pdf", ingested_via="mail",
+                    )
+                else:
+                    enqueue_index_job(
+                        store, papra_org_id=org.papra_org_id, document_id=document["id"],
+                        file_hash=file_hash, name=document["name"],
+                        mime="application/pdf", ingested_via="mail",
+                    )
                 store.add_dedup(attachment_hash)
                 result.documents_uploaded += 1
             for name in parsed.skipped_attachments:

@@ -269,6 +269,59 @@ async def run_serve(config, **kwargs) -> None:
                 signal.signal(sig, handler)   # restore exactly what we replaced
 
 
+def _index_line(store) -> str:
+    """One line for `check`: what the index holds, what Papra holds, and what hurts.
+
+    The fields are ordered the way the question is asked — how many references exist, how
+    many are indexed in the generation that is current, how many of those Papra has the
+    text for — and they end with the two numbers that say a subsystem is hurt rather than
+    merely behind:
+
+    * `extraction-empty` is the cheap signal during a backfill. A vision model that fails
+      on a page tends to fail by returning nothing, so this one count is the difference
+      between "a few odd pages" and "the extractor is wrong for this corpus". It only
+      means anything because `deliver_content` writes `EMPTY_EXTRACTION_SHA`.
+    * `cleanup-pending (failed N)` is the debt of upstream deletes still owed, with the
+      part the retries have stopped on called out: a counter that watched only `pending`
+      would fall to zero exactly when automatic retry stops.
+
+    It never fails `check`, for the same reason the events line does: an empty store is not
+    a configuration error, and a check that exits non-zero on one trains people to stop
+    running check.
+    """
+    try:
+        stats = store.ledger_stats()
+    except ValueError:
+        # A corrupt `index_generation` means no generation is current, so every
+        # generation-scoped count would be a guess and the store refuses to produce one.
+        # Naming the key is the useful part: the repair is `ledger --invalidate`, and a
+        # bare "unavailable" would send the operator to the wrong service.
+        return "index: unavailable (index_generation names no current generation)"
+    except sqlite3.Error as error:
+        return f"index: unavailable ({type(error).__name__})"
+    return (f"index: {stats['references']} refs, {stats['indexed_current']} current, "
+            f"{stats['delivered']} delivered, {stats['extraction_empty']} extraction-empty, "
+            f"{stats['repairs_24h']} repairs(24h), {stats['cleanup_pending']} "
+            f"cleanup-pending (failed {stats['cleanup_failed']})")
+
+
+def _content_writer_line(config) -> str:
+    """`content writer: ...` — who writes Papra's text under this configuration.
+
+    Computed from the config rather than from the settings rows, because `check` is asking
+    "will this start, and what will it do", and `serve` seeds those rows from this same
+    config on every startup. The state an operator cannot see is the dangerous one: the
+    handover window, where nobody owns the column, is legitimate for an afternoon and wrong
+    for a fortnight, and the two look identical from the outside.
+    """
+    from papra_suite import indexing
+    from papra_suite.pipeline import content_writer_state
+
+    delivery = bool(config.index_content_delivery
+                    and indexing.CONTENT_DELIVERY_IMPLEMENTED)
+    return f"content writer: {content_writer_state(delivery, config.legacy_workers)}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="papra-suite")
     parser.add_argument("--version", action="version", version=__version__)
@@ -315,7 +368,19 @@ def main() -> int:
         return 2
 
     if args.command == "check":
+        from papra_suite import indexing
+        from papra_suite.pipeline import content_writer_conflict
         from papra_suite.store import Store
+
+        # Asked before the store is opened: this is the one configuration that must not
+        # start, and `check` is how an operator learns it before a container enters a
+        # restart loop rather than after.
+        conflict = content_writer_conflict(
+            bool(config.index_content_delivery and indexing.CONTENT_DELIVERY_IMPLEMENTED),
+            config.legacy_workers)
+        if conflict is not None:
+            print(f"configuration error: {conflict}", file=sys.stderr)
+            return 2
 
         config.data_dir.mkdir(parents=True, exist_ok=True)
         store = Store(config.data_dir / "state.db")
@@ -326,6 +391,7 @@ def main() -> int:
             # as "unavailable" instead of the counts that are the point of the
             # line.
             recent_events = _recent_event_counts(store)
+            index_line = _index_line(store)
         finally:
             store.close()
         print(f"config ok; store migrated; data dir: {config.data_dir}")
@@ -333,6 +399,8 @@ def main() -> int:
         # arriving?": an empty allow-list denies every sender by design.
         print(f"senders: {config.allowed_senders.describe()}")
         print(recent_events)
+        print(index_line)
+        print(_content_writer_line(config))
         return 0
 
     if args.command == "replay":
@@ -378,7 +446,15 @@ def main() -> int:
     if args.command == "serve":
         import asyncio
 
-        asyncio.run(run_serve(config))
+        try:
+            asyncio.run(run_serve(config))
+        except ConfigError as error:
+            # The startup refusals — two writers of `content`, above all — arrive here as
+            # this process's answer rather than as a traceback. A container that dies with
+            # a stack trace gets filed as a crash; one that prints the order to fix gets
+            # fixed, and `2` is the exit `check` gives for the same configuration.
+            print(f"configuration error: {error}", file=sys.stderr)
+            return 2
         return 0
 
     return 1

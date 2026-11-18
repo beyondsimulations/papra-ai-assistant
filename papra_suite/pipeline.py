@@ -12,12 +12,13 @@ from dataclasses import dataclass
 
 from papra_suite import indexing
 from papra_suite.allowlist import AllowList
-from papra_suite.indexing import run_index_job
+from papra_suite.config import ConfigError
+from papra_suite.indexing import run_index_job, verify_once
 from papra_suite.kreuzakt_client import KreuzaktClient
 from papra_suite.llm_client import LLMClient
 from papra_suite.ocr import OCR_SYSTEM_PROMPT, assemble_markdown, page_count, render_page
 from papra_suite.papra_client import PapraClient
-from papra_suite.store import Job, Store
+from papra_suite.store import TRUTHY_SETTING_VALUES, Job, Store
 from papra_suite.titles import generate_title
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,81 @@ DEFAULT_DOCUMENT_NAME = "document.pdf"
 # a hostile/huge document must fail visibly (or be skipped via listing
 # metadata) instead of being pulled into memory unbounded.
 OCR_MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
+#: The `settings` row that mirrors `PAPRA_LEGACY_WORKERS`. Like the delivery flags it is
+#: written from `Config` at every startup so the sweep, the intake path and the CLI ask
+#: the store rather than guessing about a process they cannot see.
+LEGACY_WORKERS_SETTING = "legacy_workers"
+#: Six hours. The pass is a few hundred document pairs, which is to say seconds, so the
+#: interval is a bound on how long Papra's text stays wrong rather than on our cost.
+DEFAULT_VERIFICATION_INTERVAL_S = 21600
+
+#: The three states of "who writes Papra's `content` right now", as `check` prints them.
+CONTENT_WRITER_LEGACY = "suite ocr worker (legacy)"
+CONTENT_WRITER_BRIDGE = "index bridge"
+CONTENT_WRITER_NONE = "none (handover window)"
+CONTENT_WRITER_BOTH = "two writers (refused at startup)"
+
+
+class ContentWriterConflict(ConfigError):
+    """This suite's legacy OCR worker and this bridge were both told to write `content`.
+
+    This is the configuration that produced the original intermittency, and the default one
+    to fall into: `PAPRA_LEGACY_WORKERS` is true unless an operator turns it off, so setting
+    `PAPRA_INDEX_CONTENT_DELIVERY` alone re-creates the race with nothing new in the log to
+    point at it. Refusing is the only mechanism available, because the two writers are in
+    different processes and never meet.
+    """
+
+
+def content_writer_state(delivery: bool, legacy: bool) -> str:
+    """Who owns Papra's `content`, given the two switches. One definition for `serve`,
+    `check` and the refusal message, so the line an operator reads cannot disagree with
+    the decision the process made.
+    """
+    if delivery and legacy:
+        return CONTENT_WRITER_BOTH
+    if delivery:
+        return CONTENT_WRITER_BRIDGE
+    if legacy:
+        return CONTENT_WRITER_LEGACY
+    return CONTENT_WRITER_NONE
+
+
+def content_writer_conflict(delivery: bool, legacy: bool) -> ContentWriterConflict | None:
+    """The refusal for two writers, or None when this configuration can start.
+
+    The message is the runbook: naming both variables is not enough, because the fix is an
+    ORDER and the operator reading it at 23:00 is the same person who just set the flag.
+    """
+    if not (delivery and legacy):
+        return None
+    return ContentWriterConflict(
+        "PAPRA_INDEX_CONTENT_DELIVERY is on while PAPRA_LEGACY_WORKERS is also on: this "
+        "suite's legacy OCR worker and this bridge would both write the `content` column, "
+        "which is the race this bridge exists to remove. In the required order: set "
+        "PAPRA_LEGACY_WORKERS=false and recreate, prove the queue is empty twice a minute "
+        "apart (proves quiescence: `sqlite3 $DATA_DIR/state.db \"SELECT count(*) FROM jobs "
+        "WHERE kind='ocr' AND status IN ('pending','running')\"` prints 0 both times), and "
+        "only then turn on "
+        "the delivery flag PAPRA_INDEX_CONTENT_DELIVERY=true. While an ocr row remains, the "
+        "convergence pass is fighting a running job for the same document.")
+
+
+def legacy_writers_enabled(store: Store) -> bool:
+    """Are this suite's legacy `ocr`/`title` writers still in charge of their columns?
+
+    Read as ON when the row is absent, which is the one setting in this codebase that
+    fails open, and on purpose: `Config.legacy_workers` defaults to true, `serve` writes the
+    row on every startup, and what the flag DOES is stop things. A missing row therefore
+    means "nobody has taken the legacy writers away yet", which is today's behaviour; the
+    fail-closed reading would have stopped Papra's text writer on the store of every test,
+    CLI invocation and backfill helper that never ran a seeded startup, and the documents
+    in them would quietly have gone unprocessed.
+    """
+    value = store.get_setting(LEGACY_WORKERS_SETTING)
+    if value is None:
+        return True
+    return value.strip().lower() in TRUTHY_SETTING_VALUES
 
 
 @dataclass
@@ -135,11 +211,17 @@ async def serve(config, *, stop: asyncio.Event | None = None,
                 ocr_llm: LLMClient | None = None,
                 title_llm: LLMClient | None = None,
                 kreuzakt: KreuzaktClient | None = None) -> None:
-    """The process runtime: pollers, OCR/title workers, sweep.
+    """The process runtime: pollers, workers, sweep, and the convergence pass.
 
     Runs until the stop event is set (or the surrounding task is cancelled),
     then cancels its tasks and closes ONLY the clients and store it
     constructed — injected ones belong to the caller (owns_* pattern).
+
+    Which loops exist depends on the writer switches. `PAPRA_LEGACY_WORKERS=false` takes
+    this suite's `ocr`/`title` loops out of the process as well as taking their enqueues
+    out; `index_content_delivery` decides whether the index worker writes text, and the
+    verification loop is up either way and refuses per pass. The one configuration that is
+    not started at all is two writers on `content` — see `ContentWriterConflict`.
     """
     from papra_suite.logging_setup import register_config_secrets, setup_logging
 
@@ -149,6 +231,27 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         store = Store(config.data_dir / "state.db")
     store.migrate()
     _sync_settings_from_config(store, config)
+    # The two-writer refusal comes before anything else that can reach the network, and
+    # before any task is started: a container that half-indexes a corpus and then exits has
+    # already done the damage the refusal exists to prevent. Both halves of the pair are
+    # read from where their users read them — the gate from the store, because that is what
+    # the writer consults, and `legacy_workers` from the config that was just seeded into
+    # it, because that is what the operator started the process with.
+    conflict = content_writer_conflict(store.settings_flag("index_content_delivery"),
+                                       config.legacy_workers)
+    if conflict is not None:
+        logger.error("refusing to start: %s", conflict)
+        raise conflict
+    if not config.legacy_workers and not store.settings_flag("index_content_delivery"):
+        # Legitimate and temporary — the drain window between the two flags — but never
+        # silent. A window that has lasted a week reads as a configuration, and the
+        # symptom is only visible as text that never arrives.
+        logger.error(
+            "no content writer in this process is running: PAPRA_LEGACY_WORKERS is off "
+            "and PAPRA_INDEX_CONTENT_DELIVERY is off, so neither our worker nor the bridge "
+            "writes Papra's `content` column (handover window; Papra's own extraction still "
+            "runs on upload). Turn on the delivery flag once the ocr queue has drained; "
+            "`papra-suite check` prints this too.")
     recovered = store.recover_running_jobs()
     if recovered:
         logger.info("recovered %d stale running job(s) at startup", recovered)
@@ -182,15 +285,20 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         tasks.append(asyncio.create_task(
             _poll_loop(store, papra, mailbox, allowlist=config.allowed_senders),
             name=f"poll:{mailbox.id}"))
-    for _ in range(config.ocr_concurrency):
+    if config.legacy_workers:
+        # With the legacy writers switched off these loops are what keeps claiming from a
+        # queue nobody is filling any more, and a drain is only provable when the loops are
+        # gone rather than merely idle: `jobs --kind ocr --status pending` empty twice a
+        # minute apart is the evidence the handover asks for.
+        for _ in range(config.ocr_concurrency):
+            tasks.append(asyncio.create_task(worker_loop(
+                store, kind="ocr",
+                handler=lambda job: run_ocr_job(papra, ocr_llm, job, config=config),
+            ), name="ocr-worker"))
         tasks.append(asyncio.create_task(worker_loop(
-            store, kind="ocr",
-            handler=lambda job: run_ocr_job(papra, ocr_llm, job, config=config),
-        ), name="ocr-worker"))
-    tasks.append(asyncio.create_task(worker_loop(
-        store, kind="title",
-        handler=lambda job: run_title_job(papra, title_llm, job),
-    ), name="title-worker"))
+            store, kind="title",
+            handler=lambda job: run_title_job(papra, title_llm, job),
+        ), name="title-worker"))
     # ONE index worker, on purpose. Correlating an upload needs its queue row inside
     # the newest-100 window, so uploads are serial by construction: a second worker
     # would interleave uploads and make each other's correlation fail.
@@ -209,6 +317,14 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     if config.sweep_interval_s > 0:
         tasks.append(asyncio.create_task(
             _sweep_loop(store, papra, config.sweep_interval_s), name="sweep"))
+    # The convergence pass runs whether or not the gate is open, and says nothing while it
+    # is shut: the gate is read per pass, so the loop being up is what makes a flag flip
+    # take effect without a restart, and a loop that had to be started on demand is a loop
+    # that quietly never ran on the day the handover happened.
+    tasks.append(asyncio.create_task(
+        _verification_loop(store, papra, kreuzakt,
+                           interval_s=DEFAULT_VERIFICATION_INTERVAL_S, stop=stop),
+        name="verification"))
 
     def _supervise(task: asyncio.Task, name: str) -> None:
         """Log a long-lived task's exit, loudly only when it is NOT designed.
@@ -264,20 +380,30 @@ def _sync_settings_from_config(store: Store, config) -> None:
     writing one flag and not its sibling would make the settings table a half-truth
     about the process that owns it. `index_content_delivery` is the exception, and it
     is a fact about the build rather than about the operator: see the warning below.
+
+    `legacy_workers` is seeded too, because it is not only a knob about this process's
+    loops: the intake path and `enqueue_index_job` read it to decide whether a new
+    document also enters the legacy OCR queue, and a sweep or a CLI call in another
+    process has to reach the same answer the running daemon did.
     """
     if config.index_content_delivery and not indexing.CONTENT_DELIVERY_IMPLEMENTED:
         # Loud, and refused rather than obeyed. Honoured, this flag stops the legacy
         # OCR enqueue — and in a build with no delivery path that is not "the bridge
-        # will write the text instead", it is "nothing writes the text".
+        # will write the text instead", it is "nothing writes the text". The module
+        # attribute in `indexing` is the seam: a build that ships delivery sets it True,
+        # and a build that does not keeps the legacy writer no matter what the operator
+        # asks for.
         logger.warning(
             "PAPRA_INDEX_CONTENT_DELIVERY is set but this build has no content "
-            "delivery path yet: leaving the legacy OCR writer in charge of Papra's "
-            "text. Task 7's build is the one that can take the flag.")
+            "delivery path: leaving the legacy OCR writer in charge of Papra's "
+            "text. The flag is honoured only by a build that implements delivery.")
     store.set_setting("index_content_delivery",
                       "true" if (config.index_content_delivery
                                  and indexing.CONTENT_DELIVERY_IMPLEMENTED) else "false")
     store.set_setting("index_metadata_delivery",
                       "true" if config.index_metadata_delivery else "false")
+    store.set_setting(LEGACY_WORKERS_SETTING,
+                      "true" if config.legacy_workers else "false")
 
 
 async def _poll_loop(store: Store, papra: PapraClient, mailbox, *,
@@ -347,6 +473,46 @@ async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int) -> None
         # wrong must not swallow this pass's sweep summary, which is the line that
         # says whether externally uploaded documents were discovered.
         _prune_ingest_events_quietly(store)
+        await asyncio.sleep(interval_s)
+
+
+async def _verification_loop(store: Store, papra: PapraClient, kz, *,
+                             interval_s: int = DEFAULT_VERIFICATION_INTERVAL_S,
+                             stop: asyncio.Event | None = None) -> None:
+    """Papra's current text against the index's, on a timer. Never raises.
+
+    The phase is the first half of the design, and it is worth saying plainly: the pass
+    runs IMMEDIATELY when this loop starts, and only then waits `interval_s`. Startup is
+    the moment the two columns are furthest apart — the container was down while Papra kept
+    writing into documents we had delivered — so a loop that slept first would make every
+    deploy and every restart wait six hours to notice. `interval_s` is the wait BETWEEN
+    passes.
+
+    It survives a failing pass because nothing else runs this one: an exception escaping an
+    iteration would end convergence for the rest of the container's life, and the only
+    evidence would be an absence of repairs. The `stop` event is checked before each pass
+    and after it, so a shutdown during a six-hour sleep is the caller's cancellation and a
+    shutdown between passes is a clean return.
+    """
+    while True:
+        if stop is not None and stop.is_set():
+            return
+        try:
+            result = await verify_once(store, papra, kz)
+            if result.diverged or result.suppressed or result.lookup_errors:
+                # Silence means converged, which is the normal state and not worth a line
+                # every six hours. Anything else is the record of the column drifting.
+                logger.info(
+                    "verification: %d scanned, %d diverged, %d repaired, %d suppressed, "
+                    "%d extraction-empty, %d unreadable",
+                    result.scanned, result.diverged, result.repaired, result.suppressed,
+                    result.empty, result.lookup_errors)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the loop outlives a bad pass
+            logger.exception("verification pass failed")
+        if stop is not None and stop.is_set():
+            return
         await asyncio.sleep(interval_s)
 
 
@@ -431,10 +597,12 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
     writers are still running, the OCR queue too.
 
     One gap worth naming here rather than discovering later: **mail intake does not
-    come through this sweep.** `mail.py` enqueues through `enqueue_ocr_job` and records
-    the document as seen in the same call, and the sweep skips seen documents, so a
-    mail-ingested PDF has no ledger row and no index job until that call site is
-    switched over. Switching it is not part of this task's files.
+    come through this sweep**, and since Task 7 it does not need to. `mail.py` picks its
+    queue from the writer switch: while the legacy writers are on it enqueues OCR and
+    records the document as seen in the same call, and the sweep skips seen documents, so
+    such a document has no ledger row until the flag flips; with the legacy writers off it
+    goes through `enqueue_index_job` and reaches the index on arrival. `check`'s
+    `content writer:` line names which of the two this process is running.
 
     documents_checked counts every document the sweep LISTED (including
     already-seen and non-PDF ones): it means "listed and examined", not
@@ -612,7 +780,9 @@ def enqueue_index_job(store: Store, *, papra_org_id: str, document_id: str,
 
     The legacy `ocr` enqueue is what keeps today's behaviour intact: Papra keeps the
     text and the titles it has now, and the index job costs nothing but Kreuzakt
-    work. Task 7 retires it when content delivery is on, Task 8 when metadata is.
+    work. Task 7 retires it when content delivery is on, Task 8 when metadata is — and
+    `legacy_workers` retires it earlier, because a queue the drained workers are no longer
+    claiming still has to stop being filled for a drain to be provable.
     """
     if mime != "application/pdf":
         return ""
@@ -627,7 +797,7 @@ def enqueue_index_job(store: Store, *, papra_org_id: str, document_id: str,
         content_hash=file_hash,
         payload={"file_hash": file_hash, "name": name},
     )
-    if not store.settings_flag("index_content_delivery"):
+    if not store.settings_flag("index_content_delivery") and legacy_writers_enabled(store):
         store.enqueue_job(
             kind="ocr", papra_org_id=papra_org_id, document_id=document_id,
             content_hash=file_hash, payload={"file_hash": file_hash, "name": name},

@@ -39,6 +39,11 @@ papra-suite serve
 | `DATA_DIR` | defaults to `/app/data`; the SQLite file lives here |
 | `DASHBOARD_BIND` | defaults to `127.0.0.1:8080`; never publish it to the LAN |
 | `OCR_MAX_PAGES`, `OCR_PAGE_PIXEL_BUDGET`, `OCR_DPI`, `OCR_CONCURRENCY`, `SWEEP_INTERVAL_S` | optional tuning |
+| `PAPRA_KREUZAKT_URL` | the Kreuzakt index, e.g. `http://kreuzakt:3000`; unset means no index, search falls back to Papra |
+| `PAPRA_INDEX_CONTENT_DELIVERY` | default `false` — see "Handing the `content` column over" |
+| `PAPRA_INDEX_METADATA_DELIVERY` | default `false`, and **inert**: nothing reads it yet, so turning it on changes nothing at all |
+| `PAPRA_LEGACY_WORKERS` | default `true` — this suite's OCR and title workers keep writing; flipping it off is the handover |
+| `PAPRA_INDEX_MAX_ATTEMPTS`, `PAPRA_INDEX_POLL_INTERVAL_S`, `PAPRA_INDEX_WAIT_TIMEOUT_S`, `PAPRA_INDEX_QUERY_MAX_CHARS`, `PAPRA_INDEX_SEARCH_SCAN_ROWS` | optional tuning of the index pipeline |
 
 Mailboxes (IMAP host, credentials, poll interval, delete-after-download) are
 stored in the database, not in the environment.
@@ -231,6 +236,21 @@ the text may not. The mechanism and the numbers are in the characterisation spec
 addendum,
 `docs/superpowers/specs/2026-11-16-ocr-content-search-intermittent-characterisation-design.md`.
 
+**What changed once the handover is done** (see "Handing the `content` column over") is
+not the race but what happens after losing it. With the bridge as the only writer this suite
+controls, a `content` column that says something other than what the index holds is found by
+the convergence pass — every six hours, a constant rather than a knob, and once at every
+start because a stopped container is how text goes missing — and re-written, and a
+document that flip-flops twice in a day is left alone at ERROR instead of fought. So the
+promise becomes bounded rather than absent: text we delivered is text we re-apply within the
+interval, unless we deliberately stopped repairing that one document.
+
+Papra's own extraction remains a third hand on the column that nothing here stops, and the
+pass treats what it writes as a divergence and overwrites it. That is the design rather than
+a bug: once the handover is done the index is the authority for the column, and a Papra
+extraction that disagrees with it is the thing being corrected. Until the handover, the
+caveat above is the whole story.
+
 ## Development
 
 ```bash
@@ -358,3 +378,109 @@ Three things this shape depends on, all of them cheap to get wrong:
 - **`kreuzakt-data` is disposable, by decision.** It holds Kreuzakt's copy of every
   original and its own queue; the documents and the index ledger live in Papra and in
   `state.db`. Losing the volume costs VLM minutes to rebuild, nothing else.
+
+### Handing the `content` column over
+
+Until this section applies, it is this suite's own OCR worker that writes a document's
+text and the bridge only feeds the index. Two switches move that column to the bridge, and
+both are environment variables on the suite container: `serve` writes them into the
+`settings` table on every start, so the environment is what you change and the next restart
+is what applies it.
+
+| Variable | Default | Off means |
+|---|---|---|
+| `PAPRA_INDEX_CONTENT_DELIVERY` | `false` | the bridge indexes documents and never writes `content` |
+| `PAPRA_LEGACY_WORKERS` | `true` | this suite's OCR worker and title writer stay in charge, and new documents still enter the `ocr` queue. It does not touch Papra's own extraction, which no flag here stops |
+| `PAPRA_INDEX_METADATA_DELIVERY` | `false` | nothing today: the flag is seeded and read by no code, so setting it true changes neither tags nor titles. Papra's enrichment keeps writing them and the legacy title writer is stopped by `PAPRA_LEGACY_WORKERS`, not by this flag — do not plan a handover step around it |
+
+**Drain the legacy queue before you flip, and not for tidiness.** Three things write
+Papra's `content`: this suite's OCR worker, this bridge, and Papra's own extraction, which
+runs on every upload and on `organizations:update` and which nothing here can stop. The two
+switches move the column between the first two; the third is why the convergence pass exists
+at all. With the suite worker and the bridge both enabled, a delivery can land while a
+document's own OCR is in flight and be erased a moment later, with no error anywhere —
+measured on the pinned image, the later write simply wins. That is why the combination is
+refused at startup rather than treated as a configuration choice, and why the handover is an
+ordered operation:
+
+1. Deploy the build with both flags off. Nothing about Papra's records changes; documents
+   are indexed and the index fills.
+2. Let the corpus index. The sweep is the backfill: every document the ledger has never
+   held is queued as an `index` job. `check`'s `refs`/`current` counts are how far it has
+   got, and the queue's own state is in `state.db`:
+
+   ```bash
+   sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs GROUP BY 1, 2;"
+   ```
+
+   Wait for `ocr` rows in `pending` or `running` to reach zero **while the legacy loops are
+   still running**, so the worker drains its own backlog. The convergence pass ignores
+   pending work, and a delivery landing while an OCR job is in flight is the race above.
+3. Set `PAPRA_LEGACY_WORKERS=false` and restart, then prove the same query reads zero twice a
+   minute apart. You are now in the handover window: `check` prints
+   `content writer: none (handover window)` and `serve` logs the same at ERROR. Neither of our
+   two writers touches `content` in this state, and a document uploaded now keeps only what
+   Papra's own extraction makes of it — which is why this is a step you pass through and not a
+   configuration you settle into.
+
+   Anything still in `ocr` at this moment is never claimed again: the loops that claimed it
+   are gone, and a restart only rewinds `running` rows back to `pending`. Those documents
+   still get their text, from the bridge, once step 4 runs — so leftover rows are cruft to
+   delete rather than work to wait for. Step 2 exists for the documents a worker is writing
+   *right now*, not for the ones it has not reached.
+4. Set `PAPRA_INDEX_CONTENT_DELIVERY=true`, restart, and read `check` before `serve`, since
+   it prints exactly what `serve` would do:
+
+   ```bash
+   papra-suite check     # content writer: index bridge
+   papra-suite serve
+   ```
+
+   Setting both variables in one recreate is not a shortcut you are being talked out of:
+   while `legacy_workers` is still true, the two-writer refusal stops the process from
+   starting at all, so this order is not tidiness but the only sequence that boots. What
+   step 3's proof is for is the interval the refusal cannot see — a queue that is half
+   drained while the loops have already stopped claiming, which nothing refuses for you.
+
+**`check` reports the handover in the same breath as the config**, because the two
+questions an operator asks — "how far did this get" and "should I have restarted" — are
+one question. The lines are appended to what `check` already prints:
+
+```
+index: 118 refs, 112 current, 96 delivered, 3 extraction-empty, 0 repairs(24h), 0 cleanup-pending (failed 0)
+content writer: suite ocr worker (legacy)
+```
+
+- `refs` counts every row the ledger has ever held, deletions and stale bindings included;
+  `current` those bound to the live index generation; `delivered` those whose text Papra
+  holds as we last sent it. `current` below `refs` is stale bindings plus documents queued
+  for cleanup, which is what the last two fields split apart; `delivered` below `current`
+  means documents waiting for the flip or for a delivery that has not run.
+- `extraction-empty` counts documents the index holds *no* text for — a scanned page with
+  nothing on it, or an extraction that failed. These are deliberately never written, so
+  this is not a queue to drain. It is the count to look at when a document "should have
+  been OCR'd and wasn't".
+- `repairs(24h)` is how often the convergence pass found Papra holding something else.
+  Non-zero right after the handover is expected once and then should go quiet; sustained
+  non-zero means a second writer is alive somewhere.
+- `cleanup-pending (failed N)` is upstream deletes the ledger still owes, with the part the
+  retries stopped on called out separately. A `failed` row can leave a deleted document in
+  the index, so search still returns it; nothing in this build replays it by hand, so a
+  non-zero `N` is a number to report rather than one that drains on its own.
+
+`content writer:` then names the arrangement you are actually running, in one of three
+strings:
+
+| Printed | Means |
+|---|---|
+| `suite ocr worker (legacy)` | this suite's OCR worker writes content; the bridge does not (the default) |
+| `index bridge` | the bridge writes content and the legacy loops are not running |
+| `none (handover window)` | delivery off and legacy off: neither of our two writers writes content, so a document uploaded now keeps only whatever Papra's own extraction produces and never gets the index's text |
+
+The fourth arrangement, `two writers`, is never printed by a working program: `check`
+exits `2` with a `configuration error` naming the two variables to set, and `serve`
+refuses before it opens a connection to either service or starts a task — the refusal runs
+before the clients are constructed, so nothing is sent to Papra or the index on the way
+out. A `none (handover window)` is logged as an error by `serve` and is still allowed to
+run, because search and the ledger keep working and a restart with the flags corrected is
+all it takes; that window is a state you pass through, not one you configure on purpose.

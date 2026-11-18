@@ -1,3 +1,4 @@
+import json
 import time
 
 import httpx
@@ -171,6 +172,47 @@ async def test_update_document_sends_only_provided_fields():
 
     assert json.loads(bodies[0]) == {"name": "New title"}
     assert json.loads(bodies[1]) == {"content": "# markdown"}
+
+
+async def test_update_content_sends_the_content_field_alone():
+    """The one write Task 7 makes, narrowed to a single field by the method itself.
+
+    `update_document` takes name, content, tags and note, and any of them left out is
+    left alone. That flexibility is the hazard once the bridge owns the text column:
+    one stray argument and a content delivery renames a document a human titled. This
+    pins the wire body rather than the call site, so the guarantee holds for the next
+    caller too.
+    """
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.read())
+        return httpx.Response(200, json={"document": DOC})
+
+    async with make_client(handler) as client:
+        assert await client.update_content(ORG, "doc_1", "Kreuzakt's text") is None
+
+    assert seen["method"] == "PATCH"
+    assert seen["path"] == "/api/organizations/org_123/documents/doc_1"
+    assert seen["body"] == {"content": "Kreuzakt's text"}
+
+
+async def test_update_content_reports_a_refused_write_with_its_status():
+    """502 keeps its status so the worker backs off; a 404 stays permanent.
+
+    The delivery's retriability is read off this exception by `worker_loop`, so the
+    narrow method must not swallow the status that decides between the two.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="bad gateway")
+
+    async with make_client(handler) as client:
+        with pytest.raises(PapraError) as excinfo:
+            await client.update_content(ORG, "doc_1", "text")
+
+    assert excinfo.value.status == 502
 
 
 async def test_list_documents_passes_search_query():

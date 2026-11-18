@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sqlite3
 
 import pytest
@@ -168,6 +169,23 @@ def test_enqueue_index_job_stops_the_legacy_writer_once_content_is_ours(store):
     assert [job.kind for job in store.list_jobs()] == ["index"]
 
 
+def test_enqueue_index_job_stops_the_legacy_enqueue_once_the_writers_are_off(store):
+    """The drain half of the handover: `PAPRA_LEGACY_WORKERS=false` stops NEW OCR work.
+
+    Stopping the loops from claiming is only half of an empty queue — a loop that is gone
+    still leaves whatever the intake keeps enqueueing, and the sweep runs whether or not
+    anyone claims what it produces. Quiescence is proven by the `ocr` rows in `jobs`
+    staying at zero twice a minute apart, and that is not reachable while an intake path
+    is still filling the queue behind the drain.
+    """
+    store.set_setting("legacy_workers", "false")
+
+    _enqueue(store)
+
+    assert [job.kind for job in store.list_jobs()] == ["index"]
+    assert store.ledger_get(ORG, DOC_ID) is not None    # the index path is unaffected
+
+
 def test_enqueue_index_job_is_idempotent_and_rehashing_rebinds(store):
     first = _enqueue(store)
     again = _enqueue(store)
@@ -287,16 +305,148 @@ async def test_serve_seeds_the_delivery_flags_from_config(tmp_path, store, caplo
 
     assert store.settings_flag("index_metadata_delivery") is True
     assert store.settings_flag("index_content_delivery") is False
+    # and the writer switch itself, which the two-writer refusal reads alongside the
+    # delivery flag. Seeded the same way, so `check` and a running daemon cannot disagree
+    # about who owns Papra's text.
+    assert store.settings_flag("legacy_workers") is True
+
+
+class Tripwire:
+    """A client where touching any attribute is a failure.
+
+    The refusal Task 7 adds has to happen BEFORE anything reaches Papra or Kreuzakt: a
+    container that half-indexes a corpus and then exits has already done the damage the
+    refusal was supposed to prevent. "It did not crash" is not evidence of that, and
+    neither is a fake that quietly answers — so this records, and raises, on the
+    attribute access itself.
+    """
+
+    def __init__(self, name: str, sink: list) -> None:
+        self.name = name
+        self.sink = sink
+
+    def __getattr__(self, attr: str):
+        self.sink.append(f"{self.name}.{attr}")
+        raise AssertionError(f"serve reached for {self.name}.{attr} instead of refusing")
+
+
+async def test_serve_refuses_two_writers_of_the_same_column(tmp_path, store, caplog):
+    """Two writers of one column, refused at startup rather than debugged at 03:00.
+
+    The refused pair is this suite's legacy OCR worker and this bridge — the two writers
+    whose existence we control, and which are the same shape as the race behind the original
+    intermittency (that one was this suite's OCR against Papra's own extraction; Papra's
+    extraction is a third hand on the column that no flag here stops, which is what the
+    convergence pass is for rather than this check's). `PAPRA_LEGACY_WORKERS` defaults to
+    true, so an operator who sets `PAPRA_INDEX_CONTENT_DELIVERY=true` and recreates the
+    container gets both of our writers back with no new symptom to look at. The handover
+    sequence gets the order right only if a human follows it; this is what stops it being
+    followed wrongly.
+    """
+    from papra_suite.pipeline import ContentWriterConflict
+
+    config = load_config({**SERVE_ENV, "DATA_DIR": str(tmp_path),
+                          "PAPRA_INDEX_CONTENT_DELIVERY": "1"})
+    seed_ledger(store)
+    job_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
+                               content_hash=HASH, payload={"file_hash": HASH, "name": NAME})
+    touched: list = []
+
+    stop = asyncio.Event()
+    with pytest.raises(ContentWriterConflict) as excinfo:
+        await serve(config, stop=stop, store=store, papra=Tripwire("papra", touched),
+                    kreuzakt=Tripwire("kreuzakt", touched),
+                    ocr_llm=Tripwire("ocr_llm", touched),
+                    title_llm=Tripwire("title_llm", touched))
+
+    message = str(excinfo.value)
+    assert "PAPRA_INDEX_CONTENT_DELIVERY" in message
+    assert "PAPRA_LEGACY_WORKERS" in message
+    # The order, not just the two names: the fix is a sequence, and this message is the
+    # only documentation an operator reaches for at 23:00 with a container in a restart
+    # loop — legacy off, quiescence proven, then the delivery flag.
+    assert "quiesc" in message.lower()
+    assert message.index("PAPRA_LEGACY_WORKERS") < message.lower().index("quiesc")
+    assert message.lower().index("quiesc") < message.lower().index("delivery flag")
+    # And the runbook has to be runnable on THIS build. The plan drafted this message
+    # around a `papra-suite jobs` command this branch never shipped, so copying it
+    # verbatim would tell an operator at 23:00 to type a subcommand that does not exist —
+    # which reads as a broken installation rather than as a stale message. The queue is
+    # named where it actually is readable, in `state.db`.
+    assert "papra-suite jobs" not in message, message
+    assert "FROM jobs" in message, message
+    assert touched == []                     # neither service was asked for anything
+    assert store.get_job(job_id).status == "pending"
+    assert any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+async def test_the_handover_window_with_no_writer_starts_and_says_so(tmp_path, store, caplog):
+    """The opposite combination is legitimate and temporary, so it must not be refused.
+
+    Between `PAPRA_LEGACY_WORKERS=false` and the delivery flags there is a window where
+    nobody writes Papra's text: draining the queue takes minutes, and refusing it would
+    make the handover unperformable — the legal state could not be reached without
+    stopping the service. What it must not be is silent, because a window that lasts a
+    week starts to look like a configuration, so it is ERROR, and `check` prints it too.
+    """
+    config = load_config({**SERVE_ENV, "DATA_DIR": str(tmp_path),
+                          "PAPRA_LEGACY_WORKERS": "0"})
+    stop = asyncio.Event()
+    stop.set()
+    await serve(config, stop=stop, store=store, papra=FakePapra(),
+                kreuzakt=FakeKreuzakt())
+
+    assert store.settings_flag("legacy_workers") is False
+    assert store.settings_flag("index_content_delivery") is False
+    errors = [record.getMessage() for record in caplog.records
+              if record.levelno >= logging.ERROR]
+    assert any("handover window" in message and "content" in message
+               for message in errors), errors
+
+
+async def test_serve_starts_no_legacy_worker_loops_once_the_writers_are_off(tmp_path, store,
+                                                                           monkeypatch):
+    """`PAPRA_LEGACY_WORKERS=false` has to stop the claiming, not only the enqueuing.
+
+    The refusal message tells the operator to switch the legacy writers off and drain, and
+    a drain is only reachable if the loops stop taking work. Leaving them running would
+    mean the flag renamed the workers rather than stopped them: the queue would never
+    empty while the container was up, and the handover could not be completed.
+    """
+    started: list[str] = []
+
+    async def recording_loop(store, *, kind, handler, idle_sleep_s=1.0, max_attempts=None):
+        started.append(kind)
+
+    monkeypatch.setattr(pipeline, "worker_loop", recording_loop)
+
+    stop = asyncio.Event()
+    stop.set()
+    config = load_config({**SERVE_ENV, "DATA_DIR": str(tmp_path),
+                          "PAPRA_LEGACY_WORKERS": "0"})
+    await serve(config, stop=stop, store=store, papra=FakePapra(), kreuzakt=FakeKreuzakt())
+    # kinds, not counts: `OCR_CONCURRENCY` decides how many loops the legacy writer gets,
+    # and which loops exist is the property asserted here.
+    assert set(started) == {"index"}
+
+    started.clear()
+    config = load_config({**SERVE_ENV, "DATA_DIR": str(tmp_path)})
+    await serve(config, stop=stop, store=store, papra=FakePapra(), kreuzakt=FakeKreuzakt())
+    assert set(started) == {"index", "ocr", "title"}
 
 
 async def test_serve_refuses_a_content_flag_this_build_cannot_honour(tmp_path, store,
-                                                                    caplog):
+                                                                    caplog, monkeypatch):
     """The one flag that must NOT be seeded as given, because honouring it costs text.
 
     `enqueue_index_job` stops the legacy OCR enqueue while content delivery is on —
-    correct once Task 7 delivers content, and a silent content outage before then.
-    Refusing the flag loudly is the honest startup for this build.
+    correct now that Task 7 delivers content, and a silent content outage in a build
+    without that path. Refusing the flag loudly is the honest startup for such a build,
+    and the flag is read as `indexing.CONTENT_DELIVERY_IMPLEMENTED` — looked up on the
+    module, not bound by value at import — because binding it is what would make the
+    documented way of exercising a build a silent no-op.
     """
+    monkeypatch.setattr(indexing, "CONTENT_DELIVERY_IMPLEMENTED", False)
     config = load_config({**SERVE_ENV, "DATA_DIR": str(tmp_path),
                           "PAPRA_INDEX_CONTENT_DELIVERY": "1"})
 
@@ -340,19 +490,16 @@ async def test_serve_passes_the_index_attempt_ceiling_to_the_loop_that_spends_it
     assert ceilings["ocr"] is None and ceilings["title"] is None
 
 
-async def test_serve_reads_the_delivery_flag_where_it_can_be_moved(tmp_path, store,
-                                                                  monkeypatch):
-    """The documented seam is a module attribute, so the gate must read it there.
+async def test_serve_honours_the_content_flag_once_the_build_can_deliver(tmp_path, store):
+    """The other side of that seam, kept honest by the build actually shipping the path.
 
-    `from papra_suite.indexing import CONTENT_DELIVERY_IMPLEMENTED` binds the value
-    into this module at import, which makes the documented way of exercising a future
-    build — set the attribute on `indexing` — a silent no-op. Only one branch of the
-    gate was then testable, and Task 7 would have inherited "the gate works" from a
-    test that could never see it open.
+    A suite that only ever exercised the refusal would keep passing after the delivery
+    path landed, and the setting the writer consults would quietly stay false — which is
+    the failure mode where the bridge indexes and nothing ever reaches Papra.
     """
-    monkeypatch.setattr(indexing, "CONTENT_DELIVERY_IMPLEMENTED", True)
     config = load_config({**SERVE_ENV, "DATA_DIR": str(tmp_path),
-                          "PAPRA_INDEX_CONTENT_DELIVERY": "1"})
+                          "PAPRA_INDEX_CONTENT_DELIVERY": "1",
+                          "PAPRA_LEGACY_WORKERS": "0"})
 
     stop = asyncio.Event()
     stop.set()

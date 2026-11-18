@@ -10,10 +10,13 @@ with a null id — runs as product code inside every test here. A double that
 restated `wait_for_queue_row` would let `run_index_job` pass against rules the
 real client does not implement, and the two would diverge in production.
 
-**Every test asserts Papra was not written.** An autouse fixture fails any test
-whose fake Papra recorded a PATCH: this is the last phase where a bridge bug
-cannot corrupt the record, and "we do not write yet" has to be a mechanism rather
-than a review note (Task 7 puts the gate inside `deliver_content`).
+**Every test asserts Papra was not written — while the delivery gate is shut.** An
+autouse fixture fails any test whose fake Papra recorded a PATCH with
+`index_content_delivery` off: this was the last phase where a bridge bug cannot corrupt
+the record, and "we do not write yet" had to be a mechanism rather than a review note.
+Task 7 put that gate inside `deliver_content`, so the invariant is gate-scoped now: the
+one test here that opens the gate says so in its name, and the matrix of what may be
+written lives in `tests/test_content_delivery.py`.
 """
 
 import hashlib
@@ -148,6 +151,10 @@ class FakePapra:
         self.get_calls = 0
         self.download_calls = 0
         self.raise_on_get: Exception | None = None
+        # Set to an exception to make a write fail after it was attempted: Task 7's
+        # delivery tests need the failure to land *after* the PATCH left, because the
+        # property under test is what the ledger does when Papra says no.
+        self.raise_on_update: Exception | None = None
         self.closed = False
         # The bytes the file endpoint serves, separate from the metadata on purpose:
         # `download_original` verifies them against the job's hash, and the race that
@@ -186,9 +193,23 @@ class FakePapra:
 
     async def update_document(self, org_id: str, document_id: str, **body) -> dict:
         self.patch_calls += 1
+        # Recorded before the failure is raised on purpose: `patched` is "every write
+        # this bridge attempted", and a delivery that reached Papra and was refused has
+        # to be visible to the test that is checking exactly that.
         self.patched.append((org_id, document_id, body))
+        if self.raise_on_update is not None:
+            raise self.raise_on_update
         self.documents[(org_id, document_id)].update(body)
         return self.documents[(org_id, document_id)]
+
+    async def update_content(self, org_id: str, document_id: str, content: str) -> None:
+        """Mirrors `PapraClient.update_content`, which routes through `update_document`.
+
+        Delegating rather than recording separately keeps one counter set for both
+        shapes of write, so a test that asserts "only `content` was sent" asserts it
+        about the body that would actually go over the wire.
+        """
+        await self.update_document(org_id, document_id, content=content)
 
     def delete(self, org_id: str = ORG, document_id: str = DOC_ID) -> None:
         """The user deleted it: Papra answers 404 for the detail endpoint."""
@@ -537,14 +558,21 @@ def job(store):
 
 
 @pytest.fixture(autouse=True)
-def papra_is_never_written(fake_papra):
-    """The phase invariant, enforced once per test instead of once per test author.
+def papra_is_never_written(fake_papra, store):
+    """The phase invariant, scoped to the gate now that a write path exists.
 
-    Task 6 writes nothing into Papra. Every delivery path arrives later behind its
-    own gate, so a PATCH here is a bug no matter which test introduced it.
+    Task 6 shipped with no write path at all, so any PATCH was a bug whatever the
+    settings said. Task 7 moved the gate inside `deliver_content`, which makes the
+    honest invariant "nothing reaches Papra while `index_content_delivery` is off" —
+    and off is what a fresh store says, so every test in this file that does not open
+    the gate is still pinned against a write. A test that opens it is making a delivery
+    claim, and the write itself is what `tests/test_content_delivery.py` asserts.
     """
     yield
-    assert fake_papra.patched == [], f"Task 6 must not write to Papra: {fake_papra.patched}"
+    if store.settings_flag("index_content_delivery"):
+        return
+    assert fake_papra.patched == [], (
+        f"the gate was shut and Papra was written: {fake_papra.patched}")
     assert fake_papra.patch_calls == 0
 
 
@@ -1003,22 +1031,27 @@ async def test_empty_content_is_recorded_as_extraction_empty(store, job, fake_pa
     assert any("extraction-empty" in record.getMessage() for record in caplog.records)
 
 
-async def test_content_delivery_enabled_still_writes_nothing_here(store, job, fake_papra,
-                                                                  fake_kz, caplog):
-    """The flag cannot make this phase write, and saying so is operator-visible.
+async def test_content_delivery_enabled_writes_through_the_gate(store, job, fake_papra,
+                                                                fake_kz):
+    """Task 7's half of the handler: with the flag on, Kreuzakt's text becomes Papra's.
 
-    Task 7 puts the gate inside `deliver_content`; until that function exists the
-    honest answer to an enabled flag is a loud no, not a silent `delivered=True`.
+    Only the wiring is tested here — that the handler reaches `deliver_content` and
+    reports what it did. What may and may not be written is `test_content_delivery.py`,
+    split deliberately: a mutation of the emptiness guard should not be discoverable
+    only in the file about the worker.
     """
     store.set_setting("index_content_delivery", "true")
 
     outcome = await run_index_job(fake_kz, store, job, papra=fake_papra,
                                   poll_s=0, wait_timeout_s=5)
 
-    assert outcome.delivered is False
-    assert fake_papra.patch_calls == 0 and fake_papra.patched == []
-    assert any("content delivery" in record.getMessage().lower()
-               for record in caplog.records)
+    text = fake_kz.document["content"]
+    assert outcome.delivered is True
+    assert fake_papra.document["content"] == text
+    assert fake_papra.patched == [(ORG, DOC_ID, {"content": text})]
+    ref = store.ledger_get(ORG, DOC_ID)
+    assert ref.delivered_sha == hashlib.sha256(text.encode()).hexdigest()
+    assert ref.delivered_generation == store.get_generation()
 
 
 async def test_correlation_waits_on_the_name_the_upload_returned(store, job, fake_papra,

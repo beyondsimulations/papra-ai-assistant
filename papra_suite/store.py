@@ -1318,6 +1318,61 @@ class Store:
             rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_ledger_ref(row) for row in rows]
 
+    def ledger_delivered_refs(
+        self, *, generation: int, after: tuple[str, str] | None = None,
+        org_ids: list[str] | None = None, limit: int = 100,
+    ) -> list[LedgerRef]:
+        """Live references of `generation`, in a stable order, one page at a time.
+
+        The name says "delivered" and the filter does not mean "we wrote this one", and
+        that gap is deliberate enough to be worth the sentence it costs. The verification
+        pass exists to converge Papra's text onto the index's, and the population it must
+        reach is precisely the rows that were **never** delivered: every document indexed
+        during phase one, holding Papra's own extraction, with `delivered_at` and
+        `delivered_sha` both null. Filter on "delivered" and the pass converges nothing on
+        the day the flag flips, while reporting a clean corpus — the one silent failure
+        mode this task cannot afford. So eligibility is what it has always been here:
+        bound to `generation`, and not deleted.
+
+        What it does exclude, and why each one must not be written to:
+
+        * no `kreuzakt_id` — there is no indexed text to compare against, so a pass could
+          only guess; those rows are `ledger_needs_index`'s work, not this pass's.
+        * a `delivered_generation` other than `generation` — that integer names an index
+          that no longer exists, and the rule that stops the MCP server resolving it is
+          the same rule that stops us PATCHing over a document we cannot identify.
+        * `deleted_at` set — the user took the reference away; writing into the Papra
+          document to "fix" its text would be resurrecting it by side effect.
+
+        `after` is the `(papra_org_id, papra_document_id)` the previous page ended with.
+        Keyset rather than offset because the walk takes minutes and a row can change
+        under it: an offset would skip or repeat a reference whenever one became eligible
+        mid-pass, and a repeated reference spends its repair budget twice, which is what
+        decides whether the pass keeps trying to fix it.
+
+        `org_ids=[]` is "no buckets", not "no filter", matching `ledger_resolve` and
+        `ledger_stats`.
+        """
+        bounded = max(1, min(int(limit), 1000))
+        sql = (
+            "SELECT * FROM index_ledger WHERE deleted_at IS NULL"
+            " AND kreuzakt_id IS NOT NULL AND delivered_generation = ?"
+        )
+        params: list[object] = [generation]
+        if after is not None:
+            sql += " AND (papra_org_id > ? OR (papra_org_id = ? AND papra_document_id > ?))"
+            params.extend([after[0], after[0], after[1]])
+        if org_ids is not None:
+            if not org_ids:
+                return []
+            sql += " AND papra_org_id IN (" + ", ".join("?" * len(org_ids)) + ")"
+            params.extend(org_ids)
+        sql += " ORDER BY papra_org_id, papra_document_id LIMIT ?"
+        params.append(bounded)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_ledger_ref(row) for row in rows]
+
     def ledger_mark_deleted(
         self, *, papra_org_id: str, papra_document_id: str,
     ) -> tuple[int | None, int]:
@@ -1424,9 +1479,12 @@ class Store:
     ) -> None:
         """Record what we last wrote into Papra, for the generation bound now.
 
-        `delivered_sha` is the hash of the text we delivered — the convergence pass
-        compares Kreuzakt's current text against it, and `EMPTY_EXTRACTION_SHA` is
-        how "extraction produced nothing" becomes countable.
+        `delivered_sha` is the hash of the text we delivered — what the convergence pass
+        records and reports, NOT what it compares against. v1 compared Papra's live text
+        to this value and so could not see Papra overwriting us, which is the one failure
+        the pass exists to catch (Task 7): the ledger's memory is a fact about us, and the
+        pass asks the two services what they hold now. `EMPTY_EXTRACTION_SHA` is how
+        "extraction produced nothing" becomes countable.
 
         This is an authorization write, not a receipt, because it stamps
         `delivered_generation` — the column that makes a binding resolve. So the

@@ -27,7 +27,7 @@ BASE_ENV = {
 
 # coroutine qualnames of the long-lived tasks serve spawns; after serve
 # returns, none of them may linger (clean shutdown, no dangling tasks)
-_SERVE_TASK_NAMES = {"_poll_loop", "worker_loop", "_sweep_loop"}
+_SERVE_TASK_NAMES = {"_poll_loop", "worker_loop", "_sweep_loop", "_verification_loop"}
 
 # The poll loop now requires an allow-list; these tests stub the poll itself,
 # so the list only has to exist and not deny the loop its row re-fetch.
@@ -314,6 +314,183 @@ async def test_sweep_loop_survives_an_escaping_sweep_failure(tmp_path, caplog):
 
     assert papra.listings == 2  # the loop SURVIVED the escaping KeyError
     assert any("sweep loop error" in record.getMessage() for record in caplog.records)
+    store.close()
+
+
+async def test_serve_spawns_the_verification_loop(tmp_path, monkeypatch):
+    """Convergence-spawn pin: `serve` must actually start the pass, at six hours.
+
+    The verification loop is the only thing that notices Papra overwrote a document we
+    delivered — nothing in the pipeline pushes it — so a loop that is written, tested and
+    never started looks identical to a corpus that has no divergence. The interval is
+    asserted too: six hours is the design's cost model (five hundred documents is
+    seconds, so a pass can be frequent), and a mutated constant would be invisible in a
+    test that only checked the spawn.
+    """
+    import papra_suite.pipeline as pipeline_mod
+
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.create_org(papra_org_id="org_1", name="Org")
+
+    passes: list[int] = []
+    seen: dict = {}
+
+    async def recording_loop(store_arg, papra, kz, *, interval_s=21600, stop=None):
+        seen.update(store=store_arg, papra=papra, kz=kz, interval_s=interval_s, stop=stop)
+        while stop is None or not stop.is_set():
+            passes.append(interval_s)
+            if stop is not None:
+                stop.set()                # the fake ends its own loop, as the real one would
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(pipeline_mod, "_verification_loop", recording_loop)
+
+    stop = asyncio.Event()
+
+    async def stop_after_first_pass():
+        for _ in range(200):              # watchdog-shaped, like the sweep spawn pin above
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+
+    waiter = asyncio.get_running_loop().create_task(stop_after_first_pass())
+    await serve(config, stop=stop, store=store)
+    await waiter
+
+    assert len(passes) == 1
+    assert seen["interval_s"] == 21600
+    assert seen["store"] is store and seen["stop"] is stop
+    assert not _dangling_serve_tasks()
+    store.close()
+
+
+async def test_verification_loop_takes_its_first_pass_before_it_sleeps(tmp_path, monkeypatch):
+    """Startup, then every six hours — in that order.
+
+    The pass at startup is what makes a restart useful: the container is most likely to
+    have been down while Papra kept writing, so the moment it comes back is exactly when
+    the columns are most out of step. Sleeping first would make that drift wait six hours
+    on every deploy. Asserted by the absence of a sleep, so a reordered loop fails here
+    rather than by making the suite wait an interval.
+    """
+    from types import SimpleNamespace
+
+    import papra_suite.pipeline as pipeline_mod
+    from papra_suite.indexing import VerifyResult
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    stop = asyncio.Event()
+    calls: list[int] = []
+    slept: list[float] = []
+
+    async def spy_sleep(seconds, *args, **kwargs):
+        slept.append(seconds)
+        await asyncio.sleep(0)            # yields for real, so a loop that spins is visible
+
+    async def fake_verify(store_arg, papra, kz):
+        calls.append(1)
+        stop.set()
+        return VerifyResult(scanned=1)
+
+    monkeypatch.setattr(pipeline_mod, "verify_once", fake_verify)
+    # Patched on the pipeline module only: the test's own `asyncio` stays real, so the
+    # spy cannot leak into the loop teardown of anything else running in this event loop.
+    monkeypatch.setattr(pipeline_mod, "asyncio",
+                        SimpleNamespace(sleep=spy_sleep,
+                                        CancelledError=asyncio.CancelledError))
+
+    await pipeline_mod._verification_loop(store, papra=None, kz=None,
+                                         interval_s=21600, stop=stop)
+
+    assert calls == [1]
+    assert slept == []                    # the pass came first; the stop ended the loop
+    store.close()
+
+
+async def test_verification_loop_waits_the_default_interval_between_passes(tmp_path,
+                                                                          monkeypatch):
+    """Two passes, one sleep of six hours, and the loop exits on `stop`.
+
+    The 21600 is pinned at the loop as well as at `serve`: the loop is what sleeps, and a
+    default that drifted to 0 would turn a cheap six-hourly sweep into a hot PATCH loop
+    against the record of record.
+    """
+    from types import SimpleNamespace
+
+    import papra_suite.pipeline as pipeline_mod
+    from papra_suite.indexing import VerifyResult
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    stop = asyncio.Event()
+    calls: list[int] = []
+    slept: list[float] = []
+
+    async def spy_sleep(seconds, *args, **kwargs):
+        slept.append(seconds)
+        await asyncio.sleep(0)
+
+    async def fake_verify(store_arg, papra, kz):
+        calls.append(1)
+        if len(calls) >= 2:
+            stop.set()
+        return VerifyResult(scanned=1)
+
+    monkeypatch.setattr(pipeline_mod, "verify_once", fake_verify)
+    monkeypatch.setattr(pipeline_mod, "asyncio",
+                        SimpleNamespace(sleep=spy_sleep,
+                                        CancelledError=asyncio.CancelledError))
+
+    await pipeline_mod._verification_loop(store, papra=None, kz=None, stop=stop)
+
+    assert calls == [1, 1]
+    assert slept == [21600]
+    store.close()
+
+
+async def test_verification_loop_survives_a_pass_that_raises(tmp_path, monkeypatch, caplog):
+    """A six-hourly loop that dies once is a corpus that quietly stops converging.
+
+    Twin of the sweep-loop pin: nothing else ever runs this pass, so an exception escaping
+    one pass would end convergence for the rest of the container's life and leave no
+    evidence but an absence of repairs.
+    """
+    import logging
+    from types import SimpleNamespace
+
+    import papra_suite.pipeline as pipeline_mod
+    from papra_suite.indexing import VerifyResult
+
+    caplog.set_level(logging.ERROR, logger="papra_suite.pipeline")
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    stop = asyncio.Event()
+    calls: list[int] = []
+
+    async def spy_sleep(seconds, *args, **kwargs):
+        await asyncio.sleep(0)
+
+    async def failing_verify(store_arg, papra, kz):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        stop.set()
+        return VerifyResult()
+
+    monkeypatch.setattr(pipeline_mod, "verify_once", failing_verify)
+    monkeypatch.setattr(pipeline_mod, "asyncio",
+                        SimpleNamespace(sleep=spy_sleep,
+                                        CancelledError=asyncio.CancelledError))
+
+    await pipeline_mod._verification_loop(store, papra=None, kz=None, interval_s=0, stop=stop)
+
+    assert len(calls) == 2                       # the second pass happened anyway
+    assert any("verification" in record.getMessage().lower()
+               for record in caplog.records)
     store.close()
 
 

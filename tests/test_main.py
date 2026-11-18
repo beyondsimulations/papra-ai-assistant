@@ -151,6 +151,175 @@ def _seed_store(tmp_path, *, last_seen_uid=42):
     return mailbox_id, mailbox
 
 
+def _seed_index_corpus(tmp_path):
+    """A ledger with one row of each shape `check` has to distinguish.
+
+    Written through the Store API rather than by hand, so the line under test is rendered
+    from counts the store actually produces:
+
+    * `doc-1` — indexed and delivered, with an extraction that came back empty, and two
+      repairs inside the window.
+    * `doc-2` — indexed, never delivered, and owed an upstream delete.
+    * `doc-3` — never indexed, and a delete the retries have given up on.
+    """
+    from papra_suite.store import EMPTY_EXTRACTION_SHA, Store
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    generation = store.get_generation()
+    for document_id in ("doc-1", "doc-2", "doc-3"):
+        store.ledger_upsert_reference(papra_org_id="org_1", papra_document_id=document_id,
+                                      file_hash="ab" * 32,
+                                      papra_original_name=f"{document_id}.pdf")
+    for document_id in ("doc-1", "doc-2"):
+        store.ledger_set_kreuzakt_id(papra_org_id="org_1", papra_document_id=document_id,
+                                     kreuzakt_id=7, generation=generation)
+    store.ledger_record_delivery(papra_org_id="org_1", papra_document_id="doc-1",
+                                 delivered_at="2026-11-17 10:00:00",
+                                 delivered_sha=EMPTY_EXTRACTION_SHA,
+                                 generation=generation)
+    store.ledger_bump_repair(papra_org_id="org_1", papra_document_id="doc-1")
+    store.ledger_bump_repair(papra_org_id="org_1", papra_document_id="doc-1")
+    store.ledger_queue_cleanup(papra_org_id="org_1", papra_document_id="doc-2",
+                               due_at="2026-11-17T10:00:00+00:00", kreuzakt_id=7,
+                               generation=generation)
+    with store._conn:      # the gave-up-on state a cleanup pass reaches after its cap
+        store._conn.execute("UPDATE index_ledger SET cleanup_state = 'failed'"
+                            " WHERE papra_document_id = 'doc-3'")
+    store.close()
+
+
+def test_check_prints_the_index_counts(monkeypatch, tmp_path, capsys):
+    """The corpus line, in the order an operator reads it: what exists, what is indexed,
+    what Papra holds, and the two numbers that say the extractor or the cleanup is hurt.
+
+    Format is part of the contract: this line is what gets pasted into a bug report, and
+    `extraction-empty` is the one number that separates "a few odd pages" from "the
+    extractor is wrong for this corpus" — a silently missing field would remove the
+    warning without removing the confidence.
+    """
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _seed_index_corpus(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert ("index: 3 refs, 2 current, 1 delivered, 1 extraction-empty, "
+            "2 repairs(24h), 2 cleanup-pending (failed 1)") in out
+
+
+def test_check_counts_an_empty_corpus_without_hiding_it(monkeypatch, tmp_path, capsys):
+    """A fresh install says so in the same shape, rather than omitting the line."""
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+
+    assert ("index: 0 refs, 0 current, 0 delivered, 0 extraction-empty, "
+            "0 repairs(24h), 0 cleanup-pending (failed 0)") in capsys.readouterr().out
+
+
+def test_check_reports_an_unreadable_index_instead_of_a_traceback(monkeypatch, tmp_path,
+                                                                  capsys):
+    """A corrupt generation degrades the line, and says which half is unusable.
+
+    `ledger_stats` fails closed on a generation it cannot read, and `check` is the command
+    an operator runs BECAUSE something is wrong — so the failure has to arrive as a
+    reason, not as a traceback that hides the config and sender lines above it.
+    """
+    from papra_suite.store import Store
+
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    # The same corruption `test_store_ledger` pictures: a settings row that became a
+    # note instead of a number, so no generation is current.
+    store.set_setting("index_generation", "rebuild-2026-11-17")
+    store.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "index: " in out and "generation" in out
+    assert "Traceback" not in out
+
+
+def test_check_names_the_content_writer(monkeypatch, tmp_path, capsys):
+    """One line answers "who writes Papra's text right now", including when nobody does.
+
+    The three states are the handover: the legacy writer, the bridge, and the window in
+    between where nobody owns the column. The last one is legitimate for minutes and
+    wrong for days, and there is no other place an operator can see it.
+    """
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+    assert "content writer: suite ocr worker (legacy)" in capsys.readouterr().out
+
+    monkeypatch.setenv("PAPRA_INDEX_CONTENT_DELIVERY", "1")
+    monkeypatch.setenv("PAPRA_LEGACY_WORKERS", "0")
+    assert main() == 0
+    assert "content writer: index bridge" in capsys.readouterr().out
+
+    monkeypatch.setenv("PAPRA_INDEX_CONTENT_DELIVERY", "0")
+    assert main() == 0
+    assert "content writer: none (handover window)" in capsys.readouterr().out
+
+
+def test_check_refuses_a_config_with_two_content_writers(monkeypatch, tmp_path, capsys):
+    """`check` proves the deployment can start, so it refuses what `serve` would refuse.
+
+    Catching it here rather than in a restart loop is the difference between an operator
+    reading the order once and reading a container log twice a day.
+    """
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PAPRA_INDEX_CONTENT_DELIVERY", "1")
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 2
+
+    err = capsys.readouterr().err
+    assert "PAPRA_INDEX_CONTENT_DELIVERY" in err
+    assert "PAPRA_LEGACY_WORKERS" in err
+
+
+def test_serve_exits_two_on_a_conflicting_writer_config(monkeypatch, tmp_path, capsys):
+    """The same refusal reaches the process exit code, not just a traceback.
+
+    A container that dies with a stack trace gets filed as a crash; one that prints the
+    order to fix gets fixed.
+    """
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PAPRA_INDEX_CONTENT_DELIVERY", "1")
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "serve"])
+
+    assert main() == 2
+
+    err = capsys.readouterr().err
+    assert "configuration error" in err and "quiesc" in err.lower()
+    # Deliberately NOT asserted: that stderr holds no traceback. `serve` logs the refusal
+    # before `setup_logging` attaches this process's store handler, and in a shared test
+    # process a handler left by an earlier test writes into a closed store, which Python
+    # prints as "--- Logging error ---" with its own traceback. That is harness noise, not
+    # a crash; the contract is the exit code and the message.
+    assert "PAPRA_LEGACY_WORKERS" in err and "PAPRA_INDEX_CONTENT_DELIVERY" in err
+
+
 def test_replay_dry_run_changes_nothing(monkeypatch, tmp_path, capsys):
     from papra_suite.__main__ import main
     from papra_suite.store import Store
