@@ -401,6 +401,38 @@ async def test_a_refused_write_does_not_spend_the_repair_budget(store, fake_kz, 
     assert "diverged more than twice in 24h" not in caplog.text
 
 
+async def test_a_refused_write_is_still_retried_on_the_seventh_pass(store, fake_kz):
+    """The behaviour migration 005 replaces, pinned before anything replaces it.
+
+    Nothing bounded content-delivery retries. A document Papra persistently refuses (413,
+    403, an upload endpoint that will not take these bytes) was re-read, re-PATCHed and
+    re-ERROR-logged on every pass for the life of the deployment, because the only ceiling
+    in the pass answers a different question — how many repairs *landed* — and a refused
+    write lands nothing. That is correct as far as it goes, and it leaves a document nobody
+    can converge and nothing that says so.
+
+    Pinned here as the state of the world at the point 005 starts from, so that the
+    bounded retry lands as a deliberate replacement of a tested behaviour rather than as a
+    silent swap. It is rewritten in the same commit that ships the ceiling, which is the
+    evidence that the old behaviour was actually running.
+    """
+    open_gate(store)
+    papra = SelectivelyRefusingPapra(refusing=DOC_ID,
+                                     error=PapraError("PATCH document failed: 413 too large", 413))
+    indexed(store, fake_kz)
+    add_papra_document(papra, DOC_ID)
+
+    for _ in range(7):
+        result = await verify_once(store, papra, fake_kz)
+
+    assert result.repaired == 0
+    assert papra.patch_calls == 7          # one more pass, one more refused write
+    # Nothing in the ledger even remembers being refused: there is no such column yet,
+    # which is the other half of "nothing bounded this".
+    columns = {row["name"] for row in store._conn.execute("PRAGMA table_info(index_ledger)")}
+    assert "delivery_failures" not in columns
+
+
 async def test_a_refusal_on_one_document_does_not_end_the_walk(store, fake_kz):
     """One refused PATCH must cost one document, not the corpus.
 
