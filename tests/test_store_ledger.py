@@ -1125,10 +1125,14 @@ def test_stats_keys_and_counts(store):
     assert set(stats) == {"references", "indexed_current", "delivered", "extraction_empty",
                           "protected_name", "protected_date", "protected_notes",
                           "repairs_24h", "cleanup_pending", "cleanup_failed",
-                          "delivery_blocked"}
+                          "delivery_blocked", "stale", "unledgered"}
     # A repaired, delivered, cleanup-owing row is none of the things `delivery_blocked`
     # counts: that key counts references whose writes Papra has refused five times running.
     assert stats["delivery_blocked"] == 0
+    # ...and the two walks of Task 11 read the fixture the way the eligibility rules do: the
+    # org-b row exists to carry cleanup debt and was never bound, so it is backlog, and every
+    # `documents` row in this fixture has a reference behind it.
+    assert stats["stale"] == 1 and stats["unledgered"] == 0
     assert stats["references"] == 2
     assert stats["indexed_current"] == 1
     assert stats["delivered"] == 1
@@ -1555,6 +1559,23 @@ def test_a_refusal_is_not_charged_to_a_binding_that_no_longer_exists(store):
     assert store.ledger_get("org-a", "doc-1").delivery_failures == 0
 
 
+def test_charging_a_refusal_to_no_binding_at_all_is_a_programming_error(store):
+    """`kreuzakt_id = NULL` matches nothing, so a None here would mean "never charge".
+
+    The two fence mismatches above answer `None` because they are races a caller can legitimately
+    meet. Passing no id is a different thing: the write boundary always holds the Kreuzakt id it
+    addressed, so a caller that has none is not mid-race, it is wrong — and the wrong version of
+    this method looks like a working one, because the counter simply never moves and every
+    document converges forever.
+    """
+    bind_ref(store)
+
+    with pytest.raises(ValueError, match="positive kreuzakt id"):
+        store.ledger_record_delivery_failure(
+            papra_org_id="org-a", papra_document_id="doc-1", expected_kreuzakt_id=None,
+            generation=store.get_generation(), reason="PATCH document failed: 413")
+
+
 def test_the_blocked_count_appears_only_at_the_ceiling(store):
     """`delivery_blocked` is "the pass has stopped asking", not "a write failed once".
 
@@ -1635,3 +1656,207 @@ def test_a_new_binding_retires_the_refusal_history(store):
     assert (after.delivery_failures, after.last_delivery_error_at, after.kreuzakt_id) \
         == (0, None, 9)
     assert store.ledger_stats()["delivery_blocked"] == 0
+
+
+# -- the rebuild's two walks (Task 11) -------------------------------------------------
+
+def mark_unseen(store, doc, *, org="org-a", mime="application/pdf", name=None):
+    """A document the poller saw and the ledger was never told about.
+
+    That is the pre-handover mail path's shape: intake recorded the document, the index
+    bridge of the day recorded nothing, and no count an operator can run notices.
+    """
+    store.record_document_seen(papra_org_id=org, papra_document_id=doc,
+                               name=name or f"{doc}.pdf", mime=mime,
+                               ingested_via="mail")
+
+
+def test_needs_index_walks_a_cursor_the_enqueue_does_not_move(store):
+    """The rebuild's first walk has to be able to reach page two.
+
+    Enqueuing index work does not make a reference eligible-for-nothing: it stays in
+    `ledger_needs_index` until a job binds an id under this generation. So a walk that
+    asked for the same first page twice would sit on it forever, and a walk that used an
+    offset would be counting rows it had already queued while new rows shifted into the
+    positions it had skipped past. `after` is the only shape that terminates.
+    """
+    for index in range(5):
+        bind_ref(store, org="org-a", doc=f"doc-{index}", kreuzakt_id=index + 1)
+    store.bump_generation()                       # every one of them is stale now
+
+    first = store.ledger_needs_index(generation=store.get_generation(), limit=2)
+    assert [r.papra_document_id for r in first] == ["doc-0", "doc-1"]
+    # Queueing the first page's work changes nothing about who is on it.
+    for ref in first:
+        store.enqueue_job(kind="index", papra_org_id=ref.papra_org_id,
+                          document_id=ref.papra_document_id, content_hash=ref.file_hash,
+                          payload={})
+    assert store.ledger_needs_index(generation=store.get_generation(), limit=2) == first
+
+    rest = [r.papra_document_id for r in store.ledger_needs_index(
+        generation=store.get_generation(), limit=2,
+        after=(first[-1].papra_org_id, first[-1].papra_document_id))]
+    assert rest == ["doc-2", "doc-3"]
+
+
+def test_the_unledgered_walk_finds_seen_documents_the_ledger_never_held(store):
+    """The population the counts cannot see, made countable.
+
+    `documents` and `index_ledger` are two tables with two jobs, and until this walk
+    existed nothing joined them: a document marked seen with no reference is invisible to
+    every ledger statistic and to every eligibility rule, because both are derived from the
+    ledger.
+    """
+    bind_ref(store, org="org-a", doc="doc-ledger", kreuzakt_id=7)
+    mark_unseen(store, "doc-orphan")
+    mark_unseen(store, "doc-also", org="org-b")
+    store.record_document_seen(papra_org_id="org-a", papra_document_id="doc-ledger",
+                               name="ledger.pdf", mime="application/pdf",
+                               ingested_via="mail")        # enrolled: not in the answer
+
+    rows = store.documents_without_reference(limit=10)
+
+    assert [(r.papra_org_id, r.papra_document_id, r.mime, r.ingested_via) for r in rows] \
+        == [("org-a", "doc-orphan", "application/pdf", "mail"),
+            ("org-b", "doc-also", "application/pdf", "mail")]
+    assert store.ledger_stats()["unledgered"] == 2
+
+
+def test_the_unledgered_walk_survives_the_rows_it_removes(store):
+    """Keyset, because this walk's own work shrinks the result it is paging through.
+
+    Enrolling a document takes it out of the anti-join. With an offset the second page
+    would start one row past the ones that vanished and skip the documents that slid into
+    the gap — and the skip would look like success, because the walk would report having
+    seen everything it was asked to look at.
+    """
+    for index in range(5):
+        mark_unseen(store, f"doc-{index}")
+
+    first = store.documents_without_reference(limit=2)
+    assert [r.papra_document_id for r in first] == ["doc-0", "doc-1"]
+
+    # Enrol what the first page returned, the way the rebuild does, then walk on.
+    for row in first:
+        store.ledger_upsert_reference(papra_org_id=row.papra_org_id,
+                                      papra_document_id=row.papra_document_id,
+                                      file_hash=H, papra_original_name=row.name)
+    second = store.documents_without_reference(limit=2, after=(first[-1].papra_org_id,
+                                                              first[-1].papra_document_id))
+
+    assert [r.papra_document_id for r in second] == ["doc-2", "doc-3"]
+    third = store.documents_without_reference(limit=2, after=(second[-1].papra_org_id,
+                                                             second[-1].papra_document_id))
+    assert [r.papra_document_id for r in third] == ["doc-4"]
+
+
+def test_ledger_stats_counts_stale_references_the_way_eligibility_does(store):
+    """`stale` must be `ledger_needs_index` as a number, not a similar-sounding idea.
+
+    `check` and `ledger --status` will print it next to `references`, and an operator
+    comparing the two is asking "how much of my corpus is not in this index?". A count
+    that filtered differently from the eligibility rule would answer that question wrongly
+    in the direction that matters.
+    """
+    bind_ref(store, org="org-a", doc="doc-current", kreuzakt_id=1)
+    bind_ref(store, org="org-a", doc="doc-stale", kreuzakt_id=2)
+    bind_ref(store, org="org-a", doc="doc-deleted", kreuzakt_id=3)
+    store.ledger_upsert_reference(papra_org_id="org-a", papra_document_id="doc-unbound",
+                                  file_hash=H, papra_original_name="unbound.pdf")
+    store.bump_generation()                       # 1, 2 and 3 are epochs now
+    store.ledger_set_kreuzakt_id(papra_org_id="org-a", papra_document_id="doc-current",
+                                 kreuzakt_id=1, generation=store.get_generation())
+    store.ledger_mark_deleted(papra_org_id="org-a", papra_document_id="doc-deleted")
+
+    stats = store.ledger_stats()
+    eligible = store.ledger_needs_index(generation=store.get_generation(), limit=10)
+
+    assert stats["stale"] == len(eligible) == 2      # the rebuilt one and the never-bound
+    assert {r.papra_document_id for r in eligible} == {"doc-stale", "doc-unbound"}
+    assert stats["references"] == 4                  # a deleted row is still a reference
+    assert stats["indexed_current"] == 1
+
+
+def test_a_forced_cleanup_reset_fences_on_the_intent_it_clears(store):
+    """Settling a given-up delete re-queues the intent that was recorded, not a new one.
+
+    `cleanup_kreuzakt_id` is an integer that a rebuilt index may have handed to a different
+    document, so the reset keeps the generation the intent was queued under — `run_cleanup`
+    vetoes on exactly that pair. Re-stamping the current generation here would turn an old
+    number into permission to delete whatever holds it now.
+    """
+    ref = bind_ref(store, org="org-a", doc="doc-1", kreuzakt_id=7)
+    store.ledger_mark_deleted(papra_org_id="org-a", papra_document_id="doc-1")
+    store.ledger_queue_cleanup(papra_org_id="org-a", papra_document_id="doc-1",
+                               due_at="2026-11-19T09:00:00+00:00", kreuzakt_id=7,
+                               generation=ref.delivered_generation)
+    for _ in range(store_module.CLEANUP_MAX_ATTEMPTS):
+        store.ledger_cleanup_result(papra_org_id="org-a", papra_document_id="doc-1",
+                                    ok=False, reason="upstream 500")
+    failed = store.ledger_cleanup_failed(limit=10)
+    assert [r.papra_document_id for r in failed] == ["doc-1"]
+
+    # The reset names the intent it is clearing, so a row that moved underneath the
+    # operator's `--status` read is refused rather than re-pointed.
+    assert store.ledger_queue_cleanup(
+        papra_org_id="org-a", papra_document_id="doc-1",
+        due_at="2026-11-19T10:00:00+00:00", kreuzakt_id=7,
+        generation=ref.delivered_generation, reset_attempts=True,
+        expected_state="failed") is True
+    after = store.ledger_get("org-a", "doc-1")
+    assert after.cleanup_state == "pending" and after.cleanup_attempts == 0
+    assert after.cleanup_kreuzakt_id == 7
+    assert after.cleanup_generation == ref.delivered_generation
+
+    # And the same call now finds nothing to settle: the row is no longer `failed`.
+    assert store.ledger_queue_cleanup(
+        papra_org_id="org-a", papra_document_id="doc-1",
+        due_at="2026-11-19T10:00:00+00:00", kreuzakt_id=7,
+        generation=ref.delivered_generation, reset_attempts=True,
+        expected_state="failed") is False
+    assert store.ledger_cleanup_failed(limit=10) == []
+
+
+def test_a_generation_move_makes_the_queued_intent_worthless_not_dangerous(store):
+    """A `failed` row from a destroyed index is reported, and not re-queued.
+
+    Re-queueing it would hand `run_cleanup` an id from the old index. Its own generation
+    veto is what stops the delete, and `ledger_cleanup_failed` is what lets the operator
+    see that the debt exists and cannot be settled any more — the honest answer there is
+    "the index this delete belonged to is gone", not a fresh allowance.
+    """
+    ref = bind_ref(store, org="org-a", doc="doc-1", kreuzakt_id=7)
+    store.ledger_mark_deleted(papra_org_id="org-a", papra_document_id="doc-1")
+    store.ledger_queue_cleanup(papra_org_id="org-a", papra_document_id="doc-1",
+                               due_at="2026-11-19T09:00:00+00:00", kreuzakt_id=7,
+                               generation=ref.delivered_generation)
+    for _ in range(store_module.CLEANUP_MAX_ATTEMPTS):
+        store.ledger_cleanup_result(papra_org_id="org-a", papra_document_id="doc-1",
+                                    ok=False, reason="upstream 500")
+    store.bump_generation()
+
+    stale = store.ledger_cleanup_failed(limit=10)
+
+    assert [(r.papra_document_id, r.cleanup_kreuzakt_id, r.cleanup_generation)
+            for r in stale] == [("doc-1", 7, 1)]
+
+
+def test_clearing_pass_state_is_a_compare_and_swap(store):
+    """Clearing a counter has to be cleared against the value that was read.
+
+    `index_marks_rolling` is written by every marking pass, so "clear the brake the operator
+    just read about" is a read-then-write on a row that may have moved. Reading and
+    deleting is not enough: the pass that moved it may have added marks this minute, and
+    clearing that window would re-arm marking on the strength of a stale glance.
+    """
+    store.set_setting("index_marks_rolling", "2026-11-19T09:00:00+00:00|34")
+
+    assert store.clear_setting("index_marks_rolling", expected="wrong value") is False
+    assert store.get_setting("index_marks_rolling") == "2026-11-19T09:00:00+00:00|34"
+
+    assert store.clear_setting("index_marks_rolling",
+                               expected="2026-11-19T09:00:00+00:00|34") is True
+    assert store.get_setting("index_marks_rolling") is None
+    # Nothing to clear is an answer, not an error, and it writes nothing.
+    assert store.clear_setting("index_marks_rolling",
+                               expected="2026-11-19T09:00:00+00:00|34") is False

@@ -350,8 +350,11 @@ def _deletion_pass_line(store) -> str:
         # judged against, and the row to clear has to be named or this becomes an sqlite lesson.
         try:
             counted, allowance = indexing.marks_window_state(store)
-            extra += (f" | marks this window: {counted} of {allowance} allowed "
-                      f"(clear {indexing.MARKS_ROLLING_SETTING} to resume)")
+            # Both names belong here: the settings row is what holds the state, and the
+            # subcommand is what clears it without an sqlite lesson at 23:00.
+            extra += (f" | marks this window: {counted} of {allowance} allowed (clear "
+                      f"{indexing.MARKS_ROLLING_SETTING} with `papra-suite ledger --clear-marks` "
+                      "to resume)")
         except ValueError:
             counted = marks.split("|", 1)[1]
             extra += f" | marks this window: {counted}"
@@ -444,6 +447,11 @@ def main() -> int:
     from papra_suite import metadata_cli
 
     metadata_cli.add_subparser(sub)
+    # Same registration shape as `metadata`, for the same reason: the ledger commands are operator
+    # commands with their own exit-code meaning, and the entry point stays a table of where to go.
+    from papra_suite import ledger_cli
+
+    ledger_cli.add_subparser(sub)
 
     args = parser.parse_args()
 
@@ -538,6 +546,14 @@ def main() -> int:
         # run_metadata` here would bind the original at import time and make that test
         # assert about a name nothing calls.
         return metadata_cli.run_metadata(config, args)
+
+    if args.command == "ledger":
+        # Through the module for the same reason as `metadata` above, and with the same stakes:
+        # this dispatch is the difference between a documented command and a module that imports
+        # cleanly but cannot be reached from a shell.
+        from papra_suite import ledger_cli
+
+        return ledger_cli.run_ledger(config, args)
 
     if args.command == "serve":
         import asyncio

@@ -119,7 +119,8 @@ LEDGER_STAT_KEYS = (("references", "n_references"), ("indexed_current", "indexed
                     ("repairs_24h", "repairs_24h"),
                     ("cleanup_pending", "cleanup_pending"),
                     ("cleanup_failed", "cleanup_failed"),
-                    ("delivery_blocked", "delivery_blocked"))
+                    ("delivery_blocked", "delivery_blocked"),
+                    ("stale", "stale"), ("unledgered", "unledgered"))
 
 
 def _migration_001_initial(conn: sqlite3.Connection) -> None:
@@ -545,6 +546,23 @@ class LedgerRef:
 
 
 @dataclass
+class SeenDocument:
+    """One row of `documents`: what the poller or the sweep saw, with no reference behind it.
+
+    A *sighting*, not a reference — it has no `kreuzakt_id`, no `file_hash` and no ownership
+    columns, because nothing here has ever promised anything about this document to the
+    index. Which is exactly why enrolling one needs Papra: the hash that keys the work is
+    Papra's fact about its own bytes, and this table never stored one.
+    """
+
+    papra_org_id: str
+    papra_document_id: str
+    name: str
+    mime: str
+    ingested_via: str
+
+
+@dataclass
 class IngestEvent:
     """One recorded decision NOT to ingest something.
 
@@ -708,6 +726,25 @@ class Store:
         value = self.get_setting(name)
         return value is not None and value.strip().lower() in TRUTHY_SETTING_VALUES
 
+    def clear_setting(self, key: str, *, expected: str) -> bool:
+        """Delete a settings row only if it still holds the value that was read.
+
+        `set_setting` has no fence because its callers mean "make it so". This one is the
+        opposite act: an operator clearing a piece of pass state they were *shown*, on a row
+        that some background pass may have rewritten in the meantime. Read-then-delete would
+        clear whatever arrived since — which for `index_marks_rolling`, the counter that
+        brakes mass deletion, means re-arming the brake on the strength of a stale glance.
+        So the value read is the condition, and False means "it moved, nothing was cleared".
+
+        The row is deleted rather than blanked: an empty settings row is a value like any
+        other, and a reader that tests truthiness reads it the same way as an absent one
+        while anyone reading the table sees a row that means nothing.
+        """
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM settings WHERE key = ? AND value = ?", (key, expected))
+        return cursor.rowcount > 0
+
     def _read_generation_or_none(self) -> int | None:
         """The stored index generation, or None when the value cannot be trusted.
 
@@ -745,11 +782,12 @@ class Store:
             raise ValueError(
                 f"{INDEX_GENERATION_KEY} is not a positive integer, so no generation is current; "
                 "refusing to resolve or bind index ids. The state is that one row of the settings "
-                "table. `papra-suite ledger --invalidate`, which bumps the generation above every "
-                "epoch the ledger still carries, is Task 11's and this build does not parse it; "
-                "until it lands the route is to set that row by hand to a positive integer: one "
-                "above the highest generation the ledger still carries, when the point is to "
-                "invalidate what is bound to epochs nobody can identify."
+                "table. `papra-suite ledger --reindex-all` bumps the generation above every "
+                "epoch the ledger still carries, and it refuses to run while Kreuzakt is "
+                "unreachable, so fixing the row by hand is still the route when the index is "
+                "down: set it to a positive integer one above the highest generation the ledger "
+                "still carries, when the point is to invalidate what is bound to epochs nobody "
+                "can identify."
             )
         return generation
 
@@ -1491,7 +1529,8 @@ class Store:
         return [_row_to_ledger_ref(row) for row in rows]
 
     def ledger_needs_index(
-        self, *, generation: int, org_id: str | None = None, limit: int = 100,
+        self, *, generation: int, org_id: str | None = None,
+        after: tuple[str, str] | None = None, limit: int = 100,
     ) -> list[LedgerRef]:
         """Live references that have no usable id in `generation`.
 
@@ -1500,6 +1539,14 @@ class Store:
         and it is derived from the ledger alone — never from `document_seen`,
         which records ingestion history and would make a rebuild look already
         done. Soft-deleted documents are excluded: the delete pass owns those.
+
+        `after` is the keyset `(papra_org_id, papra_document_id)` the previous page ended
+        with, and the rebuild is the caller that needs it. Queueing index work does not make
+        a reference stop needing index work — the row stays in this result until a job binds
+        an id under `generation` — so a walk that re-asked for the same first page would sit
+        on it forever, and a walk that paged by offset would be counting rows it had already
+        queued while later rows slid into the gap it had skipped. Only a keyset both
+        terminates and covers.
         """
         bounded = max(1, min(int(limit), 1000))
         sql = (
@@ -1511,6 +1558,78 @@ class Store:
         if org_id is not None:
             sql += " AND papra_org_id = ?"
             params.append(org_id)
+        if after is not None:
+            sql += " AND (papra_org_id > ? OR (papra_org_id = ? AND papra_document_id > ?))"
+            params.extend([after[0], after[0], after[1]])
+        sql += " ORDER BY papra_org_id, papra_document_id LIMIT ?"
+        params.append(bounded)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_ledger_ref(row) for row in rows]
+
+    def documents_without_reference(
+        self, *, after: tuple[str, str] | None = None, limit: int = 100,
+    ) -> list[SeenDocument]:
+        """Documents this store marked seen that the ledger has never held.
+
+        The anti-join between the two tables, which is the only way to see the population
+        every other number here misses. Ingestion records a document in `documents`; the
+        index bridge records a reference in `index_ledger`; until this walk existed nothing
+        joined them, so a document seen by a build that had no ledger — everything emailed
+        before the content handover, and every document the intake path declined to enrol —
+        was invisible to every eligibility rule and every count, all of which derive from
+        the ledger. `check` can only report what these two tables jointly know, and a Papra
+        document that was never listed at all is not knowable from here at all; that is the
+        limit of the number, not a bug in it.
+
+        Non-PDF rows are included, because the caller has to be able to say *who* is left
+        out rather than hand an operator a bare count: the index is PDF-only by design, and
+        the two populations need different sentences.
+
+        `after` is a keyset for the reason the other walks have one, with a sharper edge
+        here: this walk's own work removes rows from the result. An offset would skip the
+        documents that slid into the gap the enrolled rows left, and the walk would report
+        having seen everything it was asked to look at.
+        """
+        bounded = max(1, min(int(limit), 1000))
+        sql = (
+            "SELECT d.papra_org_id, d.papra_document_id, d.name, d.mime, d.ingested_via"
+            " FROM documents d WHERE NOT EXISTS ("
+            "  SELECT 1 FROM index_ledger l"
+            "  WHERE l.papra_org_id = d.papra_org_id"
+            "   AND l.papra_document_id = d.papra_document_id)"
+        )
+        params: list[object] = []
+        if after is not None:
+            sql += " AND (d.papra_org_id > ? OR (d.papra_org_id = ? AND d.papra_document_id > ?))"
+            params.extend([after[0], after[0], after[1]])
+        sql += " ORDER BY d.papra_org_id, d.papra_document_id LIMIT ?"
+        params.append(bounded)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [SeenDocument(papra_org_id=row["papra_org_id"],
+                             papra_document_id=row["papra_document_id"],
+                             name=row["name"], mime=row["mime"],
+                             ingested_via=row["ingested_via"]) for row in rows]
+
+    def ledger_cleanup_failed(
+        self, *, after: tuple[str, str] | None = None, limit: int = 100,
+    ) -> list[LedgerRef]:
+        """References whose upstream delete the retries have stopped on.
+
+        `ledger_cleanup_due` hides these on purpose — a permanently failed intent is not due
+        — which is the same invisibility that made the debt un-findable from the CLI. The
+        rows carry `cleanup_kreuzakt_id` and `cleanup_generation` because whoever settles
+        them has to re-queue *that* intent: the id is only meaningful in the generation it
+        was recorded in, and re-stamping it with the current one would turn an old integer
+        into permission to delete whatever holds it now.
+        """
+        bounded = max(1, min(int(limit), 1000))
+        sql = "SELECT * FROM index_ledger WHERE cleanup_state = 'failed'"
+        params: list[object] = []
+        if after is not None:
+            sql += " AND (papra_org_id > ? OR (papra_org_id = ? AND papra_document_id > ?))"
+            params.extend([after[0], after[0], after[1]])
         sql += " ORDER BY papra_org_id, papra_document_id LIMIT ?"
         params.append(bounded)
         with self._lock:
@@ -1767,6 +1886,13 @@ class Store:
         not happening is a state nobody finds. The line carries `reason` because the store
         is the last place that still has it on the way to the operator.
         """
+        if not isinstance(expected_kreuzakt_id, int) or isinstance(expected_kreuzakt_id, bool) \
+                or expected_kreuzakt_id <= 0:
+            raise ValueError(
+                f"expected_kreuzakt_id must be a positive kreuzakt id, got "
+                f"{expected_kreuzakt_id!r}: a refusal is a fact about the binding whose write "
+                "papra refused, and `kreuzakt_id = NULL` matches no row, so a None here would "
+                "make this method silently never charge anything")
         now = _now()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -2079,10 +2205,10 @@ class Store:
           `pending` would fall to 0 exactly when automatic retry stops — the
           operator's number going quiet while the debt turns permanent.
         * `cleanup_failed` — the subset of `cleanup_pending` the retries have
-          stopped on. Nothing in this build takes those rows back: the route is
-          `papra-suite ledger --cleanup`, which the plan gives to Task 11, so
-          until that lands the number is a count of debt an operator can see and
-          cannot settle from the CLI. `cleanup_pending - cleanup_failed` are still
+          stopped on. `papra-suite ledger --cleanup` settles them: it re-queues each
+          row with the Kreuzakt id and generation it was queued under, so a delete
+          whose index no longer exists is reported rather than re-armed, and drives
+          one pass there and then. `cleanup_pending - cleanup_failed` are still
           being retried. Rows `skipped` by the cleanup pass are in neither: nothing
           is owed on them.
         * `delivery_blocked` — references the convergence pass has stopped writing to,
@@ -2090,6 +2216,17 @@ class Store:
           references, not refusals: one refusal is an ordinary bad hour and belongs in the
           log, while this number is the set that will never converge on its own. It is not
           the same population as `repairs_24h`, which counts writes that landed.
+        * `stale` — live references with no id in the current generation, which is
+          `ledger_needs_index`'s predicate counted: backlog in the same currency the sweep
+          spends work in. After a generation bump this is the whole corpus, and that is the
+          correct reading — it is all waiting to be re-derived, not broken.
+        * `unledgered` — documents this store marked seen that the ledger has never held.
+          The count of the gap between ingestion history and index history, and the only
+          number that can see that population at all. It is what these two tables jointly
+          know: a Papra document this suite never listed is not knowable from here, so
+          `unledgered == 0` means "nothing we have seen is missing", not "Papra and the
+          ledger agree". Non-PDF documents are in this count and stay in it, because the
+          index is PDF-only by design and the operator still has to be told who is left out.
 
         `org_ids=[]` is "no buckets", not "no filter": a token with nothing
         granted must not receive corpus-wide counts.
@@ -2115,11 +2252,28 @@ class Store:
             " SUM(CASE WHEN cleanup_state IN ('pending', 'failed')"
             " THEN 1 ELSE 0 END) AS cleanup_pending,"
             " SUM(CASE WHEN cleanup_state = 'failed' THEN 1 ELSE 0 END) AS cleanup_failed,"
-            " SUM(CASE WHEN delivery_failures >= ? THEN 1 ELSE 0 END) AS delivery_blocked"
+            " SUM(CASE WHEN delivery_failures >= ? THEN 1 ELSE 0 END) AS delivery_blocked,"
+            # The same predicate `ledger_needs_index` applies, so the number an operator
+            # compares against `references` answers "how much of my corpus is not in this
+            # index?" in the same currency the sweep spends work in.
+            " SUM(CASE WHEN deleted_at IS NULL AND (kreuzakt_id IS NULL"
+            " OR delivered_generation IS NULL OR delivered_generation != ?)"
+            " THEN 1 ELSE 0 END) AS stale,"
+            # The anti-join, counted rather than walked: this is the number that used to be
+            # structurally invisible, and `ledger --status` prints it beside `stale` so the
+            # two ways a document can be missing from the index are not confused.
+            " (SELECT COUNT(*) FROM documents d WHERE NOT EXISTS"
+            "  (SELECT 1 FROM index_ledger l WHERE l.papra_org_id = d.papra_org_id"
+            "   AND l.papra_document_id = d.papra_document_id)"
+            + (" AND d.papra_org_id IN (" + ", ".join("?" * len(org_ids)) + ")"
+               if org_ids is not None else "")
+            + ") AS unledgered"
             " FROM index_ledger"
         )
         params: list[object] = [generation, generation, EMPTY_EXTRACTION_SHA, generation,
-                                cutoff, DELIVERY_MAX_FAILURES]
+                                cutoff, DELIVERY_MAX_FAILURES, generation]
+        if org_ids is not None:
+            params.extend(org_ids)
         if org_ids is not None:
             sql += " WHERE papra_org_id IN (" + ", ".join("?" * len(org_ids)) + ")"
             params.extend(org_ids)
@@ -2132,8 +2286,9 @@ class Store:
     def ledger_queue_cleanup(
         self, *, papra_org_id: str, papra_document_id: str, due_at: str,
         kreuzakt_id: int, generation: int, reset_attempts: bool = False,
-    ) -> None:
-        """Make "delete Kreuzakt document N" outlive this process.
+        expected_state: str | None = None,
+    ) -> bool:
+        """Make "delete Kreuzakt document N" outlive this process; report whether it is queued.
 
         The intent has to live in the ledger: a crash between marking a reference
         deleted and deleting upstream must not lose the orphan. `cleanup_kreuzakt_id`
@@ -2148,23 +2303,35 @@ class Store:
         the allowance a permanently failing delete would get five fresh attempts
         forever and never reach `failed`. So the counter survives by default, and
         `reset_attempts=True` exists for the one caller entitled to refill it: an
-        operator saying "the outage is over, try again". That caller is Task 11's
-        `papra-suite ledger --cleanup` and is not in this build, so today a row that
-        reaches `failed` stays there and is visible in `ledger_stats` as debt. The
-        parameter stays because without it a forced pass would get exactly one
-        attempt: the row is already at the maximum, so the first failure wrote
-        `failed` again even with Kreuzakt healthy.
+        operator saying "the outage is over, try again", which is
+        `papra-suite ledger --cleanup`.
+
+        That caller also passes `expected_state="failed"`, and that is the fence on the
+        reset. It re-queues a row it read as given-up, and a row that stopped being
+        given-up in between — the daemon's own pass took it, or a restore closed it — is not
+        the row the operator was looking at. Refusing on the mismatch returns False and
+        writes nothing, which is the difference between a reset and a guess: without it,
+        `--cleanup` could refill the allowance of a delete that had already succeeded and
+        set it running again. `False` has to be the answer rather than a silent no-op in
+        the `None` sense, because the CLI reports how many rows it settled.
+
+        Note what the fence is *not*: `generation` is written as given, so a caller settling
+        a `failed` row passes the row's own `cleanup_generation` back. Re-stamping the
+        current one would authorise a delete whose Kreuzakt id belongs to a destroyed index.
         """
         _require_store_utc_iso(due_at, "due_at")
         with self._lock, self._conn:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE index_ledger SET cleanup_state = 'pending', cleanup_next_at = ?,"
                 " cleanup_kreuzakt_id = ?, cleanup_generation = ?,"
                 " cleanup_attempts = CASE WHEN ? THEN 0 ELSE cleanup_attempts END"
-                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                " WHERE papra_org_id = ? AND papra_document_id = ?"
+                + (" AND cleanup_state = ?" if expected_state is not None else ""),
                 (due_at, kreuzakt_id, generation, 1 if reset_attempts else 0,
-                 papra_org_id, papra_document_id),
+                 papra_org_id, papra_document_id,
+                 *([expected_state] if expected_state is not None else [])),
             )
+        return cursor.rowcount > 0
 
     def ledger_cleanup_due(self, *, now: str, limit: int = 50) -> list[LedgerRef]:
         """Queued upstream deletes that have come due, earliest first.
@@ -2265,8 +2432,8 @@ class Store:
             # BEGIN IMMEDIATE: reading `cleanup_attempts` and `cleanup_state` and
             # writing them back is one decision. Outside the write lock, the
             # daemon's cleanup pass and a second writer of the same row — a second
-            # process, or Task 11's operator-forced retry — can both read attempt 4,
-            # both write 5, lose an increment, and announce the permanent failure
+            # process, or `papra-suite ledger --cleanup` refilling the same row — can both read
+            # attempt 4, both write 5, lose an increment, and announce the permanent failure
             # twice — which breaks the one thing that log line is for: being
             # countable.
             self._conn.execute("BEGIN IMMEDIATE")

@@ -80,6 +80,7 @@ trust boundary is verified for a specific provider.
 | `papra-suite replay --mailbox-id ID [--from-uid N] [--dry-run]` | rewind the poll cursor |
 | `papra-suite events [--limit N] [--mailbox-id ID] [--kind K] [--since YYYY-MM-DD] [--json]` | why messages and attachments were **not** ingested |
 | `papra-suite metadata [--restore-auto \| --force] [--org-id ID] [--document-id ID] [--field name\|date\|notes] [--dry-run]` | deliver Kreuzakt's title, date and note into Papra, or hand a protected field back to automatic delivery |
+| `papra-suite ledger (--status \| --reindex-all \| --requeue \| --cleanup \| --clear-marks) [--dry-run] [--yes-i-mean-it]` | read the index ledger's counts; rebuild the index from Papra's bytes after Kreuzakt was wiped (`--invalidate` is the same command) or resume the queueing half of one (`--requeue`); settle upstream deletes the retries gave up on; release the deletion marks brake |
 
 `check` ends with one line — `events (last 24h): sender_denied=3, upload_failed=1`
 — because `check` is the command an operator already runs when something is wrong,
@@ -413,14 +414,27 @@ ordered operation:
    seen-with-no-ledger-row is a real population: every PDF emailed into the intake address
    while the legacy writers were in charge was marked seen by the legacy OCR enqueue and
    never ledgered, and oversized skips are marked the same way. Those documents appear in
-   **neither** `refs` **nor** `current`, and `check` cannot currently reveal them — it has
-   no count of Papra documents the ledger has never held. So it is possible to follow these
-   steps, read `112 current`, and still have months of emailed invoices outside the index.
-   The enrolment path is `papra-suite backfill`, which is Task 15 and not in this build;
-   Task 12 gives `check` an `unledgered=N` count so this blind spot becomes a number
-   instead of a paragraph. Until both exist, treat the indexed corpus as "everything
-   uploaded or discovered since the ledger started watching", and write that into the
-   handover notes rather than a bare `current` count.
+   **neither** `refs` **nor** `current`, so it is possible to follow these steps, read
+   `112 current`, and still have months of emailed invoices outside the index. That
+   population has a name and a number now — `unledgered` — and a way in:
+
+   ```bash
+   papra-suite ledger --status            # stale: N | unledgered: N | delivery blocked: N
+   papra-suite ledger --reindex-all --yes-i-mean-it    # enrolls them and queues the work
+   ```
+
+   `--reindex-all` asks Papra what each unledgered document is (the seen table never stored a
+   content hash, and a hash invented here fails the moment the job verifies the bytes it
+   downloaded), writes the reference, and queues the index job through the same intake path the
+   sweep uses. Read [Rebuilding the index](#rebuilding-the-index) before you run it on a live
+   corpus, and see it for what stays `unledgered` afterwards.
+
+   The limit that remains is structural and worth writing into the handover notes: the count is
+   an anti-join between this store's `documents` and `index_ledger`, so the widest claim it can
+   make is "everything this suite has ever listed". A Papra document that was never listed — a
+   bucket added while the sweep was off, a period before the suite knew the organization existed
+   — is outside both tables and outside the number, and no count of these two tables can find it.
+   `check` does not print `unledgered` on its own line yet; read it from `ledger --status`.
 
    ```bash
    sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs GROUP BY 1, 2;"
@@ -767,3 +781,116 @@ Three limits worth stating plainly, because all three look like bugs on the day 
   because its counters are all ledger-derived and a job moving from `done` to `failed`
   changes none of them; the worker's ERROR line is what names it, and naming the document
   again is an operator's act (`jobs --reset` is Task 15's).
+
+### Rebuilding the index
+
+Run this when Kreuzakt's data was wiped or restored from a different backup, or when the ids the
+ledger holds are known to be wrong. `papra-suite ledger --reindex-all` is the command
+(`--invalidate` is the same command under its older name), and the model behind it is worth
+stating before the flags, because it explains every refusal the command makes: the ids being
+rebuilt away are integers in an index that has been thrown away, and a rebuilt Kreuzakt numbers
+its documents from 1. So the old ids are not facts to be reconciled, they are facts about a
+different corpus. Nothing in this command consults one, copies one forward, or writes to Papra.
+
+```bash
+papra-suite ledger --status                    # read what is there: refs, current, stale, unledgered
+papra-suite ledger --reindex-all --yes-i-mean-it
+papra-suite ledger --status                    # and again while the queue drains
+```
+
+Without `--yes-i-mean-it` the command prints the scope it would touch — references plus unledgered
+documents — and exits `1` having changed nothing.
+
+Five properties make it safe to run against a live corpus:
+
+1. **It refuses unless Kreuzakt says it is well.** `GET /api/health` has to answer
+   `status: ok`; anything else, including a body that reports `degraded`, exits `2` with the
+   generation untouched. Bumping the generation is a one-row update that makes the whole corpus
+   stale at once, and while the index is not answering that is indistinguishable from an outage
+   of search: the work gets queued, drains into a dead index, and `check` reports everything as
+   backlog while someone hunts for the thing that broke.
+2. **One bump, then queueing — and the queueing is resumable.** Bumping first is what guarantees
+   no half of the corpus is judged against the old epoch while the other half is judged against
+   the new. The price is that everything is stale and already-marked-seen until the queueing
+   finishes, which is why the queueing is a separate pass that pages by keyset and can be
+   resumed: `ctrl-C`, a crash, or a generation moving underneath it all end the walk with a
+   non-zero exit and the sentence telling you to finish it. Finishing it is
+   `papra-suite ledger --requeue` — the queueing half on its own, which bumps nothing, because
+   re-running the invalidation to complete a partial rebuild would throw away the bindings the
+   first pass had already re-derived. Re-queuing a document that is already queued is absorbed by
+   the live row, so resuming costs nothing and duplicates nothing.
+3. **It schedules rather than indexes.** Every document goes into the same intake queue the sweep
+   uses — reference, then index job, then seen record, in that order — so a rebuild cannot skip
+   the rename baseline or the protection flags, and cannot queue work no later pass can see. That
+   also means the command finishing is not the rebuild finishing. The end state is `stale: 0` in
+   `papra-suite ledger --status` **and** no `index` rows left in `pending` or `running`:
+   ```bash
+   sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs GROUP BY 1, 2;"
+   ```
+   Do not use `current == refs` as the finish line: `references` counts rows the index will never
+   hold — deleted ones, and any that a rebuild reported as left out on purpose — so that condition
+   can stay unreachable forever on a healthy corpus. `stale` is the eligible-live population, which
+   is why it is the number that has to reach zero.
+4. **It reads Papra only for documents the ledger never held.** The stale references already carry
+   a content hash, and `run_index_job` verifies the bytes it downloads against that hash, so a
+   fresh read would be a guess the job then checks — a few hundred requests per corpus, on a path
+   operators often run while a service is unhappy. Unledgered documents are the exception: the
+   seen table never stored a hash, so Papra is asked for `originalSha256Hash`, and where a server
+   does not supply one the body is downloaded and hashed. Nothing is ever written to Papra; if
+   this command changes a byte of a Papra record, that is a bug.
+5. **No id crosses the generation boundary.** The job a rebuild queued binds under the generation
+   the queueing pass saw. If a newer rebuild lands while that job is in flight, the id it is
+   holding names an index that no longer exists, so the bind is a compare-and-swap on the
+   generation: it fails, the log says `generation changed mid-flight`, and the document becomes
+   work for the newer index. Without that fence a live reference would point at an integer that
+   now names different content — a wrong document behind a row that resolves, which is the one
+   failure a rebuild must not produce.
+
+**It does not refill the legacy `ocr` queue.** With `PAPRA_INDEX_CONTENT_DELIVERY` off, ordinary
+intake also enqueues a legacy OCR job so Papra's `content` keeps a writer; the rebuild asks for
+the index job alone, because re-enrolling a corpus would otherwise order one paid VLM extraction
+per document in order to rewrite a column Papra already holds. If the point really is to run the
+suite's own extraction over the corpus, that is `papra-suite backfill` (Task 15), which says so in
+its own `--dry-run`.
+
+**What stays `unledgered` afterwards, and why.** `--reindex-all` prints these buckets rather than
+leaving them inside a bare count, because each one needs a different sentence:
+
+- **in Papra's trash** — the deletion pass owns those references; enrolling one would be
+  resurrecting a document the user threw away.
+- **not a PDF** — the index is PDF-only, by the same rule that makes the sweep skip them. An
+  emailed JPEG stays outside the index for good, and `unledgered` will keep counting it.
+- **over the size limit** — refused on the size Papra declared, without downloading the body, so a
+  400 MB scan does not become the reason a rebuild ran out of memory. These are also permanent: a
+  re-index does not make a document smaller.
+- **Papra would not describe it right now** — a 5xx or a timeout, counted separately and the only
+  bucket that is an instruction to run the command again.
+
+The fourth bucket is the only one that can be fixed by re-running. The first three are the honest
+floor of the number, and the structural limit above (documents this suite never listed) is not in
+the count at all.
+
+Two other ledger commands, both ledger-only or debt-shaped enough to belong here:
+
+- `papra-suite ledger --cleanup` settles deletes in `cleanup_state: failed`, which no automatic
+  pass will look at again because a permanently failed intent is not due. Each row is re-queued
+  with **the Kreuzakt id and generation it was originally queued under** — never the current
+  generation, which after a rebuild would turn an id from a destroyed index into permission to
+  delete whatever holds that number now — and its attempt allowance refilled, which is the part
+  only an operator can decide. Then one cleanup pass runs and revalidates as it always does, so a
+  stale-generation intent is reported and settled as a recorded skip rather than re-armed.
+- `papra-suite ledger --clear-marks` clears `index_marks_rolling`, the rolling counter that can
+  hold deletion marking for a day after a listing nobody has confirmed. It prints the value it is
+  clearing and requires `--yes-i-mean-it`, and the clear is a compare-and-swap: if a pass rewrote
+  the counter while this command was running, it refuses and says the value moved. Like
+  `metadata --restore-auto` it reads neither service, so it works in the middle of the incident it
+  is for.
+
+**Measure the rebuild, do not decorate it.** No duration is recorded here because none has been
+measured on a real corpus, and a runbook with an invented time in it is worse than none. On the
+first rebuild of a real deployment, write down: wall-clock from `--reindex-all` returning to
+`stale: 0` in `ledger --status` with the `index` queue empty; the peak `extraction empty` count in
+that output
+(that is Kreuzakt answering "no text" for documents it accepted, and it is the number that says
+whether the corpus is worth indexing at all); and the count in each `left out of the index on
+purpose` bucket, so the next rebuild has something to compare against.

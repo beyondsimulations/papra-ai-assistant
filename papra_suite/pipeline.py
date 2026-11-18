@@ -968,7 +968,8 @@ def enqueue_ocr_job(store: Store, *, papra_org_id: str, document_id: str,
 
 
 def enqueue_index_job(store: Store, *, papra_org_id: str, document_id: str,
-                      file_hash: str, name: str, mime: str, ingested_via: str) -> str:
+                      file_hash: str, name: str, mime: str, ingested_via: str,
+                      legacy_ocr: bool = True) -> str:
     """Enqueue index work for one ingested document. Returns "" for a non-PDF.
 
     Three writes, in this order, because each crash has to leave something the
@@ -997,6 +998,17 @@ def enqueue_index_job(store: Store, *, papra_org_id: str, document_id: str,
     what makes the two handovers genuinely independent. `legacy_workers` retires the `ocr`
     enqueue earlier still, because a queue the drained workers are no longer claiming still
     has to stop being filled for a drain to be provable.
+
+    `legacy_ocr=False` asks for the index job alone, and one caller has reason to: Task 11's
+    rebuild. Before migration 004 a full re-index could not refill that queue because the spent
+    `ocr` rows absorbed the insert; now that they are history, re-enrolling a corpus would order
+    one paid VLM extraction per document to rewrite a Papra column Papra already holds. It stops
+    that enqueue and nothing else — the reference, the index job and the seen record are still
+    written in the same order, because the seen record is what keeps the sweep from arriving
+    later and enqueueing the legacy job this caller was refusing. Nothing else may pass False:
+    the intake paths (sweep, watch, mail, restore) all still need the legacy writer running while
+    the delivery gate is shut, and a default of `False` would silently leave Papra's `content`
+    with no writer.
     """
     if mime != "application/pdf":
         return ""
@@ -1011,7 +1023,8 @@ def enqueue_index_job(store: Store, *, papra_org_id: str, document_id: str,
         content_hash=file_hash,
         payload={"file_hash": file_hash, "name": name},
     )
-    if not store.settings_flag("index_content_delivery") and legacy_writers_enabled(store):
+    if legacy_ocr and not store.settings_flag("index_content_delivery") \
+            and legacy_writers_enabled(store):
         store.enqueue_job(
             kind="ocr", papra_org_id=papra_org_id, document_id=document_id,
             content_hash=file_hash, payload={"file_hash": file_hash, "name": name},

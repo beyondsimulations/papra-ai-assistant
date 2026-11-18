@@ -821,5 +821,10 @@ def test_check_prints_the_marks_counter_the_walk_gate_and_the_probe_queue(monkey
 
     assert "marks this window: 34" in out, "the counter that can stop the pass is invisible"
     assert indexing.MARKS_ROLLING_SETTING in out, "check must name the row to clear"
+    # ...and the subcommand that clears it, because the plan's rule for both operator resets is
+    # "subcommands, not SQL": a line that ends at the row name is an invitation to edit a table
+    # four writers depend on, and the row name is only there so the sentence is checkable.
+    assert "papra-suite ledger --clear-marks" in out, \
+        "check names the state but not the command that clears it"
     assert "gated until" in out, "a skipped pass read as a pass that just ran"
     assert "probe re-reads: 3" in out
