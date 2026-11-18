@@ -308,6 +308,12 @@ class FakeKreuzakt:
     async def get_document(self, document_id: int):
         return await self.client.get_document(document_id)
 
+    async def delete_document(self, document_id: int) -> None:
+        # Task 9's cleanup pass runs through the real client too, so the measured
+        # rule it depends on — a 404 on a DELETE is the wanted end state, not a
+        # failure — is the client's behaviour and not the fake's.
+        await self.client.delete_document(document_id)
+
     async def retry_queue(self, entry_id: int) -> None:
         await self.client.retry_queue(entry_id)
 

@@ -37,7 +37,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from papra_suite.kreuzakt_client import (
     AmbiguousCorrelation,
@@ -47,12 +47,30 @@ from papra_suite.kreuzakt_client import (
 )
 from papra_suite.papra_client import PapraError
 from papra_suite.store import (
+    CLEANUP_MAX_ATTEMPTS as CLEANUP_MAX_ATTEMPTS,
+)
+from papra_suite.store import (
     EMPTY_EXTRACTION_SHA,
     PROTECTION_FIELDS,
     Job,
     LedgerRef,
     Store,
+    _iso,
+    _require_store_utc_iso,
 )
+from papra_suite.store import (
+    _now as _store_now,
+)
+
+# Two names come in through the door marked private, and both because a second definition of
+# the same rule would be the bug rather than a shortcut. The timestamp form is compared as
+# *text* inside the ledger, so code that schedules a backoff has to produce and validate it
+# with the store's own helpers or a `Z` suffix silently reschedules a delete.
+# `CLEANUP_MAX_ATTEMPTS` is re-exported under the `import X as X` convention — that spelling
+# is how a name declares itself part of this module's surface rather than a forgotten import:
+# the ceiling lives in the store, which is what enforces it, but it belongs to the retry shape
+# `CLEANUP_BACKOFF_S` below also describes, and restating a number in two places is how a
+# configured 5 becomes a realised 3.
 
 logger = logging.getLogger(__name__)
 
@@ -350,10 +368,10 @@ def papra_document_is_deleted(document: dict) -> bool:
     One definition, used by the index job, the vanished-row branch, the convergence pass
     and the writer itself, because the consequence of the two readings disagreeing is a
     write into a document the user deleted: Papra resurrects it when the column changes,
-    so a "helpful" repair un-deletes something on purpose. Nothing on this branch sets the
-    ledger's own `deleted_at` — Task 9 owns `reconcile_deletions` — so for every
-    soft-deleted Papra document the ledger still considers live, the writer is the only
-    thing standing between the pass and the trash.
+    so a "helpful" repair un-deletes something on purpose. `reconcile_deletions` is what
+    sets the ledger's own `deleted_at`, and it asks this question (or Papra's 404) before it
+    does — so for every soft-deleted Papra document the ledger still considers live, the
+    writer is the only thing standing between the pass and the trash.
     """
     return bool(document.get("isDeleted") or document.get("deletedAt"))
 
@@ -1398,3 +1416,858 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
                           f"{max_recovery_actions} recovery actions with no recorded "
                           "reason")
     raise reason
+
+
+# --- delete and restore propagation ------------------------------------------------
+#
+# Task 9: Papra's trash, propagating one way. The rules below exist because the mistake
+# available here is not a wrong count — it is a document the user kept losing its index
+# entry, or a document the user deleted leaving its text in the index forever. So the pass
+# reads everything before it writes anything, treats absence as the weakest signal it is
+# given, and never destroys anything itself.
+#
+# The trust predicate for a listing, spelled out because it is the difference between
+# pruning one reference and pruning the index. A bucket's listing is untrustworthy, and the
+# whole pass is discarded, when:
+#
+#   1. `list_documents` raises at all — a paging error, a 5xx, a timeout, a transport failure.
+#      An error is not an empty bucket.
+#   2. A page contains a row that is not a document, or a document with no usable id. That is
+#      a proxy, a login redirect or an error body wearing a 200.
+#   3. The same document id is answered two different ways inside one walk. Pages shift under
+#      a live listing, so a duplicate is ordinary; a duplicate that contradicts itself means
+#      neither answer can be believed.
+#   4. The walk ends with fewer rows than the endpoint's own total. The walk is only
+#      exhaustive if the server agrees it was exhaustive; a truncated page read as a finished
+#      walk is what "everything after row two was deleted" looks like from in here.
+#   5. The listing answers empty for a bucket the ledger holds references for. This is a
+#      circuit breaker, not a proof: the last document of a bucket genuinely can be purged,
+#      and then propagation for that bucket stops until an operator looks at it. The trade is
+#      deliberate, because "empty" is also exactly what a broken listing looks like, and the
+#      cost of being wrong in that direction is every reference in the corpus.
+#   6. The walk reaches `MAX_LISTING_PAGES_PER_ORG` without ever going short. An endpoint that
+#      ignores `pageIndex` must not be walked into a mass deletion.
+#
+# And even a trustworthy listing only *proposes* candidates. Nothing is marked until Papra's
+# own detail endpoint confirms that individual document — `deleted` or a genuine 404 — so one
+# stale page, a partial listing or a correlated endpoint failure cannot delete by itself. What
+# that trust is worth is stated where it is used: it rests on Papra's 404 meaning "this
+# document does not exist", which is measured behaviour of the pinned container but is still
+# Papra's answer and not a fact we can verify.
+
+#: How many references one pass may mark deleted. A mass deletion is either a user emptying a
+#: bucket or a listing that has stopped being trustworthy, and this number is the only thing
+#: that decides which one becomes real downstream. It bounds the damage per pass, NOT in
+#: total: a persistent fault still drains the corpus at this rate, pass after pass, which is
+#: why every mark also needs Papra's own detail confirmation and the aborts above.
+MAX_DELETIONS_PER_PASS = 20
+#: How many candidates one pass may put a question to Papra about. Deliberately larger than
+#: the cap above and separately counted: a candidate Papra's detail read refuses is not a
+#: deletion, and if the two shared one budget a handful of unreachable documents could hold
+#: every deletion behind them.
+MAX_CANDIDATE_PROBES = 50
+#: Page size of the listing walk, and how far that walk may go before it is treated as a
+#: broken endpoint rather than a large bucket.
+LISTING_PAGE_SIZE = 100
+MAX_LISTING_PAGES_PER_ORG = 100
+#: How often the index is asked whether the documents our bindings name still exist. One full
+#: read costs a GET per distinct Kreuzakt id — the same profile as `verify_once` — so it runs
+#: on the scale of hours, which is the scale on which the state it looks for changes.
+LIVENESS_PROBE_INTERVAL_S = 21600
+#: How long a queued upstream delete waits between attempts, and how many it gets. The
+#: attempts ceiling is the store's (`CLEANUP_MAX_ATTEMPTS`); the interval is this pass's
+#: because it owns the schedule it writes into `cleanup_next_at`.
+CLEANUP_BACKOFF_S = 300
+#: Rows one cleanup pass drains, so a backlog cannot monopolise the sweep.
+CLEANUP_DUE_LIMIT = 50
+#: Settings keys. The probe stamp and the candidate cursor are pass state that has to
+#: outlive the pass; the last-pass summary is what `check` prints.
+LIVENESS_PROBE_STAMP_SETTING = "index_liveness_probe_at"
+DELETION_CURSOR_SETTING = "index_deletion_cursor"
+LAST_DELETION_PASS_SETTING = "index_last_deletion_pass"
+
+#: What Papra's detail read said about one candidate. `GONE` is a 404 — Papra hard-deletes, so
+#: absence from a listing plus a 404 for that specific id is the record's own answer.
+DELETED_THERE = "deleted"
+GONE = "gone"
+LIVE_THERE = "live"
+
+
+# --- delete and restore propagation ------------------------------------------------
+#
+# Task 9: Papra's trash, propagating one way. The mistake available here is not a wrong
+# count — it is a document the user kept losing its index entry, or a document the user
+# deleted leaving its text in the index forever. So this pass reads everything before it
+# writes anything, treats absence as the weakest signal it is given, and never destroys
+# anything itself: `reconcile_deletions` marks and queues, `run_cleanup` executes.
+#
+# The trust predicate for a listing, spelled out because it is the difference between
+# pruning one reference and pruning the index. A bucket's listing is untrustworthy, and the
+# whole pass is discarded, when:
+#
+#   1. `list_documents` raises at all — a paging error, a 5xx, a timeout, a transport
+#      failure. An error is not an empty bucket.
+#   2. A page contains a row that is not a document, or a document with no usable id. That
+#      is a proxy, a login redirect, or an error body wearing a 200.
+#   3. The same document id is answered two different ways inside one walk. Pages shift
+#      under a live listing, so a duplicate is ordinary; a duplicate that contradicts
+#      itself means neither answer can be believed.
+#   4. The walk ends with fewer rows than the endpoint's own total. The walk is only
+#      exhaustive if the server agrees it was; a truncated page read as a finished walk is
+#      what "everything after row two was deleted" looks like from in here.
+#   5. The listing answers empty for a bucket the ledger holds references for. This is a
+#      circuit breaker, not a proof: the last document of a bucket genuinely can be purged,
+#      and then propagation for that bucket stops until an operator looks. Deliberate,
+#      because "empty" is also exactly what a broken listing looks like, and being wrong in
+#      that direction costs every reference in the corpus.
+#   6. The walk reaches `MAX_LISTING_PAGES_PER_ORG` without ever going short. An endpoint
+#      that ignores `pageIndex` must not be walked into a mass deletion.
+#
+# And even a trustworthy listing only *proposes* candidates. Nothing is marked until Papra's
+# own detail endpoint confirms that individual document — deleted, or a genuine 404 — so a
+# stale page, a partial listing or a correlated endpoint failure cannot delete by itself. What
+# that trust is worth is stated where it is used: it rests on Papra's 404 meaning "this
+# document does not exist", which is measured behaviour of the pinned container but is still
+# Papra's answer and not a fact we can verify from here.
+
+#: How many references one pass may mark deleted. A mass deletion is either a user emptying a
+#: bucket or a listing that has stopped being trustworthy, and this number is the only thing
+#: that decides which one becomes real downstream. It bounds the damage per pass, NOT in
+#: total: a persistent fault still drains the corpus at this rate, pass after pass, which is
+#: why every mark also needs Papra's own detail confirmation and the aborts above.
+MAX_DELETIONS_PER_PASS = 20
+#: How many candidates one pass may put a question to Papra about. Deliberately larger than
+#: the cap above, and counted separately: a candidate Papra's detail read refuses is not a
+#: deletion, and if the two shared one budget a handful of unreachable documents could hold
+#: every deletion behind them.
+MAX_CANDIDATE_PROBES = 50
+#: Page size of the listing walk, and how far that walk may go before it is treated as a
+#: broken endpoint rather than a large bucket.
+LISTING_PAGE_SIZE = 100
+MAX_LISTING_PAGES_PER_ORG = 100
+#: How often the index is asked whether the documents our bindings name still exist. One full
+#: read costs a GET per distinct Kreuzakt id — the same profile as `verify_once` — so it runs
+#: on the scale of hours, which is the scale on which the state it looks for changes.
+LIVENESS_PROBE_INTERVAL_S = 21600
+#: How long a queued upstream delete waits between attempts, and how many rows one pass
+#: drains. The attempt ceiling is the store's (`CLEANUP_MAX_ATTEMPTS`, imported at the top of
+#: this module rather than restated, because `ledger_cleanup_result` is what enforces it); the
+#: interval is this pass's, because this pass owns the schedule it writes into
+#: `cleanup_next_at`. Two definitions of one ceiling is how a configured 5 becomes a realised
+#: 3, which is the mistake the index job already had to fix.
+CLEANUP_BACKOFF_S = 300
+CLEANUP_DUE_LIMIT = 50
+#: Settings keys. The probe stamp and the candidate cursor are pass state that has to outlive
+#: the pass; the last-pass summary is the line `check` prints.
+LIVENESS_PROBE_STAMP_SETTING = "index_liveness_probe_at"
+DELETION_CURSOR_SETTING = "index_deletion_cursor"
+LAST_DELETION_PASS_SETTING = "index_last_deletion_pass"
+
+#: What Papra's detail read said about one candidate. `GONE` is a 404: Papra hard-deletes, so
+#: absence from a listing plus a 404 for that specific id is the record's own answer.
+DELETED_THERE = "deleted"
+GONE = "gone"
+LIVE_THERE = "live"
+
+
+@dataclass(frozen=True)
+class DeletionResult:
+    """What one delete/restore pass did, counted in references.
+
+    `aborted` and `capped` are not metrics, they are alarms, and neither may be silent: a
+    pass that refused to touch anything for a week and a pass that deleted twenty of five
+    hundred documents both look like a quiet corpus from the ledger alone. So the sweep logs
+    them at ERROR and `check` prints the last pass's outcome, which is why this pass stamps
+    its result into `settings` instead of only returning it.
+
+    Three fields carry meanings worth stating rather than assuming:
+
+    * `upstream_pending` is the durable queue — the intent written, nothing destroyed. The
+      marking pass never deletes anything itself; `run_cleanup` does, after revalidating.
+    * `upstream_deleted` counts the references whose upstream end state this pass settled
+      *without* a delete call: the index no longer has that document at all, so the debt is
+      paid rather than owed. Without that check the intent would fail five times against a
+      404 and land in `failed`, which reads as an outage and is nothing of the sort.
+    * `stale_bindings` is the `(-1, -1)` answer from `ledger_mark_deleted` counted as its own
+      outcome. A reference bound to a superseded index is still marked deleted — the
+      reference is gone whatever index it pointed at — but it queues nothing, and a corpus
+      full of those has to be visible as itself rather than as a corpus with nothing to do.
+    """
+
+    refs_marked: int = 0
+    upstream_deleted: int = 0
+    upstream_pending: int = 0
+    restored: int = 0
+    aborted: bool = False
+    capped: int = 0
+    stale_bindings: int = 0
+
+
+@dataclass(frozen=True)
+class CleanupResult:
+    """What one cleanup pass did, with one arithmetic identity pinned by a test.
+
+    `attempted` is every queued intent the pass took off the due list and judged — not the
+    calls it made — because the number an operator needs is "how much of the debt did this
+    pass handle", and a pass that refused forty of them is not a pass that did nothing. Then
+    `attempted == deleted + deferred + failed`, exactly one bucket per intent, so a fourth
+    outcome cannot arrive without breaking the identity.
+
+    `deferred` is "we looked, and we did not delete": the reference is no longer deleted, the
+    generation moved, the intent names no id, a live reference still resolves to it, or the
+    index was not answering and the pass stopped rather than spend anyone's retries. Most of
+    those are terminal for the row (`skipped`), and each writes its own INFO line, so the
+    count never stands in for the reason.
+    """
+
+    attempted: int = 0
+    deleted: int = 0
+    deferred: int = 0
+    failed: int = 0
+
+
+class _ListingUntrusted(Exception):
+    """One bucket's listing did not answer in a shape absence may be read from.
+
+    Private and never surfaced: the caller's contract is `aborted=True` plus one ERROR line
+    naming the bucket and the page, which is what an operator acts on.
+    """
+
+    def __init__(self, message: str, *, org_id: str, page: int) -> None:
+        super().__init__(f"{message} (org={org_id} page={page})")
+        self.message = message
+        self.org_id = org_id
+        self.page = page
+
+
+def _shift(now: str, *, seconds: int) -> str:
+    """`now` plus a delay, rendered in the store's own text form.
+
+    Every timestamp this module writes is compared as *text* inside the ledger —
+    `cleanup_next_at <= now` — which is chronological only while every stored value carries the
+    same zero offset. So a delay is computed on parsed values and rendered with the store's own
+    formatter rather than a local `strftime`: a `Z` suffix sorts after every offset, a naive
+    value is silently hours away from what it means, and the only symptom is a delete that fired
+    early or a row that never came due. The write boundary validates as well
+    (`_require_store_utc_iso`, reached through `ledger_cleanup_result`), because a guard nobody
+    can see is a guard that gets stepped on.
+    """
+    return _iso(datetime.fromisoformat(now) + timedelta(seconds=seconds))
+
+
+def _stamp_expired(stamp: str | None, *, interval_s: int, now: str) -> bool:
+    """Has the last full probe fallen out of its interval?
+
+    A corrupt stamp counts as expired. It is a schedule rather than a record: the cost of
+    doubting it is one extra read of the index, while the cost of trusting garbage is a corpus
+    whose dead bindings nobody ever re-checks.
+    """
+    if not stamp:
+        return True
+    try:
+        return _shift(stamp, seconds=interval_s) <= now
+    except (TypeError, ValueError):
+        return True
+
+
+async def _walk_listing(papra, org_id: str, *, expected_refs: int) -> dict[str, bool]:
+    """Every document Papra lists for one bucket, as `{document_id: deleted_there}`.
+
+    Raises `_ListingUntrusted` for any of the six conditions named at the top of this
+    section; the caller drops the whole pass on one. The return value is the only place the
+    walk's verdict exists, and it is deliberately a *complete* set of ids: a document missing
+    from the dict is what the caller reads as "Papra did not list this one", which is a
+    candidate, and it must not be confusable with "the walk never got this far" — that case
+    does not return.
+
+    `expected_refs` is what the ledger holds for this bucket, and it is what makes an empty
+    answer suspicious rather than merely surprising. It counts every reference, deleted ones
+    included, because the question is not "is there work here" but "could this bucket really
+    be empty" — and the answer to that is no while the ledger still carries rows for it.
+    """
+    listed: dict[str, bool] = {}
+    rows_seen = 0
+    reported: int | None = None
+    page_index = 0
+    while True:
+        try:
+            documents, count = await papra.list_documents(
+                org_id, page_index=page_index, page_size=LISTING_PAGE_SIZE,
+                sort_field="createdAt", sort_order="desc")
+        except Exception as error:
+            raise _ListingUntrusted(
+                f"listing failed: {type(error).__name__}: {error}",
+                org_id=org_id, page=page_index) from error
+        rows = list(documents or ())
+        rows_seen += len(rows)
+        if isinstance(count, int):
+            reported = count
+        for document in rows:
+            if not isinstance(document, dict):
+                raise _ListingUntrusted(
+                    f"a listing row is {type(document).__name__}, not a document",
+                    org_id=org_id, page=page_index)
+            document_id = document.get("id")
+            if not isinstance(document_id, str) or not document_id:
+                raise _ListingUntrusted(
+                    f"a listing row carries no usable id: {document_id!r}",
+                    org_id=org_id, page=page_index)
+            deleted_there = papra_document_is_deleted(document)
+            if document_id in listed and listed[document_id] != deleted_there:
+                raise _ListingUntrusted(
+                    f"document {document_id} answered "
+                    f"{'deleted' if deleted_there else 'live'} after answering "
+                    f"{'deleted' if listed[document_id] else 'live'}",
+                    org_id=org_id, page=page_index)
+            listed[document_id] = deleted_there
+        if len(rows) < LISTING_PAGE_SIZE:
+            break
+        page_index += 1
+        if page_index >= MAX_LISTING_PAGES_PER_ORG:
+            raise _ListingUntrusted(
+                f"{MAX_LISTING_PAGES_PER_ORG} pages in a row came back full, so the endpoint "
+                "is not paging", org_id=org_id, page=page_index)
+    if reported is not None and rows_seen < reported:
+        raise _ListingUntrusted(
+            f"the endpoint reported {reported} documents and served {rows_seen}",
+            org_id=org_id, page=page_index)
+    if not listed and expected_refs:
+        raise _ListingUntrusted(
+            f"the listing answered empty while the ledger holds {expected_refs} "
+            "reference(s) for this bucket", org_id=org_id, page=0)
+    return listed
+
+
+async def _ask_papra(papra, org_id: str, document_id: str) -> str | None:
+    """Ask Papra's detail endpoint about one candidate. `None` means it did not answer.
+
+    This is the second and stronger question behind the listing, and it is the only thing that
+    turns a candidate into a mark. `GONE` is a 404 *for this document id*, which is Papra
+    saying it has never heard of the one record we are asking about — a different kind of
+    answer from a listing that did not include it, because a broken listing stops listing
+    everything while a 404 is about exactly one thing. Any other failure answers `None`, and
+    `None` marks nothing: a document whose detail will not load is a document nothing is known
+    about, and an outage on the read side must not be spent as evidence of a deletion.
+    """
+    try:
+        document = await papra.get_document(org_id, document_id)
+    except PapraError as error:
+        if error.status == 404:
+            return GONE
+        logger.warning("deletion candidate papra=%s/%s could not be read: %s",
+                       org_id, document_id, error)
+        return None
+    except Exception as error:
+        logger.warning("deletion candidate papra=%s/%s could not be read: %s: %s",
+                       org_id, document_id, type(error).__name__, error)
+        return None
+    return DELETED_THERE if papra_document_is_deleted(document) else LIVE_THERE
+
+
+def _rotate(candidates: list[tuple[str, str]], store) -> list[tuple[str, str]]:
+    """The next `MAX_CANDIDATE_PROBES` candidates, starting where the last pass stopped.
+
+    Rotation is not a nicety. A candidate that will not confirm — its detail read errors, or
+    Papra says live while the listing said trash — stays a candidate on the next pass too, so
+    a fixed window anchored at the start of the sorted list probes the same refusals forever
+    and never reaches the documents behind them. The pass would report `refs_marked=0` every
+    pass and look exactly like a corpus with nothing to do.
+
+    The cursor is modulo the list, so it stays valid when the candidate set shrinks (a mark
+    takes a candidate out of the population) and when it grows. It is pass state in the
+    settings table rather than a local, because the pass runs once per sweep in a process
+    expected to restart.
+    """
+    if not candidates:
+        store.set_setting(DELETION_CURSOR_SETTING, "0")
+        return []
+    try:
+        start = int(store.get_setting(DELETION_CURSOR_SETTING) or "0")
+    except ValueError:
+        start = 0                      # a corrupt cursor must not wedge the pass
+    start %= len(candidates)
+    ordered = candidates[start:] + candidates[:start]
+    window = ordered[:MAX_CANDIDATE_PROBES]
+    store.set_setting(DELETION_CURSOR_SETTING,
+                      str((start + len(window)) % len(candidates)))
+    return window
+
+
+async def _index_lacks_document(kz, kreuzakt_id: int) -> bool | None:
+    """Does the index answer 404 for this document? `None` means it did not answer at all.
+
+    Three answers, not two, because the difference between "the index has forgotten it" and
+    "the index is down" is the difference between a repair and a corpus of wrongly dropped
+    bindings. A caller that treats `None` as `True` would unbind every reference in the
+    ledger during an outage, and unbinding is the expensive mistake: it makes a live document
+    unfindable, and its rows become backlog that has to be re-uploaded to be found again.
+    """
+    try:
+        document = await kz.get_document(kreuzakt_id)
+    except KreuzaktError as error:
+        if error.status == 404:
+            return True
+        logger.warning("kreuzakt=%s could not be read: %s", kreuzakt_id, error)
+        return None
+    except Exception as error:
+        logger.warning("kreuzakt=%s could not be read: %s: %s",
+                       kreuzakt_id, type(error).__name__, error)
+        return None
+    return document is None
+
+
+def _readmit_index_job(store: Store, ref: LedgerRef, *, reason: str) -> None:
+    """Ask for this document to be indexed again, and mean it.
+
+    The trap is in the queue, not here: `enqueue_job` is `INSERT OR IGNORE` against a unique
+    idempotency index, so an already-`failed` row for these bytes makes every re-enqueue a
+    silent no-op that returns the old id — pinned in
+    `tests/test_metadata_delivery.py::test_a_permanently_failed_index_row_makes_the_next_enqueue_a_noop`.
+    A restore or an unbind that only called `enqueue_job` would therefore report success and
+    change nothing, and the document would stay missing from search while the log said it was
+    being indexed. So the pass reads the row back and resets it when it is spent: that is the
+    only way this call can honestly be called a re-admission.
+
+    The durable fix is Task 11's partial unique index (unique only over rows that can still
+    run), after which a terminal row stops shadowing a fresh request and this reset becomes
+    redundant rather than load-bearing. Until then it is the mechanism, and it logs, because
+    "we reset a job the queue had given up on" is the sentence that explains a document that
+    came back. `worker_loop` already shouts about this trap when a job dies; resetting it here
+    is the automated counterpart of the `jobs --reset` that message tells an operator to run.
+
+    It does not check whether the row is *eligible* — `ledger_needs_index` is the eligibility
+    rule, and it is the caller's job to have made the row eligible first (an unbound row, or a
+    binding that is not current). A spurious extra index job costs one idempotent upload; a
+    missing one costs a document that is never found.
+    """
+    job_id = store.enqueue_job(
+        kind="index", papra_org_id=ref.papra_org_id, document_id=ref.papra_document_id,
+        content_hash=ref.file_hash,
+        payload={"file_hash": ref.file_hash, "name": ref.papra_original_name or "",
+                 "ingested_via": reason})
+    job = store.get_job(job_id)
+    if job is not None and job.status in ("failed", "done"):
+        store.reset_job(job_id)
+        logger.info(
+            "re-admitted index job %s for papra=%s/%s (%s): the queue's idempotency index "
+            "had it pinned as %s, so a plain enqueue would have been a no-op",
+            job_id, ref.papra_org_id, ref.papra_document_id, reason, job.status)
+
+
+async def _apply_mark(store: Store, kz, ref: LedgerRef, *,
+                      generation: int) -> str:
+    """Mark one reference deleted, queue the upstream delete if nothing else needs it.
+
+    Returns `queued` | `closed` | `shared` | `unbound` | `stale`, which is the same
+    distinction `DeletionResult` counts — with `shared` and `unbound` deliberately counted
+    nowhere, because "a sibling still needs this document" and "this was never indexed" are
+    both ordinary outcomes of an ordinary corpus, and a counter that includes them cannot be
+    the alarm the two real anomalies need.
+
+    The order is the point, and it is an order the store forces: `ledger_mark_deleted`
+    soft-deletes the row and counts the surviving references in one immediate transaction, so
+    the number below is the count *at the moment the row became deleted* rather than a number
+    read a statement earlier. It is also only the queue-side half of the guard — the cleanup
+    pass takes the count again before it destroys anything, because a queued intent is a claim
+    about the future and a reference that comes back between the two is right and the intent
+    is wrong.
+
+    Nothing is deleted here. The last reference's intent goes into `cleanup_state`, and
+    `run_cleanup` performs it, so a crash between the two leaves a debt the next process can
+    see.
+    """
+    kreuzakt_id, remaining = store.ledger_mark_deleted(
+        papra_org_id=ref.papra_org_id, papra_document_id=ref.papra_document_id)
+    if ref.kreuzakt_id is None:
+        # Never indexed, so nothing upstream was ever created for it. The mark is the whole
+        # story — and it is not an anomaly. A corpus with many never-indexed documents is
+        # backlog, not damage, and warning about each one would bury the case below, which is.
+        logger.info("marked papra=%s/%s deleted with no binding: never indexed, so nothing is "
+                    "owed upstream", ref.papra_org_id, ref.papra_document_id)
+        return "unbound"
+    if kreuzakt_id is None or kreuzakt_id <= 0:
+        # Bound, but under an index that no longer exists: `mark_deleted` answered `(-1, -1)`
+        # for a row that carries an id. The row still got its `deleted_at` — the reference is
+        # gone either way — it just queues nothing, because a stale integer names no document
+        # we may destroy, and the same number may belong to different content now. The row as
+        # it was read before the mark is the only place the two histories differ, so the
+        # distinction is taken there and counted separately.
+        logger.warning(
+            "marked papra=%s/%s deleted with a stale binding to a superseded generation: "
+            "nothing queued, because that integer names nothing we may destroy",
+            ref.papra_org_id, ref.papra_document_id)
+        return "stale"
+    outcome = "shared"
+    if remaining == 0:
+        # The last live reference of the current generation. Ask the index whether the
+        # document is even still there before booking the debt: if it is gone, the intent
+        # would fail five times against a 404 and land in `failed`, which reads as an outage.
+        gone = await _index_lacks_document(kz, kreuzakt_id)
+        store.ledger_queue_cleanup(papra_org_id=ref.papra_org_id,
+                                   papra_document_id=ref.papra_document_id,
+                                   due_at=_store_now(), kreuzakt_id=kreuzakt_id,
+                                   generation=generation)
+        if gone is True:
+            store.ledger_cleanup_result(papra_org_id=ref.papra_org_id,
+                                        papra_document_id=ref.papra_document_id, ok=True)
+            outcome = "closed"
+        else:
+            outcome = "queued"
+    # Stop the dead reference occupying the id. Scoped to this row: a sibling in another
+    # bucket may still be live and still needs the binding, and clearing it would unfind a
+    # document nobody deleted.
+    store.ledger_unbind(
+        expected_kreuzakt_id=kreuzakt_id, generation=generation,
+        reason=f"papra deleted {ref.papra_org_id}/{ref.papra_document_id}",
+        papra_org_id=ref.papra_org_id, papra_document_id=ref.papra_document_id)
+    return outcome
+
+
+def _apply_restore(store: Store, ref: LedgerRef) -> None:
+    """Bring one reference back, and refuse to assume the index still holds it.
+
+    `ledger_mark_restored` clears `deleted_at` and nothing else, which is correct as far as it
+    goes — a restore is not a human edit, so it sets no protection, and it leaves a queued
+    upstream delete for the cleanup pass to revalidate and skip rather than rewriting the
+    state machine from here. On its own it is not enough, for two reasons this pass has to
+    finish:
+
+    * **The binding cannot be trusted.** If the cleanup pass already deleted the document, the
+      row is bound to an id that answers 404, and — because the row is live again — it now
+      *resolves*, so every token that matches hands out a Kreuzakt document that does not
+      exist. That is worse than the row being missing, and it is the state Task 9 exists to
+      escape. Deciding per-row whether the upstream delete actually ran would mean reading
+      `cleanup_state` and trusting it to describe Kreuzakt; instead the binding is dropped
+      unconditionally and the work is re-admitted. The cost when the document survived is one
+      idempotent re-upload, because Kreuzakt deduplicates identical bytes; the cost when it
+      did not is a permanently broken hit.
+    * **Nothing will ask for the work again.** So the row is made eligible (unbound) and the
+      index job is re-admitted, reset if the queue had pinned it as spent.
+
+    A row that was bound under a superseded generation is unbound the same way: its binding is
+    already meaningless, and dropping it is what makes the row visible to this generation's
+    passes instead of invisible to all of them.
+    """
+    store.ledger_mark_restored(papra_org_id=ref.papra_org_id,
+                               papra_document_id=ref.papra_document_id)
+    after = store.ledger_get(ref.papra_org_id, ref.papra_document_id)
+    if after is None:
+        return
+    if after.kreuzakt_id is not None:
+        store.ledger_unbind(
+            expected_kreuzakt_id=after.kreuzakt_id,
+            generation=after.delivered_generation if after.delivered_generation is not None
+            else store.get_generation(),
+            reason="restored in papra: the index entry cannot be assumed to have survived "
+                   "the trash",
+            papra_org_id=after.papra_org_id, papra_document_id=after.papra_document_id)
+    _readmit_index_job(store, after, reason="restored in papra")
+
+
+async def probe_index_liveness(store: Store, kz, generation: int) -> int:
+    """Ask the index whether the documents our bindings still name; drop the ones that do not.
+
+    Returns documents read, and runs at most once per `LIVENESS_PROBE_INTERVAL_S` — the gate
+    is a stamp in `settings`, because this is a GET per distinct Kreuzakt id and the sweep that
+    calls it runs every few minutes. The state it looks for changes on the scale of hours, so a
+    tighter cadence buys nothing and would make this the most expensive thing in the process.
+
+    What it is for: Task 6 left a state pinned as a known limitation. A row can end up bound,
+    stamped as delivered under the *current* generation, with its index job permanently failed
+    because Kreuzakt answered 404 for the id. `ledger_needs_index` excludes exactly that
+    combination, so the sweep, a rebuild and a backfill all walk past it, and the row still
+    resolves — a search hit that leads nowhere, forever. Nothing in this codebase detects it,
+    because nothing else asks Kreuzakt about an id we already believe we delivered. This probe
+    is the detection, and the unbind plus `_readmit_index_job` are the recovery: unbound, the
+    row is eligible again, and the reset job is what makes "eligible" mean a worker will claim
+    it.
+
+    The verdict is a 404 and nothing else. `None` — the index not answering — leaves every
+    binding alone, and it also leaves the stamp unwritten, so the next pass tries again instead
+    of waiting out the interval on the strength of a walk that read nothing. Where a read
+    failed, the pass reports how many references it could not judge rather than reporting a
+    clean corpus.
+    """
+    now = _store_now()
+    stamp = store.get_setting(LIVENESS_PROBE_STAMP_SETTING)
+    if not _stamp_expired(stamp, interval_s=LIVENESS_PROBE_INTERVAL_S, now=now):
+        return 0
+    probed = 0
+    unbound = 0
+    unreadable = 0
+    seen: set[int] = set()
+    after: tuple[str, str] | None = None
+    while True:
+        refs = store.ledger_delivered_refs(generation=generation, after=after,
+                                           limit=VERIFY_PAGE_SIZE)
+        if not refs:
+            break
+        for ref in refs:
+            kreuzakt_id = ref.kreuzakt_id
+            if kreuzakt_id is None or kreuzakt_id in seen:
+                continue           # one document, however many references point at it
+            seen.add(kreuzakt_id)
+            verdict = await _index_lacks_document(kz, kreuzakt_id)
+            if verdict is None:
+                unreadable += 1
+                continue
+            probed += 1
+            if verdict is not True:
+                continue
+            # The verdict is about the document, so every reference to it follows: leaving one
+            # bound would leave it resolving to an id that answers 404.
+            affected = store.ledger_resolve([kreuzakt_id], generation=generation)
+            unbound += store.ledger_unbind(
+                expected_kreuzakt_id=kreuzakt_id, generation=generation,
+                reason=f"kreuzakt document {kreuzakt_id} answers 404 for a current binding")
+            for item in affected:
+                _readmit_index_job(store, item, reason="liveness probe found the document gone")
+        after = (refs[-1].papra_org_id, refs[-1].papra_document_id)
+        if len(refs) < VERIFY_PAGE_SIZE:
+            break
+    if not unreadable:
+        store.set_setting(LIVENESS_PROBE_STAMP_SETTING, now)
+    if unbound:
+        logger.warning(
+            "unbound %d reference(s) whose kreuzakt document answers 404 and re-admitted "
+            "their index work; they were resolving to nothing", unbound)
+    if unreadable:
+        logger.warning(
+            "liveness probe could not judge %d bound document(s) because kreuzakt did not "
+            "answer; no binding was dropped and the next pass will look again", unreadable)
+    return probed
+
+
+async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
+    """Propagate Papra's trash into the index, and restore back the other way.
+
+    Three phases, in this order, and the order is the safety property:
+
+    1. **Read every bucket.** Each one's listing is walked to exhaustion and judged against the
+       trust predicate at the top of this section. Any bucket that fails it discards the whole
+       pass — `aborted=True`, nothing written — because the pass's central inference is
+       *absence*, and an inference from absence is only as good as the completeness of the
+       listing it came from. Half a corpus's verdicts cannot be kept while the other half is
+       doubted: the marks that were already applied are the ones nobody questioned.
+    2. **Confirm each candidate individually.** A listing that is trustworthy enough to propose
+       is not evidence about one document, so each candidate is put to Papra's detail endpoint
+       (bounded by `MAX_CANDIDATE_PROBES`, rotated so refusals cannot starve the tail). Only
+       `deleted` or a 404 marks anything; a live answer vetoes the mark and, if the ledger was
+       already marked, becomes a restore.
+    3. **Then write.** Marks, restores, the liveness probe, and one summary stamp.
+       The probe is inside that ordering, so an aborted pass does not run it either: a pass
+       that could not read the record does not spend the interval on repair work, and the
+       stamp it leaves says `aborted` instead of recording a probe that never happened.
+
+    Candidates are the ledger compared against the listing in both directions: a live row whose
+    document Papra says is in the trash, a live row whose document Papra no longer lists at all
+    (a purge — the listing cannot prove it, so the 404 has to), and a deleted row whose
+    document Papra lists live again. Deleted rows are read from `ledger_org_refs`, the one walk
+    that hides no state: `ledger_resolve` hides the soft-deleted rows that are exactly the
+    restore population.
+
+    Nothing here destroys anything. `MAX_DELETIONS_PER_PASS` bounds how many references are
+    marked per pass, and the upstream delete waits for `run_cleanup`.
+    """
+    generation = store.get_generation()
+    counts = {"refs_marked": 0, "upstream_deleted": 0, "upstream_pending": 0,
+              "restored": 0, "capped": 0, "stale_bindings": 0}
+    proposed: list[tuple[str, str]] = []
+    for org_id in store.ledger_org_ids():
+        expected_refs = store.ledger_stats(org_ids=[org_id])["references"]
+        try:
+            listed = await _walk_listing(papra, org_id, expected_refs=expected_refs)
+        except _ListingUntrusted as error:
+            logger.error(
+                "listing untrustworthy, skipping deletion pass entirely org=%s page=%s: %s",
+                error.org_id, error.page, error.message)
+            store.set_setting(LAST_DELETION_PASS_SETTING,
+                              f"aborted: {error.org_id} page {error.page}: {error.message}")
+            return DeletionResult(aborted=True)
+        for ref in _walk_org_refs(store, org_id):
+            deleted_there = listed.get(ref.papra_document_id)
+            if ref.deleted_at is None and deleted_there is True:
+                proposed.append((org_id, ref.papra_document_id))
+            elif ref.deleted_at is None and deleted_there is None:
+                # Not listed: the strongest-looking absence in the whole pass, and the reason a
+                # detail read is mandatory. An id that stopped being listed is also what a
+                # broken listing, a filtered listing and a bucket rename all produce.
+                proposed.append((org_id, ref.papra_document_id))
+            elif ref.deleted_at is not None and deleted_there is False:
+                proposed.append((org_id, ref.papra_document_id))
+    marks: list[LedgerRef] = []
+    restores: list[LedgerRef] = []
+    for org_id, document_id in _rotate(sorted(proposed), store):
+        verdict = await _ask_papra(papra, org_id, document_id)
+        if verdict is None:
+            continue
+        ref = store.ledger_get(org_id, document_id)
+        if ref is None:
+            continue
+        if verdict in (DELETED_THERE, GONE):
+            if ref.deleted_at is None:
+                marks.append(ref)
+            continue
+        if ref.deleted_at is not None:
+            restores.append(ref)
+        else:
+            # The listing proposed a deletion and the document itself denies it. The live answer
+            # wins, loudly: this is the pair of Papra endpoints disagreeing about one record,
+            # and which one is stale decides whether a document keeps its index entry.
+            logger.warning(
+                "deletion candidate papra=%s/%s refused: the listing did not say deleted but "
+                "the detail read says live, so nothing was marked", org_id, document_id)
+    marks.sort(key=lambda ref: (ref.papra_org_id, ref.papra_document_id))
+    if len(marks) > MAX_DELETIONS_PER_PASS:
+        counts["capped"] = MAX_DELETIONS_PER_PASS
+        logger.error(
+            "deletion pass capped at %d references this pass, %d left for the next: if this "
+            "repeats without anyone deleting anything, suspect the listing",
+            MAX_DELETIONS_PER_PASS, len(marks) - MAX_DELETIONS_PER_PASS)
+        marks = marks[:MAX_DELETIONS_PER_PASS]
+    for ref in marks:
+        outcome = await _apply_mark(store, kz, ref, generation=generation)
+        counts["refs_marked"] += 1
+        if outcome == "queued":
+            counts["upstream_pending"] += 1
+        elif outcome == "closed":
+            counts["upstream_deleted"] += 1
+        elif outcome == "stale":
+            counts["stale_bindings"] += 1
+    for ref in restores:
+        _apply_restore(store, ref)
+        counts["restored"] += 1
+    probed = await probe_index_liveness(store, kz, generation)
+    store.set_setting(LAST_DELETION_PASS_SETTING,
+                      "ok marked={refs_marked} queued={upstream_pending} closed="
+                      "{upstream_deleted} restored={restored} stale={stale_bindings} "
+                      "capped={capped} probed={probed}".format(probed=probed, **counts))
+    return DeletionResult(**counts)
+
+
+def _walk_org_refs(store: Store, org_id: str) -> list[LedgerRef]:
+    """Every reference of one bucket, pages and duplicates collapsed.
+
+    Keyset paging, so a row that changes under the walk cannot shift the window and hide a
+    neighbour — the failure the other walks in `store` use a keyset for, and the reason the
+    pass that infers from absence must not be the one that walks with an offset.
+
+    The `seen` guard is not paranoia about the store: it is protection against a caller whose
+    `after` tuple repeats a row, which with an offset-free keyset would loop forever on a
+    bucket large enough to page. A candidate appearing twice costs one wasted detail read, so
+    duplicates are dropped here rather than treated as a reason to abort.
+    """
+    refs: list[LedgerRef] = []
+    seen: set[tuple[str, str]] = set()
+    after: tuple[str, str] | None = None
+    while True:
+        page = store.ledger_org_refs(org_id=org_id, after=after, limit=VERIFY_PAGE_SIZE)
+        if not page:
+            break
+        for ref in page:
+            key = (ref.papra_org_id, ref.papra_document_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(ref)
+        after = (page[-1].papra_org_id, page[-1].papra_document_id)
+        if len(page) < VERIFY_PAGE_SIZE:
+            break
+    return refs
+
+
+async def run_cleanup(store: Store, kz, *, now: str | None = None) -> CleanupResult:
+    """Perform the upstream deletes the ledger says are owed. This is the only place anything
+    in Task 9 destroys anything, and even here only what the record has already let go of.
+
+    Every row taken off the due list is *judged* before it is acted on, because the queue is a
+    claim about a moment that has already passed. Four checks, each of which can veto the delete
+    on its own, in the order a wrong answer is cheapest to catch:
+
+    1. the reference is still deleted in the ledger — if it is not, the user restored it and the
+       intent is stale;
+    2. the intent names a real Kreuzakt id — `ledger_queue_cleanup` refuses to store anything
+       else, so a `-1` here would be a corrupt row, not a decision;
+    3. `cleanup_generation` still equals the current generation — after a rebuild the same
+       integer may name different content, and the queued id says nothing about what it points
+       at now;
+    4. **no live reference of the current generation resolves to that id** — the count taken at
+       queue time, taken again. This is the one that holds when the queueing side was wrong: a
+       document restored between the mark and the delete, or a second bucket that arrived in
+       the meantime and was indexed onto the same id because Kreuzakt deduplicates identical
+       bytes. Deleting then removes content the survivor cannot rebuild from the index.
+
+    A transport failure stops the pass for the rows it has not reached. It is not an attempt:
+    "there is no answer" spent like "the answer is no" would walk every queued delete in the
+    corpus to `failed` in five passes, and an operator would come back to a debt only a forced
+    pass can retry. So nothing is recorded, the rows stay pending with their attempts intact,
+    and the pass says so at ERROR. A 404 *is* an answer, and the wanted one — Kreuzakt has
+    already forgotten the document, which `KreuzaktClient.delete_document` reports as success.
+
+    `now` exists for the schedule to be testable rather than for production use; it is validated
+    against the store's own timestamp form and the refusal is allowed to propagate, because a
+    naive `now` would produce a `cleanup_next_at` that sorts wrong — a delete firing early or a
+    row never coming due, with no error anywhere.
+    """
+    moment = _store_now() if now is None else _require_store_utc_iso(now, "now")
+    current = store.get_generation()
+    due = store.ledger_cleanup_due(now=moment, limit=CLEANUP_DUE_LIMIT)
+    attempted = len(due)
+    deleted = deferred = failed = 0
+    for position, ref in enumerate(due):
+        where = {"papra_org_id": ref.papra_org_id, "papra_document_id": ref.papra_document_id}
+        kreuzakt_id = ref.cleanup_kreuzakt_id
+        if ref.deleted_at is None:
+            store.ledger_skip_cleanup(**where,
+                                      reason="the papra reference is no longer deleted")
+            deferred += 1
+            continue
+        if kreuzakt_id is None or kreuzakt_id <= 0:
+            store.ledger_skip_cleanup(**where,
+                                      reason="the queued intent names no kreuzakt id")
+            deferred += 1
+            continue
+        if ref.cleanup_generation != current:
+            store.ledger_skip_cleanup(
+                **where,
+                reason=f"generation changed: queued under {ref.cleanup_generation}, the index "
+                       f"is now {current}, so the queued id may name other content")
+            deferred += 1
+            continue
+        live = store.ledger_resolve([kreuzakt_id], generation=current)
+        if live:
+            store.ledger_skip_cleanup(
+                **where,
+                reason=f"a live reference still resolves to kreuzakt={kreuzakt_id}: "
+                       + ", ".join(f"{item.papra_org_id}/{item.papra_document_id}"
+                                   for item in live))
+            deferred += 1
+            continue
+        try:
+            await kz.delete_document(kreuzakt_id)
+        except KreuzaktError as error:
+            if error.status is None:
+                logger.error(
+                    "kreuzakt is not answering, stopping the cleanup pass before it spends "
+                    "the retry allowance of %d queued delete(s): %s",
+                    len(due) - position, error)
+                deferred += len(due) - position
+                break
+            failed += 1
+            store.ledger_cleanup_result(**where, ok=False, reason=str(error),
+                                        next_at=_shift(moment,
+                                                       seconds=CLEANUP_BACKOFF_S
+                                                       * (ref.cleanup_attempts + 1)))
+            continue
+        store.ledger_cleanup_result(**where, ok=True)
+        deleted += 1
+        # The document is gone, so no reference may still claim it is indexed. Unscoped on
+        # purpose: the last live reference was the condition for getting here, and any row
+        # still bound to this id is bound to something that no longer exists.
+        store.ledger_unbind(
+            expected_kreuzakt_id=kreuzakt_id,
+            generation=ref.cleanup_generation if ref.cleanup_generation is not None
+            else current,
+            reason=f"kreuzakt document {kreuzakt_id} deleted by the cleanup pass")
+    return CleanupResult(attempted=attempted, deleted=deleted, deferred=deferred,
+                         failed=failed)

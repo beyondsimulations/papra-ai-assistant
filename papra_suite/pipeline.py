@@ -175,6 +175,19 @@ class SweepResult:
     non_pdf_skipped: int = 0
     errors: int = 0
     oversized_skipped: int = 0
+    # Task 9: what delete/restore propagation did. Carried here rather than kept in the pass's
+    # own return value because the sweep's log line is the one an operator reads, and two of
+    # these (`deletions_aborted`, `deletions_capped`) are alarms that must not be visible only
+    # in a log the pass wrote for itself.
+    deletions_marked: int = 0
+    deletions_pending: int = 0
+    deletions_restored: int = 0
+    deletions_capped: int = 0
+    deletions_aborted: bool = False
+    cleanup_attempted: int = 0
+    cleanup_deleted: int = 0
+    cleanup_deferred: int = 0
+    cleanup_failed: int = 0
 
 
 async def run_ocr_job(papra: PapraClient, ocr_llm: LLMClient, job: Job, *,
@@ -407,7 +420,8 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     ), name="index-worker"))
     if config.sweep_interval_s > 0:
         tasks.append(asyncio.create_task(
-            _sweep_loop(store, papra, config.sweep_interval_s), name="sweep"))
+            _sweep_loop(store, papra, config.sweep_interval_s, kreuzakt=kreuzakt),
+            name="sweep"))
     # The convergence pass runs whether or not the gate is open, and says nothing while it
     # is shut: the gate is read per pass, so the loop being up is what makes a flag flip
     # take effect without a restart, and a loop that had to be started on demand is a loop
@@ -554,10 +568,35 @@ def _prune_ingest_events_quietly(store: Store) -> int:
     return pruned
 
 
-async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int) -> None:
+def _log_deletion_counts(result: SweepResult) -> None:
+    """The two counts that must never be silent, on the line the operator actually reads.
+
+    A pass that refused to touch anything and a pass that marked the whole of its budget both
+    look like a quiet corpus in the ledger, so they are ERROR here and repeated by `check` from
+    the store: an alarm that lives only in a debug-level line is an alarm nobody hears. Ordinary
+    activity is INFO, and a sweep in which nothing happened says nothing.
+    """
+    if result.deletions_aborted:
+        logger.error(
+            "sweep: deletion pass aborted, nothing was marked or queued this pass; the reason "
+            "is in `papra-suite check` (a listing that could not be trusted is the usual one)")
+    elif result.deletions_capped:
+        logger.error(
+            "sweep: deletion pass capped at %d references, more remain for the next pass",
+            result.deletions_capped)
+    elif (result.deletions_marked or result.deletions_restored or result.cleanup_attempted):
+        logger.info(
+            "sweep: deletions %d marked, %d queued upstream, %d restored; cleanup %d attempted, "
+            "%d deleted, %d deferred, %d failed", result.deletions_marked,
+            result.deletions_pending, result.deletions_restored, result.cleanup_attempted,
+            result.cleanup_deleted, result.cleanup_deferred, result.cleanup_failed)
+
+
+async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int, *,
+                      kreuzakt: KreuzaktClient | None = None) -> None:
     while True:
         try:
-            result = await sweep_once(store, papra)
+            result = await sweep_once(store, papra, kreuzakt=kreuzakt)
             if result.documents_enqueued or result.non_pdf_skipped:
                 logger.info("sweep: %d checked, %d documents enqueued, %d non-pdf",
                             result.documents_checked, result.documents_enqueued,
@@ -701,13 +740,20 @@ def _is_pdf(document: dict) -> bool:
     return (document.get("name") or "").lower().endswith(".pdf")
 
 
-async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
+async def sweep_once(store: Store, papra: PapraClient,
+                     *, kreuzakt: KreuzaktClient | None = None) -> SweepResult:
     """Record and enqueue indexing for externally-ingested documents (decisions §4).
 
     Papra-native uploads — a PDF dropped into the web UI — are documents this process
     never ingested, and the sweep is what finds them. Its enqueue call site is
     `enqueue_index_job`, so those documents enter the index pipeline and, while the old
     writers are still running, the OCR queue too.
+
+    With a `kreuzakt` client it also propagates deletions, at the end: Papra's trash into the
+    index, the queued upstream deletes executed, restores taken back. That stage needs both
+    services, so without a client it does not run — and says so, because a sweep that skipped
+    the look would otherwise report exactly what a sweep that found nothing reports. Its
+    failures are the pass's own to report (`aborted`, `capped`); see `reconcile_deletions`.
 
     One gap worth naming here rather than discovering later: **mail intake does not
     come through this sweep**, and since Task 7 it does not need to. `mail.py` picks its
@@ -835,6 +881,27 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
                 "sweep: page cap reached for org %s after %d pages; resuming at "
                 "page %d next pass (~%d documents remaining)",
                 org.papra_org_id, MAX_SWEEP_PAGES, page_index, remaining)
+    if kreuzakt is None:
+        # Said out loud, because the alternative is indistinguishable from a corpus in which
+        # nothing was deleted: this sweep did not look for deletions at all. Propagation needs
+        # both services — Papra's listing for the verdict and Kreuzakt for the delete.
+        logger.warning("sweep: no kreuzakt client, so no delete propagation ran this pass")
+        return result
+    deletions = await indexing.reconcile_deletions(store, papra, kreuzakt)
+    result.deletions_marked = deletions.refs_marked
+    result.deletions_pending = deletions.upstream_pending
+    result.deletions_restored = deletions.restored
+    result.deletions_capped = deletions.capped
+    result.deletions_aborted = deletions.aborted
+    cleanup = await indexing.run_cleanup(store, kreuzakt)
+    result.cleanup_attempted = cleanup.attempted
+    result.cleanup_deleted = cleanup.deleted
+    result.cleanup_deferred = cleanup.deferred
+    result.cleanup_failed = cleanup.failed
+    # Reported here rather than by the loop that calls this: `aborted` and `capped` are facts
+    # about the pass, and a caller that runs one pass from a command line deserves the same
+    # alarm the daemon gets. Silence is the failure mode — see `_log_deletion_counts`.
+    _log_deletion_counts(result)
     return result
 
 

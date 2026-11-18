@@ -1265,6 +1265,59 @@ class Store:
             ).fetchone()
         return _row_to_ledger_ref(row) if row else None
 
+    def ledger_org_ids(self) -> list[str]:
+        """Every bucket the ledger holds references for, whatever the `orgs` table says.
+
+        The delete pass walks these rather than `list_orgs()`. A bucket can leave the
+        `orgs` table — an operator removing it, a store copied without it — while its
+        references and their Kreuzakt documents remain, and a reconciliation driven by
+        `orgs` would never look at them again: index entries that outlive every record of
+        why they exist. Naming them is also what makes an orphan bucket loud in the delete
+        pass's own error line instead of invisible.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT papra_org_id FROM index_ledger ORDER BY papra_org_id"
+            ).fetchall()
+        return [row["papra_org_id"] for row in rows]
+
+    def ledger_org_refs(
+        self, *, org_id: str, after: tuple[str, str] | None = None, limit: int = 100,
+    ) -> list[LedgerRef]:
+        """Every reference of one bucket, deleted and stale ones included, one page at a time.
+
+        The only walk here that filters on nothing but the bucket, and that is the point:
+        every other one excludes a state on purpose, and the delete pass is the caller that
+        has to see all of them.
+
+        * `ledger_resolve` is the authorization boundary, so it hides soft-deleted and stale
+          rows — which is precisely the population a restore has to be found in.
+        * `ledger_needs_index` is work for the indexer, so it hides deleted rows entirely; a
+          document the user threw away is not work.
+        * `ledger_delivered_refs` needs a current binding, so it hides the unbound and the
+          never-indexed, which is where a hard-deleted document's reference usually sits.
+
+        Driven one bucket at a time because its caller is walking Papra's listing for that
+        bucket and comparing. `after` is the keyset `(papra_org_id, papra_document_id)` the
+        previous page ended with, for the same reason `ledger_delivered_refs` uses one: a row
+        changing under an offset would skip or repeat a reference mid-pass, and the row it
+        skipped is the one whose index entry survives or does not.
+
+        `limit` is bounded like the other walks: this pass runs inside the sweep, and one
+        bucket's whole table must not be the reason a poll cycle stalls.
+        """
+        bounded = max(1, min(int(limit), 1000))
+        sql = "SELECT * FROM index_ledger WHERE papra_org_id = ?"
+        params: list[object] = [org_id]
+        if after is not None:
+            sql += " AND (papra_org_id > ? OR (papra_org_id = ? AND papra_document_id > ?))"
+            params.extend([after[0], after[0], after[1]])
+        sql += " ORDER BY papra_org_id, papra_document_id LIMIT ?"
+        params.append(bounded)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_ledger_ref(row) for row in rows]
+
     def ledger_resolve(self, kreuzakt_ids, *, generation: int) -> list[LedgerRef]:
         """Active references of `generation` that point at these Kreuzakt ids.
 
@@ -1454,6 +1507,74 @@ class Store:
                 self._conn.rollback()
                 raise
         return (row["kreuzakt_id"], remaining)
+
+    def ledger_unbind(
+        self, *, expected_kreuzakt_id: int, generation: int, reason: str,
+        papra_org_id: str | None = None, papra_document_id: str | None = None,
+    ) -> int:
+        """Drop a binding the caller can name; report how many references it cleared.
+
+        Clearing `kreuzakt_id` is what turns a reference back into work: with no id it is a
+        `ledger_needs_index` candidate again, so the sweep, a rebuild and a backfill can all
+        reach it. The state this exists to escape is the opposite one — a row still bound,
+        under the generation that is current, to a Kreuzakt document that answers 404. That
+        row still resolves, so the search path hands out a hit that leads nowhere, and it
+        looks finished to every eligibility rule in this file, so nothing short of an
+        operator resets it.
+
+        Two fences, because clearing a binding destroys nothing and therefore gets away with
+        being wrong right up until it does not:
+
+        * `expected_kreuzakt_id` — the caller states which document it believes is gone. A
+          bare `SET kreuzakt_id = NULL` aimed at a row or a bucket would be the unconditional
+          write this plan refuses everywhere else, and the id is the one thing that names
+          which claim is being retracted.
+        * `generation` — an id from a superseded index resolves to nothing already, so
+          unbinding it is not a repair but a guess about which row meant what. The same fence
+          refuses to clear a row a rebuild has since rebound to a live document, which is the
+          worst thing this call could do.
+
+        Scope: pass `papra_org_id` and `papra_document_id` to retract one reference's
+        binding, omit both to retract every reference to that document. Both forms are
+        needed and they are not interchangeable. When a reference goes away in Papra, its own
+        binding is what stops occupying the id, and a sibling in another bucket is still live
+        and still needs it — clear that one and the search path stops finding a document
+        nobody deleted. When the index itself says the document is gone, the verdict was
+        about the document, so every reference pointing at it follows together.
+
+        Returns references cleared, and logs one INFO line with the reason: "we deliberately
+        stopped claiming this document is indexed" is the answer to a later "why is this
+        document missing from search?", and it has to be findable. A non-positive
+        `expected_kreuzakt_id` is refused rather than ignored — nothing is bound to `-1`, so
+        a caller that arrived there has lost its place, and an unbind that reports success on
+        the strength of a non-answer is how a stale integer earns trust.
+        """
+        if expected_kreuzakt_id is None or int(expected_kreuzakt_id) <= 0:
+            raise ValueError(
+                f"expected_kreuzakt_id must be a real kreuzakt id, got {expected_kreuzakt_id!r}:"
+                " no reference is bound to a non-positive id, so there is nothing to retract"
+                " and the unbind would be a guess")
+        if not (reason or "").strip():
+            raise ValueError("reason is required: an unbind with no reason is unauditable")
+        if (papra_org_id is None) != (papra_document_id is None):
+            raise ValueError(
+                "scope is a pair: pass both papra_org_id and papra_document_id, or neither")
+        scoped = papra_org_id is not None
+        sql = ("UPDATE index_ledger SET kreuzakt_id = NULL, delivered_generation = NULL"
+               " WHERE kreuzakt_id = ? AND delivered_generation = ?")
+        params: list[object] = [int(expected_kreuzakt_id), generation]
+        if scoped:
+            sql += " AND papra_org_id = ? AND papra_document_id = ?"
+            params.extend([papra_org_id, papra_document_id])
+        with self._lock, self._conn:
+            cursor = self._conn.execute(sql, params)
+            cleared = cursor.rowcount
+        if cleared:
+            logger.info(
+                "unbound kreuzakt=%s generation=%s references=%d: %s%s",
+                expected_kreuzakt_id, generation, cleared, reason,
+                f" papra={papra_org_id}/{papra_document_id}" if scoped else "")
+        return cleared
 
     def ledger_mark_restored(self, *, papra_org_id: str, papra_document_id: str) -> None:
         """Clear `deleted_at`, which is the whole of a restore here.

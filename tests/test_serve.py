@@ -224,8 +224,10 @@ async def test_serve_spawns_sweep_loop(tmp_path, monkeypatch):
     stop = asyncio.Event()
     sweeps = []
 
-    async def sweep_once_and_stop(store_arg, papra):
-        sweeps.append(store_arg)
+    async def sweep_once_and_stop(store_arg, papra, *, kreuzakt=None):
+        # `kreuzakt` is Task 9's: the sweep propagates deletions, so the double takes the
+        # keyword the loop passes, and the assertion below pins serve handing it over.
+        sweeps.append((store_arg, kreuzakt))
         stop.set()  # end serve from within the FIRST sweep
         return SweepResult()
 
@@ -242,6 +244,8 @@ async def test_serve_spawns_sweep_loop(tmp_path, monkeypatch):
     watchdog.cancel()  # untriggered in the passing case — do not linger
 
     assert len(sweeps) == 1  # the sweep ran once, then serve stopped
+    assert sweeps[0][1] is not None, \
+        "serve gave the sweep no kreuzakt client, so delete propagation would never run"
     assert not _dangling_serve_tasks()
     store.close()
 

@@ -1302,3 +1302,169 @@ def test_ledger_rows_survive_reopening_the_store(tmp_path):
         assert ref.cleanup_state == "none"
     finally:
         reopened.close()
+
+
+# -- unbinding a binding that cannot be honoured -----------------------------------
+#
+# `ledger_needs_index` is the eligibility rule the sweep, a rebuild and a backfill share, and
+# it excludes exactly one bad state: a row bound and stamped as delivered under the
+# generation that is current. A row in that state looks finished forever. The tests below pin
+# the state on the row that produces it in anger — a Papra 404 that outlived the job's
+# attempts, pinned in `tests/test_index_job.py` — and then the one call that gets out.
+
+def stuck_row(store):
+    """Bound, stamped as delivered under the current generation, work permanently spent.
+
+    Not a hypothetical: it is where `run_index_job` leaves a row whose Kreuzakt document
+    answers 404 on the attempt that exhausts the job's budget. The row was never read, and
+    nothing will look at it again.
+    """
+    store.ledger_upsert_reference(papra_org_id="org-a", papra_document_id="doc-1",
+                                  file_hash=H, papra_original_name="doc-1.pdf")
+    store.ledger_set_kreuzakt_id(papra_org_id="org-a", papra_document_id="doc-1",
+                                 kreuzakt_id=7, generation=store.get_generation())
+    job_id = store.enqueue_job(kind="index", papra_org_id="org-a", document_id="doc-1",
+                               content_hash=H, payload={"file_hash": H})
+    store.mark_job_failed(job_id, "kreuzakt document 7 answers 404", max_attempts=1)
+    return job_id
+
+
+def test_the_stuck_row_is_invisible_until_a_fenced_unbind_frees_it(store):
+    """The stuck state reproduced rather than described, and the call that ends it.
+
+    Both halves matter. Asserting only the unbind would leave this a test of an UPDATE; the
+    first half is what says the state is genuinely unreachable — every pass reads this
+    query — and the failed job is what says the queue will not ask for the work either.
+    """
+    job_id = stuck_row(store)
+    generation = store.get_generation()
+    ref = store.ledger_get("org-a", "doc-1")
+    assert ref.kreuzakt_id == 7 and ref.delivered_generation == generation
+    assert store.ledger_needs_index(generation=generation) == []   # every pass walks past it
+    assert store.get_job(job_id).status == "failed"
+    assert store.claim_next_job("index") is None
+
+    cleared = store.ledger_unbind(expected_kreuzakt_id=7, generation=generation,
+                                  reason="kreuzakt document 7 answers 404")
+
+    assert cleared == 1
+    after = store.ledger_get("org-a", "doc-1")
+    assert after.kreuzakt_id is None and after.delivered_generation is None
+    assert [r.papra_document_id for r in store.ledger_needs_index(generation=generation)] \
+        == ["doc-1"]
+
+
+def test_the_unbind_refuses_an_id_it_was_not_given(store):
+    """The fence is the point: a caller that named the wrong document clears nothing.
+
+    A row bound to 8 is a claim about a different document than the one 7 names, and an
+    unbind that "helpfully" cleared it would be retracting a binding on a document nobody
+    said was gone.
+    """
+    store.ledger_upsert_reference(papra_org_id="org-a", papra_document_id="doc-1",
+                                  file_hash=H, papra_original_name="doc-1.pdf")
+    store.ledger_set_kreuzakt_id(papra_org_id="org-a", papra_document_id="doc-1",
+                                 kreuzakt_id=8, generation=store.get_generation())
+
+    assert store.ledger_unbind(expected_kreuzakt_id=7, generation=store.get_generation(),
+                               reason="kreuzakt document 7 is gone") == 0
+    assert store.ledger_get("org-a", "doc-1").kreuzakt_id == 8
+
+
+def test_the_unbind_refuses_a_generation_it_was_not_given(store):
+    """The fence is the row's own stamp, which cuts both ways and has to.
+
+    A caller naming the CURRENT generation cannot reach a row still bound under a destroyed
+    index — which is the protection that matters, because after a rebuild the same integer may
+    name a live document a later pass has just rebound. And naming the stale generation can
+    reach it, which the restore path depends on: a binding to an index that no longer exists is
+    already meaningless, and freeing it is what makes the row visible to this generation again.
+    """
+    stuck_row(store)
+    stale = store.get_generation()
+    store.bump_generation()
+
+    assert store.ledger_unbind(expected_kreuzakt_id=7, generation=store.get_generation(),
+                              reason="a current caller must not reach a stale binding") == 0
+    assert store.ledger_get("org-a", "doc-1").kreuzakt_id == 7
+    assert store.ledger_unbind(expected_kreuzakt_id=7, generation=stale,
+                              reason="the binding names an index that no longer exists") == 1
+    assert store.ledger_get("org-a", "doc-1").kreuzakt_id is None
+
+
+@pytest.mark.parametrize("kwargs, message", [
+    ({"expected_kreuzakt_id": -1, "generation": 1, "reason": "gone"}, "expected_kreuzakt_id"),
+    ({"expected_kreuzakt_id": 0, "generation": 1, "reason": "gone"}, "expected_kreuzakt_id"),
+    ({"expected_kreuzakt_id": 7, "generation": 1, "reason": "  "}, "reason"),
+    ({"expected_kreuzakt_id": 7, "generation": 1, "reason": "gone",
+      "papra_org_id": "org-a"}, "pair"),
+])
+def test_an_unbind_refuses_an_argument_that_could_only_be_a_bug(store, kwargs, message):
+    """Each refusal is a caller that would otherwise write a half-thought clear.
+
+    `-1` is the one that matters: nothing is bound to a non-positive id, so a caller that
+    arrived there has lost its place, and an unbind that reported success on the strength of a
+    non-answer is how a stale integer earns trust. A scope named on one side only is the same
+    class of bug — it would clear a reference the caller never meant to name.
+    """
+    with pytest.raises(ValueError, match=message):
+        store.ledger_unbind(**kwargs)
+
+
+def test_a_scoped_unbind_leaves_a_live_sibling_bound(store):
+    """Two buckets, one document: losing one reference must not unfind the other.
+
+    The unscoped form is for a verdict about the document. Here the document is fine and one
+    reference went away, so the scope is the difference between freeing a row and deleting a
+    document from search.
+    """
+    two_refs(store)
+    generation = store.get_generation()
+
+    cleared = store.ledger_unbind(expected_kreuzakt_id=7, generation=generation,
+                                  reason="papra deleted org-a/doc-1",
+                                  papra_org_id="org-a", papra_document_id="doc-1")
+
+    assert cleared == 1
+    assert store.ledger_get("org-a", "doc-1").kreuzakt_id is None
+    assert store.ledger_get("org-b", "doc-2").kreuzakt_id == 7
+    assert [r.papra_document_id for r in store.ledger_resolve([7], generation=generation)] \
+        == ["doc-2"]
+
+
+def test_an_unscoped_unbind_clears_every_reference_to_a_destroyed_document(store):
+    """When the index says the document is gone, the verdict covers all of its references.
+
+    Leaving one bound would leave it resolving to a Kreuzakt id that answers 404 — a hit that
+    goes nowhere — so the row that "still looks indexed" is the row that lies.
+    """
+    two_refs(store)
+
+    cleared = store.ledger_unbind(expected_kreuzakt_id=7, generation=store.get_generation(),
+                                  reason="kreuzakt 404s for both buckets")
+
+    assert cleared == 2
+    assert store.ledger_resolve([7], generation=store.get_generation()) == []
+
+
+def test_the_unbind_keeps_what_we_wrote_into_papra(store):
+    """The binding is a claim about the index; the delivery record is a fact about Papra.
+
+    `delivered_at` and `delivered_sha` say what this bridge last put into Papra's `content`,
+    which stays true after the index loses its copy — and the convergence pass needs them to
+    stay true, or an unbind would erase the memory that lets it tell its own write from a
+    human's.
+    """
+    stuck_row(store)
+    store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-1",
+                                 delivered_at="2026-11-19T09:00:00+00:00",
+                                 delivered_sha="be" * 32,
+                                 generation=store.get_generation())
+
+    store.ledger_unbind(expected_kreuzakt_id=7, generation=store.get_generation(),
+                        reason="kreuzakt document 7 is gone")
+
+    after = store.ledger_get("org-a", "doc-1")
+    assert after.delivered_at == "2026-11-19T09:00:00+00:00"
+    assert after.delivered_sha == "be" * 32
+    assert after.kreuzakt_id is None and after.delivered_generation is None

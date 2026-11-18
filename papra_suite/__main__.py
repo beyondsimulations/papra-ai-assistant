@@ -315,6 +315,25 @@ def _index_line(store) -> str:
             f"cleanup-pending (failed {stats['cleanup_failed']})")
 
 
+def _deletion_pass_line(store) -> str:
+    """`deletions: ...` — what the last delete-propagation pass did, or why it refused.
+
+    `check` opens no Papra or Kreuzakt client — its whole purpose is answering "is this
+    healthy?" without the services in front of it — so it cannot run a pass to find out. The
+    pass therefore stamps its own outcome into `settings` and this prints it, which is the only
+    way `aborted` and `capped` reach the command the README names for "why did nothing change".
+    They need to: a corpus whose listing stopped being trustworthy propagates no deletions at
+    all, and from the ledger that is indistinguishable from a corpus where nobody deleted
+    anything.
+    """
+    from papra_suite import indexing
+
+    stamp = store.get_setting(indexing.LAST_DELETION_PASS_SETTING)
+    if not stamp:
+        return "deletions: never ran (the sweep does this once per pass, with kreuzakt up)"
+    return f"deletions: {stamp}"
+
+
 def _content_writer_line(config) -> str:
     """`content writer: ...` — who writes Papra's text under this configuration.
 
@@ -424,6 +443,7 @@ def main() -> int:
             # line.
             recent_events = _recent_event_counts(store)
             index_line = _index_line(store)
+            deletion_line = _deletion_pass_line(store)
         finally:
             store.close()
         print(f"config ok; store migrated; data dir: {config.data_dir}")
@@ -432,6 +452,7 @@ def main() -> int:
         print(f"senders: {config.allowed_senders.describe()}")
         print(recent_events)
         print(index_line)
+        print(deletion_line)
         print(_content_writer_line(config))
         print(_metadata_writer_line(config))
         return 0

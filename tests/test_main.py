@@ -706,3 +706,43 @@ def test_events_json_leaves_no_terminal_control_bytes(monkeypatch, tmp_path, cap
     rows = json.loads(out)                     # still parseable
     assert rows[0]["filename"] == "R\u00f6ntgen.pdf"   # readable, not \\u00f6
     assert any(row["filename"] == "a\x9bb\u2028" for row in rows)  # value preserved
+
+
+def test_check_prints_the_last_deletion_pass(monkeypatch, tmp_path, capsys):
+    """`aborted` and `capped` have to reach the command an operator actually runs.
+
+    `check` opens no Papra or Kreuzakt client — that is the point of it — so it cannot run a
+    pass to find out what the pass would do. The pass therefore stamps its outcome into the
+    store, and this is the half that makes the signal usable: an aborted pass stops delete
+    propagation for every bucket until someone notices, and from the ledger alone that is
+    indistinguishable from a corpus where nobody deleted anything.
+    """
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from papra_suite import indexing
+    from papra_suite.store import Store
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.set_setting(indexing.LAST_DELETION_PASS_SETTING,
+                      "aborted: org-a page 0: listing failed: PapraError: 503")
+    store.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "deletions: aborted: org-a page 0" in out, "the abort reason belongs in check"
+
+
+def test_check_says_delete_propagation_never_ran(monkeypatch, tmp_path, capsys):
+    """A fresh install says so, rather than printing a pass summary that never happened."""
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+
+    assert "deletions: never ran" in capsys.readouterr().out
