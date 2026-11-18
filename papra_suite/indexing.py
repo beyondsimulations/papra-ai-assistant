@@ -50,6 +50,9 @@ from papra_suite.store import (
     CLEANUP_MAX_ATTEMPTS as CLEANUP_MAX_ATTEMPTS,
 )
 from papra_suite.store import (
+    DELIVERY_MAX_FAILURES as DELIVERY_MAX_FAILURES,
+)
+from papra_suite.store import (
     EMPTY_EXTRACTION_SHA,
     PROTECTION_FIELDS,
     Job,
@@ -497,6 +500,24 @@ async def deliver_content(papra, store: Store, ref: LedgerRef, kz_doc: KzDocumen
         # The write is not recorded, so nothing claims a delivery: the row stays as it was,
         # the exception travels with its status so `worker_loop` can tell a retry from a
         # permanent no, and this is the line that says which document to go and look at.
+        #
+        # This is also the only place the refused-write counter is charged, and its position
+        # here is the whole rule: a refusal is a fact about this reference's binding and
+        # nothing else. A caller whose `get_document` failed never reaches this line, so an
+        # outage cannot spend the ceiling; the read above and the write below are separated
+        # on purpose, because the alternative was a counter that retired documents from
+        # convergence on the strength of a timeout.
+        #
+        # The identity named is `kz_doc.id`, not `ref.kreuzakt_id`, and the difference is not
+        # cosmetic. The worker reaches here with the reference it read at job start, which
+        # predates the bind this very job just took — so the snapshot's id is null on the
+        # most common path of all, a first delivery, and a fence built on it would drop every
+        # refusal for a newly indexed document. The text being written is document
+        # `kz_doc.id`'s text, which is the thing the refusal is actually about.
+        store.ledger_record_delivery_failure(
+            papra_org_id=ref.papra_org_id, papra_document_id=ref.papra_document_id,
+            expected_kreuzakt_id=kz_doc.id, generation=generation,
+            reason=str(error))
         logger.error("content delivery to papra=%s failed: %s", ref.papra_document_id, error)
         raise
     store.ledger_record_delivery(papra_org_id=ref.papra_org_id,
@@ -888,7 +909,12 @@ class VerifyResult:
     they had already reached the ceiling of landed repairs inside the window — a count of
     references, not a diagnosis of why the text keeps changing; the ERROR line beside each
     one carries the document and the count, and nothing here can name the hand that
-    overwrote us. `lookup_errors` counts references this pass could not finish, for either
+    overwrote us. `blocked` counts the references left alone for the other reason, which is
+    the one `suppressed` cannot describe: Papra has refused our write
+    `DELIVERY_MAX_FAILURES` times in a row, so it is not a document we keep losing to some-
+    body else, it is a document whose column we have never taken. Both counts mean "left
+    alone", and they name different faults because the operator's next move differs.
+    `lookup_errors` counts references this pass could not finish, for either
     reason: a side that would not answer, or a repair Papra refused mid-write. Both mean
     "this document was not converged by this pass", which is the only decision the loop
     makes with it.
@@ -900,6 +926,7 @@ class VerifyResult:
     suppressed: int = 0
     empty: int = 0
     lookup_errors: int = 0
+    blocked: int = 0
 
 
 async def verify_once(store: Store, papra, kz) -> VerifyResult:
@@ -924,6 +951,20 @@ async def verify_once(store: Store, papra, kz) -> VerifyResult:
     refused one, which turns one bad document into a corpus-wide blind spot. And a write
     that never landed must not spend the repair budget: the ceiling answers "how many times
     did we write this column and lose it again", and a refusal wrote nothing.
+
+    Which is why a refused write needed a ceiling of its own, and why that ceiling lives
+    beside this one rather than inside it. Before migration 005 a document Papra would not
+    take — over the upload limit, a column it will not let us touch — was re-read, re-PATCHed
+    and re-ERROR-logged every six hours for the rest of the deployment's life, because the
+    only brake in this function counted repairs that landed and a refusal lands nothing. Now
+    `DELIVERY_MAX_FAILURES` refusals retire the reference from the attempt list, and the
+    counter is charged by `deliver_content`, at the write, so a reference that was merely
+    read a lot cannot reach it. Three things are deliberately not changed by the ceiling:
+    the reference is still read on every pass, because the usual way out of a refusal is
+    someone else putting the right text there and that convergence still has to be
+    recorded; it is still counted `diverged`, because at the moment we read it the two sides
+    did disagree; and the repair budget is untouched, because these are different faults and
+    an operator reading `suppressed` is looking for a second writer, not for a refusal.
     """
     if not store.settings_flag("index_content_delivery"):
         # Not an error, and not a read either: a gate that queries first and refuses second
@@ -932,7 +973,7 @@ async def verify_once(store: Store, papra, kz) -> VerifyResult:
 
     generation = store.get_generation()
     counts = {"scanned": 0, "diverged": 0, "repaired": 0, "suppressed": 0, "empty": 0,
-              "lookup_errors": 0}
+              "lookup_errors": 0, "blocked": 0}
     after: tuple[str, str] | None = None
     while True:
         refs = store.ledger_delivered_refs(generation=generation, after=after,
@@ -982,6 +1023,19 @@ async def verify_once(store: Store, papra, kz) -> VerifyResult:
                 continue
 
             counts["diverged"] += 1
+            if ref.delivery_failures >= DELIVERY_MAX_FAILURES:
+                # Counted as the divergence it is, and left alone. The reads above already
+                # happened, which is what keeps this state recoverable: if Papra or a person
+                # put our text there in the end, the equality branch recorded it on the next
+                # pass and cleared the counter. The loud version of this line was written by
+                # the store when the count reached the ceiling, once; a pass that shouted
+                # here too would be the repeating log this ceiling exists to stop.
+                logger.info(
+                    "papra=%s kreuzakt=%s has refused %d writes, not attempting again: "
+                    "the index holds text Papra does not",
+                    ref.papra_document_id, ref.kreuzakt_id, ref.delivery_failures)
+                counts["blocked"] += 1
+                continue
             # READ before the repair, spent after it lands. The ceiling is about repairs
             # rather than about successes — a repair that diverged again an hour later is
             # the second loss whether or not the PATCH was pleasant about it — but a write

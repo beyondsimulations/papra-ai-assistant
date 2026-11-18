@@ -246,7 +246,11 @@ def test_migration_004_makes_the_idempotency_index_partial(tmp_path):
     store = Store(db_path)
     store.migrate()
     try:
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        # What belongs to 004 is the stored SQL below. The version is the current one,
+        # because a 003 file runs 005 on the way too; the literal that catches a migration
+        # which never ran lives in `test_store.py`.
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == len(
+            store_module.MIGRATIONS)
         entries = idempotency_index(store._conn)
         assert len(entries) == 1, f"the old index must be replaced, not doubled: {entries}"
         name, sql = entries[0]
@@ -369,7 +373,103 @@ def test_failed_migration_004_leaves_nothing_behind_and_can_be_retried(tmp_path,
     store = Store(db_path)
     try:
         store.migrate()
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == len(
+            store_module.MIGRATIONS)
         assert "WHERE status IN ('pending','running')" in idempotency_index(store._conn)[0][1]
+    finally:
+        store.close()
+
+
+# --- migration 005: the refused-write history ---------------------------------------
+
+def ledger_row_at_004(path, *, doc="doc_survivor", delivered_sha=None):
+    """One ledger reference in a database whose schema stops at 004.
+
+    005 is an `ALTER TABLE` over a table the operator already has rows in, so the
+    starting state has to be a real row written through the real API rather than an
+    empty table: the claim under test is that an existing reference arrives at 005 with
+    its history intact and the new columns saying "never refused", not NULL and not
+    missing.
+    """
+    store = Store(path)
+    store.migrate()
+    store.ledger_upsert_reference(papra_org_id="org_1", papra_document_id=doc,
+                                  file_hash="ab" * 32, papra_original_name=f"{doc}.pdf")
+    store.ledger_set_kreuzakt_id(papra_org_id="org_1", papra_document_id=doc,
+                                 kreuzakt_id=7, generation=store.get_generation())
+    if delivered_sha is not None:
+        store.ledger_record_delivery(papra_org_id="org_1", papra_document_id=doc,
+                                     delivered_at="2026-11-19T09:00:00+00:00",
+                                     delivered_sha=delivered_sha,
+                                     generation=store.get_generation())
+    store.close()
+    return path
+
+
+def test_migration_005_adds_the_refused_write_history(tmp_path):
+    """005 gives the ledger a memory of writes Papra refused, defaulting to "none".
+
+    A fresh column whose default is not the neutral value turns every healthy document
+    into a refused one on upgrade day, so the default is the assertion here as much as
+    the column's presence is.
+    """
+    db_path = tmp_path / "db.sqlite"
+    build_store_at_version(db_path, 4)
+    ledger_row_at_004(db_path, delivered_sha="be" * 32)
+
+    store = Store(db_path)
+    store.migrate()
+    try:
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        columns = {row["name"]: row for row in
+                   store._conn.execute("PRAGMA table_info(index_ledger)")}
+        assert columns["delivery_failures"]["notnull"] == 1
+        assert columns["delivery_failures"]["dflt_value"] == "0"
+        assert "delivery_failures" in columns and "last_delivery_error_at" in columns
+        ref = store.ledger_get("org_1", "doc_survivor")
+        assert (ref.delivery_failures, ref.last_delivery_error_at) == (0, None)
+        # The history that was already there is untouched.
+        assert ref.kreuzakt_id == 7 and ref.delivered_sha == "be" * 32
+        assert store.ledger_stats()["delivery_blocked"] == 0
+    finally:
+        store.close()
+
+
+def test_failed_migration_005_leaves_nothing_behind_and_can_be_retried(tmp_path, monkeypatch):
+    """Same contract as 004, asserted on 005 because it is 005 that adds statements.
+
+    Two `ALTER TABLE`s look unbreakable, which is exactly why they need the guard: a
+    half-applied pair would leave `delivery_failures` present and `last_delivery_error_at`
+    absent while `user_version` stayed at 4, and the retry would then die on "duplicate
+    column name" forever — an operator's store that can never be opened again. Applied
+    statement by statement inside `migrate()`'s transaction, the rollback takes both.
+    """
+    db_path = tmp_path / "db.sqlite"
+    build_store_at_version(db_path, 4)
+    real = store_module._migration_005_delivery_refusals
+
+    def exploding(conn):
+        real(conn)
+        raise RuntimeError("simulated: a statement after the columns failed")
+
+    monkeypatch.setattr(store_module, "MIGRATIONS",
+                        [*store_module.MIGRATIONS[:4], exploding])
+    store = Store(db_path)
+    try:
+        with pytest.raises(RuntimeError, match="simulated"):
+            store.migrate()
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        columns = {row["name"] for row in
+                   store._conn.execute("PRAGMA table_info(index_ledger)")}
+        assert "delivery_failures" not in columns
+        assert "last_delivery_error_at" not in columns
+    finally:
+        store.close()
+
+    monkeypatch.undo()
+    store = Store(db_path)
+    try:
+        store.migrate()
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
     finally:
         store.close()

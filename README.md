@@ -478,11 +478,19 @@ metadata writer: suite title worker (legacy)
   nothing on it, or an extraction that failed. These are deliberately never written, so
   this is not a queue to drain. It is the count to look at when a document "should have
   been OCR'd and wasn't".
-- `repairs(24h)` is how often the convergence pass wrote Papra's text back inside a rolling
-  day — a count of repairs spent, not of divergences noticed, so a document Papra refuses
-  to accept writes for does not inflate it and a document the pass has stopped fighting does
-  not add to it either. Non-zero right after the handover is expected once and then should
-  go quiet; sustained non-zero means the text we send is not the text that stays.
+- `repairs(24h)` counts writes that landed and diverged again — a count of repairs spent,
+  not of divergences noticed. Non-zero right after the handover is expected once and then
+  should go quiet; sustained non-zero means the text we send is not the text that stays.
+  A write Papra *refused* is not in this number, and never was: it landed nothing, so
+  counting it reported a second writer that did not exist. It has its own history now, on
+  the reference itself. Five refused writes in a row and the convergence pass stops
+  attempting that text — the ceiling exists because the alternative was a document nobody
+  could converge and nothing that said so, retried every six hours forever. Refused writes
+  are a separate number from repairs because they are a separate fault: a non-zero
+  `repairs(24h)` says someone else is editing the column, and a retired reference says Papra
+  would not take what we sent. The retirement is announced once, in an ERROR naming the
+  document and the refusal; a re-index of that document retires the count, and a convergence
+  that arrives by any other route clears it without a write of ours.
 - `cleanup-pending (failed N)` is upstream deletes the ledger still owes, with the part the
   retries stopped on called out separately. A `failed` row can leave a deleted document in
   the index, so search still returns it; nothing in this build replays it by hand, so a

@@ -648,14 +648,18 @@ async def _verification_loop(store: Store, papra: PapraClient, kz, *,
             return
         try:
             result = await verify_once(store, papra, kz)
-            if result.diverged or result.suppressed or result.lookup_errors:
+            if (result.diverged or result.suppressed or result.lookup_errors
+                    or result.blocked):
                 # Silence means converged, which is the normal state and not worth a line
                 # every six hours. Anything else is the record of the column drifting.
+                # `blocked` belongs on this line rather than only in the store's one-time
+                # ERROR: the ERROR says when a reference was retired, and this says it is
+                # still retired on the pass the operator is reading about.
                 logger.info(
                     "verification: %d scanned, %d diverged, %d repaired, %d suppressed, "
-                    "%d extraction-empty, %d read/repair errors",
+                    "%d extraction-empty, %d read/repair errors, %d delivery-blocked",
                     result.scanned, result.diverged, result.repaired, result.suppressed,
-                    result.empty, result.lookup_errors)
+                    result.empty, result.lookup_errors, result.blocked)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - the loop outlives a bad pass

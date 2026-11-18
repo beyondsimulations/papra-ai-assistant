@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+import papra_suite.store as store_module
 from papra_suite.indexing import (
     DeliveryDisabled,
     IndexFailed,
@@ -107,16 +108,17 @@ class SelectivelyRefusingPapra(FakePapra):
     `FakePapra.raise_on_update` is corpus-wide, which is the right shape for the worker
     tests and useless for the convergence pass: the property worth pinning there is that
     one document Papra refuses does not end the walk over the other four hundred. So the
-    refusal has to be addressable.
+    refusal has to be addressable. Setting `refusing` to None ends it, which is how a test
+    says "and then it started working" without building a second fake.
     """
 
-    def __init__(self, *, refusing: str, error: PapraError) -> None:
+    def __init__(self, *, refusing: str | None, error: PapraError) -> None:
         super().__init__()
         self.refusing = refusing
         self.error = error
 
     async def update_document(self, org_id: str, document_id: str, **body) -> dict:
-        if document_id != self.refusing:
+        if self.refusing is None or document_id != self.refusing:
             return await super().update_document(org_id, document_id, **body)
         # Recorded before the raise, exactly as the parent does: the write was attempted.
         self.patch_calls += 1
@@ -278,9 +280,15 @@ async def test_the_handler_lets_the_failure_through_so_the_job_stays_retriable(
         store, fake_papra, fake_kz, job):
     """The delivery is part of the job, so a refused write fails the job rather than the corpus.
 
-    Swallowing it here would mark the job done: the document would keep Papra's own
-    text, the sweep would consider it seen, and nothing but `jobs --reset` would look
-    again.
+    Swallowing it here would mark the job done: the document would keep Papra's own text,
+    the sweep would consider it seen, and nothing would ask about these bytes again by
+    itself.
+
+    It is also where the refused write gets counted, and this path is the one that has to
+    work: a first-time index job holds a reference it read before it took the binding, so a
+    refusal counted against `ref.kreuzakt_id` would be counted against nothing exactly when
+    the document is new. The assertion below is the whole reason the counter is keyed to the
+    document whose text was being written.
     """
     open_gate(store)
     fake_papra.raise_on_update = PapraError("PATCH document failed: 502 bad gateway", 502)
@@ -292,6 +300,7 @@ async def test_the_handler_lets_the_failure_through_so_the_job_stays_retriable(
     ref = store.ledger_get(ORG, DOC_ID)
     assert ref.kreuzakt_id == 7                       # the binding is real and kept
     assert ref.delivered_sha is None                  # the delivery is not claimed
+    assert ref.delivery_failures == 1                 # and the refusal was not lost
 
 
 # --- the blank-page rule ----------------------------------------------------------
@@ -401,36 +410,131 @@ async def test_a_refused_write_does_not_spend_the_repair_budget(store, fake_kz, 
     assert "diverged more than twice in 24h" not in caplog.text
 
 
-async def test_a_refused_write_is_still_retried_on_the_seventh_pass(store, fake_kz):
-    """The behaviour migration 005 replaces, pinned before anything replaces it.
+async def test_a_refused_delivery_is_retried_five_times_and_then_left_alone(store, fake_kz,
+                                                                            caplog):
+    """The bounded replacement for `test_a_refused_write_is_still_retried_on_the_seventh_pass`.
 
-    Nothing bounded content-delivery retries. A document Papra persistently refuses (413,
-    403, an upload endpoint that will not take these bytes) was re-read, re-PATCHed and
-    re-ERROR-logged on every pass for the life of the deployment, because the only ceiling
-    in the pass answers a different question — how many repairs *landed* — and a refused
-    write lands nothing. That is correct as far as it goes, and it leaves a document nobody
-    can converge and nothing that says so.
+    That test pinned the world this commit replaces: seven passes, seven refused PATCHes,
+    seven ERROR lines, nothing in the ledger recording that the write had ever been
+    refused. It went green the day it was written and would have gone green forever, which
+    is the shape of a document that is never searchable and never reported.
 
-    Pinned here as the state of the world at the point 005 starts from, so that the
-    bounded retry lands as a deliberate replacement of a tested behaviour rather than as a
-    silent swap. It is rewritten in the same commit that ships the ceiling, which is the
-    evidence that the old behaviour was actually running.
+    The ceiling is five refused writes, and it is a different budget from
+    `repairs(24h)`: that one counts writes that LANDED and were overwritten again, and a
+    refusal landed nothing. Both properties have to hold at once, so the repair counters are
+    asserted here too — a document Papra never accepted must not be reported as one we keep
+    losing to a second writer.
     """
     open_gate(store)
+    caplog.set_level(logging.INFO, logger="papra_suite.indexing")
     papra = SelectivelyRefusingPapra(refusing=DOC_ID,
                                      error=PapraError("PATCH document failed: 413 too large", 413))
     indexed(store, fake_kz)
     add_papra_document(papra, DOC_ID)
 
-    for _ in range(7):
-        result = await verify_once(store, papra, fake_kz)
+    results = [await verify_once(store, papra, fake_kz) for _ in range(7)]
 
-    assert result.repaired == 0
-    assert papra.patch_calls == 7          # one more pass, one more refused write
-    # Nothing in the ledger even remembers being refused: there is no such column yet,
-    # which is the other half of "nothing bounded this".
-    columns = {row["name"] for row in store._conn.execute("PRAGMA table_info(index_ledger)")}
-    assert "delivery_failures" not in columns
+    assert papra.patch_calls == store_module.DELIVERY_MAX_FAILURES
+    assert store.ledger_get(ORG, DOC_ID).delivery_failures == \
+        store_module.DELIVERY_MAX_FAILURES
+    # The pass still walks the reference and still says what it found.
+    assert results[-1].scanned == 1 and results[-1].diverged == 1
+    assert results[-1].blocked == 1
+    assert results[-1].repaired == 0 and results[-1].suppressed == 0
+    assert results[-1].lookup_errors == 0
+    # ...without spending the repair budget or blaming a writer that was never there.
+    assert store.ledger_get(ORG, DOC_ID).repair_count == 0
+    assert store.ledger_stats()["repairs_24h"] == 0
+    assert store.ledger_stats()["delivery_blocked"] == 1
+    # Loud once, not every pass for the rest of the deployment's life.
+    errors = [record.getMessage() for record in caplog.records
+              if record.levelno >= logging.ERROR]
+    blocked = [line for line in errors if "will not attempt" in line]
+    assert len(blocked) == 1, errors
+    assert DOC_ID in blocked[0] and "413" in blocked[0]
+    assert "diverged more than twice in 24h" not in caplog.text
+
+
+async def test_a_blocked_document_is_back_in_play_once_it_converges(store, fake_kz):
+    """Retiring the retries must not retire the eyes, or the way back.
+
+    The usual end of a refusal is not us asking better: it is someone else putting the
+    right text there — Papra's own OCR, a later upload, an operator. The pass still reads
+    both sides of a blocked reference, so that convergence is recorded rather than lost,
+    and recording it is what clears the counter: the document is a live one again, not one
+    that stays retired because of a text it no longer has.
+    """
+    open_gate(store)
+    papra = SelectivelyRefusingPapra(refusing=DOC_ID,
+                                     error=PapraError("PATCH document failed: 413", 413))
+    indexed(store, fake_kz)
+    add_papra_document(papra, DOC_ID)
+    for _ in range(store_module.DELIVERY_MAX_FAILURES):
+        await verify_once(store, papra, fake_kz)
+    assert store.ledger_stats()["delivery_blocked"] == 1
+
+    # Papra's own pass produced the same text we had been trying to send. No write of ours
+    # is involved, and none is attempted: the equality branch records the convergence.
+    papra.document["content"] = KZ_TEXT
+    result = await verify_once(store, papra, fake_kz)
+
+    assert (result.repaired, result.blocked) == (0, 0)
+    ref = store.ledger_get(ORG, DOC_ID)
+    assert ref.delivered_sha == sha(KZ_TEXT)
+    assert (ref.delivery_failures, ref.last_delivery_error_at) == (0, None)
+    assert store.ledger_stats()["delivery_blocked"] == 0
+
+    # And it is back in the retry loop rather than merely un-counted: diverge it again and
+    # this pass writes, because the refusals it had were about a state it no longer is in.
+    papra.refusing = None                        # whatever it was about it, it is over
+    papra.document["content"] = PAPRA_TEXT
+    result = await verify_once(store, papra, fake_kz)
+
+    assert result.repaired == 1
+    assert store.ledger_get(ORG, DOC_ID).delivered_sha == sha(KZ_TEXT)
+
+
+async def test_a_read_error_does_not_count_toward_the_delivery_ceiling(store, fake_kz):
+    """"Would not answer" is not "refused the write", and the two must not share a counter.
+
+    An outage is the common case, and a pass that charged read failures to the ceiling
+    would retire half a corpus from convergence on a bad afternoon — silently, since the
+    retired references are the ones the pass stops writing.
+    """
+    open_gate(store)
+    papra = FakePapra()
+    papra.raise_on_get = PapraError("papra is down: 503", 503)
+    indexed(store, fake_kz)
+
+    for _ in range(store_module.DELIVERY_MAX_FAILURES * 2):
+        result = await verify_once(store, papra, fake_kz)
+        assert result.lookup_errors == 1        # one reference, one unreadable side
+        assert result.blocked == 0
+
+    assert store.ledger_get(ORG, DOC_ID).delivery_failures == 0
+    assert store.ledger_stats()["delivery_blocked"] == 0
+
+
+async def test_a_refused_write_is_counted_once_per_attempt_not_per_pass(store, fake_kz):
+    """The counter counts attempted writes, so one pass is one attempt.
+
+    `deliver_content` re-reads Papra before it writes, and both the index worker and the
+    convergence pass call it. Charging the counter at the writer rather than in the pass is
+    what makes that true for both callers, and it is why the ceiling cannot be reached by a
+    document that was merely read a lot.
+    """
+    open_gate(store)
+    papra = SelectivelyRefusingPapra(refusing=DOC_ID,
+                                     error=PapraError("PATCH document failed: 502", 502))
+    indexed(store, fake_kz)
+    add_papra_document(papra, DOC_ID)
+
+    await verify_once(store, papra, fake_kz)
+    assert store.ledger_get(ORG, DOC_ID).delivery_failures == 1
+    with pytest.raises(PapraError):
+        await deliver_content(papra, store, store.ledger_get(ORG, DOC_ID), kz_doc(),
+                              generation=1)
+    assert store.ledger_get(ORG, DOC_ID).delivery_failures == 2
 
 
 async def test_a_refusal_on_one_document_does_not_end_the_walk(store, fake_kz):

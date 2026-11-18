@@ -81,6 +81,15 @@ REPAIR_WINDOW_H = 24
 # on the operator's data".
 CLEANUP_MAX_ATTEMPTS = 5
 
+# How many refused content writes a reference accumulates before the convergence pass
+# stops asking. It is a ceiling on *refusals*, and it is deliberately not
+# `MAX_REPAIRS_IN_WINDOW`: that one counts writes that landed and were overwritten again,
+# and a PATCH Papra refused landed nothing, so the two budgets answer different questions
+# and a document can be at one ceiling while nowhere near the other. Five is the same
+# "not a blip" judgement as the cleanup cap, made for the same reason: below it an outage
+# is ordinary, above it a six-hourly pass is shouting at a wall for years.
+DELIVERY_MAX_FAILURES = 5
+
 # The three fields we may write into Papra, and therefore the only fields that
 # can be protected. A field name outside this set is a programming error, never
 # a column name to interpolate.
@@ -109,7 +118,8 @@ LEDGER_STAT_KEYS = (("references", "n_references"), ("indexed_current", "indexed
                     ("protected_notes", "protected_notes"),
                     ("repairs_24h", "repairs_24h"),
                     ("cleanup_pending", "cleanup_pending"),
-                    ("cleanup_failed", "cleanup_failed"))
+                    ("cleanup_failed", "cleanup_failed"),
+                    ("delivery_blocked", "delivery_blocked"))
 
 
 def _migration_001_initial(conn: sqlite3.Connection) -> None:
@@ -307,6 +317,35 @@ def _migration_003_index_ledger(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_005_delivery_refusals(conn) -> None:
+    """005: remember the content writes Papra refused, so refusing can eventually stop.
+
+    Nothing bounded them. A document whose PATCH Papra rejects for a reason that does not
+    heal (413 over the upload limit, 403 on a column a human locked, an endpoint that will
+    not take these bytes) was re-read, re-PATCHed and re-ERROR-logged by every convergence
+    pass for the life of the deployment. The suppression ceiling could not see it, because
+    that ceiling counts repairs that *landed* and a refusal lands nothing — so the one
+    state the pass can never resolve by itself was also the one it never stopped paying
+    for, and the only evidence was a log line repeating every six hours.
+
+    Two columns, because "how many in a row" and "when were we last refused" answer
+    different questions and only the first one can be acted on: the count is what retires
+    a reference from the retry loop and what `check` will count, the timestamp is what tells
+    an operator whether the refusals are this afternoon's or from before the last upgrade.
+
+    `NOT NULL DEFAULT 0` on the counter is not decoration: a NULL default would make
+    `delivery_failures >= 5` false for every row that ever existed, which is a silent
+    no-op migration — the counter would read as healthy precisely because nothing could
+    ever be counted. Applied statement by statement, inside `migrate()`'s transaction, for
+    the reason 003 and 004 spell out: half an `ALTER TABLE` pair at the old
+    `user_version` cannot be repaired by the retry, it can only be opened once.
+    """
+    conn.execute(
+        "ALTER TABLE index_ledger ADD COLUMN delivery_failures INTEGER NOT NULL DEFAULT 0"
+    )
+    conn.execute("ALTER TABLE index_ledger ADD COLUMN last_delivery_error_at TEXT")
+
+
 # The statuses that mean "this piece of work still exists", as one SQL fragment.
 # Migration 004's partial index, `enqueue_job`'s read-back and `reset_job`'s refusal
 # all have to agree on it, and three hand-written copies of a predicate is how a
@@ -353,6 +392,7 @@ MIGRATIONS = [
     _migration_002_ingest_events,
     _migration_003_index_ledger,
     _migration_004_jobs_live_idempotency,
+    _migration_005_delivery_refusals,
 ]
 
 # The closed set of outcomes worth recording. A sixth value must be added here
@@ -497,6 +537,11 @@ class LedgerRef:
     # defaults does not have to know they exist.
     cleanup_kreuzakt_id: int | None = None
     cleanup_generation: int | None = None
+    # Also defaulted, and also load-bearing for a pass rather than for a writer:
+    # `verify_once` reads `delivery_failures` to decide whether to attempt a repair at
+    # all, so a reference whose refusals are unknown has to read as "none", not as None.
+    delivery_failures: int = 0
+    last_delivery_error_at: str | None = None
 
 
 @dataclass
@@ -558,6 +603,8 @@ def _row_to_ledger_ref(row: sqlite3.Row) -> LedgerRef:
         cleanup_attempts=row["cleanup_attempts"], cleanup_next_at=row["cleanup_next_at"],
         cleanup_kreuzakt_id=row["cleanup_kreuzakt_id"],
         cleanup_generation=row["cleanup_generation"],
+        delivery_failures=row["delivery_failures"],
+        last_delivery_error_at=row["last_delivery_error_at"],
     )
 
 
@@ -1318,6 +1365,11 @@ class Store:
         while writing a `delivered_generation` that no backfill can ever match:
         the row stops resolving, stops looking like work to the sweep, and reports
         success — so the mismatch is refused as the caller bug it is.
+
+        Binding also retires the refused-write history. `delivery_failures` records what
+        Papra said about the text this binding pointed at; a new binding is a new extraction
+        the document has not been refused for yet, and carrying the old verdict over would
+        make the ceiling a permanent exclusion — the thing it exists to avoid being.
         """
         if only_if_generation is not None and generation != only_if_generation:
             raise ValueError(
@@ -1334,7 +1386,8 @@ class Store:
                     self._conn.rollback()
                     return False
                 cursor = self._conn.execute(
-                    "UPDATE index_ledger SET kreuzakt_id = ?, delivered_generation = ?"
+                    "UPDATE index_ledger SET kreuzakt_id = ?, delivered_generation = ?,"
+                    " delivery_failures = 0, last_delivery_error_at = NULL"
                     " WHERE papra_org_id = ? AND papra_document_id = ?",
                     (kreuzakt_id, generation, papra_org_id, papra_document_id),
                 )
@@ -1687,6 +1740,70 @@ class Store:
                 (papra_org_id, papra_document_id),
             )
 
+    def ledger_record_delivery_failure(
+        self, *, papra_org_id: str, papra_document_id: str, expected_kreuzakt_id: int,
+        generation: int, reason: str,
+    ) -> int | None:
+        """Charge one refused content write to the binding that was refused.
+
+        Called from the write boundary, never from a pass: the counter means "a PATCH of
+        ours was attempted against this reference and Papra said no", so a caller that
+        could not reach Papra, could not read it, or never got as far as composing a write
+        must not reach this method at all. Charging read failures would retire a corpus from
+        convergence on a bad afternoon, silently, because the retired references are the
+        ones the pass then stops writing.
+
+        The write is fenced twice, for the reason `ledger_set_kreuzakt_id` fences for: a
+        refusal is a fact about the binding that was tried and about the index it was tried
+        against. If a re-index has replaced that binding while the write was in flight, or a
+        rebuild has moved the generation underneath it, the answer about those bytes says
+        nothing about the row that exists now, and charging it would bring a document that
+        has never been tried straight to the ceiling that retires it. `None` means exactly
+        that: not charged. The fence and the write share one `BEGIN IMMEDIATE`, so a
+        `bump_generation()` from another thread cannot slip between them.
+
+        The fifth one is the interesting row, so the fifth one is announced: after it the
+        convergence pass stops attempting this reference, and a state that only shows up by
+        not happening is a state nobody finds. The line carries `reason` because the store
+        is the last place that still has it on the way to the operator.
+        """
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self._read_generation() != generation:
+                    self._conn.rollback()
+                    return None
+                cursor = self._conn.execute(
+                    "UPDATE index_ledger SET delivery_failures = delivery_failures + 1,"
+                    " last_delivery_error_at = ?"
+                    " WHERE papra_org_id = ? AND papra_document_id = ?"
+                    " AND kreuzakt_id = ? AND delivered_generation = ?",
+                    (now, papra_org_id, papra_document_id, expected_kreuzakt_id, generation),
+                )
+                if cursor.rowcount == 0:
+                    self._conn.rollback()
+                    return None
+                row = self._conn.execute(
+                    "SELECT delivery_failures FROM index_ledger"
+                    " WHERE papra_org_id = ? AND papra_document_id = ?",
+                    (papra_org_id, papra_document_id),
+                ).fetchone()
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        count = int(row["delivery_failures"])
+        if count == DELIVERY_MAX_FAILURES:
+            logger.error(
+                "papra=%s/%s has refused %d content writes in a row (%s): the convergence "
+                "pass will not attempt this text again. Papra does not hold what the index "
+                "holds; a re-index of the document retires this count, and nothing else "
+                "will",
+                papra_org_id, papra_document_id, count, reason,
+            )
+        return count
+
     def ledger_record_delivery(
         self, *, papra_org_id: str, papra_document_id: str, delivered_at: str,
         delivered_sha: str, generation: int,
@@ -1708,12 +1825,27 @@ class Store:
         row would retire a live one. A refused write logs, because a tripwire
         nobody can see is a tripwire that will be stepped on: the return contract
         is `None` either way, so the row's state and this line are the evidence.
+
+        A delivery that lands also retires the refused-write history, and only a delivery
+        that lands does. The counter answers "has Papra been taking our text for this
+        reference", and a write that arrived is the only answer that resets the question —
+        so the count means *consecutive* refusals rather than a tally of bad days. The
+        `EMPTY_EXTRACTION_SHA` record is the exception worth naming, because it goes through
+        this same statement: stamping "the index produced no text" is not evidence of
+        anything Papra did or did not accept, and letting it clear the history would let a
+        blank scan disarm the one ceiling on re-writing a document Papra has refused.
         """
+        text_delivered = delivered_sha != EMPTY_EXTRACTION_SHA
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 "UPDATE index_ledger SET delivered_at = ?, delivered_sha = ?,"
                 " delivered_generation = ?"
-                " WHERE papra_org_id = ? AND papra_document_id = ?"
+                # Built as two statements rather than a `CASE` because the columns being
+                # written are the point of the difference, and a reader of the trace sees
+                # exactly which of the two happened.
+                + (", delivery_failures = 0, last_delivery_error_at = NULL"
+                   if text_delivered else "")
+                + " WHERE papra_org_id = ? AND papra_document_id = ?"
                 " AND kreuzakt_id IS NOT NULL AND delivered_generation = ?",
                 (delivered_at, delivered_sha, generation, papra_org_id, papra_document_id,
                  generation),
@@ -1953,6 +2085,11 @@ class Store:
           cannot settle from the CLI. `cleanup_pending - cleanup_failed` are still
           being retried. Rows `skipped` by the cleanup pass are in neither: nothing
           is owed on them.
+        * `delivery_blocked` — references the convergence pass has stopped writing to,
+          because Papra refused `DELIVERY_MAX_FAILURES` content writes in a row. It counts
+          references, not refusals: one refusal is an ordinary bad hour and belongs in the
+          log, while this number is the set that will never converge on its own. It is not
+          the same population as `repairs_24h`, which counts writes that landed.
 
         `org_ids=[]` is "no buckets", not "no filter": a token with nothing
         granted must not receive corpus-wide counts.
@@ -1977,11 +2114,12 @@ class Store:
             " THEN repair_count ELSE 0 END) AS repairs_24h,"
             " SUM(CASE WHEN cleanup_state IN ('pending', 'failed')"
             " THEN 1 ELSE 0 END) AS cleanup_pending,"
-            " SUM(CASE WHEN cleanup_state = 'failed' THEN 1 ELSE 0 END) AS cleanup_failed"
+            " SUM(CASE WHEN cleanup_state = 'failed' THEN 1 ELSE 0 END) AS cleanup_failed,"
+            " SUM(CASE WHEN delivery_failures >= ? THEN 1 ELSE 0 END) AS delivery_blocked"
             " FROM index_ledger"
         )
         params: list[object] = [generation, generation, EMPTY_EXTRACTION_SHA, generation,
-                                cutoff]
+                                cutoff, DELIVERY_MAX_FAILURES]
         if org_ids is not None:
             sql += " WHERE papra_org_id IN (" + ", ".join("?" * len(org_ids)) + ")"
             params.extend(org_ids)

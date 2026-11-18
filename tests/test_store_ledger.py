@@ -1124,7 +1124,11 @@ def test_stats_keys_and_counts(store):
     stats = store.ledger_stats()
     assert set(stats) == {"references", "indexed_current", "delivered", "extraction_empty",
                           "protected_name", "protected_date", "protected_notes",
-                          "repairs_24h", "cleanup_pending", "cleanup_failed"}
+                          "repairs_24h", "cleanup_pending", "cleanup_failed",
+                          "delivery_blocked"}
+    # A repaired, delivered, cleanup-owing row is none of the things `delivery_blocked`
+    # counts: that key counts references whose writes Papra has refused five times running.
+    assert stats["delivery_blocked"] == 0
     assert stats["references"] == 2
     assert stats["indexed_current"] == 1
     assert stats["delivered"] == 1
@@ -1275,6 +1279,9 @@ def test_ledger_ref_exposes_the_contract_fields_in_order():
         "deleted_at", "cleanup_state", "cleanup_attempts", "cleanup_next_at",
         # the two cleanup columns the delete-propagation pass revalidates from:
         "cleanup_kreuzakt_id", "cleanup_generation",
+        # and the refused-write history the convergence pass reads before it attempts a
+        # repair -- defaulted, for the same reason the two above are:
+        "delivery_failures", "last_delivery_error_at",
     ]
 
 
@@ -1468,3 +1475,163 @@ def test_the_unbind_keeps_what_we_wrote_into_papra(store):
     assert after.delivered_at == "2026-11-19T09:00:00+00:00"
     assert after.delivered_sha == "be" * 32
     assert after.kreuzakt_id is None and after.delivered_generation is None
+
+
+# -- the refused-write history (migration 005) ---------------------------------------
+
+def bind_ref(store, *, org="org-a", doc="doc-1", kreuzakt_id=7, generation=None):
+    """A bound reference, as the index job leaves it before any content delivery."""
+    generation = store.get_generation() if generation is None else generation
+    store.ledger_upsert_reference(papra_org_id=org, papra_document_id=doc,
+                                  file_hash=H, papra_original_name=f"{doc}.pdf")
+    store.ledger_set_kreuzakt_id(papra_org_id=org, papra_document_id=doc,
+                                 kreuzakt_id=kreuzakt_id, generation=generation)
+    return store.ledger_get(org, doc)
+
+
+def refuse(store, ref, times=1, reason="PATCH document failed: 413 too large"):
+    """Charge refusals the way `deliver_content` does, at the write, fenced on the binding."""
+    for _ in range(times):
+        store.ledger_record_delivery_failure(
+            papra_org_id=ref.papra_org_id, papra_document_id=ref.papra_document_id,
+            expected_kreuzakt_id=ref.kreuzakt_id, generation=ref.delivered_generation,
+            reason=reason)
+
+
+def test_a_refused_write_is_counted_against_the_binding_that_tried_it(store):
+    """The counter belongs to the binding whose PATCH was refused, and to that one only.
+
+    The attempt was made against a document the writer had read as `kreuzakt_id` under
+    `generation`. If that binding has gone away underneath the attempt — rebound by a
+    re-index, invalidated by a rebuild — the refusal says nothing about the row that
+    exists now, and charging it would walk a document that has never been tried into the
+    ceiling that retires a document from convergence.
+    """
+    ref = bind_ref(store)
+
+    assert store.ledger_record_delivery_failure(
+        papra_org_id=ref.papra_org_id, papra_document_id=ref.papra_document_id,
+        expected_kreuzakt_id=ref.kreuzakt_id, generation=ref.delivered_generation,
+        reason="PATCH document failed: 413 too large") == 1
+    again = store.ledger_record_delivery_failure(
+        papra_org_id=ref.papra_org_id, papra_document_id=ref.papra_document_id,
+        expected_kreuzakt_id=ref.kreuzakt_id, generation=ref.delivered_generation,
+        reason="PATCH document failed: 403 forbidden")
+    assert again == 2
+    after = store.ledger_get("org-a", "doc-1")
+    assert after.delivery_failures == 2
+    assert after.last_delivery_error_at is not None
+
+
+def test_a_refusal_is_not_charged_to_a_binding_that_no_longer_exists(store):
+    """Both halves of the fence: the binding, and the index that binding belongs to.
+
+    A refusal that arrives after a rebuild says something about bytes the rebuild has
+    already retired, and charging it would start a brand-new reference at the ceiling — the
+    one way this mechanism could lose a document by itself.
+    """
+    ref = bind_ref(store)
+    store.bump_generation()                      # the rebuild this refusal predates
+
+    charged = store.ledger_record_delivery_failure(
+        papra_org_id=ref.papra_org_id, papra_document_id=ref.papra_document_id,
+        expected_kreuzakt_id=ref.kreuzakt_id, generation=ref.delivered_generation,
+        reason="PATCH document failed: 413 too large")
+
+    assert charged is None
+    assert store.ledger_get("org-a", "doc-1").delivery_failures == 0
+
+    # The other half, inside one generation: the row was rebound while the write was in
+    # flight, so the refusal belongs to a Kreuzakt id this reference no longer holds.
+    store.ledger_unbind(papra_org_id="org-a", papra_document_id="doc-1",
+                        expected_kreuzakt_id=7, generation=store.get_generation(),
+                        reason="re-index")
+    store.ledger_set_kreuzakt_id(papra_org_id="org-a", papra_document_id="doc-1",
+                                 kreuzakt_id=11, generation=store.get_generation())
+
+    assert store.ledger_record_delivery_failure(
+        papra_org_id="org-a", papra_document_id="doc-1", expected_kreuzakt_id=7,
+        generation=store.get_generation(), reason="PATCH document failed: 413") is None
+    assert store.ledger_get("org-a", "doc-1").delivery_failures == 0
+
+
+def test_the_blocked_count_appears_only_at_the_ceiling(store):
+    """`delivery_blocked` is "the pass has stopped asking", not "a write failed once".
+
+    One refusal in five is a document having an ordinary bad hour; five in a row is the
+    state Task 12 has to print, because it is the one a convergence pass will never
+    resolve by itself.
+    """
+    ref = bind_ref(store)
+    for _ in range(store_module.DELIVERY_MAX_FAILURES - 1):
+        refuse(store, ref)
+        assert store.ledger_stats()["delivery_blocked"] == 0
+
+    refuse(store, ref)
+
+    assert store.ledger_stats()["delivery_blocked"] == 1
+    assert store.ledger_get("org-a", "doc-1").delivery_failures == \
+        store_module.DELIVERY_MAX_FAILURES
+
+
+def test_a_delivery_that_lands_clears_the_refusal_history(store):
+    """Consecutive, not cumulative: a write that arrives restarts the count.
+
+    A document refused through an outage and then taken is a converged document, and a
+    converged document must not be one refused-write away from being retired on its next
+    bad day.
+    """
+    ref = bind_ref(store)
+    refuse(store, ref, times=3)
+
+    store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-1",
+                                 delivered_at="2026-11-19T09:00:00+00:00",
+                                 delivered_sha="be" * 32,
+                                 generation=ref.delivered_generation)
+
+    after = store.ledger_get("org-a", "doc-1")
+    assert (after.delivery_failures, after.last_delivery_error_at) == (0, None)
+
+
+def test_an_empty_extraction_does_not_clear_the_refusal_history(store):
+    """Stamping "the index has no text" proves nothing about Papra's willingness.
+
+    `_record_extraction_empty` writes `delivered_sha` too, so a clear hung off that column
+    in general would let a blank scan erase the evidence of five refused writes — and the
+    pass would start knocking again on a document it had already been told not to write.
+    """
+    ref = bind_ref(store)
+    refuse(store, ref, times=store_module.DELIVERY_MAX_FAILURES)
+    assert store.ledger_stats()["delivery_blocked"] == 1
+
+    store.ledger_record_delivery(papra_org_id="org-a", papra_document_id="doc-1",
+                                 delivered_at="2026-11-19T09:00:00+00:00",
+                                 delivered_sha=EMPTY_EXTRACTION_SHA,
+                                 generation=ref.delivered_generation)
+
+    assert store.ledger_get("org-a", "doc-1").delivery_failures == \
+        store_module.DELIVERY_MAX_FAILURES
+    assert store.ledger_stats()["delivery_blocked"] == 1
+
+
+def test_a_new_binding_retires_the_refusal_history(store):
+    """Different bytes, different document: the old refusals were about something else.
+
+    A re-index is the deliberate act that re-reads a document, so the ceiling the previous
+    text earned does not carry over to the new one. Without this, a document whose text
+    Papra refused for size would stay retired after the corpus had fixed it.
+    """
+    ref = bind_ref(store)
+    refuse(store, ref, times=store_module.DELIVERY_MAX_FAILURES)
+    assert store.ledger_stats()["delivery_blocked"] == 1
+
+    store.ledger_unbind(papra_org_id="org-a", papra_document_id="doc-1",
+                        expected_kreuzakt_id=ref.kreuzakt_id,
+                        generation=ref.delivered_generation, reason="re-index")
+    store.ledger_set_kreuzakt_id(papra_org_id="org-a", papra_document_id="doc-1",
+                                 kreuzakt_id=9, generation=store.get_generation())
+
+    after = store.ledger_get("org-a", "doc-1")
+    assert (after.delivery_failures, after.last_delivery_error_at, after.kreuzakt_id) \
+        == (0, None, 9)
+    assert store.ledger_stats()["delivery_blocked"] == 0

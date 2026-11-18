@@ -867,7 +867,7 @@ def test_upgrade_from_001_adds_ingest_events_and_keeps_rows(tmp_path):
     ever been applied, the file holds rows, and the current code opens it. The
     test above starts from an empty database, so it never runs 002 as an upgrade
     and never asks whether 001's data survived it — and its user_version check
-    tracks len(MIGRATIONS), so nothing there pins the number 3."""
+    tracks len(MIGRATIONS), so nothing there pins a literal."""
     db_path = tmp_path / "state.db"
     conn = sqlite3.connect(db_path)
     store_module._migration_001_initial(conn)
@@ -892,12 +892,12 @@ def test_upgrade_from_001_adds_ingest_events_and_keeps_rows(tmp_path):
     store = Store(db_path)
     store.migrate()
     try:
-        # 004 (the partial jobs index) is the migration this path now runs, so the
-        # expected value moved 3 -> 4 when it landed. Adding a migration 005 must
-        # bump it to 5: that is the intended signal, and pinning the literal rather
-        # than len(MIGRATIONS) is the whole point — a test that tracked the list
-        # length could not notice a migration that never ran.
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        # 005 (the refused-write history) is the migration this path now runs, so the
+        # expected value moved 4 -> 5 when it landed. Adding a migration 006 must bump it
+        # to 6: that is the intended signal, and pinning the literal rather than
+        # len(MIGRATIONS) is the whole point — a test that tracked the list length could
+        # not notice a migration that never ran.
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
         tables = {row[0] for row in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "ingest_events" in tables
