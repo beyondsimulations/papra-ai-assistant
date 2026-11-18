@@ -1265,6 +1265,18 @@ Commit as `feat(index): metadata delivery on Papra-side baselines with explicit 
 **Interfaces:**
 - Consumes: `ledger_mark_deleted/mark_restored/ledger_queue_cleanup/ledger_cleanup_due/ledger_cleanup_result/ledger_resolve`, `KreuzaktClient.delete_document`, `PapraClient.list_documents`, `Store.get_generation`.
 - Also produces (added after Task 4, which found the gap): `Store.ledger_unbind(kreuzakt_id, *, reason) -> int` — clears `kreuzakt_id` on every reference still pointing at a destroyed document so they become `ledger_needs_index` candidates again. The hazard Task 4 identified by hand: a restore that arrives **after** the upstream delete completed leaves a live `kreuzakt_id` aimed at a document that no longer exists, and the search path would keep returning a hit that resolves to nothing.
+- **Also owns, and this changes the signature above (found by Task 6's follow-up round, pinned by
+  `tests/test_index_job.py:890`
+  `test_a_fresh_404_that_outlives_the_attempts_leaves_the_row_stuck`): the unbind must be fenced, and it must
+  be the recovery for a stuck row.** A Papra 404 that outlives the attempt ceiling leaves the ledger row
+  **bound and stamped as delivered under the current generation without the document ever having been read**.
+  `ledger_needs_index` excludes exactly that state, so the sweep, a rebuild and backfill all walk past it and
+  the only escape is a per-document `jobs --reset`. `ledger_unbind(kreuzakt_id, *, reason)` alone cannot clear
+  it — unbinding by Kreuzakt id with no expectation is the same unguarded clear this plan rejects everywhere
+  else. Fence it on `expected_kreuzakt_id` **and** generation, use it in the delete-candidate path so a
+  document Papra has forgotten stops occupying a Kreuzakt id, and add a ledger test that reproduces the stuck
+  state (bound + `delivered_generation == current` + a permanently failed job) and shows the unbind making the
+  document eligible again.
 - Produces:
   - `async def reconcile_deletions(store, papra, kz) -> DeletionResult(refs_marked: int, upstream_deleted: int, upstream_pending: int, restored: int, aborted: bool, capped: int)`
   - `async def run_cleanup(store, kz) -> CleanupResult(attempted: int, deleted: int, deferred: int, failed: int)`
