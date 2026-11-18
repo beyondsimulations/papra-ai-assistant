@@ -120,9 +120,9 @@ async def test_sweep_enqueues_externally_uploaded_pdf(stack):
 
     result = await sweep_once(store, papra)
 
-    assert result.jobs_enqueued == 1
+    assert result.documents_enqueued == 1
     job = store.claim_next_job("ocr")
     assert job.document_id == document["id"]
     assert job.payload["name"] == "extern-upload.pdf"
     # second sweep is a no-op
-    assert (await sweep_once(store, papra)).jobs_enqueued == 0
+    assert (await sweep_once(store, papra)).documents_enqueued == 0

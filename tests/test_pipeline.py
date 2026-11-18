@@ -3,6 +3,7 @@ import sqlite3
 
 import pytest
 
+from papra_suite import indexing, pipeline
 from papra_suite.config import load_config
 from papra_suite.pipeline import enqueue_index_job, enqueue_ocr_job, serve, sweep_once
 from papra_suite.store import Store
@@ -221,7 +222,7 @@ async def test_sweep_enqueues_index_work_for_an_externally_uploaded_pdf(store):
 
     result = await sweep_once(store, papra)
 
-    assert (result.documents_checked, result.jobs_enqueued) == (1, 1)
+    assert (result.documents_checked, result.documents_enqueued) == (1, 1)
     index_job = store.claim_next_job("index")
     assert index_job is not None and index_job.document_id == DOC_ID
     assert store.claim_next_job("ocr") is not None      # the old writer still runs
@@ -309,3 +310,52 @@ async def test_serve_refuses_a_content_flag_this_build_cannot_honour(tmp_path, s
     # and the consequence the warning promises: the old writer is still enqueued
     _enqueue(store)
     assert [job.kind for job in store.list_jobs()] == ["ocr", "index"]
+
+
+async def test_serve_passes_the_index_attempt_ceiling_to_the_loop_that_spends_it(
+        tmp_path, store, monkeypatch):
+    """`PAPRA_INDEX_MAX_ATTEMPTS` has to reach the code that ends a job.
+
+    The value went to the handler, which spent it on its own row re-runs, while the
+    worker loop marked failures with the store's default of 3 — so the knob moved one
+    budget and not the other, and an operator reading `.env.example` would believe a
+    configured 5 meant five runs. This pins the wiring at the place that starts the
+    worker, and pins the legacy kinds to the store's default so an index-shaped
+    ceiling cannot spread by accident.
+    """
+    ceilings = {}
+
+    async def recording_loop(store, *, kind, handler, idle_sleep_s=1.0, max_attempts=None):
+        ceilings[kind] = max_attempts
+
+    monkeypatch.setattr(pipeline, "worker_loop", recording_loop)
+    config = load_config({**SERVE_ENV, "DATA_DIR": str(tmp_path),
+                          "PAPRA_INDEX_MAX_ATTEMPTS": "5"})
+
+    stop = asyncio.Event()
+    stop.set()
+    await serve(config, stop=stop, store=store, papra=FakePapra(), kreuzakt=FakeKreuzakt())
+
+    assert ceilings["index"] == 5
+    assert ceilings["ocr"] is None and ceilings["title"] is None
+
+
+async def test_serve_reads_the_delivery_flag_where_it_can_be_moved(tmp_path, store,
+                                                                  monkeypatch):
+    """The documented seam is a module attribute, so the gate must read it there.
+
+    `from papra_suite.indexing import CONTENT_DELIVERY_IMPLEMENTED` binds the value
+    into this module at import, which makes the documented way of exercising a future
+    build — set the attribute on `indexing` — a silent no-op. Only one branch of the
+    gate was then testable, and Task 7 would have inherited "the gate works" from a
+    test that could never see it open.
+    """
+    monkeypatch.setattr(indexing, "CONTENT_DELIVERY_IMPLEMENTED", True)
+    config = load_config({**SERVE_ENV, "DATA_DIR": str(tmp_path),
+                          "PAPRA_INDEX_CONTENT_DELIVERY": "1"})
+
+    stop = asyncio.Event()
+    stop.set()
+    await serve(config, stop=stop, store=store, papra=FakePapra(), kreuzakt=FakeKreuzakt())
+
+    assert store.settings_flag("index_content_delivery") is True

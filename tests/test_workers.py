@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -495,6 +496,82 @@ async def test_worker_loop_marks_failures(store, config):
     assert job.status == "pending" and job.attempts == 1 and "boom" in job.error
 
 
+def _age_the_backoff(store, job_id: str) -> None:
+    """Pull `next_attempt_at` into the past so the next pass can claim the job again.
+
+    The schedule itself is `test_store`'s subject; these two tests count the runs a
+    job is allowed, and 30 s of backoff per run is not what they measure.
+    """
+    with store._lock, store._conn:
+        store._conn.execute(
+            "UPDATE jobs SET next_attempt_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), job_id),
+        )
+
+
+async def _run_the_loop_until_it_gives_up(store, job_id, kind, handler, seam_claims,
+                                         **loop_kwargs) -> int:
+    """Drive `worker_loop` over one job until it stops reclaiming it.
+
+    Returns how many times the loop looked for work. The claim seam is also the stop
+    seam, so a ceiling that never arrives fails an assertion in the test rather than
+    spinning forever.
+    """
+    original_claim = store.claim_next_job
+    state = {"claims": 0}
+
+    def claim(kind):
+        state["claims"] += 1
+        if state["claims"] > seam_claims:
+            raise KeyboardInterrupt()
+        _age_the_backoff(store, job_id)
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    with pytest.raises(KeyboardInterrupt):
+        await worker_loop(store, kind=kind, handler=handler, idle_sleep_s=0,
+                          **loop_kwargs)
+    return state["claims"]
+
+
+async def test_worker_loop_gives_a_job_the_attempt_ceiling_it_is_given(store):
+    """The ceiling that ends a job has to be the one the caller names.
+
+    `PAPRA_INDEX_MAX_ATTEMPTS` was passed to the handler, which used it for its own
+    row re-runs, while the call that actually decided permanence used `mark_job_failed`'s
+    default of 3 — so an operator who configured 5 got three runs and one who
+    configured 1 still got three. A configured ceiling that changes nothing is worse
+    than no knob, because it reads as though it were honoured.
+    """
+    job = make_job(store, kind="index", doc="doc_1")
+
+    async def handler(job):
+        raise RuntimeError("kreuzakt is not listening")
+
+    await _run_the_loop_until_it_gives_up(store, job.id, "index", handler, 8,
+                                          max_attempts=5)
+
+    row = store.get_job(job.id)
+    assert row.attempts == 5 and row.status == "failed"
+
+
+async def test_worker_loop_keeps_the_default_ceiling_for_a_kind_that_sets_none(store):
+    """The parameter is opt-in per kind: the legacy workers keep the store's default.
+
+    Without this, the test above could be satisfied by raising every kind's ceiling,
+    which would quietly give the OCR and title workers five futile runs each.
+    """
+    job = make_job(store, kind="ocr", doc="doc_1")
+
+    async def handler(job):
+        raise RuntimeError("the llm is not listening")
+
+    await _run_the_loop_until_it_gives_up(store, job.id, "ocr", handler, 6)
+
+    row = store.get_job(job.id)
+    assert row.attempts == 3 and row.status == "failed"
+
+
 async def test_worker_loop_survives_mark_job_failed_error(store, caplog):
     """A sqlite error while RECORDING a failure must not kill the worker
     task (the job would wedge 'running' until restart)."""
@@ -843,7 +920,7 @@ async def test_sweep_once_enqueues_for_unseen_pdfs_only(store):
 
     assert isinstance(result, SweepResult)
     assert result.documents_checked == 2
-    assert result.jobs_enqueued == 1  # doc_1 (pdf), not doc_2 (txt)
+    assert result.documents_enqueued == 1  # doc_1 (pdf), not doc_2 (txt)
     assert result.non_pdf_skipped == 1
     assert store.document_seen("org_1", "doc_1")
     assert store.document_seen("org_1", "doc_2")
@@ -870,7 +947,7 @@ async def test_sweep_is_pdf_falls_back_to_pdf_name(store):
 
     result = await sweep_once(store, papra)
 
-    assert result.jobs_enqueued == 1  # scan.pdf made it in via the .pdf name
+    assert result.documents_enqueued == 1  # scan.pdf made it in via the .pdf name
     assert result.non_pdf_skipped == 1  # notes.txt skipped
     job = store.claim_next_job("ocr")
     assert job is not None and job.document_id == "doc_scan"
@@ -893,7 +970,7 @@ async def test_sweep_matches_uppercase_pdf_extension(store):
 
     result = await sweep_once(store, UpperPdfPapra())
 
-    assert result.jobs_enqueued == 1  # `Scan.PDF` is a document to transcribe
+    assert result.documents_enqueued == 1  # `Scan.PDF` is a document to transcribe
     assert result.non_pdf_skipped == 0  # not silently skipped-and-forgotten
     job = store.claim_next_job("ocr")
     assert job is not None and job.document_id == "doc_scan"
@@ -922,14 +999,14 @@ async def test_sweep_continues_past_download_failure(store):
     first = await sweep_once(store, papra)
 
     assert first.errors == 1
-    assert first.jobs_enqueued == 1  # doc_2 enrolled despite doc_1 failing
+    assert first.documents_enqueued == 1  # doc_2 enrolled despite doc_1 failing
     assert not store.document_seen("org_1", "doc_1")  # failed doc stays unseen
     assert store.document_seen("org_1", "doc_2")
 
     # a second sweep retries doc_1 (and fails again) but does not re-enqueue doc_2
     second = await sweep_once(store, papra)
     assert second.errors == 1
-    assert second.jobs_enqueued == 0
+    assert second.documents_enqueued == 0
     assert not store.document_seen("org_1", "doc_1")
 
 
@@ -960,7 +1037,7 @@ async def test_sweep_continues_past_org_listing_failure(store):
     result = await sweep_once(store, OrgListingFailsPapra())
 
     assert result.errors == 1
-    assert result.jobs_enqueued == 1  # org_2's PDF enrolled despite org_1 failing
+    assert result.documents_enqueued == 1  # org_2's PDF enrolled despite org_1 failing
     job = store.claim_next_job("ocr")
     assert job.papra_org_id == "org_2" and job.document_id == "doc_3"
 
@@ -992,7 +1069,7 @@ async def test_sweep_once_paginates_past_first_page(store):
     result = await sweep_once(store, papra)
 
     assert result.documents_checked == 75
-    assert result.jobs_enqueued == 75  # every PDF across BOTH pages
+    assert result.documents_enqueued == 75  # every PDF across BOTH pages
     assert papra.pages_requested == [0, 1]  # stopped at the short page
 
 
@@ -1002,7 +1079,7 @@ async def test_sweep_once_stops_at_page_boundary(store):
     result = await sweep_once(store, papra)
 
     assert result.documents_checked == SWEEP_PAGE_SIZE
-    assert result.jobs_enqueued == SWEEP_PAGE_SIZE
+    assert result.documents_enqueued == SWEEP_PAGE_SIZE
     # page 0 is full -> one confirming fetch of page 1 (empty) -> stop
     assert papra.pages_requested == [0, 1]
 
@@ -1050,24 +1127,24 @@ async def test_sweep_covers_large_orgs_across_passes(store, caplog):
     with caplog.at_level(logging.WARNING):
         first = await sweep_once(store, papra)
 
-    assert first.jobs_enqueued == MAX_SWEEP_PAGES * SWEEP_PAGE_SIZE  # 5000
+    assert first.documents_enqueued == MAX_SWEEP_PAGES * SWEEP_PAGE_SIZE  # 5000
     assert store.get_setting("sweep_offset:org_1") == "100"  # resume point saved
     assert any(record.levelno == logging.WARNING and "org_1" in record.getMessage()
                and "1000" in record.getMessage()  # remaining estimate
                for record in caplog.records)
 
     second = await sweep_once(store, papra)
-    assert second.jobs_enqueued == 1000  # docs 5000-5999, resumed at page 100
+    assert second.documents_enqueued == 1000  # docs 5000-5999, resumed at page 100
     assert store.get_setting("sweep_offset:org_1") == "0"  # short page -> reset
 
     third = await sweep_once(store, papra)
-    assert third.jobs_enqueued == 0  # fully caught up; nothing left to enqueue
+    assert third.documents_enqueued == 0  # fully caught up; nothing left to enqueue
     # pass 3 re-walked the seen prefix from page 0 and hit the cap again
     # (bounded per-pass work; the seen-table gate skips processed docs)
     assert store.get_setting("sweep_offset:org_1") == "100"
 
     fourth = await sweep_once(store, papra)
-    assert fourth.jobs_enqueued == 0
+    assert fourth.documents_enqueued == 0
     assert fourth.documents_checked == 1000  # resumed at 100, short page at 120
     assert store.get_setting("sweep_offset:org_1") == "0"  # reset on the short page
     # every one of the 6000 documents made it into the seen table eventually
@@ -1099,7 +1176,7 @@ async def test_sweep_uses_listing_hash_without_download(store):
 
     result = await sweep_once(store, papra)
 
-    assert result.jobs_enqueued == 1
+    assert result.documents_enqueued == 1
     job = store.claim_next_job("ocr")
     assert job is not None and job.document_id == "doc_h"
     # the LISTING's hash, not a recompute of the downloaded body
@@ -1130,7 +1207,7 @@ async def test_sweep_falls_back_to_download_hash_when_listing_hash_absent(store,
     with caplog.at_level(logging.INFO):
         result = await sweep_once(store, papra)
 
-    assert result.jobs_enqueued == 1
+    assert result.documents_enqueued == 1
     assert papra.download_calls == 1  # fallback path did download
     job = store.claim_next_job("ocr")
     assert job.content_hash == hashlib.sha256(papra.pdf).hexdigest()
@@ -1149,7 +1226,7 @@ async def test_sweep_self_heals_corrupt_offset(store):
     result = await sweep_once(store, StubPapra())
 
     assert result.errors == 0
-    assert result.jobs_enqueued == 1  # swept from healed offset 0
+    assert result.documents_enqueued == 1  # swept from healed offset 0
     assert store.document_seen("org_1", "doc_1")
     # healed and then reset to 0 by the short page
     assert store.get_setting("sweep_offset:org_1") == "0"
@@ -1159,7 +1236,7 @@ async def test_sweep_once_is_idempotent(store):
     papra = StubPapra()
     first = await sweep_once(store, papra)
     second = await sweep_once(store, papra)
-    assert first.jobs_enqueued == 1 and second.jobs_enqueued == 0
+    assert first.documents_enqueued == 1 and second.documents_enqueued == 0
     assert second.documents_checked == 2
 
 
@@ -1189,7 +1266,7 @@ async def test_sweep_skips_oversized_document(store, caplog):
         result = await sweep_once(store, papra)
 
     assert result.oversized_skipped == 1
-    assert result.jobs_enqueued == 0
+    assert result.documents_enqueued == 0
     assert store.document_seen("org_1", "doc_big")  # skip is permanent
     assert papra.download_calls == 0  # never downloaded the huge body
     assert any("oversized" in record.getMessage() and "doc_big" in record.getMessage()

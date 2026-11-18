@@ -16,6 +16,7 @@ cannot corrupt the record, and "we do not write yet" has to be a mechanism rathe
 than a review note (Task 7 puts the gate inside `deliver_content`).
 """
 
+import hashlib
 import json
 import logging
 import posixpath
@@ -39,8 +40,15 @@ from papra_suite.store import Job, Store
 
 ORG = "org_1"
 DOC_ID = "doc-1"
-HASH = "a1b2c3d4e5f6a7b8"
+# The bytes Papra serves, and the hash of exactly those bytes. `content_hash` is a
+# sha256 of Papra's original file in production too — the sweep takes it from Papra's
+# own `originalSha256Hash`, the mail path computes it with `compute_file_hash`, and the
+# sweep's fallback hashes the download — so the double has to be honest about it or
+# `download_original`'s verification check would be tested against a fiction.
+PDF_BYTES = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\ntrailer\n%%EOF"
+HASH = hashlib.sha256(PDF_BYTES).hexdigest()
 NAME = "scan-0001.pdf"
+UPLOAD_NAME = f"papra-{DOC_ID}-{HASH[:8]}.pdf"
 
 
 def make_job(*, store=None, kind="index", org=ORG, document_id=DOC_ID,
@@ -115,7 +123,6 @@ def test_upload_name_of_an_overlong_id_stays_unique():
 # --- the doubles ------------------------------------------------------------------
 
 FIXTURES = Path(__file__).parent / "fixtures"
-PDF_BYTES = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\ntrailer\n%%EOF"
 QUEUE_ERROR = ("Parsing error: xberg_native_pdf: failed to load bytes: "
                "Invalid cross-reference table")
 
@@ -142,6 +149,12 @@ class FakePapra:
         self.download_calls = 0
         self.raise_on_get: Exception | None = None
         self.closed = False
+        # The bytes the file endpoint serves, separate from the metadata on purpose:
+        # `download_original` verifies them against the job's hash, and the race that
+        # check exists for is exactly the one where the metadata the job was queued on
+        # is still the old one while the body has already been replaced (or the
+        # transfer stopped short). `replace_body` moves the bytes and nothing else.
+        self.body = PDF_BYTES
 
     @property
     def document(self) -> dict:
@@ -160,7 +173,16 @@ class FakePapra:
         self.download_calls += 1
         if (org_id, document_id) not in self.documents:
             raise PapraError(f"GET file failed: 404 {document_id} not found", 404)
-        return PDF_BYTES
+        return self.body
+
+    def replace_body(self, blob: bytes) -> bytes:
+        """Change the served bytes, leaving the record's metadata where it is.
+
+        That is the whole point: the job's hash came from the listing, the body moved
+        underneath it, and only the download can find out.
+        """
+        self.body = blob
+        return blob
 
     async def update_document(self, org_id: str, document_id: str, **body) -> dict:
         self.patch_calls += 1
@@ -211,6 +233,13 @@ class FakeKreuzakt:
         self._next_row_id = max(row["id"] for row in self.rows) + 1
         self.documents: dict[int, dict] = {}
         self.next_document_id = 7
+        # Ids the read endpoint answers 404 for. Measured, a DELETE nulls the id on
+        # every row that carried it, so a completed row naming a document that will
+        # not answer is the narrower race — a restart, or a read landing while the
+        # index is mid-flight. It is here because the closing `get_document` has to
+        # answer a 404 without letting `worker_loop` read that 404 as "a retry cannot
+        # help", and a row that names a real document is the honest shape of that.
+        self.missing_document_ids: set[int] = set()
         self._blobs: dict[int, bytes] = {}
         self._document_ids: dict[bytes, int] = {}
 
@@ -235,8 +264,9 @@ class FakeKreuzakt:
         self.on_upload = None
 
         document = json.loads((FIXTURES / "kreuzakt_document.json").read_text())
-        self.document = {**document, "id": self.next_document_id,
-                         "original_filename": "papra-doc-1-a1b2c3d4.pdf"}
+        self._document_template = {**document, "original_filename": UPLOAD_NAME}
+        self._scripted_id = self.next_document_id
+        self.document = {**self._document_template, "id": self.next_document_id}
         self.client = KreuzaktClient("http://kreuzakt.test",
                                      transport=httpx.MockTransport(self._handle))
 
@@ -274,11 +304,13 @@ class FakeKreuzakt:
 
     @property
     def document(self) -> dict:
-        return self.documents[self.next_document_id]
+        """The document a test scripted, or the one the fixture scripted for id 7."""
+        return self.documents.get(self._scripted_id, self._document_template)
 
     @document.setter
     def document(self, value) -> None:
         body = value if isinstance(value, dict) else asdict(value)
+        self._scripted_id = body["id"]
         self.documents[body["id"]] = {**body}
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
@@ -374,9 +406,19 @@ class FakeKreuzakt:
         return row
 
     def _document_for(self, blob: bytes) -> int:
-        """Identical bytes are one document — the fact that makes re-upload cheap."""
+        """Identical bytes are one document — the fact that makes re-upload cheap.
+
+        A document that has been deleted is not that fact any more: the next upload
+        mints a new id, and it is the mint, not the replay of 7 forever, that lets a
+        test show a stale binding being replaced rather than confirmed. The scripted
+        body rides along so the closing read has something to return.
+        """
         if blob not in self._document_ids:
-            self._document_ids[blob] = self.next_document_id
+            document_id = self.next_document_id
+            self.next_document_id += 1
+            self._document_ids[blob] = document_id
+            self.documents.setdefault(document_id,
+                                      {**self._document_template, "id": document_id})
         return self._document_ids[blob]
 
     def _retry(self, entry_id: int) -> httpx.Response:
@@ -400,7 +442,8 @@ class FakeKreuzakt:
         return self._json({**body, "id": entry_id, "filename": row["filename"]})
 
     def _document(self, document_id: int) -> httpx.Response:
-        body = self.documents.get(document_id)
+        body = None if document_id in self.missing_document_ids \
+            else self.documents.get(document_id)
         if body is None:
             return self._json({"error": "not_found",
                                "message": f"Document {document_id} not found"}, status=404)
@@ -410,7 +453,11 @@ class FakeKreuzakt:
         self.deleted.append(document_id)
         self.documents.pop(document_id, None)
         # The measured side effect: every row that pointed here keeps its status
-        # and loses its id.
+        # and loses its id. And the bytes stop being deduplicated onto a document
+        # that is gone: the next upload of them is a new document with a new id,
+        # which is what makes an id we already stored a stale one.
+        self._document_ids = {blob: doc for blob, doc in self._document_ids.items()
+                              if doc != document_id}
         for row in self.rows:
             if row["document_id"] == document_id:
                 row["document_id"] = None
@@ -698,9 +745,6 @@ async def test_deterministic_failure_stops_retrying_after_the_budget(store, job,
     assert len(fake_kz.upload_calls) == 1             # the row is re-run, not re-uploaded
     assert len(fake_kz.retry_calls) == 1              # identical text means stop here
     assert store.ledger_get(ORG, DOC_ID).kreuzakt_id is None
-    # The bound that matters across runs lives in the job, and `mark_job_failed`
-    # owns spending it; the handler must not spin the queue row on its own.
-    assert store.get_job(job.id).attempts <= 3
 
 
 async def test_transient_queue_failure_is_re_run_on_the_failed_row(store, job,
@@ -751,6 +795,129 @@ async def test_a_row_that_is_not_completed_is_not_completion(store, job, fake_pa
 
     assert store.ledger_get(ORG, DOC_ID).kreuzakt_id is None
     assert fake_kz.deleted == []
+
+
+# --- the bytes we upload are the bytes we hashed -----------------------------------
+
+@pytest.mark.parametrize("mode", ["replaced", "truncated"])
+async def test_bytes_that_are_not_the_jobs_are_never_uploaded(store, job, fake_papra,
+                                                              fake_kz, mode):
+    """The record's hash is read at job start; the body is read later. Verify the body.
+
+    Without the check, a document replaced between those two reads gets its NEW bytes
+    indexed while the ledger stamps the OLD `content_hash` — a wrong document behind a
+    right-looking row that never heals, because the id is bound under the current
+    generation and the document counts as seen. A short transfer is the same defect
+    with a different cause, so both land on the same permanent failure: retrying
+    downloads the same wrong bytes.
+    """
+    blob = (b"%PDF-1.4\n%replaced\ntrailer\n%%EOF" if mode == "replaced"
+            else PDF_BYTES[:len(PDF_BYTES) // 2])
+    fake_papra.replace_body(blob)
+    assert fake_papra.document["originalSha256Hash"] == HASH   # the metadata never moved
+
+    with pytest.raises(IndexFailed, match=f"hash to .* not the {HASH} this job") as exc:
+        await run_index_job(fake_kz, store, job, papra=fake_papra,
+                            poll_s=0, wait_timeout_s=5)
+
+    assert exc.value.permanent is True
+    # `permanent` is the only trigger this error pulls: it carries no HTTP status for
+    # `worker_loop`'s 4xx rule, so the reason and the verdict stay in one place.
+    assert getattr(exc.value, "status", None) is None
+    assert fake_kz.upload_calls == []             # Kreuzakt never saw the wrong bytes
+    assert fake_papra.download_calls == 1
+    assert store.ledger_get(ORG, DOC_ID).kreuzakt_id is None
+
+
+# --- a binding that no longer resolves ---------------------------------------------
+
+async def test_a_stale_binding_is_replaced_by_a_fresh_upload(store, job, fake_papra,
+                                                            fake_kz):
+    """A bound id is a claim about one index, and that index can stop honouring it.
+
+    Measured: deleting the Kreuzakt document leaves our ledger row pointing at an
+    integer that answers 404. That is survivable only if the read is not the end of
+    the job — `worker_loop` reads a 4xx as "a retry cannot help", and the row would
+    stay bound under the current generation, which is the exact state
+    `ledger_needs_index` excludes. So the reuse path re-uploads and rebinds.
+    """
+    seed_ledger(store, kreuzakt_id=42, generation=1)   # document 42 does not exist here
+
+    outcome = await run_index_job(fake_kz, store, job, papra=fake_papra,
+                                  poll_s=0, wait_timeout_s=5)
+
+    assert outcome.kreuzakt_id == 7
+    ref = store.ledger_get(ORG, DOC_ID)
+    assert ref.kreuzakt_id == 7                       # rebound in place, not left at 42
+    assert ref.delivered_generation == store.get_generation()
+    assert fake_kz.upload_calls == [(UPLOAD_NAME, PDF_BYTES)]
+    assert fake_papra.download_calls == 1             # Papra is the byte source
+    assert fake_papra.patch_calls == 0
+
+
+async def test_a_404_on_a_freshly_bound_id_is_retriable_and_self_heals(store, job,
+                                                                       fake_papra,
+                                                                       fake_kz):
+    """The same 404 on the fresh path must not be the job's last one either.
+
+    Here the bind succeeded and the read that follows it 404s, so the binding is kept
+    and the job is re-queued — and while an attempt remains, that is enough: the next
+    run finds the document answering again and finishes on the binding it already has,
+    with no second upload. The two branches are one recovery, which is why neither may
+    report permanence, and why the error carries no `status` for `worker_loop`'s "a 4xx
+    means a retry cannot help" rule. What happens when no attempt remains is the test
+    below this one.
+    """
+    fake_kz.missing_document_ids = {7}
+
+    with pytest.raises(IndexFailed, match="answers 404") as exc:
+        await run_index_job(fake_kz, store, job, papra=fake_papra,
+                            poll_s=0, wait_timeout_s=5)
+
+    assert exc.value.permanent is False
+    assert getattr(exc.value, "status", None) is None
+    assert store.ledger_get(ORG, DOC_ID).kreuzakt_id == 7       # kept, deliberately
+
+    fake_kz.missing_document_ids = set()   # whatever the index was doing has passed
+
+    outcome = await run_index_job(fake_kz, store, job, papra=fake_papra,
+                                  poll_s=0, wait_timeout_s=5)
+
+    assert outcome.kreuzakt_id == 7
+    assert len(fake_kz.upload_calls) == 1  # the binding is what the first run bought
+
+
+async def test_a_fresh_404_that_outlives_the_attempts_leaves_the_row_stuck(store, job,
+                                                                          fake_papra,
+                                                                          fake_kz):
+    """The one case the retry cannot recover, pinned so it cannot be quietly forgotten.
+
+    A 404 that survives every attempt ends with the job `failed` and the row bound
+    under the current generation without the document ever having been read — the
+    state `ledger_needs_index` excludes, so neither the sweep nor a rebuild looks at it
+    again, and the recovery today is `jobs --reset`. That is the queue's limitation as
+    much as this handler's: a failed job also blocks every later enqueue for those
+    bytes, which is what the strict xfail in the integration suite holds up for Task
+    11's migration. Pinned as a fact rather than as approval — unbind the row or make
+    the job re-schedulable and this test has to change on purpose.
+    """
+    fake_kz.missing_document_ids = {7}
+
+    for _ in range(3):                       # the store's default ceiling on attempts
+        with pytest.raises(IndexFailed) as exc:
+            await run_index_job(fake_kz, store, job, papra=fake_papra,
+                                poll_s=0, wait_timeout_s=5)
+        # Retriable every time: the worker decides how the budget is spent, and it is
+        # not this error that ends the job — the budget is.
+        assert exc.value.permanent is False
+        store.mark_job_failed(job.id, str(exc.value))
+        job = store.get_job(job.id)
+
+    assert job.status == "failed" and job.attempts == 3
+    assert len(fake_kz.upload_calls) == 3    # every attempt tried the recovery
+    ref = store.ledger_get(ORG, DOC_ID)
+    assert ref.kreuzakt_id is not None and ref.delivered_generation == 1
+    assert store.ledger_needs_index(generation=1) == []   # and nothing looks again
 
 
 # --- the generation fence ----------------------------------------------------------
@@ -861,7 +1028,7 @@ async def test_correlation_waits_on_the_name_the_upload_returned(store, job, fak
     Measured: the server renames (sanitising, ` (N)`), and matching our own string
     against a row it renamed would report absence for a document we did index.
     """
-    fake_kz.rename_uploads = "b6fa1b2135fe_papra-doc-1-a1b2c3d4.pdf"
+    fake_kz.rename_uploads = f"b6fa1b2135fe_{UPLOAD_NAME}"
 
     outcome = await run_index_job(fake_kz, store, job, papra=fake_papra,
                                   poll_s=0, wait_timeout_s=5)

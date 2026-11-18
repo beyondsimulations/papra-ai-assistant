@@ -10,8 +10,9 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 
+from papra_suite import indexing
 from papra_suite.allowlist import AllowList
-from papra_suite.indexing import CONTENT_DELIVERY_IMPLEMENTED, run_index_job
+from papra_suite.indexing import run_index_job
 from papra_suite.kreuzakt_client import KreuzaktClient
 from papra_suite.llm_client import LLMClient
 from papra_suite.ocr import OCR_SYSTEM_PROMPT, assemble_markdown, page_count, render_page
@@ -32,8 +33,17 @@ OCR_MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
 
 @dataclass
 class SweepResult:
+    """What one sweep pass did, counted in DOCUMENTS rather than in queue rows.
+
+    `documents_enqueued` counts the documents this pass enrolled, and one PDF can
+    write two job rows while the legacy OCR writer is still switched on for it — so a
+    row-counting name here would report two jobs for one document and make the sweep's
+    own log line disagree with the queue. `documents_checked` is "listed and
+    examined", including documents already seen and documents that are not PDFs.
+    """
+
     documents_checked: int = 0
-    jobs_enqueued: int = 0
+    documents_enqueued: int = 0
     non_pdf_skipped: int = 0
     errors: int = 0
     oversized_skipped: int = 0
@@ -184,6 +194,9 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     # ONE index worker, on purpose. Correlating an upload needs its queue row inside
     # the newest-100 window, so uploads are serial by construction: a second worker
     # would interleave uploads and make each other's correlation fail.
+    # `max_attempts` goes to the LOOP as well as the handler: the loop is what spends
+    # an attempt and decides the job is over, and the handler needs the same number to
+    # know when a re-run of a Kreuzakt row is the last one anyone will ask for.
     tasks.append(asyncio.create_task(worker_loop(
         store, kind="index",
         handler=lambda job: run_index_job(
@@ -191,6 +204,7 @@ async def serve(config, *, stop: asyncio.Event | None = None,
             poll_s=config.index_poll_interval_s,
             wait_timeout_s=config.index_wait_timeout_s,
             max_attempts=config.index_max_attempts),
+        max_attempts=config.index_max_attempts,
     ), name="index-worker"))
     if config.sweep_interval_s > 0:
         tasks.append(asyncio.create_task(
@@ -251,7 +265,7 @@ def _sync_settings_from_config(store: Store, config) -> None:
     about the process that owns it. `index_content_delivery` is the exception, and it
     is a fact about the build rather than about the operator: see the warning below.
     """
-    if config.index_content_delivery and not CONTENT_DELIVERY_IMPLEMENTED:
+    if config.index_content_delivery and not indexing.CONTENT_DELIVERY_IMPLEMENTED:
         # Loud, and refused rather than obeyed. Honoured, this flag stops the legacy
         # OCR enqueue — and in a build with no delivery path that is not "the bridge
         # will write the text instead", it is "nothing writes the text".
@@ -261,7 +275,7 @@ def _sync_settings_from_config(store: Store, config) -> None:
             "text. Task 7's build is the one that can take the flag.")
     store.set_setting("index_content_delivery",
                       "true" if (config.index_content_delivery
-                                 and CONTENT_DELIVERY_IMPLEMENTED) else "false")
+                                 and indexing.CONTENT_DELIVERY_IMPLEMENTED) else "false")
     store.set_setting("index_metadata_delivery",
                       "true" if config.index_metadata_delivery else "false")
 
@@ -320,9 +334,9 @@ async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int) -> None
     while True:
         try:
             result = await sweep_once(store, papra)
-            if result.jobs_enqueued or result.non_pdf_skipped:
-                logger.info("sweep: %d checked, %d enqueued, %d non-pdf",
-                            result.documents_checked, result.jobs_enqueued,
+            if result.documents_enqueued or result.non_pdf_skipped:
+                logger.info("sweep: %d checked, %d documents enqueued, %d non-pdf",
+                            result.documents_checked, result.documents_enqueued,
                             result.non_pdf_skipped)
         except Exception:  # noqa: BLE001
             logger.exception("sweep loop error")
@@ -337,8 +351,18 @@ async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int) -> None
 
 
 async def worker_loop(store: Store, *, kind: str, handler,
-                      idle_sleep_s: float = 1.0) -> None:
+                      idle_sleep_s: float = 1.0,
+                      max_attempts: int | None = None) -> None:
     """Claim-and-run loop for one job kind. Never raises.
+
+    `max_attempts` is this kind's ceiling on attempts at the JOB across runs — the
+    number the operator configured (`PAPRA_INDEX_MAX_ATTEMPTS` for the index worker),
+    and it is honoured here because this is the loop that spends an attempt. Left as
+    None it keeps `Store.mark_job_failed`'s default, which is what the kinds written
+    before that knob existed still get. It is not the handler's bound on recovery
+    actions inside one run (`indexing.DEFAULT_INDEX_RECOVERY_ACTIONS`), and the two
+    must not be passed for each other: one is "how many times may this job be tried",
+    the other is "how much repair may one try attempt".
 
     Transition ordering is crash-safety critical: on_job_done (enqueue the
     title job) runs BEFORE mark_job_done. A crash between the two leaves the
@@ -383,8 +407,10 @@ async def worker_loop(store: Store, *, kind: str, handler,
                 )
                 if permanent:
                     store.mark_job_failed(job.id, str(error), max_attempts=1)
-                else:
+                elif max_attempts is None:
                     store.mark_job_failed(job.id, str(error))
+                else:
+                    store.mark_job_failed(job.id, str(error), max_attempts=max_attempts)
             except (ValueError, sqlite3.Error):
                 logger.error("job %s vanished before failure could be recorded", job.id)
 
@@ -493,7 +519,7 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
                             file_hash=file_hash, name=document.get("name", "document.pdf"),
                             mime="application/pdf", ingested_via="sweep",
                         )
-                        result.jobs_enqueued += 1
+                        result.documents_enqueued += 1
                     else:
                         store.record_document_seen(
                             papra_org_id=org.papra_org_id, papra_document_id=document_id,

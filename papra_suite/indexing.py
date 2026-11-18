@@ -36,7 +36,12 @@ import re
 import time
 from dataclasses import dataclass
 
-from papra_suite.kreuzakt_client import AmbiguousCorrelation, CorrelationWindowFull, KreuzaktError
+from papra_suite.kreuzakt_client import (
+    AmbiguousCorrelation,
+    CorrelationWindowFull,
+    KreuzaktError,
+    KzDocument,
+)
 from papra_suite.store import Job, LedgerRef, Store
 
 logger = logging.getLogger(__name__)
@@ -92,7 +97,19 @@ CONTENT_DELIVERY_IMPLEMENTED = False
 
 DEFAULT_POLL_S = 2.0
 DEFAULT_WAIT_TIMEOUT_S = 900.0
+#: The ceiling on attempts at the JOB, across runs, which is what
+#: `PAPRA_INDEX_MAX_ATTEMPTS` means and what `Store.mark_job_failed` spends to decide
+#: when a row becomes `failed` for good. `worker_loop` takes it as its own parameter
+#: and the handler takes it to know when the budget is spent; the number of recovery
+#: actions one run may take is `DEFAULT_INDEX_RECOVERY_ACTIONS`, and passing one as the
+#: other is how a configured 5 bought three attempts while a configured 1 bought three.
 DEFAULT_INDEX_MAX_ATTEMPTS = 3
+#: How many recovery actions one run of a job may take: re-uploads and row re-runs
+#: together. Bounded by the shape of the repair rather than by taste — every recovery
+#: action here ends in an upload or a re-run, so a row that stays broken costs three
+#: round trips and then reports itself. That is what keeps a permanent error from being
+#: paid for three times inside one job attempt.
+DEFAULT_INDEX_RECOVERY_ACTIONS = 3
 
 # Task 5's client reports a completed row whose `document_id` was nulled as a plain
 # `KreuzaktError`, not a type of its own, so recognising the vanished-document case
@@ -164,6 +181,50 @@ def _is_vanished_row_error(error: KreuzaktError) -> bool:
     return _VANISHED_ROW_MARKER in str(error)
 
 
+async def _read_binding(kz, document_id: int) -> KzDocument | None:
+    """Read the document a binding names, with a 404 answered as "nothing there".
+
+    A binding is a claim about one index, and that index can stop honouring it:
+    measured, a document DELETE leaves our ledger row pointing at an integer that
+    answers 404, and a read landing while the index is mid-restart answers the same
+    way for a document that is perfectly there. Neither is the fact `worker_loop`'s
+    4xx rule reads — "a retry cannot help" — and letting the client's error through
+    would leave the row bound under the current generation, which is exactly the state
+    `ledger_needs_index` excludes: the document would never be indexed again while it
+    sits in Papra looking handled. So the 404 comes back as None and the caller
+    decides, which is the only place that knows whether it is re-uploading or
+    re-queueing.
+    """
+    try:
+        return await kz.get_document(document_id)
+    except KreuzaktError as error:
+        if error.status != 404:
+            raise
+        return None
+
+
+def _outcome(store: Store, job: Job, kreuzakt_id: int, kz_doc: KzDocument) -> IndexOutcome:
+    """Report what the index holds, and refuse out loud when a switch has no code."""
+    empty = not kz_doc.content.strip()
+    if empty:
+        # Reported, not interpreted: "extraction-empty" is a fact about the index,
+        # "legitimately blank" is a fact about the document, and nothing here can
+        # establish the second one.
+        logger.info("extraction-empty papra=%s kreuzakt=%s", job.document_id, kreuzakt_id)
+    delivered = False
+    if store.settings_flag("index_content_delivery"):
+        # Task 7 writes `deliver_content`, gate included. Until that function
+        # exists the honest answer to an enabled flag is a loud refusal: saying
+        # nothing and returning `delivered=True` would report a write we did not
+        # make, and saying nothing silently would leave an operator believing the
+        # switch had been thrown.
+        logger.warning(
+            "content delivery is enabled but this build has no delivery path yet: "
+            "papra=%s kreuzakt=%s left untouched", job.document_id, kreuzakt_id)
+    return IndexOutcome(kreuzakt_id=kreuzakt_id, content_len=len(kz_doc.content),
+                        empty_content=empty, delivered=delivered)
+
+
 def _require_budget(deadline: float, wait_timeout_s: float, job: Job, attempts_done: int,
                     reason: Exception | None) -> None:
     """Stop before starting work this job no longer has time to finish.
@@ -187,14 +248,37 @@ def _require_budget(deadline: float, wait_timeout_s: float, job: Job, attempts_d
 
 
 async def download_original(papra, job: Job) -> bytes:
-    """Papra's own bytes, always — including after a Kreuzakt rebuild.
+    """Papra's own bytes, always, and always the ones this job was queued for.
 
     There is deliberately no "reuse what Kreuzakt has" branch: the index may be
     wiped, restored from an older backup, or holding a different document under
     this name, and Papra is the record. That is also what makes a re-upload free of
     side effects — the bytes are the same bytes, so dedup lands on one document.
+
+    The bytes are hashed here rather than trusted from the record read at the start
+    of the job, because the two reads are not the same moment: the metadata the job
+    was queued on is a fact from job start, and the body arrives later. A document
+    replaced in between would otherwise have its NEW bytes indexed while the ledger
+    stamps the OLD `content_hash` — a wrong document behind a right-looking row that
+    never heals, since the id is bound under the current generation and the document
+    counts as seen. A transfer that stopped short is the same defect with a different
+    cause, and it gets the same permanent failure — but that is a fail-closed choice,
+    not a claim about the transport: some short transfers would succeed on a second
+    try. What decides it is that the alternative is uploading bytes we cannot name, and
+    a retry here downloads from the same body we just refused. Recovery is a fresh job
+    for the bytes Papra actually holds — `jobs --reset` today, and Task 11's
+    re-schedulable queue after it — not this job.
     """
-    return await papra.download_file(job.papra_org_id, job.document_id)
+    blob = await papra.download_file(job.papra_org_id, job.document_id)
+    digest = hashlib.sha256(blob).hexdigest()
+    if digest != job.content_hash:
+        raise IndexFailed(
+            f"papra://{job.papra_org_id}/{job.document_id} sent {len(blob)} bytes that "
+            f"hash to {digest}, not the {job.content_hash} this job was queued for: the "
+            "document moved under the job or the transfer stopped short, and none of it "
+            "went up",
+            permanent=True)
+    return blob
 
 
 async def _papra_holds_document(papra, job: Job) -> bool:
@@ -237,7 +321,9 @@ def _first_sight(store: Store, job: Job, document: dict) -> LedgerRef:
 async def run_index_job(kz, store: Store, job: Job, *, papra,
                         poll_s: float = DEFAULT_POLL_S,
                         wait_timeout_s: float = DEFAULT_WAIT_TIMEOUT_S,
-                        max_attempts: int = DEFAULT_INDEX_MAX_ATTEMPTS) -> IndexOutcome:
+                        max_attempts: int = DEFAULT_INDEX_MAX_ATTEMPTS,
+                        max_recovery_actions: int = DEFAULT_INDEX_RECOVERY_ACTIONS
+                        ) -> IndexOutcome:
     """Upload one Papra document to Kreuzakt, find its queue row, record the id.
 
     `generation` is read once, here, and everything this job binds is stamped and
@@ -247,6 +333,11 @@ async def run_index_job(kz, store: Store, job: Job, *, papra,
     Eligibility is the ledger's, never the seen-table's: an id bound under the
     current generation means done, anything else is work. `document_seen` records
     that we ingested something, which is exactly the fact a rebuild invalidates.
+
+    A binding the index answers 404 for is neither of those. While the job has attempts
+    left, both places we can meet it end in work rather than a verdict — see
+    `_read_binding`; the one attempt that has no attempt behind it is the documented
+    residual in `_upload_and_correlate`'s caller.
     """
     generation = store.get_generation()
 
@@ -266,36 +357,53 @@ async def run_index_job(kz, store: Store, job: Job, *, papra,
                                                                               document)
 
     if ref.kreuzakt_id is not None and ref.delivered_generation == generation:
-        kreuzakt_id = ref.kreuzakt_id                    # nothing to upload
-    else:
-        kreuzakt_id = await _upload_and_correlate(
-            kz, store, job, papra=papra, generation=generation, poll_s=poll_s,
-            wait_timeout_s=wait_timeout_s, max_attempts=max_attempts)
-
-    kz_doc = await kz.get_document(kreuzakt_id)
-    empty = not kz_doc.content.strip()
-    if empty:
-        # Reported, not interpreted: "extraction-empty" is a fact about the index,
-        # "legitimately blank" is a fact about the document, and nothing here can
-        # establish the second one.
-        logger.info("extraction-empty papra=%s kreuzakt=%s", job.document_id, kreuzakt_id)
-    delivered = False
-    if store.settings_flag("index_content_delivery"):
-        # Task 7 writes `deliver_content`, gate included. Until that function
-        # exists the honest answer to an enabled flag is a loud refusal: saying
-        # nothing and returning `delivered=True` would report a write we did not
-        # make, and saying nothing silently would leave an operator believing the
-        # switch had been thrown.
+        kreuzakt_id = ref.kreuzakt_id
+        bound = await _read_binding(kz, kreuzakt_id)
+        if bound is not None:
+            return _outcome(store, job, kreuzakt_id, bound)     # nothing to upload
+        # A binding that answers 404 is not a finished document, and stopping here
+        # would say it was: the row stays bound under the current generation, which is
+        # the state `ledger_needs_index` excludes, so the sweep would never look again
+        # while Papra holds a document nothing has indexed. Kreuzakt deduplicates on
+        # content, so the fix is the upload we already know how to do — it replaces the
+        # id in place and costs one request for bytes the index already digested.
         logger.warning(
-            "content delivery is enabled but this build has no delivery path yet: "
-            "papra=%s kreuzakt=%s left untouched", job.document_id, kreuzakt_id)
-    return IndexOutcome(kreuzakt_id=kreuzakt_id, content_len=len(kz_doc.content),
-                        empty_content=empty, delivered=delivered)
+            "kreuzakt document %s is gone behind the binding for %s: re-uploading and "
+            "rebinding in place", kreuzakt_id, job.document_id)
+
+    kreuzakt_id = await _upload_and_correlate(
+        kz, store, job, papra=papra, generation=generation, poll_s=poll_s,
+        wait_timeout_s=wait_timeout_s, max_attempts=max_attempts,
+        max_recovery_actions=max_recovery_actions)
+
+    bound = await _read_binding(kz, kreuzakt_id)
+    if bound is None:
+        # The bind is kept and the job is re-queued: while attempts remain, the next
+        # run either reads the document (a restart that has passed) or takes the
+        # stale-binding path above and uploads again. A 404 straight off our own upload
+        # is therefore a spent attempt rather than a verdict, which is what the client's
+        # error, with its status on it, would have said.
+        #
+        # What that does NOT buy, stated because the ledger is where it shows: on the
+        # attempt that exhausts the ceiling, the row is left bound under the current
+        # generation without the document ever having been read, and
+        # `ledger_needs_index` excludes exactly that state. Nothing in the sweep or a
+        # rebuild will look at it again; the recovery is `jobs --reset`, and Task 11's
+        # migration is what turns that into a path rather than an intervention. A
+        # binding that was never verified is not worth a new Store API in a follow-up
+        # round, but it is worth a named limit — see
+        # `test_a_fresh_404_that_outlives_the_attempts_leaves_the_row_stuck`.
+        raise IndexFailed(
+            f"kreuzakt document {kreuzakt_id} answers 404 for {job.document_id} right "
+            "after being bound: the binding is kept and the job retries, because either "
+            "answer about the index makes a retry useful")
+    return _outcome(store, job, kreuzakt_id, bound)
 
 
 async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation: int,
                                 poll_s: float, wait_timeout_s: float,
-                                max_attempts: int) -> int:
+                                max_attempts: int,
+                                max_recovery_actions: int) -> int:
     """One upload, correlated, with a bounded recovery — and a reason on failure.
 
     The loop has two recoveries, and they are different actions because the failures
@@ -307,12 +415,14 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
     * a `failed` row is a finished row, and re-running *that row* is the only thing
       `retry` accepts, so it is re-run rather than re-uploaded.
 
-    Both are bounded by `max_attempts`, which counts the recovery actions of this run —
-    uploads and row re-runs together — while `job.attempts` is the worker's count of runs
-    of this job across the backoff; they bound different things and neither substitutes
-    for the other. The failure that follows names the condition. Falling through as
-    "nothing to do" is the outcome this function exists to make impossible: the job would
-    be marked done with no id recorded.
+    Both budgets show up here and neither stands in for the other. The recovery bound
+    (`max_recovery_actions`) is this run's: how many re-uploads and row re-runs one
+    attempt may spend before it reports itself. `max_attempts` is the job's ceiling
+    across runs, which matters at the failed-row branch — on what would be the last
+    attempt there is nobody left to re-run the row, so the attempt says so instead of
+    leaving a finished row nobody will revisit. The failure that follows names the
+    condition. Falling through as "nothing to do" is the outcome this function exists
+    to make impossible: the job would be marked done with no id recorded.
     """
     filename = index_upload_name(job)
     deadline = _clock() + wait_timeout_s
@@ -323,7 +433,7 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
     after_id = 0
     last_error_text: str | None = None
 
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, max_recovery_actions + 1):
         _require_budget(deadline, wait_timeout_s, job, attempt - 1, reason)
 
         if requeue_row is None:
@@ -349,8 +459,8 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
             reason = error
             logger.warning(
                 "index correlation incomplete (%s) for %s above id %s: re-uploading, "
-                "attempt %d of %d", type(error).__name__, job.document_id, after_id,
-                attempt, max_attempts)
+                "recovery action %d of %d", type(error).__name__, job.document_id,
+                after_id, attempt, max_recovery_actions)
             continue
         except KreuzaktError as error:
             if not _is_vanished_row_error(error):
@@ -369,9 +479,9 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
                     f"(the deletion pass owns this document)", permanent=True) from error
             vanished = True
             logger.warning(
-                "kreuzakt completed a row for %s with no document id (attempt %d of %d) "
-                "and papra still holds it: re-uploading", job.document_id, attempt,
-                max_attempts)
+                "kreuzakt completed a row for %s with no document id (recovery action "
+                "%d of %d) and papra still holds it: re-uploading", job.document_id,
+                attempt, max_recovery_actions)
             continue
 
         if entry.status == "failed":
@@ -394,7 +504,6 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
                 "job attempt %d of %d", entry.id, job.document_id, text,
                 job.attempts + 1, max_attempts)
             continue
-
         if entry.status == "completed" and entry.document_id is not None:
             bound = store.ledger_set_kreuzakt_id(
                 papra_org_id=job.papra_org_id, papra_document_id=job.document_id,
@@ -416,6 +525,13 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
         # `wait_for_queue_row` only ever returns a terminal row, and a completed row
         # with a null id reaches us as an error, so this is the shape we cannot read
         # as either completion or re-run. Say so rather than return nothing.
+        #
+        # Belt, and a known-unkillable one: under the client's contract today no row
+        # can arrive here, so a mutation that deletes this raise survives the suite —
+        # the same equivalence as the "completed means completed" check in the branch
+        # above. It stays because the thing it protects is the return value: falling
+        # out of the loop with no id would mark a job done with nothing recorded, and
+        # that is cheaper to survive than to rediscover if the client's rule changes.
         raise IndexFailed(
             f"kreuzakt queue row {entry.id} for {job.document_id} ended {entry.status} "
             f"with document_id={entry.document_id}: not a completion we may bind and not "
@@ -424,9 +540,10 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
     if vanished:
         raise IndexFailed(
             f"index document vanished: Kreuzakt completed a row for {filename} with no "
-            f"document id {max_attempts} times while papra still holds "
+            f"document id {max_recovery_actions} times while papra still holds "
             f"{job.document_id}") from reason
-    if reason is None:      # unreachable: every path that continues has set one
-        raise IndexFailed(f"index of {job.document_id} gave up after {max_attempts} "
-                          "attempts with no recorded reason")
+    if reason is None:      # unreachable under Task 5's client, see the note below
+        raise IndexFailed(f"index of {job.document_id} gave up after "
+                          f"{max_recovery_actions} recovery actions with no recorded "
+                          "reason")
     raise reason

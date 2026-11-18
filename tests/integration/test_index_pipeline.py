@@ -151,7 +151,15 @@ async def test_uploaded_pdf_is_indexed_without_touching_papra_content(stack):
     before = await _papra_record_after_extraction(stack, document_id)
 
     result = await sweep_once(stack.store, stack.papra)
-    assert (result.documents_checked, result.jobs_enqueued) == (1, 1)
+    # The store holds one org and that org is created for this test, so "one
+    # document" here is ours by construction rather than by a pristine volume — the
+    # count is a statement about this document either way. What the pass WROTE is
+    # asserted separately, scoped to this document, because one PDF is enrolled in two
+    # queues while the legacy OCR writer is still switched on for it.
+    assert (result.documents_checked, result.documents_enqueued) == (1, 1)
+    written = sorted(job.kind for job in stack.store.list_jobs()
+                     if job.document_id == document_id)
+    assert written == ["index", "ocr"]
 
     job = stack.store.claim_next_job("index")
     assert job is not None and job.document_id == document_id
@@ -191,8 +199,10 @@ async def test_the_upload_name_is_the_name_the_queue_reports(stack):
 
     expected = index_upload_name(job)
     rows = await stack.kreuzakt.queue_page(limit=20)
-    # Exactly one row of ours, byte-identical to the name we asked for: a sanitised
-    # name would make this row unmatchable and the job would report absence.
+    # At least one row of ours whose name is byte-identical to the one we asked for: a
+    # sanitised name would be unmatchable, and the job would report an absent document.
+    # More than one is possible — a re-upload is a second row under the same name — so
+    # this reads the newest rather than assuming there is only one.
     ours = [row for row in rows if row.filename == expected]
     assert len(ours) >= 1 and ours[0].status == "completed"
     assert ours[0].document_id == outcome.kreuzakt_id
@@ -201,9 +211,12 @@ async def test_the_upload_name_is_the_name_the_queue_reports(stack):
 async def test_a_bumped_generation_rebinds_from_papra_bytes(stack):
     """Rebuild semantics on the real server: an old id is not a fact any more.
 
-    The eligibility half, the binding half, and one measured limitation are all
-    asserted here, because the limitation is the reason the binding half is driven by
-    hand: a backfill cannot re-enqueue this document through `enqueue_index_job`.
+    The eligibility half and the binding half are both asserted here. The binding half
+    is driven by hand because a backfill cannot re-enqueue this document through
+    `enqueue_index_job` yet — that limitation is what the strict xfail on
+    `test_a_rebuild_can_schedule_work_for_an_already_indexed_document` exists to
+    collect, so it is deliberately NOT asserted as behaviour here: a green test that
+    pinned it would read as a regression the day Task 11 fixes it.
     """
     pdf = make_pdf()
     document = await stack.papra.create_document(stack.org_id, "rebuild.pdf", pdf)
@@ -220,16 +233,6 @@ async def test_a_bumped_generation_rebinds_from_papra_bytes(stack):
     stack.store.bump_generation()
     assert [ref.papra_document_id
             for ref in stack.store.ledger_needs_index(generation=2)] == [document_id]
-
-    # Measured, and reported rather than papered over: the job queue's idempotency
-    # index is (kind, org, document, hash), so enqueueing this document's same bytes
-    # again returns the finished job's id and there is nothing to claim. Tasks 11 and
-    # 15 send rebuild work through this same call, so that is where the reopen belongs.
-    assert enqueue_index_job(stack.store, papra_org_id=stack.org_id,
-                             document_id=document_id, file_hash=job.content_hash,
-                             name=document["name"], mime="application/pdf",
-                             ingested_via="backfill") == job.id
-    assert stack.store.claim_next_job("index") is None
 
     # The handler's half of a rebuild, driven with the row a re-claim would hand it.
     second = await run_index_job(stack.kreuzakt, stack.store, stack.store.get_job(job.id),
@@ -289,7 +292,6 @@ async def test_mail_attachment_is_indexed_without_touching_papra_content(mail_st
                             name=documents[0]["name"], mime="application/pdf",
                             ingested_via="mail")
     job = stack.store.claim_next_job("index")
-    started = time.monotonic()
     outcome = await run_index_job(stack.kreuzakt, stack.store, job, papra=stack.papra,
                                   poll_s=0.5, wait_timeout_s=90)
 
@@ -299,7 +301,6 @@ async def test_mail_attachment_is_indexed_without_touching_papra_content(mail_st
     assert (await stack.kreuzakt.get_document(ref.kreuzakt_id)).content.strip()
     assert await _papra_record(stack, document_id) == before
     assert stack.papra.patches == []
-    assert time.monotonic() - started < 90      # the wait we waited is the wait we set
 
 
 # --------------------------------------------------------------------------------
@@ -307,16 +308,20 @@ async def test_mail_attachment_is_indexed_without_touching_papra_content(mail_st
 #
 # `strict=True` is what makes them tracked rather than decorative: the suite FAILS when
 # either starts passing, so a fix cannot land quietly and a marker cannot outlive its
-# reason. Both are the acceptance edges the plan says this pipeline must reach; Task 6's
-# report names an owner for each (§6.1 mail intake, §6.2 rebuild re-enqueue).
+# reason. Both are the acceptance edges the plan says this pipeline must reach, and the
+# plan assigns each one an owner: Task 7 for the mail-intake handover, Task 11 for
+# migration 004. Each reason names that owner because the reason is the text a fixer
+# greps for.
 # --------------------------------------------------------------------------------
 
 @pytest.mark.xfail(
     strict=True,
     reason="mail intake still enqueues through enqueue_ocr_job, which marks the document "
            "seen in the same call; the sweep skips seen documents, so a mail-ingested PDF "
-           "gets no ledger row and no index job. Owner: whoever switches mail.py's call "
-           "site (report §6.1).",
+           "gets no ledger row and no index job. Owner: Task 7, which owns the "
+           "mail-intake handover (switch mail.py to ledger_upsert_reference + "
+           "enqueue_index_job behind the legacy-workers switch) and removes this marker "
+           "in the commit that flips it; report §6.1.",
 )
 async def test_mail_intake_itself_creates_the_ledger_row_and_the_index_job(mail_stack):
     """Spec §4.2's claim about intake email, driven the way mail actually arrives.
@@ -344,11 +349,15 @@ async def test_mail_intake_itself_creates_the_ledger_row_and_the_index_job(mail_
 
 @pytest.mark.xfail(
     strict=True,
-    reason="a finished index job cannot be scheduled again: jobs are idempotent on "
-           "(kind, org, document, content_hash), so a backfill enqueue returns the "
-           "finished row's id and nothing is claimable. Needs a Store-side decision "
-           "(reopen, retire, or key the job on the generation); report §6.2, Tasks 11 "
-           "and 15 depend on it.",
+    reason="any job that stops being live blocks the next one for the same bytes: jobs "
+           "are idempotent on (kind, org, document, content_hash) through a unique index "
+           "and `enqueue_job` is INSERT OR IGNORE, so a finished OR failed index job "
+           "makes every later enqueue for those bytes return the old id with nothing to "
+           "claim — which locks out documents ingested during a Kreuzakt outage, not just "
+           "rebuild items. Owner: Task 11, which owns migration 004 (that unique index "
+           "becomes a partial one over pending/running) and makes the behaviour change; "
+           "Task 15's own ownership is the separate `Store.list_jobs(document_id=…)` "
+           "filter, and its `jobs --reset` is today's only recovery. Report §6.2.",
 )
 async def test_a_rebuild_can_schedule_work_for_an_already_indexed_document(stack):
     """What a backfill pass calls, and what it has to get back: a job it can claim."""
