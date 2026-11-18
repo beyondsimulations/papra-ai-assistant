@@ -222,12 +222,12 @@ async def test_the_upload_name_is_the_name_the_queue_reports(stack):
 async def test_a_bumped_generation_rebinds_from_papra_bytes(stack):
     """Rebuild semantics on the real server: an old id is not a fact any more.
 
-    The eligibility half and the binding half are both asserted here. The binding half
-    is driven by hand because a backfill cannot re-enqueue this document through
-    `enqueue_index_job` yet — that limitation is what the strict xfail on
-    `test_a_rebuild_can_schedule_work_for_an_already_indexed_document` exists to
-    collect, so it is deliberately NOT asserted as behaviour here: a green test that
-    pinned it would read as a regression the day Task 11 fixes it.
+    The eligibility half and the binding half are both asserted here. The binding half is
+    driven by hand — a fresh `enqueue_index_job` for the same bytes, then the job — because
+    the point here is what the *index* does with a stale id, not how the request gets
+    scheduled. `test_a_rebuild_can_schedule_work_for_an_already_indexed_document` covers
+    the scheduling half; `test_a_reconcile_rebuilds_every_binding_from_papra_bytes` drives
+    both through the path an operator runs.
     """
     pdf = make_pdf()
     document = await stack.papra.create_document(stack.org_id, "rebuild.pdf", pdf)
@@ -514,20 +514,18 @@ async def test_a_document_that_flip_flops_twice_is_left_alone_with_one_error(del
     assert "reprocess" not in caplog.text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="any job that stops being live blocks the next one for the same bytes: jobs "
-           "are idempotent on (kind, org, document, content_hash) through a unique index "
-           "and `enqueue_job` is INSERT OR IGNORE, so a finished OR failed index job "
-           "makes every later enqueue for those bytes return the old id with nothing to "
-           "claim — which locks out documents ingested during a Kreuzakt outage, not just "
-           "rebuild items. Owner: Task 11, which owns migration 004 (that unique index "
-           "becomes a partial one over pending/running) and makes the behaviour change; "
-           "Task 15's own ownership is the separate `Store.list_jobs(document_id=…)` "
-           "filter, and its `jobs --reset` is today's only recovery. Report §6.2.",
-)
 async def test_a_rebuild_can_schedule_work_for_an_already_indexed_document(stack):
-    """What a backfill pass calls, and what it has to get back: a job it can claim."""
+    """What a backfill pass calls, and what it has to get back: a job it can claim.
+
+    This ran as a strict `xfail` for two review rounds: the idempotency index covered the
+    whole `jobs` table, so an index row that had already finished — cleanly or not — made
+    every later request to index the same bytes a no-op, and a rebuild could not reach a
+    document the ledger already knew about. That locked out the documents ingested during
+    a Kreuzakt outage, not just rebuild items. Migration 004 narrowed the index to live
+    rows, and this test is the live-server proof that the narrowing landed: the second
+    `enqueue_index_job` returns a row the worker can claim, and the re-index still costs
+    nothing but a Kreuzakt round trip.
+    """
     pdf = make_pdf()
     document = await stack.papra.create_document(stack.org_id, "reschedule.pdf", pdf)
     document_id = document["id"]

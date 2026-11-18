@@ -926,14 +926,16 @@ async def test_a_fresh_404_that_outlives_the_attempts_leaves_the_row_stuck(store
                                                                           fake_kz):
     """The one case the retry cannot recover, pinned so it cannot be quietly forgotten.
 
-    A 404 that survives every attempt ends with the job `failed` and the row bound
-    under the current generation without the document ever having been read — the
-    state `ledger_needs_index` excludes, so neither the sweep nor a rebuild looks at it
-    again, and the recovery today is `jobs --reset`. That is the queue's limitation as
-    much as this handler's: a failed job also blocks every later enqueue for those
-    bytes, which is what the strict xfail in the integration suite holds up for Task
-    11's migration. Pinned as a fact rather than as approval — unbind the row or make
-    the job re-schedulable and this test has to change on purpose.
+    A 404 that survives every attempt ends with the job `failed` and the row bound under
+    the current generation without the document ever having been read — the state
+    `ledger_needs_index` excludes, so neither the sweep nor a rebuild looks at it again.
+
+    Migration 004 removed the *second* half of this trap: the spent row used to absorb
+    every later enqueue for these bytes too, so even an operator asking for the document
+    back got a no-op. Now the queue takes the request; what still keeps the document out
+    of reach is the ledger's own verdict that this row is finished, which no queue change
+    can answer. Pinned as a fact rather than as approval — make the row eligible again and
+    this test has to change on purpose.
     """
     fake_kz.missing_document_ids = {7}
 

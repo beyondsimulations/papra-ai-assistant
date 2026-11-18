@@ -793,10 +793,9 @@ async def deliver_metadata(papra, store: Store, ref: LedgerRef, kz_doc: KzDocume
         raise IndexFailed(
             f"no ledger reference for papra://{ref.papra_org_id}/{ref.papra_document_id}: "
             "refusing to deliver metadata from a caller's snapshot, because the record of "
-            "which fields are ours is gone. Permanent, so the index job for these bytes ends "
-            "failed, and a failed index row absorbs every later enqueue for the same hash "
-            "until that row is reset — by `jobs --reset` once Task 15 ships it, by a hand edit "
-            "of the `jobs` table until then — or by the queue being made re-schedulable",
+            "which fields are ours is gone. Permanent, so the index job for these bytes "
+            "ends failed and nothing re-asks on its own: the ledger row, not the queue, is "
+            "what decides whether this document is work again.",
             permanent=True)
 
     actions: dict[str, str] = {}
@@ -1134,8 +1133,9 @@ async def download_original(papra, job: Job) -> bytes:
     not a claim about the transport: some short transfers would succeed on a second
     try. What decides it is that the alternative is uploading bytes we cannot name, and
     a retry here downloads from the same body we just refused. Recovery is a fresh job
-    for the bytes Papra actually holds — `jobs --reset` today, and Task 11's
-    re-schedulable queue after it — not this job.
+    for the bytes Papra actually holds — the queue has accepted those bytes again since
+    migration 004, but naming that job is still an operator's act (`jobs --reset`, Task
+    15) rather than something this job can do for itself.
     """
     blob = await papra.download_file(job.papra_org_id, job.document_id)
     digest = hashlib.sha256(blob).hexdigest()
@@ -1256,11 +1256,11 @@ async def run_index_job(kz, store: Store, job: Job, *, papra,
         # What that does NOT buy, stated because the ledger is where it shows: on the
         # attempt that exhausts the ceiling, the row is left bound under the current
         # generation without the document ever having been read, and
-        # `ledger_needs_index` excludes exactly that state. Nothing in the sweep or a
-        # rebuild will look at it again; the recovery is `jobs --reset`, and Task 11's
-        # migration is what turns that into a path rather than an intervention. A
-        # binding that was never verified is not worth a new Store API in a follow-up
-        # round, but it is worth a named limit — see
+        # `ledger_needs_index` excludes exactly that state. Migration 004 took the queue
+        # out of the way — a fresh index job for these bytes is schedulable now — but
+        # nothing will ask for one: eligibility is the ledger's decision, and this row
+        # reads as finished. So the recovery is still to name the document by hand, a
+        # named limit rather than a path — see
         # `test_a_fresh_404_that_outlives_the_attempts_leaves_the_row_stuck`.
         raise IndexFailed(
             f"kreuzakt document {kreuzakt_id} answers 404 for {job.document_id} right "
@@ -1902,47 +1902,34 @@ async def _index_lacks_document(kz, kreuzakt_id: int) -> bool | None:
 
 
 def _readmit_index_job(store: Store, ref: LedgerRef, *, reason: str) -> None:
-    """Ask for this document to be indexed again, and mean it.
+    """Ask for this document to be indexed again.
 
-    The trap is in the queue, not here: `enqueue_job` is `INSERT OR IGNORE` against a unique
-    idempotency index, so an already-`failed` row for these bytes makes every re-enqueue a
-    silent no-op that returns the old id — pinned in
-    `tests/test_metadata_delivery.py::test_a_permanently_failed_index_row_makes_the_next_enqueue_a_noop`.
-    A restore or an unbind that only called `enqueue_job` would therefore report success and
-    change nothing, and the document would stay missing from search while the log said it was
-    being indexed. So the pass reads the row back and resets it when it is spent: that is the
-    only way this call can honestly be called a re-admission.
+    This used to be a two-step operation, and the second step was the point. The queue
+    keyed idempotency over the whole `jobs` table, so an already-`failed` or `done` row
+    for these bytes made a bare `enqueue_job` a silent no-op returning the old id — and
+    every re-admission move works by enqueuing exactly that tuple, so a restore or an
+    unbind could report success and change nothing. The pass therefore read the row back
+    and reset it when it was spent, and that reset was load-bearing: it is what made the
+    call honest enough to be called a re-admission.
 
-    The durable fix is Task 11's partial unique index (unique only over rows that can still
-    run), after which a terminal row stops shadowing a fresh request and this reset becomes
-    redundant rather than load-bearing. Until then it is the mechanism, and it logs, because
-    "we reset a job the queue had given up on" is the sentence that explains a document that
-    came back. `worker_loop` already shouts about this trap when a job dies; resetting it here
-    is the automated counterpart of the `jobs --reset` that message tells an operator to run.
+    Migration 004 moved the guarantee into the schema: the idempotency index covers
+    `pending` and `running` rows only, so a terminal row no longer shadows the request,
+    and `enqueue_job` answers with the live row that carries the work — always, because
+    the insert and the read-back happen inside one transaction that holds the write lock.
+    Read-back-and-reset went with the reason for it. A branch that cannot be reached is
+    not belt-and-braces, it is a claim about the queue that stopped being true, and the
+    spent row now keeps the verdict that explains why the document needed re-admitting.
 
     It does not check whether the row is *eligible* — `ledger_needs_index` is the eligibility
     rule, and it is the caller's job to have made the row eligible first (an unbound row, or a
     binding that is not current). A spurious extra index job costs one idempotent upload; a
     missing one costs a document that is never found.
-
-    The branch that resets a `done` row is the common one rather than the alarming one, and it is
-    not free: the row usually finished cleanly once, so re-opening it discards that history — the
-    attempt count and any terminal error — and the job is judged again on its next run. That is
-    the price of the asymmetry above, and the log line is what records that a finished job was
-    re-used instead of a new one being created.
     """
-    job_id = store.enqueue_job(
+    store.enqueue_job(
         kind="index", papra_org_id=ref.papra_org_id, document_id=ref.papra_document_id,
         content_hash=ref.file_hash,
         payload={"file_hash": ref.file_hash, "name": ref.papra_original_name or "",
                  "ingested_via": reason})
-    job = store.get_job(job_id)
-    if job is not None and job.status in ("failed", "done"):
-        store.reset_job(job_id)
-        logger.info(
-            "re-admitted index job %s for papra=%s/%s (%s): the queue's idempotency index "
-            "had it pinned as %s, so a plain enqueue would have been a no-op",
-            job_id, ref.papra_org_id, ref.papra_document_id, reason, job.status)
 
 
 async def _apply_mark(store: Store, kz, ref: LedgerRef, *,

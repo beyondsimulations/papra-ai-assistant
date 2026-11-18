@@ -748,14 +748,14 @@ Three limits worth stating plainly, because all three look like bugs on the day 
   than a retry. Changing a column resurrects a trashed document, so "helpfully" delivering
   metadata into one would un-delete something the user threw away. The delete propagation pass
   owns those references, not this one.
-- **A permanent refusal fails the `index` job, and that job slot is the document's only way
-  back into the index.** There is no separate metadata job kind: this pass runs inside the
-  `index` job, so a permanent verdict here leaves an `index` row in `failed`. The queue is
-  idempotent on `(kind, organization, document, content_hash)` and `INSERT OR IGNORE`d, so
-  every later request to index those same bytes is silently ignored while that row sits there
-  — and a restore, an unbind or a backfill works by making exactly such a request, so it can
-  report success and enqueue nothing. Escape: reset that row (`jobs --reset`, whose command is
-  still to come; until it exists this is a hand edit of the `jobs` table), with the partial
-  jobs index of Task 11 as the durable fix. `check` cannot see it, because its counters are all
-  ledger-derived and a job moving from `done` to `failed` changes none of them; the worker's
-  ERROR line is what names it.
+- **A permanent refusal fails the `index` job, and nothing re-asks on its own.** There is
+  no separate metadata job kind: this pass runs inside the `index` job, so a permanent
+  verdict here leaves an `index` row in `failed`. Since migration 004 that spent row no
+  longer blocks the queue — the idempotency index covers `pending` and `running` rows, so
+  a later request for the same bytes takes a row of its own and can be claimed — but the
+  ledger still has to consider the document work. A reference left bound under the current
+  generation is not work by that rule, so a restore, an unbind or a backfill that only
+  enqueues what the ledger calls stale will walk past it. `check` cannot see any of this,
+  because its counters are all ledger-derived and a job moving from `done` to `failed`
+  changes none of them; the worker's ERROR line is what names it, and naming the document
+  again is an operator's act (`jobs --reset` is Task 15's).

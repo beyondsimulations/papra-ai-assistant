@@ -563,19 +563,23 @@ async def test_the_ledger_row_is_required_rather_than_the_callers_memory(store, 
     assert fake_papra.patch_calls == 0
 
 
-def test_a_permanently_failed_index_row_makes_the_next_enqueue_a_noop(store):
-    """Today's trap, pinned so Task 11's migration has to invert it on purpose.
+def test_a_permanently_failed_index_row_no_longer_blocks_the_next_enqueue(store):
+    """The trap this build used to have, pinned so its inversion is on the record.
 
-    The job kind this path fails is `index` — there is no metadata job kind — and the verdict
-    above is permanent, which `worker_loop` writes as `status='failed'` via
-    `mark_job_failed(..., max_attempts=1)`. `enqueue_job` is `INSERT OR IGNORE` against the
-    *unique* `idx_jobs_idempotency (kind, org, document, content_hash)`, so from that moment
-    every later enqueue for those same bytes is a silent no-op returning the failed row's id.
-    Every re-admission move works by enqueuing exactly that tuple — Task 9's restore and
-    unbind, Task 15's backfill — so a restore can report success and enqueue nothing.
+    The verdict that puts a row in `failed` is permanent — `worker_loop` writes it with
+    `mark_job_failed(..., max_attempts=1)` — and for the whole of this file's history
+    `enqueue_job` was `INSERT OR IGNORE` against a *whole-table* unique
+    `idx_jobs_idempotency (kind, org, document, content_hash)`. From that moment every
+    later enqueue for the same bytes was a silent no-op returning the failed row's id,
+    and every re-admission move works by enqueuing exactly that tuple: the restore and
+    unbind passes, the rebuild, and Task 15's backfill. A restore could report success
+    and enqueue nothing.
 
-    The durable fix is Task 11's partial unique index; until it lands the escape is
-    `jobs --reset` on that row. This test describes the trap, not the intended behaviour.
+    Migration 004 inverts this on purpose: the index is unique over live rows only, so
+    the spent row stops being a lock, the next enqueue is a row that can be claimed,
+    and the failure keeps its own row as the record it is. The escape hatch this test
+    used to point at (`jobs --reset` on that row) is now a convenience rather than the
+    only way out.
     """
     job_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
                                content_hash=HASH, payload={"file_hash": HASH})
@@ -586,19 +590,24 @@ def test_a_permanently_failed_index_row_makes_the_next_enqueue_a_noop(store):
                               content_hash=HASH, payload={"file_hash": HASH,
                                                           "ingested_via": "restore"})
 
-    assert again == job_id, "a new id would imply a new row that nobody can claim"
-    assert store.get_job(again).status == "failed"
-    assert store.claim_next_job("index") is None
-    assert len([job for job in store.list_jobs() if job.kind == "index"]) == 1
+    assert again != job_id, "the spent row absorbed the enqueue: 004's predicate is gone"
+    claimed = store.claim_next_job("index")
+    assert claimed is not None and claimed.id == again
+    rows = [job for job in store.list_jobs() if job.kind == "index"]
+    assert len(rows) == 2
+    assert store.get_job(job_id).status == "failed"
 
 
-async def test_a_permanently_failed_index_job_names_the_lock_it_leaves(store, caplog):
+async def test_a_permanently_failed_index_job_names_what_it_leaves_behind(store, caplog):
     """The consequence has to be in the log, not only in a plan document.
 
     `check`'s counters are all ledger-derived, so a `done` job flipping to `failed` moves no
     number an operator reads; the ERROR line is the only place this failure is written down.
-    It must therefore say what the failure costs — that this document cannot be re-enrolled
-    until the row is reset — otherwise the operator reads "failed" as "it will try again".
+    It must therefore say what the failure costs — that nothing will ask about these bytes
+    again by itself — otherwise the operator reads "failed" as "it will try again". What it
+    must not do is blame the queue: since migration 004 a spent row does not block a fresh
+    request, and a message that sent an operator to untangle a lock that does not exist
+    would cost them the actual cause, which is a ledger row that reads as finished.
     """
     from papra_suite.pipeline import worker_loop
 

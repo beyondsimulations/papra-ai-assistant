@@ -1091,31 +1091,38 @@ async def test_a_restore_cancels_a_pending_delete_without_deleting(store, papra,
     assert store.ledger_get(ORG, DOC_ID).cleanup_state == "skipped"
 
 
-async def test_a_restore_resets_a_permanently_failed_index_job(store, papra, index):
-    """A restore has to be able to ask for the work again, and the queue says no by default.
+async def test_a_restore_requeues_work_past_a_permanently_failed_index_job(store, papra,
+                                                                           index):
+    """A restore has to be able to ask for the work again, and since 004 it can.
 
-    `tests/test_metadata_delivery.py::test_a_permanently_failed_index_row_makes_the_next_enqueue_a_noop`
-    pins the trap: `enqueue_job` is `INSERT OR IGNORE` against the unique idempotency index,
-    so a `failed` row for these bytes turns every re-enqueue — restore, unbind, backfill —
-    into a silent no-op that reports the old id. Here the restore path is shown resetting
-    that row so the document is claimable again. Task 11's partial unique index is the
-    durable fix; the reset is today's, and it is the reason a restore is not a lie.
+    This test used to show the restore path *resetting* a spent row, because
+    `enqueue_job` was `INSERT OR IGNORE` against a whole-table unique idempotency index
+    and a `failed` row for these bytes made every re-enqueue — restore, unbind, backfill
+    — a silent no-op reporting the old id.
+
+    Migration 004 moved that mechanism into the schema: the index is unique over live
+    rows only, so the restore's enqueue is a fresh row the worker can claim and the spent
+    row is left alone as the record of what already went wrong. What the test demands has
+    not changed — a restore must leave claimable work behind — only which row carries it.
     """
     seed_reference(store, papra, kreuzakt_id=7, deleted=True)
     await indexing.reconcile_deletions(store, papra, index)
     await indexing.run_cleanup(store, papra, index, now=due(store))
-    job_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
-                               content_hash=HASH, payload={"file_hash": HASH})
-    store.mark_job_failed(job_id, "document deleted in papra", max_attempts=1)
-    assert store.get_job(job_id).status == "failed"
+    spent_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
+                                 content_hash=HASH, payload={"file_hash": HASH})
+    store.mark_job_failed(spent_id, "document deleted in papra", max_attempts=1)
+    assert store.get_job(spent_id).status == "failed"
 
     papra.documents[(ORG, DOC_ID)]["isDeleted"] = False
     papra.documents[(ORG, DOC_ID)]["deletedAt"] = None
     await indexing.reconcile_deletions(store, papra, index)
 
-    assert store.get_job(job_id).status == "pending"
     claimed = store.claim_next_job("index")
-    assert claimed is not None and claimed.id == job_id
+    assert claimed is not None and claimed.kind == "index"
+    assert claimed.id != spent_id
+    # The spent row keeps its verdict: it is why the log says this document failed once,
+    # and rewriting history to make work schedulable is the trade this build refused.
+    assert store.get_job(spent_id).status == "failed"
 
 
 async def test_a_restore_creates_the_index_job_when_none_exists(store, papra, index):
@@ -1210,9 +1217,9 @@ async def test_the_liveness_probe_unbinds_a_dead_binding_and_readmits_the_job(st
     enqueue is eligible in a sense nobody can act on.
     """
     seed_reference(store, papra, kreuzakt_id=7)
-    job_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
-                               content_hash=HASH, payload={"file_hash": HASH})
-    store.mark_job_failed(job_id, "kreuzakt document 7 answers 404", max_attempts=1)
+    spent_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
+                                 content_hash=HASH, payload={"file_hash": HASH})
+    store.mark_job_failed(spent_id, "kreuzakt document 7 answers 404", max_attempts=1)
     index.missing_document_ids = {7}
     assert store.ledger_needs_index(generation=store.get_generation()) == []
 
@@ -1221,8 +1228,13 @@ async def test_the_liveness_probe_unbinds_a_dead_binding_and_readmits_the_job(st
     assert store.ledger_get(ORG, DOC_ID).kreuzakt_id is None
     assert [r.papra_document_id for r in
             store.ledger_needs_index(generation=store.get_generation())] == [DOC_ID]
-    assert store.get_job(job_id).status == "pending"
-    assert store.claim_next_job("index").id == job_id
+    # Migration 004 is what makes the last two lines agree. The probe's enqueue used to be
+    # absorbed by this spent row, which left the row eligible in the ledger and unclaimable
+    # in the queue at the same time; now the request takes a row of its own and the failed
+    # one keeps the verdict that explains why the document needed probing at all.
+    claimed = store.claim_next_job("index")
+    assert claimed is not None and claimed.id != spent_id
+    assert store.get_job(spent_id).status == "failed"
 
 
 async def test_the_liveness_probe_does_not_run_twice_inside_the_interval(store, papra,

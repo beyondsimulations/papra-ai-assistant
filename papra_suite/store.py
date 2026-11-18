@@ -307,10 +307,52 @@ def _migration_003_index_ledger(conn: sqlite3.Connection) -> None:
     )
 
 
+# The statuses that mean "this piece of work still exists", as one SQL fragment.
+# Migration 004's partial index, `enqueue_job`'s read-back and `reset_job`'s refusal
+# all have to agree on it, and three hand-written copies of a predicate is how a
+# queue ends up with a row that is live to one query and invisible to another.
+LIVE_JOB_STATUS_SQL = "status IN ('pending','running')"
+
+
+def _migration_004_jobs_live_idempotency(conn) -> None:
+    """004: the jobs idempotency key constrains live rows only.
+
+    A job row is a *scheduling record*, and 001 constrained the key over the whole
+    table — so a row that reached `done` or `failed` kept absorbing every later
+    `INSERT OR IGNORE` for the same (kind, org, document, content hash) forever. The
+    bridge's own recovery paths died there: a document whose Kreuzakt copy was
+    deleted could not be re-indexed, because the completed `index` row was still
+    sitting on its bytes, and the sweep only ever saw it as `done`. Making the
+    constraint partial turns a terminal row into history rather than a lock, which
+    is what lets a rebuild re-derive a document from Papra's bytes at all.
+
+    Narrowing the constraint can only *admit* rows the old one admitted fewer of, so
+    no existing row can violate the new index and no de-duplication pass is needed:
+    the old constraint was strictly stronger, so at most one row per key exists and
+    it either is live (and stays the only live one) or is not (and is now free).
+
+    Two statements, each with its own `conn.execute`, for the reason 003 learned:
+    `executescript` commits `migrate()`'s pending `BEGIN IMMEDIATE` before it runs.
+    Here the shape of the damage is worse than a lost table — a `DROP INDEX` that
+    committed on its own leaves the queue with *no* unique index while
+    `user_version` still reads 3, so the retry does not fail loudly, it silently
+    stops de-duplicating and the first symptom is duplicate upstream work.
+    """
+    conn.execute("DROP INDEX idx_jobs_idempotency")
+    conn.execute(
+        f"""
+        CREATE UNIQUE INDEX idx_jobs_idempotency
+            ON jobs(kind, papra_org_id, document_id, content_hash)
+        WHERE {LIVE_JOB_STATUS_SQL}
+        """
+    )
+
+
 MIGRATIONS = [
     _migration_001_initial,
     _migration_002_ingest_events,
     _migration_003_index_ledger,
+    _migration_004_jobs_live_idempotency,
 ]
 
 # The closed set of outcomes worth recording. A sixth value must be added here
@@ -830,6 +872,21 @@ class Store:
 
     def enqueue_job(self, *, kind: str, papra_org_id: str, document_id: str,
                     content_hash: str, payload: dict) -> str:
+        """Queue this work, or name the live job that already carries it.
+
+        The idempotency key is `(kind, papra_org_id, document_id, content_hash)`, and
+        since migration 004 it constrains live rows only: a `pending` or `running` row
+        absorbs the insert, a `done` or `failed` one does not. So the same key can now
+        hold several rows, and the read-back has to say which one this call is about.
+        It prefers the live row — the insert above can only have been ignored because
+        a live row exists — and falls back to the newest row by rowid, which keeps the
+        return value a real row for the key instead of `None` if another writer settled
+        it between the two statements.
+
+        Handing back a terminal row would be a silent wrong answer:
+        `indexing._readmit_index_job` reads the returned id back and acts on it, and
+        `jobs --reset` will hand an id straight to `reset_job`.
+        """
         job_id = uuid.uuid4().hex
         now = _now()
         with self._lock, self._conn:
@@ -842,8 +899,10 @@ class Store:
                  json.dumps(payload), now, now, now),
             )
             row = self._conn.execute(
-                "SELECT id FROM jobs WHERE kind = ? AND papra_org_id = ? "
-                "AND document_id = ? AND content_hash = ?",
+                f"SELECT id FROM jobs WHERE kind = ? AND papra_org_id = ?"
+                f" AND document_id = ? AND content_hash = ?"
+                f" ORDER BY CASE WHEN {LIVE_JOB_STATUS_SQL} THEN 0 ELSE 1 END,"
+                " rowid DESC LIMIT 1",
                 (kind, papra_org_id, document_id, content_hash),
             ).fetchone()
         return row["id"]
@@ -909,7 +968,37 @@ class Store:
                 )
 
     def reset_job(self, job_id: str) -> None:
+        """Put a settled job back at the front of the queue.
+
+        Since migration 004 a terminal row no longer *blocks* anything: asking for the
+        same work again takes a fresh row, which is the recovery path the sweep and the
+        rebuild use. This method is the other path — an operator naming one row
+        (`jobs --reset`), which keeps that row's identity and history in one place
+        instead of growing a second one.
+
+        It refuses when the two paths would collide. Reviving a terminal row whose key
+        already has a live row would violate the partial unique index, so SQLite would
+        raise `IntegrityError` out of a CLI command; the honest answer is that the work
+        is already queued, in words, with the rows left untouched.
+        """
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT kind, papra_org_id, document_id, content_hash, status FROM jobs"
+                " WHERE id = ?", (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown job: {job_id}")
+            live = self._conn.execute(
+                f"SELECT id FROM jobs WHERE kind = ? AND papra_org_id = ?"
+                f" AND document_id = ? AND content_hash = ? AND id != ?"
+                f" AND {LIVE_JOB_STATUS_SQL} LIMIT 1",
+                (row["kind"], row["papra_org_id"], row["document_id"],
+                 row["content_hash"], job_id),
+            ).fetchone()
+            if live is not None:
+                raise ValueError(
+                    f"job {job_id}: the same work is already queued as {live['id']}"
+                )
             self._conn.execute(
                 "UPDATE jobs SET status = 'pending', attempts = 0, error = NULL, "
                 "next_attempt_at = ?, updated_at = ? WHERE id = ?",

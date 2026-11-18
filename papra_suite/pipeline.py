@@ -725,17 +725,21 @@ async def worker_loop(store: Store, *, kind: str, handler,
                     if kind == "index":
                         # Stated because nothing else says it. `check`'s counters are all
                         # ledger-derived, so this job flipping `done` -> `failed` moves no
-                        # number an operator reads, and `enqueue_job` is `INSERT OR IGNORE`
-                        # against the unique idempotency index: the failed row now absorbs
-                        # every later request to index these same bytes, which is what a
-                        # restore or a backfill does to bring a document back.
+                        # number an operator reads. What the row still costs is stated
+                        # accurately rather than at its worst: since migration 004 the
+                        # idempotency index covers live rows only, so the spent row no
+                        # longer absorbs a later request for these bytes — the ledger is
+                        # what decides whether anything asks again, and a row left bound
+                        # under the current generation is not eligible however the queue
+                        # is indexed.
                         logger.error(
                             "index job %s for papra document %s failed permanently at "
-                            "content %s: the queue row is the idempotency key, so every later "
-                            "enqueue for these same bytes is ignored until that row is reset — "
-                            "by `jobs --reset` once Task 15 ships that command, by a hand edit "
-                            "of the `jobs` table until then. A restore or backfill that reports "
-                            "success and enqueues nothing has met this row.",
+                            "content %s: nothing will ask about these bytes again on its own. "
+                            "The queue no longer blocks a fresh request for them, so the "
+                            "recovery is to name the document — `jobs --reset` on this row "
+                            "once Task 15 ships that command, or a hand-built index row for "
+                            "this content hash until then. A restore or backfill that "
+                            "reported success without queueing anything has met this row.",
                             job.id, job.document_id, job.content_hash[:12])
                 elif max_attempts is None:
                     store.mark_job_failed(job.id, str(error))

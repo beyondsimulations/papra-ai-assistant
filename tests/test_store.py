@@ -253,6 +253,125 @@ def test_reset_job_makes_job_claimable(store):
     assert claimed.status == "running"
 
 
+def test_a_terminal_row_does_not_block_a_fresh_enqueue(store):
+    """A finished job is history, not a lock — for every kind, not just `index`.
+
+    The constraint is over the idempotency key, so this is the queue-wide rule the
+    index bridge depends on: the document whose Kreuzakt copy was deleted can be
+    queued again, and so can a `title` job whose row completed under a different
+    mind about what the right title was. `ocr` is the third kind and gets the same
+    sentence, because a rule that only holds for the kind someone was thinking of
+    is not a rule.
+    """
+    for kind, document_id in (("index", "doc_1"), ("title", "doc_2"), ("ocr", "doc_3")):
+        first = store.enqueue_job(kind=kind, papra_org_id="org_1", document_id=document_id,
+                                  content_hash="abc", payload={})
+        store.mark_job_done(first)
+
+        second = store.enqueue_job(kind=kind, papra_org_id="org_1",
+                                   document_id=document_id, content_hash="abc",
+                                   payload={})
+        assert second != first, f"a done {kind} row absorbed the next enqueue"
+        claimed = store.claim_next_job(kind)
+        assert claimed is not None and claimed.id == second
+        assert store.get_job(first).status == "done"
+
+
+def test_a_live_row_still_absorbs_the_enqueue(store):
+    """The other half of the partial index: live work is still deduplicated.
+
+    Without this, the narrowed constraint would double the queue for every sweep
+    that overlaps a running job, and the second worker would upload a document the
+    first one is uploading.
+    """
+    first = store.enqueue_job(kind="index", papra_org_id="org_1", document_id="doc_1",
+                              content_hash="abc", payload={})
+    store.claim_next_job("index")  # -> running
+
+    assert store.enqueue_job(kind="index", papra_org_id="org_1", document_id="doc_1",
+                             content_hash="abc", payload={}) == first
+    assert store.claim_next_job("index") is None
+    pending = [job for job in store.list_jobs() if job.kind == "index"]
+    assert len(pending) == 1
+
+
+def test_enqueue_job_returns_the_live_row_not_the_completed_one(store):
+    """Which row an idempotent enqueue names is a contract, not an accident.
+
+    Several rows can now share one idempotency key, so a lookup that ignores
+    status is free to hand back the oldest — a `done` row, whose id callers act
+    on. `indexing._readmit_index_job` reads the returned id back and acts on it,
+    and `jobs --reset` will take it from an operator, so a stale answer is a wrong
+    instruction rather than a harmless detail.
+    """
+    done_id = store.enqueue_job(kind="index", papra_org_id="org_1", document_id="doc_1",
+                                content_hash="abc", payload={})
+    store.mark_job_done(done_id)
+
+    fresh = store.enqueue_job(kind="index", papra_org_id="org_1", document_id="doc_1",
+                              content_hash="abc", payload={})
+    assert fresh != done_id
+    # And a second call while that fresh row is live names the *live* row, not the
+    # completed one that sorts first by rowid.
+    assert store.enqueue_job(kind="index", papra_org_id="org_1", document_id="doc_1",
+                             content_hash="abc", payload={}) == fresh
+
+
+def test_reset_job_refuses_when_the_bytes_already_have_live_work(store):
+    """Reviving a terminal row alongside live work would break the new index.
+
+    `reset_job` is what `jobs --reset` will drive, so it has to answer this case in
+    words rather than by letting SQLite's IntegrityError escape into a traceback:
+    the work is already queued, and reviving the second row would also make
+    completed work run twice.
+    """
+    terminal = store.enqueue_job(kind="index", papra_org_id="org_1", document_id="doc_1",
+                                 content_hash="abc", payload={})
+    store.mark_job_done(terminal)
+    live = store.enqueue_job(kind="index", papra_org_id="org_1", document_id="doc_1",
+                             content_hash="abc", payload={})
+
+    with pytest.raises(ValueError, match="already queued"):
+        store.reset_job(terminal)
+
+    assert store.get_job(terminal).status == "done"
+    assert store.get_job(live).status == "pending"
+
+
+def test_two_connections_cannot_queue_the_same_live_work(tmp_path):
+    """The narrowed constraint still holds across connections.
+
+    Partial unique indexes are enforced by SQLite, not by the caller, but a
+    migration that wrote the predicate slightly wrong — `WHERE status = 'pending'`,
+    say — would leave `running` rows out of the constraint and let two workers claim
+    two jobs for one document. Two stores, one file, one key.
+    """
+    db_path = tmp_path / "state.db"
+    worker_a = Store(db_path)
+    worker_a.migrate()
+    worker_b = Store(db_path)
+    worker_b.migrate()
+    try:
+        first = worker_a.enqueue_job(kind="index", papra_org_id="org_1",
+                                     document_id="doc_1", content_hash="abc", payload={})
+        second = worker_b.enqueue_job(kind="index", papra_org_id="org_1",
+                                      document_id="doc_1", content_hash="abc", payload={})
+        assert first == second
+        assert worker_a._conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE kind='index'").fetchone()[0] == 1
+
+        # And across the same pair once that row is terminal: the constraint is
+        # gone for the dead row, so the next enqueue must be a new one.
+        worker_a.mark_job_done(first)
+        fresh = worker_b.enqueue_job(kind="index", papra_org_id="org_1",
+                                     document_id="doc_1", content_hash="abc", payload={})
+        assert fresh != first
+        assert worker_b.claim_next_job("index").id == fresh
+    finally:
+        worker_a.close()
+        worker_b.close()
+
+
 def test_document_seen_roundtrip(store):
     assert not store.document_seen("org_1", "doc_1")
     store.record_document_seen(papra_org_id="org_1", papra_document_id="doc_1",
@@ -773,12 +892,12 @@ def test_upgrade_from_001_adds_ingest_events_and_keeps_rows(tmp_path):
     store = Store(db_path)
     store.migrate()
     try:
-        # 003 (index_ledger) is the migration this path now runs, so the expected
-        # value moved 2 -> 3 when it landed. Adding a migration 004 must bump it to
-        # 4: that is the intended signal, and pinning the literal rather than
-        # len(MIGRATIONS) is the whole point — a test that tracked the list length
-        # could not notice a migration that never ran.
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        # 004 (the partial jobs index) is the migration this path now runs, so the
+        # expected value moved 3 -> 4 when it landed. Adding a migration 005 must
+        # bump it to 5: that is the intended signal, and pinning the literal rather
+        # than len(MIGRATIONS) is the whole point — a test that tracked the list
+        # length could not notice a migration that never ran.
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
         tables = {row[0] for row in store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "ingest_events" in tables
