@@ -1360,6 +1360,43 @@ Commit as `feat(index): metadata delivery on Papra-side baselines with explicit 
      operator loses an hour. Same rule already applied to `jobs --drain` and `jobs --reset`.
   8. *One module, one definition.* The Task 9 header and 13 constants are defined twice in `indexing.py` and the
      later block wins, so an edit to the first is silently ignored in the file that documents the trust predicate.
+**Requirements added by Task 9's re-review (all binding on the follow-up round).** Round 1's decision logic
+survived verification — the count is taken inside the marking transaction and retaken at execution time, the
+race-tight re-admission holds, and Papra is still never written or deleted. Round 2's *suppression* mechanisms
+were scoped wrongly, and suppression is where stalls hide:
+  9. *The marks brake gates marks, not the pass.* As written it refuses before reading, so it freezes the
+     non-destructive work — restores and the liveness probe — while `run_cleanup`, the only destructive half,
+     keeps running from `sweep_once`. That is an inversion: it stops the safe work and continues the dangerous
+     one. It also fires at realistic sizes (allowance `max(20, 10% of refs)` ≈ 30 marks/day on a ~300-reference
+     corpus), so one afternoon of decluttering trips it.
+ 10. *`run_cleanup` must re-ask Papra about the document it is about to destroy.* Its first veto consults the
+     ledger (`ref.deleted_at is None`), and only `reconcile_deletions` ever notices a Papra-side restore. So:
+     trash → mark → delete deferred by outage → user restores → brake freezes the restore arm for up to 24h →
+     Kreuzakt recovers → the delete fires against a document the user kept. One GET per queued delete, skipping
+     when the answer is "live there", closes that race independent of any cadence or brake. Pin the interleaving
+     as a regression test.
+ 11. *Quarantine a bucket only when it has work.* `expected_refs` counts `COUNT(*)` with no `deleted_at` filter
+     and ledger rows are never deleted, so a legitimately emptied and already-cleaned bucket quarantines forever:
+     ERROR every walk and `set aside: <org>` in `check` permanently. Nothing is blocked, which is precisely the
+     problem — the health surface goes red for a finished state, on a four-bucket personal corpus, aimed at the
+     two mechanisms whose only defence is being loud. Require a live reference **or** cleanup debt
+     (`pending`/`failed`), and hoist the per-bucket `ledger_stats` out while at it.
+ 12. *The total-stability arm must not abort on ordinary churn.* `documentsCount` is the live count, so any
+     create or trash between pages discards the whole pass — and an aborted pass earns no cadence stamp, so the
+     next sweep re-pays the entire walk. The safety property is "we saw at least as many rows as the server
+     claims exist": compare `rows_seen >= max(totals)`, keep refusing when no page ever reported a total.
+ 13. *A brake trip must be announced as a brake trip, and both brakes must be visible in `check` under test.*
+     The pre-pass refusal returns `aborted=True`, so the sweep blames an untrustworthy listing; and the
+     `set aside:` / `marks this window:` fields have no tests, while the equivalent pattern for `aborted` exists.
+ 14. *Cadence honesty.* Stamp the interval whenever the ref walk ran to its end — that is what a cadence bounds;
+     carry "not known clean" solely in the unanswered list, cap and age that list, print its size in `check`, and
+     make the retry test assert the cost is one read rather than merely "more reads than before". Today a total
+     outage re-runs the corpus-wide walk every 900 s while the constants advertise 6 h, and the narrow retry is
+     dead code in exactly that case.
+ 15. *Two resets need an owner that exists.* Clearing `index_marks_rolling` and settling
+     `cleanup_state='failed'` are today `sqlite3` incantations, and `store.py:659` **raises** telling the operator
+     to run `papra-suite ledger --invalidate`, a subcommand `__main__.py` does not parse. Task 11 owns both
+     resets; the round must stop citing missing commands in raised errors.
 
 - Produces:
   - `async def reconcile_deletions(store, papra, kz) -> DeletionResult(refs_marked: int, upstream_deleted: int, upstream_pending: int, restored: int, aborted: bool, capped: int)`
@@ -1471,7 +1508,9 @@ or if `ledger_resolve([cleanup_kreuzakt_id], generation=current)` returns anythi
 needs that document). Only then call `delete_document(cleanup_kreuzakt_id)`, and record
 `ledger_cleanup_result(ok=…, next_at=…)` with `defer = CLEANUP_BACKOFF_S * attempts`; on the fifth failure
 log at ERROR naming the Kreuzakt id and stop retrying (`cleanup_state='failed'`), leaving the operator
-`papra-suite ledger --cleanup` to force a retry.
+`papra-suite ledger --cleanup` to force a retry. Task 11 also owns the second reset the deletion round created: clearing
+`index_marks_rolling` when the operator has confirmed the listing is trustworthy again. Both must be subcommands, not
+SQL, and both must name the state they clear in their output.
 
 **Queue-side rule (added after Task 4, which changed what `ledger_mark_deleted` can return):** decide from
 the returned **id**, not from `remaining == 0`. `ledger_mark_deleted` now answers `(-1, -1)` both when the
@@ -1710,6 +1749,12 @@ reference, so `refs` and `current` can both look healthy while a chunk of the co
 index. A warning in the README is not a control; a number that must reach zero is. Print `delivery-blocked=N` from Task 11's counter on the same line: a document Papra has refused five times running is invisible today except in a log line every six hours, and an operator should not have to read logs to learn that a document will never be searchable.
 
 Auth and transport come from `docs/superpowers/specs/2026-11-16-mcp-search-server-design.md` **verbatim**: `mcp` 2.x Streamable HTTP, `token_verifier` under `auth` settings, the Host/Origin allow-list answering **421** to a bare host, 401 for query-string tokens, no Funnel, pydantic returns, the error model. What changes is the token store: per-token rows carrying bucket lists, replacing that spec's single `mcp_allowed_org_ids` key.
+
+`index_status` treats the two deletion brakes as **first-class propagation states**, not as log lines to
+re-derive: bucket quarantine (`index_deletion_quarantine`), marks brake (`index_marks_rolling`, with the window
+count and the allowance), the pending-liveness-probe list size, and a gated pass shown as "gated until …" rather
+than a stale `ok marked=…` line. Task 9's review found that an operator comparing a stale-looking `check` to a
+fresh trash would conclude propagation is broken; this is the surface that has to answer that question.
 
 **Files:** Create `papra_suite/mcp_tokens.py`, `papra_suite/mcp_server.py`, `tests/test_mcp_tokens.py`, `tests/test_mcp_server_auth.py`; Modify `papra_suite/__main__.py`, `papra_suite/pipeline.py`, the 2026-11-16 spec.
 
