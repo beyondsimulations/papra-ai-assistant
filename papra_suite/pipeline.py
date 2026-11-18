@@ -11,6 +11,8 @@ import sqlite3
 from dataclasses import dataclass
 
 from papra_suite.allowlist import AllowList
+from papra_suite.indexing import CONTENT_DELIVERY_IMPLEMENTED, run_index_job
+from papra_suite.kreuzakt_client import KreuzaktClient
 from papra_suite.llm_client import LLMClient
 from papra_suite.ocr import OCR_SYSTEM_PROMPT, assemble_markdown, page_count, render_page
 from papra_suite.papra_client import PapraClient
@@ -121,7 +123,8 @@ async def run_title_job(papra: PapraClient, title_llm: LLMClient, job: Job) -> N
 async def serve(config, *, stop: asyncio.Event | None = None,
                 store: Store | None = None, papra: PapraClient | None = None,
                 ocr_llm: LLMClient | None = None,
-                title_llm: LLMClient | None = None) -> None:
+                title_llm: LLMClient | None = None,
+                kreuzakt: KreuzaktClient | None = None) -> None:
     """The process runtime: pollers, OCR/title workers, sweep.
 
     Runs until the stop event is set (or the surrounding task is cancelled),
@@ -135,6 +138,7 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     if store is None:
         store = Store(config.data_dir / "state.db")
     store.migrate()
+    _sync_settings_from_config(store, config)
     recovered = store.recover_running_jobs()
     if recovered:
         logger.info("recovered %d stale running job(s) at startup", recovered)
@@ -159,6 +163,9 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         title_llm = LLMClient(config.llm_base_url, config.llm_api_key,
                               config.title_model, timeout_s=300.0)
         built_clients.append(title_llm)
+    if kreuzakt is None:
+        kreuzakt = KreuzaktClient(config.kreuzakt_base_url)
+        built_clients.append(kreuzakt)
 
     tasks = []
     for mailbox in store.list_mailboxes(enabled_only=True):
@@ -174,6 +181,17 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         store, kind="title",
         handler=lambda job: run_title_job(papra, title_llm, job),
     ), name="title-worker"))
+    # ONE index worker, on purpose. Correlating an upload needs its queue row inside
+    # the newest-100 window, so uploads are serial by construction: a second worker
+    # would interleave uploads and make each other's correlation fail.
+    tasks.append(asyncio.create_task(worker_loop(
+        store, kind="index",
+        handler=lambda job: run_index_job(
+            kreuzakt, store, job, papra=papra,
+            poll_s=config.index_poll_interval_s,
+            wait_timeout_s=config.index_wait_timeout_s,
+            max_attempts=config.index_max_attempts),
+    ), name="index-worker"))
     if config.sweep_interval_s > 0:
         tasks.append(asyncio.create_task(
             _sweep_loop(store, papra, config.sweep_interval_s), name="sweep"))
@@ -217,6 +235,35 @@ async def serve(config, *, stop: asyncio.Event | None = None,
                 store.close()
             except Exception:  # noqa: BLE001
                 logger.exception("error closing store during shutdown")
+
+
+def _sync_settings_from_config(store: Store, config) -> None:
+    """Write the delivery flags from `Config` into `settings` at every startup.
+
+    The gate is read out of the store — by the worker loop, by the CLI, and (from
+    Task 7) from inside `deliver_content` itself — because a flag only the scheduler
+    consults can be bypassed by any other caller. `Config` is what the operator
+    actually started the process with, so it is written on startup and the readers
+    cannot disagree about which build is running.
+
+    `index_metadata_delivery` is seeded as given although nothing reads it yet:
+    writing one flag and not its sibling would make the settings table a half-truth
+    about the process that owns it. `index_content_delivery` is the exception, and it
+    is a fact about the build rather than about the operator: see the warning below.
+    """
+    if config.index_content_delivery and not CONTENT_DELIVERY_IMPLEMENTED:
+        # Loud, and refused rather than obeyed. Honoured, this flag stops the legacy
+        # OCR enqueue — and in a build with no delivery path that is not "the bridge
+        # will write the text instead", it is "nothing writes the text".
+        logger.warning(
+            "PAPRA_INDEX_CONTENT_DELIVERY is set but this build has no content "
+            "delivery path yet: leaving the legacy OCR writer in charge of Papra's "
+            "text. Task 7's build is the one that can take the flag.")
+    store.set_setting("index_content_delivery",
+                      "true" if (config.index_content_delivery
+                                 and CONTENT_DELIVERY_IMPLEMENTED) else "false")
+    store.set_setting("index_metadata_delivery",
+                      "true" if config.index_metadata_delivery else "false")
 
 
 async def _poll_loop(store: Store, papra: PapraClient, mailbox, *,
@@ -350,7 +397,18 @@ def _is_pdf(document: dict) -> bool:
 
 
 async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
-    """Record and enqueue OCR for externally-ingested documents (decisions §4).
+    """Record and enqueue indexing for externally-ingested documents (decisions §4).
+
+    Papra-native uploads — a PDF dropped into the web UI — are documents this process
+    never ingested, and the sweep is what finds them. Its enqueue call site is
+    `enqueue_index_job`, so those documents enter the index pipeline and, while the old
+    writers are still running, the OCR queue too.
+
+    One gap worth naming here rather than discovering later: **mail intake does not
+    come through this sweep.** `mail.py` enqueues through `enqueue_ocr_job` and records
+    the document as seen in the same call, and the sweep skips seen documents, so a
+    mail-ingested PDF has no ledger row and no index job until that call site is
+    switched over. Switching it is not part of this task's files.
 
     documents_checked counts every document the sweep LISTED (including
     already-seen and non-PDF ones): it means "listed and examined", not
@@ -430,7 +488,7 @@ async def sweep_once(store: Store, papra: PapraClient) -> SweepResult:
                             )
                             file_bytes = await papra.download_file(org.papra_org_id, document_id)
                             file_hash = hashlib.sha256(file_bytes).hexdigest()
-                        enqueue_ocr_job(
+                        enqueue_index_job(
                             store, papra_org_id=org.papra_org_id, document_id=document_id,
                             file_hash=file_hash, name=document.get("name", "document.pdf"),
                             mime="application/pdf", ingested_via="sweep",
@@ -501,6 +559,55 @@ def enqueue_ocr_job(store: Store, *, papra_org_id: str, document_id: str,
         papra_document_id=document_id,
         name=name,
         mime=mime,
+        ingested_via=ingested_via,
+    )
+    return job_id
+
+
+def enqueue_index_job(store: Store, *, papra_org_id: str, document_id: str,
+                      file_hash: str, name: str, mime: str, ingested_via: str) -> str:
+    """Enqueue index work for one ingested document. Returns "" for a non-PDF.
+
+    Three writes, in this order, because each crash has to leave something the
+    pipeline can still act on:
+
+    1. the **ledger reference**, before the job is visible. Eligibility is derived
+       from the ledger (`ledger_needs_index`), so a queued job with no row behind it
+       is work no sweep, backfill or rebuild pass can see — the job would be the
+       only record that this document was ever meant to be indexed. The row also
+       carries `papra_original_name`, the rename baseline, taken while we hold
+       Papra's own name for it.
+    2. the **index job**, then the legacy `ocr` job while content delivery is off.
+       Enqueue before the seen-record is the M3 ordering, unchanged: a crash between
+       the writes leaves the document unseen, so the sweep re-enqueues it (the
+       enqueue is idempotent on kind+org+document+hash) and records it. Seen-first
+       would strand it forever, because the sweep skips documents it has seen.
+    3. the **seen record**, last.
+
+    The legacy `ocr` enqueue is what keeps today's behaviour intact: Papra keeps the
+    text and the titles it has now, and the index job costs nothing but Kreuzakt
+    work. Task 7 retires it when content delivery is on, Task 8 when metadata is.
+    """
+    if mime != "application/pdf":
+        return ""
+    store.ledger_upsert_reference(
+        papra_org_id=papra_org_id, papra_document_id=document_id, file_hash=file_hash,
+        papra_original_name=name or None,
+    )
+    job_id = store.enqueue_job(
+        kind="index",
+        papra_org_id=papra_org_id,
+        document_id=document_id,
+        content_hash=file_hash,
+        payload={"file_hash": file_hash, "name": name},
+    )
+    if not store.settings_flag("index_content_delivery"):
+        store.enqueue_job(
+            kind="ocr", papra_org_id=papra_org_id, document_id=document_id,
+            content_hash=file_hash, payload={"file_hash": file_hash, "name": name},
+        )
+    store.record_document_seen(
+        papra_org_id=papra_org_id, papra_document_id=document_id, name=name, mime=mime,
         ingested_via=ingested_via,
     )
     return job_id
