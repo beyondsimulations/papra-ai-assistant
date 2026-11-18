@@ -35,10 +35,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import sqlite3
 import sys
 from dataclasses import dataclass
+from functools import partial
 
 from papra_suite.indexing import (
+    CLEANUP_DUE_LIMIT,
     MARKS_ROLLING_SETTING,
     IndexFailed,
     papra_document_is_deleted,
@@ -387,6 +390,17 @@ def run_ledger(config, args, *, store: Store | None = None, papra=None,
     point: `--status` and `--clear-marks` work with both services down, because they are the
     commands an operator reaches for *during* an incident. The ones that need a service are the
     ones that would do something irreversible with its answer.
+
+    **One `asyncio.run` per command, and the clients are closed inside it.** The first version
+    of this function closed them in a `finally` *after* `asyncio.run` returned — that is, on a
+    brand-new loop, against an `httpx.AsyncClient` whose connections were made on the loop that
+    has just been closed. Two things were wrong with that, and the second is the reason the
+    order is not a style choice: an exception raised from a `finally` discards the value the
+    `try` was returning, so a `--reindex-all` that really did bump the generation and queue the
+    corpus, or a `--cleanup` that really did delete, could report failure — the one reading an
+    operator cannot recover from, because the honest answer to "did it work" was replaced by
+    "it raised". Close on the using loop, and let a close failure be a log line rather than a
+    verdict on work that already happened.
     """
     owns_store = store is None
     if owns_store:
@@ -398,38 +412,66 @@ def run_ledger(config, args, *, store: Store | None = None, papra=None,
             return _status(store)
         if args.clear_marks:
             return _clear_marks(store, args)
-        own_clients = papra is None or kreuzakt is None
-        if own_clients:
-            papra = papra or PapraClient(config.papra_base_url, config.papra_api_key)
-            kreuzakt = kreuzakt or KreuzaktClient(config.kreuzakt_base_url)
-        try:
-            if args.requeue:
-                return asyncio.run(_requeue(store, papra, args))
-            if args.reindex_all:
-                return asyncio.run(_reindex_all(store, kreuzakt, papra, args))
-            return asyncio.run(_cleanup(store, papra, kreuzakt, args))
-        finally:
-            # Clients this function created are closed here, inside the loop that used them: a
-            # transport belongs to the event loop its connections were made on, and `asyncio.run`
-            # has closed that loop by the time it returns.
-            if own_clients:
-                asyncio.run(_aclose_both(papra, kreuzakt))
-    except (ValueError, KreuzaktError, PapraError, IndexFailed) as error:
-        # `get_generation`'s refusal, a store that will not answer, a client that could not be
-        # built. "This will not start" is a different report from "I walked the corpus and one row
-        # did not read", and it must not be counted as one of those.
+        # Tracked per client, not as one flag: a caller that injected one service and not the
+        # other handed its own client to this function to close, mid-command, while it still
+        # belonged to the caller.
+        owns_papra = papra is None
+        owns_kreuzakt = kreuzakt is None
+        if owns_papra:
+            papra = PapraClient(config.papra_base_url, config.papra_api_key)
+        if owns_kreuzakt:
+            kreuzakt = KreuzaktClient(config.kreuzakt_base_url)
+        if args.requeue:
+            command = partial(_requeue, store, papra, args)
+        elif args.reindex_all:
+            command = partial(_reindex_all, store, kreuzakt, papra, args)
+        else:
+            command = partial(_cleanup, store, papra, kreuzakt, args)
+        to_close = [client for client, owned in ((papra, owns_papra), (kreuzakt, owns_kreuzakt))
+                    if owned and getattr(client, "aclose", None) is not None]
+        return asyncio.run(_run_and_close(command, to_close))
+    except (ValueError, KreuzaktError, PapraError, IndexFailed, sqlite3.Error) as error:
+        # `get_generation`'s refusal, a client that could not be built, and — since `sqlite3.Error`
+        # joined this tuple — a store that is locked or busy. That last one matters most for
+        # `--status`, the command reached for *during* an incident while a daemon may be mid-write:
+        # a traceback there costs the operator the reading they came for and buries the reason.
+        # "This will not start" is a different report from "I walked the corpus and one row did
+        # not read", and it must not be counted as one of those.
         print(f"ledger refused: {error}", file=sys.stderr)
         return EXIT_REFUSED
+    except KeyboardInterrupt:
+        # Ctrl-C is not a crash, and the README promises a sentence with a non-zero exit rather
+        # than a traceback. Nothing here needs rolling back by hand: the generation bump is one
+        # committed UPDATE and the queueing is a resumable walk, so the instruction that follows
+        # an interruption is the one `--reindex-all` already prints.
+        print("ledger stopped: interrupted. A rebuild that was interrupted mid-queueing is "
+              "finished with `papra-suite ledger --requeue`, which bumps nothing", file=sys.stderr)
+        return EXIT_INCOMPLETE
     finally:
         if owns_store:
             store.close()
 
 
-async def _aclose_both(papra, kreuzakt) -> None:
-    for client in (papra, kreuzakt):
-        close = getattr(client, "aclose", None)
-        if close is not None:
-            await close()
+async def _run_and_close(command, to_close):
+    """Await one command, then close these clients on the loop that just used them.
+
+    The `finally` is inside the coroutine, so it runs before `asyncio.run` closes the loop —
+    which is the only place an `httpx` transport may be closed. Its own failures are swallowed
+    into a WARNING on purpose, and that is a decision rather than an oversight: a socket that
+    would not shut down cleanly says nothing about whether the corpus was queued, and letting it
+    propagate would put a `finally` between the operator and the answer they asked for. The
+    process exits either way, and the OS closes what the client could not.
+    """
+    try:
+        return await command()
+    finally:
+        for client in to_close:
+            try:
+                await client.aclose()
+            except Exception as error:
+                logger.warning("ledger: a client did not close cleanly (%s: %s) — the command's "
+                               "result stands; the socket goes with the process",
+                               type(error).__name__, error)
 
 
 def _status(store: Store) -> int:
@@ -508,9 +550,14 @@ def _report(result: RebuildResult) -> int:
     if result.stale or result.enrolled:
         print(f"generation {result.generation}: {result.requeued} of {result.stale} stale "
               f"reference(s) queued, {result.enrolled} unledgered document(s) enrolled")
-    print("left out of the index on purpose: "
-          f"{result.skipped_deleted} in papra's trash, {result.skipped_non_pdf} not a pdf, "
-          f"{result.skipped_oversized} over the {OCR_MAX_DOCUMENT_BYTES} byte limit")
+    if result.skipped_deleted or result.skipped_non_pdf or result.skipped_oversized:
+        # Only when there is something in it. These three buckets are permanent by design — a PNG,
+        # a trashed document, a 400 MB scan — so a line that prints "0, 0, 0" above every clean
+        # rebuild reads as a warning nobody can act on, and the operator learns to ignore the one
+        # line that exists to say *which* documents stayed outside the index.
+        print("left out of the index on purpose: "
+              f"{result.skipped_deleted} in papra's trash, {result.skipped_non_pdf} not a pdf, "
+              f"{result.skipped_oversized} over the {OCR_MAX_DOCUMENT_BYTES} byte limit")
     if result.unledgered:
         print(f"still unledgered: {result.unledgered} — the populations above, plus anything "
               "papra would not describe")
@@ -649,4 +696,15 @@ async def _cleanup(store: Store, papra, kreuzakt: KreuzaktClient, args) -> int:
     result = await run_cleanup(store, papra, kreuzakt)
     print(f"cleanup pass: {result.deleted} deleted, {result.deferred} skipped or deferred, "
           f"{result.failed} failed again ({result.attempted} judged)")
+    if result.attempted < settled:
+        # The re-queue walked every failed row and the pass judges at most `CLEANUP_DUE_LIMIT` of
+        # them, so on a backlog one invocation is not the whole debt. Saying "re-queued 120"
+        # above a pass that reached 50 was a number the operator read as a settled account; the
+        # debt is printed as the store counts it, with the instruction that actually finishes it.
+        debt = store.ledger_stats()["cleanup_pending"]
+        print(f"cleanup: one pass judges at most {CLEANUP_DUE_LIMIT} delete(s) and this one "
+              f"judged {result.attempted} of the {settled} it re-queued — {debt} delete(s) are "
+              "still owed upstream. Run `papra-suite ledger --cleanup` again to settle the rest",
+              file=sys.stderr)
+        return EXIT_INCOMPLETE
     return EXIT_INCOMPLETE if result.failed else EXIT_OK

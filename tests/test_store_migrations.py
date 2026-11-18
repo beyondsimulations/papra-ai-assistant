@@ -382,27 +382,33 @@ def test_failed_migration_004_leaves_nothing_behind_and_can_be_retried(tmp_path,
 
 # --- migration 005: the refused-write history ---------------------------------------
 
-def ledger_row_at_004(path, *, doc="doc_survivor", delivered_sha=None):
-    """One ledger reference in a database whose schema stops at 004.
+def seed_ledger_row_at_004(path, *, doc="doc_survivor", kreuzakt_id=7, delivered_sha=None,
+                           generation=1):
+    """Put one ledger reference into a database whose schema stops at 004.
 
-    005 is an `ALTER TABLE` over a table the operator already has rows in, so the
-    starting state has to be a real row written through the real API rather than an
-    empty table: the claim under test is that an existing reference arrives at 005 with
-    its history intact and the new columns saying "never refused", not NULL and not
-    missing.
+    Raw SQL, like `seed_job_at_003`, and for the reason that matters here: 005 is an
+    `ALTER TABLE … ADD COLUMN … DEFAULT 0` over a table the operator already has rows in,
+    so the row has to exist *before* the upgrade. Written through `Store`'s own API the
+    helper would have to open the file, and `Store.migrate()` would apply 005 before the
+    row was inserted — the row would then be written into a schema that already had the
+    column, by code that fills it in, and the test's own `migrate()` would be a no-op.
+    That proves nothing crosses the boundary; a default that landed as `NULL` on a
+    populated table would pass it. Only a pre-existing row makes "every existing reference
+    arrives saying 'never refused'" an assertion about the migration.
     """
-    store = Store(path)
-    store.migrate()
-    store.ledger_upsert_reference(papra_org_id="org_1", papra_document_id=doc,
-                                  file_hash="ab" * 32, papra_original_name=f"{doc}.pdf")
-    store.ledger_set_kreuzakt_id(papra_org_id="org_1", papra_document_id=doc,
-                                 kreuzakt_id=7, generation=store.get_generation())
-    if delivered_sha is not None:
-        store.ledger_record_delivery(papra_org_id="org_1", papra_document_id=doc,
-                                     delivered_at="2026-11-19T09:00:00+00:00",
-                                     delivered_sha=delivered_sha,
-                                     generation=store.get_generation())
-    store.close()
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO index_ledger (papra_org_id, papra_document_id, kreuzakt_id,"
+            " file_hash, papra_original_name, delivered_at, delivered_sha,"
+            " delivered_generation, repair_count, cleanup_state, cleanup_attempts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2, 'none', 0)",
+            ("org_1", doc, kreuzakt_id, "ab" * 32, f"{doc}.pdf",
+             "2026-11-19T09:00:00+00:00", delivered_sha, generation),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return path
 
 
@@ -411,11 +417,20 @@ def test_migration_005_adds_the_refused_write_history(tmp_path):
 
     A fresh column whose default is not the neutral value turns every healthy document
     into a refused one on upgrade day, so the default is the assertion here as much as
-    the column's presence is.
+    the column's presence is — and a default is only proven against a row the `ALTER TABLE`
+    had to rewrite, which is why the row below is seeded into a 004 file by hand.
     """
     db_path = tmp_path / "db.sqlite"
     build_store_at_version(db_path, 4)
-    ledger_row_at_004(db_path, delivered_sha="be" * 32)
+    seed_ledger_row_at_004(db_path, delivered_sha="be" * 32)
+
+    # Pinned pre-upgrade, so the assertions below cannot be resting on a file that had
+    # already arrived at 005 by some other route: the row is there, the column is not.
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        before = {row[1] for row in conn.execute("PRAGMA table_info(index_ledger)")}
+        assert "delivery_failures" not in before and "last_delivery_error_at" not in before
+        assert conn.execute("SELECT count(*) FROM index_ledger").fetchone()[0] == 1
 
     store = Store(db_path)
     store.migrate()
@@ -425,12 +440,34 @@ def test_migration_005_adds_the_refused_write_history(tmp_path):
                    store._conn.execute("PRAGMA table_info(index_ledger)")}
         assert columns["delivery_failures"]["notnull"] == 1
         assert columns["delivery_failures"]["dflt_value"] == "0"
-        assert "delivery_failures" in columns and "last_delivery_error_at" in columns
+        # The row that was already there, read as raw SQL: `DEFAULT 0` on an `ADD COLUMN`
+        # is what SQLite calls a "non-NULL default", and the only honest reading of it is
+        # that existing rows come out `0`. `IS NULL` here would be the upgrade-day bug this
+        # test exists for — every healthy document reading as a refused one.
+        existing = store._conn.execute(
+            "SELECT delivery_failures, last_delivery_error_at FROM index_ledger"
+            " WHERE papra_document_id = 'doc_survivor'").fetchone()
+        assert existing["delivery_failures"] == 0 and existing["last_delivery_error_at"] is None
+        assert store._conn.execute(
+            "SELECT count(*) FROM index_ledger WHERE delivery_failures IS NULL"
+        ).fetchone()[0] == 0
+
         ref = store.ledger_get("org_1", "doc_survivor")
         assert (ref.delivery_failures, ref.last_delivery_error_at) == (0, None)
-        # The history that was already there is untouched.
+        # The history that was already there is untouched, including the count 005 left
+        # alone: two repairs were spent on this document before the upgrade.
         assert ref.kreuzakt_id == 7 and ref.delivered_sha == "be" * 32
+        assert ref.repair_count == 2 and ref.papra_original_name == "doc_survivor.pdf"
         assert store.ledger_stats()["delivery_blocked"] == 0
+        # Usable, not merely present: the row that predated the column can be charged, and
+        # charging it is what turns "the column exists" into "the ceiling works on a store
+        # that was upgraded rather than created".
+        charged = store.ledger_record_delivery_failure(
+            papra_org_id="org_1", papra_document_id="doc_survivor",
+            expected_kreuzakt_id=7, generation=store.get_generation(),
+            reason="papra said no")
+        assert charged is not None
+        assert store.ledger_get("org_1", "doc_survivor").delivery_failures == 1
     finally:
         store.close()
 

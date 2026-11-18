@@ -193,12 +193,33 @@ def _require_str(body: Mapping[str, Any], key: str, where: str, why: str) -> str
     return value
 
 
-def _require_int(body: Mapping[str, Any], key: str, where: str, why: str) -> int:
+def _require_int(body: Mapping[str, Any], key: str, where: str, why: str, *,
+                 positive: bool = False) -> int:
+    """A present integer — and, for `positive`, one that can name a row.
+
+    `positive` exists because a Kreuzakt id is not any integer, it is a SQLite rowid, and
+    the code downstream of this client says so: `store.ledger_record_delivery_failure`
+    refuses a non-positive `expected_kreuzakt_id` with `ValueError`, on the reasoning that
+    `kreuzakt_id = NULL` matches no row so a refusal would silently charge nothing. That
+    refusal is correct *and* it is not a `KreuzaktError`, so when a malformed body let `0`
+    through here the `ValueError` arrived mid-pass in `verify_once` — which catches
+    `PapraError`, `KreuzaktError` and `IndexFailed` and cannot be asked to catch a
+    programming error — and the pass died for every reference after the one bad document.
+    One malformed row is a corpus-wide blind spot, which is exactly the failure
+    `verify_once`'s docstring promises it will not commit. So the malformed value is
+    refused at the boundary that read it, as the typed error every caller already handles.
+    """
     value = body.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         raise KreuzaktError(
             f"unexpected {where}: missing {key} — {value!r} is not an integer; {why} "
             f"(body keys: {_body_keys(body)})"
+        )
+    if positive and value <= 0:
+        raise KreuzaktError(
+            f"unexpected {where}: {key} is {value!r}, which cannot name a row — ids here "
+            f"are counted from 1, and the ledger refuses to bind or charge a non-positive "
+            f"one; {why} (body keys: {_body_keys(body)})"
         )
     return value
 
@@ -226,7 +247,8 @@ def _to_queue_entry(row: Any) -> QueueEntry:
     where = "/api/queue row"
     body = _require_json_object(row, where)
     entry_id = _require_int(body, "id", where,
-                            "the id is the high-water mark and the correlation comparison")
+                            "the id is the high-water mark and the correlation comparison",
+                            positive=True)
     filename = _require_str(body, "filename", where,
                             "correlation matches queue rows on this value")
     status = _require_str(body, "status", where,
@@ -564,7 +586,8 @@ class KreuzaktClient:
         body = _require_json_object(await self._get_json(f"/api/documents/{document_id}"),
                                     where)
         entry_id = _require_int(body, "id", where,
-                                "it is the id the ledger stores next to the Papra document")
+                                "it is the id the ledger stores next to the Papra document",
+                                positive=True)
         title = _require_str(body, "title", where,
                              "it is written back into Papra's title, so an absent one must "
                              "not become an empty one")
@@ -699,7 +722,8 @@ def _hit_from_row(row: Any) -> KzHit:
     where = "/api/search row"
     body = _require_json_object(row, where)
     return KzHit(
-        id=_require_int(body, "id", where, "it is the Kreuzakt id the ledger resolves"),
+        id=_require_int(body, "id", where, "it is the Kreuzakt id the ledger resolves",
+                        positive=True),
         title=_require_str(body, "title", where, "it is shown to the user as the hit title"),
         document_date=body.get("document_date"),
         added_at=_require_str(body, "added_at", where,

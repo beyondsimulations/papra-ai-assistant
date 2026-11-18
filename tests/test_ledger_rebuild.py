@@ -22,8 +22,10 @@ how "this task does not touch Papra" is a fact about the run rather than a claim
 """
 
 import argparse
+import asyncio
 import hashlib
 import logging
+import sqlite3
 import sys
 from types import SimpleNamespace
 
@@ -32,13 +34,21 @@ import pytest
 import papra_suite.store as store_module
 from papra_suite.config import load_config
 from papra_suite.indexing import (
+    CLEANUP_DUE_LIMIT,
     CLEANUP_MAX_ATTEMPTS,
     MARKS_ROLLING_SETTING,
     IndexFailed,
     run_index_job,
 )
 from papra_suite.kreuzakt_client import KreuzaktError
-from papra_suite.ledger_cli import RebuildResult, add_subparser, reconcile_generation, run_ledger
+from papra_suite.ledger_cli import (
+    EXIT_INCOMPLETE,
+    EXIT_REFUSED,
+    RebuildResult,
+    add_subparser,
+    reconcile_generation,
+    run_ledger,
+)
 from papra_suite.papra_client import PapraError
 from papra_suite.pipeline import OCR_MAX_DOCUMENT_BYTES, enqueue_index_job
 from papra_suite.store import DELIVERY_MAX_FAILURES, Store
@@ -307,15 +317,26 @@ async def test_a_stopped_rebuild_resumes_on_the_same_generation(store, monkeypat
 # --- the population that has no ledger row (Z6) ---------------------------------------
 
 async def test_a_seen_document_with_no_reference_is_enrolled_and_becomes_resolvable(
-        store):
-    """The count that used to be impossible, made reachable rather than merely reported.
+        store, fake_kz):
+    """The count that used to be impossible, walked all the way to a resolvable binding.
 
     A document marked seen with no reference is invisible to every eligibility rule, every
-    count and the sweep, all of which read the ledger. Enrolling it through the intake path
-    has to end with the document resolvable through the authorization boundary — a row in a
-    table is not the fix, a binding that survives `ledger_resolve` is.
+    count and the sweep, all of which read the ledger. Enrolling it is only half the fix —
+    `enrolled: 1` is a count of queue rows, and a queue row is not a document in the index.
+    So the job the enrolment queued is claimed and *run* here, against the real client, and
+    the claim asserted at the end is the one the search path makes: `ledger_resolve` names
+    the document under the generation that is current, which is the authorization boundary
+    an MCP answer has to pass through. A row in a table that nothing can resolve would
+    pass a test that stopped at `enrolled`.
+
+    The writer switch is on (`legacy_workers`) because that is the state in which the intake
+    path also fills the legacy `ocr` queue: the enrolment walk asks for the index job alone,
+    and `legacy_ocr=False` is the only thing between a rebuild and one paid vision extraction
+    per document. Flipping that flag is silent unless it is pinned here.
     """
-    record = seen_only(store, "doc-email-1", hash_="cd" * 32)
+    store.set_setting("legacy_workers", "1")
+    store.set_setting("index_content_delivery", "0")
+    record = seen_only(store, "doc-email-1")
     papra = with_papra([record])
     assert store.ledger_stats()["unledgered"] == 1
 
@@ -323,11 +344,27 @@ async def test_a_seen_document_with_no_reference_is_enrolled_and_becomes_resolva
 
     assert (result.enrolled, result.unledgered) == (1, 0)
     ref = store.ledger_get(ORG, "doc-email-1")
-    assert ref is not None and ref.file_hash == "cd" * 32
+    assert ref is not None and ref.file_hash == HASH
     assert ref.papra_original_name == "doc-email-1.pdf"   # Papra's name, first sight
     job = jobs_for(store)[0]
-    assert job.document_id == "doc-email-1" and job.content_hash == "cd" * 32
+    assert job.document_id == "doc-email-1" and job.content_hash == HASH
     assert store.ledger_stats()["unledgered"] == 0
+    assert jobs_for(store, "ocr") == [], "the enrolment walk ordered a paid extraction"
+
+    # ...and the work it queued actually indexes the document, under this generation.
+    claimed = store.claim_next_job("index")
+    assert claimed is not None and claimed.document_id == "doc-email-1"
+    outcome = await run_index_job(fake_kz, store, claimed, papra=papra, poll_s=0,
+                                  wait_timeout_s=5)
+    store.mark_job_done(claimed.id)
+
+    resolved = store.ledger_resolve([outcome.kreuzakt_id], generation=store.get_generation())
+    assert [item.papra_document_id for item in resolved] == ["doc-email-1"]
+    settled = store.ledger_get(ORG, "doc-email-1")
+    assert settled.kreuzakt_id == outcome.kreuzakt_id
+    assert settled.delivered_generation == store.get_generation()
+    assert store.ledger_needs_index(generation=store.get_generation()) == []
+    assert papra.patched == []
 
 
 async def test_enrolment_uses_papras_hash_because_the_seen_table_stores_none(store):
@@ -632,7 +669,29 @@ def test_reindex_all_bumps_once_and_queues_the_corpus(store, tmp_path, capsys):
     assert code == 0 and store.get_generation() == 2
     assert len(jobs_for(store)) == 1
     assert "generation 2: 1 of 1 stale reference(s) queued" in out
-    assert "left out of the index on purpose" in out
+    # A rebuild that left nothing out does not print the bucket line: three zeroes read as a
+    # warning, and a line that prints on every clean run is a line nobody reads on the run
+    # where it mattered.
+    assert "left out of the index on purpose" not in out
+
+
+def test_the_left_out_buckets_are_printed_only_when_one_of_them_has_a_document(
+        store, tmp_path, capsys):
+    """The opposite half of the same line, so the suppression cannot become the silence.
+
+    The buckets are the answer to "why is `unledgered` not zero", and a permanent one (a PNG
+    in a PDF-only index) has to be named rather than added into a count — so it is asserted
+    that the line does print when there is something in it.
+    """
+    non_pdf = seen_only(store, "doc-photo", mime="image/png", name="holiday.png")
+    papra = with_papra([non_pdf])
+
+    code = run_ledger(configuration(tmp_path), cli_args(reindex_all=True, yes_i_mean_it=True),
+                      store=store, papra=papra, kreuzakt=FakeKreuzakt())
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "left out of the index on purpose: 0 in papra's trash, 1 not a pdf" in out
 
 
 def test_reindex_all_reports_a_walk_it_could_not_finish(store, tmp_path, capsys):
@@ -680,10 +739,16 @@ def test_requeue_finishes_an_interrupted_rebuild_without_a_second_bump(store, tm
 
     monkeypatch.setattr(store, "enqueue_job", enqueue_then_die)
     first = cli_args(reindex_all=True, yes_i_mean_it=True)
-    with pytest.raises(KeyboardInterrupt):
-        run_ledger(config, first, store=store, papra=with_papra([]),
-                   kreuzakt=ScriptedHealth(status="ok"))
+    # Ctrl-C is the operator reaching for exactly this resume path, so it is answered with a
+    # sentence and exit 1 — not a traceback. Before `run_ledger` caught it, the interrupt left
+    # `asyncio.run` as an uncaught `BaseException` and this test pinned the traceback as the
+    # expected behaviour, which is the wrong thing for a runbook to be able to quote.
+    interrupted = run_ledger(config, first, store=store, papra=with_papra([]),
+                             kreuzakt=ScriptedHealth(status="ok"))
     monkeypatch.undo()
+    assert interrupted == EXIT_INCOMPLETE
+    stopped = capsys.readouterr().err
+    assert "interrupted" in stopped and "--requeue" in stopped
     assert store.get_generation() == 2 and len(jobs_for(store)) == 2
 
     code = run_ledger(config, cli_args(requeue=True), store=store, papra=with_papra([]))
@@ -952,3 +1017,204 @@ def test_the_entry_point_runs_a_real_status_command(tmp_path, monkeypatch, capsy
     out = capsys.readouterr().out
     assert "generation: 1" in out and "references: 0" in out
     assert "unledgered: 0" in out and "cleanup failed: 0" in out
+
+
+# --- the rehearsal: `--dry-run` may not touch anything -----------------------------
+#
+# `--requeue` and `--cleanup` have had a dry-run test each. `--reindex-all` is the one command
+# in this file whose dry run stands between an operator and a generation bump — the single
+# UPDATE that makes every bound id in the corpus stale at once — and `--clear-marks` is the one
+# that releases a safety, so both are pinned from the side that matters: the state that must
+# still be there afterwards.
+
+def test_reindex_all_dry_run_bumps_nothing_and_asks_for_nothing(store, tmp_path, capsys):
+    """`--dry-run` is the rehearsal, and the bump is the thing it rehearses.
+
+    Three things must all still be true when it returns: the generation is the one that was
+    already there, the queue is empty, and Kreuzakt was never asked whether it was well — the
+    gate belongs to the act, and a rehearsal that probes the index is a run with a quieter
+    exit code. `--yes-i-mean-it` is passed anyway: the dry run must answer *itself*, not fall
+    through to the confirmation it is supposed to stand in for.
+    """
+    indexable(store, kreuzakt_id=7)
+    seen_only(store, "doc-email-1")
+    healthy = ScriptedHealth(status="ok")
+
+    code = run_ledger(configuration(tmp_path),
+                      cli_args(reindex_all=True, dry_run=True, yes_i_mean_it=True),
+                      store=store, papra=with_papra([]), kreuzakt=healthy)
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert store.get_generation() == 1, "the dry run bumped the generation"
+    assert jobs_for(store) == [], "the dry run queued work"
+    assert healthy.health_calls == 0, "the dry run spoke to kreuzakt"
+    assert "dry run" in out and "1 reference(s)" in out
+
+
+def test_clear_marks_dry_run_leaves_the_counter_standing(store, tmp_path, capsys):
+    """The counter is shown, not cleared — and the confirmation is not asked for either.
+
+    The settings row is the state this command exists to remove, so it is the assertion: a
+    rehearsal that deleted the row would be indistinguishable from the real thing to the next
+    deletion pass, which is the pass the counter is protecting against.
+    """
+    value = "2026-11-19T09:00:00+00:00|34"
+    store.set_setting(MARKS_ROLLING_SETTING, value)
+
+    code = run_ledger(configuration(tmp_path), cli_args(clear_marks=True, dry_run=True),
+                      store=store)
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert store.get_setting(MARKS_ROLLING_SETTING) == value, "the dry run cleared the brake"
+    assert value in out and "dry run" in out
+    assert "--yes-i-mean-it" not in out, "a rehearsal asked for a confirmation"
+
+
+# --- the clients, and the loop that used them --------------------------------------
+
+
+class LoopRecordingPapra:
+    """A Papra double that remembers which event loop served it, and which closed it.
+
+    `used_on` is captured on the request path and `closed_on` inside `aclose`, so the pair says
+    something no fake with a boolean `closed` flag can: whether the close happened on the loop
+    that made the connections. `run_ledger` builds its own clients when none are injected, so
+    monkeypatching the two client names in `ledger_cli` is what lets a test hold the real
+    lifecycle without holding a network.
+    """
+
+    def __init__(self, *, close_error: Exception | None = None) -> None:
+        self.used_on: asyncio.AbstractEventLoop | None = None
+        self.closed_on: asyncio.AbstractEventLoop | None = None
+        self.close_error = close_error
+        self.close_calls = 0
+
+    async def get_document(self, org_id: str, document_id: str) -> dict:
+        self.used_on = asyncio.get_running_loop()
+        # 404 is the answer the cleanup pass wants: Papra has forgotten this document, so the
+        # delete is owed. Recorded on the way out, because the point is that this coroutine ran.
+        raise PapraError(f"GET document failed: 404 {document_id} not found", 404)
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.closed_on = asyncio.get_running_loop()
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class LoopRecordingKreuzakt(LoopRecordingPapra):
+    """The index side of the same pair: health for the gate, delete for the cleanup pass."""
+
+    def __init__(self, *, close_error: Exception | None = None) -> None:
+        super().__init__(close_error=close_error)
+        self.deleted: list[int] = []
+
+    async def health(self) -> dict:
+        self.used_on = asyncio.get_running_loop()
+        return {"status": "ok"}
+
+    async def delete_document(self, document_id: int) -> None:
+        self.used_on = asyncio.get_running_loop()
+        self.deleted.append(document_id)
+
+
+def test_clients_are_closed_on_the_loop_that_used_them(store, tmp_path, monkeypatch, capsys):
+    """A transport belongs to the loop its connections were made on, and that is the whole test.
+
+    The first version closed the clients in a `finally` *after* `asyncio.run` returned — a
+    brand-new loop, with the using loop already closed. Two commands then became unreportable:
+    a `--reindex-all` that had really bumped and queued, and a `--cleanup` that had really
+    deleted. An exception raised from a `finally` discards the value the `try` was returning,
+    and a close on a foreign loop is exactly the kind of exception that raises.
+
+    So: identity, not a flag. `closed_on is used_on` fails the moment the close moves back
+    outside the using loop, and both clients are checked because both are created here.
+    """
+    import papra_suite.ledger_cli as ledger_cli_module
+
+    failed_delete(store, "doc-owed")
+    papra = LoopRecordingPapra()
+    index = LoopRecordingKreuzakt()
+    monkeypatch.setattr(ledger_cli_module, "PapraClient", lambda url, key: papra)
+    monkeypatch.setattr(ledger_cli_module, "KreuzaktClient", lambda url: index)
+
+    code = run_ledger(configuration(tmp_path), cli_args(cleanup=True), store=store)
+
+    assert code == 0, capsys.readouterr().err
+    assert index.deleted == [7]
+    assert papra.used_on is not None and papra.close_calls == 1
+    assert index.used_on is not None and index.close_calls == 1
+    assert papra.closed_on is papra.used_on, "papra was closed on a loop it never used"
+    assert index.closed_on is index.used_on, "kreuzakt was closed on a loop it never used"
+    assert store.ledger_get(ORG, "doc-owed").cleanup_state == "done"
+
+
+def test_a_client_that_refuses_to_close_does_not_undo_the_work(store, tmp_path, monkeypatch,
+                                                               capsys, caplog):
+    """A socket that will not shut down says nothing about whether the corpus was rebuilt.
+
+    The close is in the `finally` now, so without the swallow any exception it raised would
+    replace the command's exit code — the same defect the loop fix removed, arriving from the
+    other direction. The result stands, the reason is logged, and the process still exits.
+    """
+    failed_delete(store, "doc-owed")
+    papra = LoopRecordingPapra()
+    index = LoopRecordingKreuzakt(close_error=RuntimeError("transport would not shut down"))
+    monkeypatch.setattr("papra_suite.ledger_cli.PapraClient", lambda url, key: papra)
+    monkeypatch.setattr("papra_suite.ledger_cli.KreuzaktClient", lambda url: index)
+    caplog.set_level(logging.WARNING, logger="papra_suite.ledger_cli")
+
+    code = run_ledger(configuration(tmp_path), cli_args(cleanup=True), store=store)
+
+    out, err = capsys.readouterr()
+    assert code == 0, "a close failure replaced the command's own verdict"
+    assert index.deleted == [7] and "1 deleted" in out
+    assert "did not close cleanly" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert err == ""
+
+
+def test_a_locked_store_answers_with_a_sentence_not_a_traceback(store, tmp_path, capsys,
+                                                                monkeypatch):
+    """`--status` is the command reached for *during* an incident, possibly against a busy store.
+
+    A daemon mid-write holds the lock, `sqlite3.OperationalError` leaves `run_ledger` and the
+    operator gets a traceback where the reading was. The refusal path prints the reason and
+    exits 2, which is the same answer every other "this will not start" in this CLI gives.
+    """
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "get_generation", locked)
+
+    code = run_ledger(configuration(tmp_path), cli_args(status=True), store=store)
+
+    assert code == EXIT_REFUSED
+    assert "database is locked" in capsys.readouterr().err
+
+
+def test_cleanup_says_so_when_the_backlog_outlives_the_pass(store, tmp_path, capsys):
+    """Re-queueing every failed row is not the same act as settling it, and the output said it was.
+
+    The re-queue walk pages at 100 and settles every row it finds; the cleanup pass underneath
+    judges at most `CLEANUP_DUE_LIMIT` of them. On a backlog bigger than that one invocation
+    therefore left rows re-queued and undone while printing a number that read as a settled
+    account — so the shortfall is printed against the store's own count of what is still owed,
+    with the instruction that finishes it, and the exit code says "come back".
+    """
+    total = CLEANUP_DUE_LIMIT + 10
+    for position in range(total):
+        failed_delete(store, f"doc-{position:03d}", kreuzakt_id=position + 1)
+    index = ScriptedDeleter()
+
+    code = run_ledger(configuration(tmp_path), cli_args(cleanup=True), store=store,
+                      papra=with_papra([]), kreuzakt=index)
+
+    captured = capsys.readouterr()
+    assert code == EXIT_INCOMPLETE, "a pass that left debt behind is not a pass that finished"
+    assert f"re-queued {total} delete(s)" in captured.out
+    assert len(index.deleted) == CLEANUP_DUE_LIMIT      # one pass, one page
+    assert f"{total - CLEANUP_DUE_LIMIT} delete(s) are still owed upstream" in captured.err
+    assert "--cleanup" in captured.err

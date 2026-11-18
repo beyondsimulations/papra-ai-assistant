@@ -243,6 +243,11 @@ class FakeKreuzakt:
     * `window_saturated_once` / `window_saturated_always` — the newest-100 window
       holds only unrelated newer rows, hiding ours.
     * `rename_uploads` — the server stores under another name than we asked.
+    * `serve_id_verbatim` — `/api/documents/{id}` echoes the id the request asked for by
+      default, which is the measured behaviour; this flag makes the body carry the id it
+      was scripted with instead, so a test can hand out a response that contradicts its
+      own endpoint. That is the only way a malformed id reaches a caller through the real
+      client rather than around it.
     * `on_wait` — fired on every `/api/queue` read, for mid-flight races.
     * `on_upload` — fired on every upload, for "the request itself took too long".
     """
@@ -281,6 +286,7 @@ class FakeKreuzakt:
         self.window_saturated_once = False
         self.window_saturated_always = False
         self.rename_uploads: str | None = None
+        self.serve_id_verbatim = False
         self.on_wait = None
         self.on_upload = None
 
@@ -474,6 +480,11 @@ class FakeKreuzakt:
         if body is None:
             return self._json({"error": "not_found",
                                "message": f"Document {document_id} not found"}, status=404)
+        if self.serve_id_verbatim:
+            # The body's own `id`, whatever the test scripted into it — including one that
+            # cannot name a row. Measured servers echo the requested id; a server that does
+            # not is a server whose response the client has to refuse for itself.
+            return self._json(dict(body))
         return self._json({**body, "id": document_id})
 
     def _delete(self, document_id: int) -> httpx.Response:

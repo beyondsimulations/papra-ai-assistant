@@ -564,6 +564,42 @@ async def test_a_refusal_on_one_document_does_not_end_the_walk(store, fake_kz):
     assert store.ledger_get(ORG, "doc-001").repair_count == 0
 
 
+async def test_a_malformed_index_side_id_costs_one_document_not_the_corpus(store, fake_kz):
+    """The sibling of the test above, arriving through the other side of the pass.
+
+    The document endpoint answers with a body whose `id` contradicts its own URL. Handing
+    that out as a `KzDocument` looked harmless — an integer is an integer — until the write
+    was refused: `deliver_content` charges the refusal to `kz_doc.id`, and
+    `ledger_record_delivery_failure` raises `ValueError` for a non-positive one (a fence on
+    `kreuzakt_id = NULL` matches no row, so it would silently charge nothing). `ValueError`
+    is not a failure this pass may catch — swallowing it would hide real bugs in
+    `indexing.py` — so before the client's positivity check it escaped `verify_once` and
+    lost every reference after the bad one, which is the corpus-wide blind spot this pass
+    promises not to commit.
+
+    The fix is therefore at the boundary that read the value, and what is pinned here is
+    the consequence: the malformed response is a lookup error, the pass walks on, and the
+    next document is still repaired.
+    """
+    open_gate(store)
+    papra = FakePapra()
+    for document_id in ("doc-001", "doc-002"):
+        add_papra_document(papra, document_id)
+    seed_ref(store, document_id="doc-001", kreuzakt_id=7)
+    seed_ref(store, document_id="doc-002", kreuzakt_id=8)
+    fake_kz.serve_id_verbatim = True
+    fake_kz.document = kz_doc(doc_id=8)                  # the healthy document
+    fake_kz.documents[7] = {**fake_kz.documents[8], "id": 0}   # /7 answers "I am document 0"
+
+    result = await verify_once(store, papra, fake_kz)
+
+    assert (result.scanned, result.lookup_errors, result.repaired) == (2, 1, 1)
+    assert papra.documents[(ORG, "doc-001")]["content"] == PAPRA_TEXT   # never even attempted
+    assert papra.documents[(ORG, "doc-002")]["content"] == KZ_TEXT      # the walk carried on
+    assert store.ledger_get(ORG, "doc-001").delivery_failures == 0     # nothing was charged
+    assert store.ledger_get(ORG, "doc-002").delivered_sha == sha(KZ_TEXT)
+
+
 # --- a document the user deleted in Papra ----------------------------------------
 
 async def test_a_document_in_the_papra_trash_is_neither_repaired_nor_charged(

@@ -1015,3 +1015,64 @@ async def test_list_documents_drops_the_link_keys_a_row_does_not_yet_carry():
     assert "kreuzakt" not in json.dumps(rows)
     assert rows[0]["original_filename"] == "papra-search0004-44444444.pdf"   # real fields survive
     await client.aclose()
+
+
+# ---- 9. an id that cannot name a row is refused where it was read
+#
+# A Kreuzakt id is a SQLite rowid, counted from 1, and the code downstream of this client
+# says so in a language its callers do not catch: `store.ledger_record_delivery_failure`
+# refuses a non-positive `expected_kreuzakt_id` with `ValueError`, because a fence on
+# `kreuzakt_id = NULL` matches no row and the refusal would silently charge nothing. That
+# is the right rule for the store and the wrong exception for a network read — so a `0`
+# that passed the client arrived as a `ValueError` inside `verify_once`, which handles
+# `PapraError`, `KreuzaktError` and `IndexFailed` and must not be taught to swallow
+# programming errors. One bad document then ended the pass for every reference after it.
+
+
+@pytest.mark.parametrize("bad_id", [0, -1, -99999])
+async def test_get_document_refuses_an_id_that_cannot_name_a_row(bad_id):
+    """The endpoint asked for one document and the body named something else.
+
+    Refused as a `KreuzaktError` — the failure every caller in `indexing.py` already
+    classifies as "this document could not be read" — rather than handed out as a
+    `KzDocument` whose id the ledger would then refuse to charge.
+    """
+    client, _ = make_client([("/api/documents/15",
+                              ok(patched(load("kreuzakt_document.json"), id=bad_id)))])
+    with pytest.raises(KreuzaktError, match="cannot name a row"):
+        await client.get_document(15)
+    await client.aclose()
+
+
+async def test_get_document_still_accepts_the_id_the_server_actually_sent():
+    """`id: 1` is a real row — the captured probe's own search rows are numbered from one.
+
+    The guard is about integers that cannot be rowids, not about small ids: a freshly
+    wiped Kreuzakt numbers its first document 1, and refusing that would refuse the first
+    document of every rebuild.
+    """
+    client, _ = make_client([("/api/documents/1",
+                              ok(patched(load("kreuzakt_document.json"), id=1)))])
+    doc = await client.get_document(1)
+    assert doc.id == 1
+    await client.aclose()
+
+
+async def test_a_queue_row_and_a_search_hit_are_held_to_the_same_id_rule():
+    """The other two places this client hands an id to a caller, checked the same way.
+
+    A queue id is compared against the high-water mark and a hit id is what the ledger
+    resolves, so a non-positive one is as unusable there as in the document body — and
+    three call sites reading the same helper must not disagree about what an id is.
+    """
+    row_client, _ = make_client([("/api/queue", ok(queue_body([queue_row(id=0)])))])
+    with pytest.raises(KreuzaktError, match="cannot name a row"):
+        await row_client.queue_page()
+    await row_client.aclose()
+
+    hits = load("kreuzakt_search_page.json")
+    hits["results"] = [patched(hits["results"][0], id=0)]
+    hit_client, _ = make_client([("/api/search", ok(hits))])
+    with pytest.raises(KreuzaktError, match="cannot name a row"):
+        await hit_client.search("Ziphoid")
+    await hit_client.aclose()

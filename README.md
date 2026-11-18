@@ -419,7 +419,10 @@ ordered operation:
    population has a name and a number now — `unledgered` — and a way in:
 
    ```bash
-   papra-suite ledger --status            # stale: N | unledgered: N | delivery blocked: N
+   papra-suite ledger --status
+   # one field per line, in this order: generation, references, indexed current, stale,
+   # unledgered, delivered, extraction empty, delivery blocked, repairs (24h), cleanup
+   # pending, cleanup failed, protected name/date/notes, and the marks counter.
    papra-suite ledger --reindex-all --yes-i-mean-it    # enrolls them and queues the work
    ```
 
@@ -507,8 +510,12 @@ metadata writer: suite title worker (legacy)
   that arrives by any other route clears it without a write of ours.
 - `cleanup-pending (failed N)` is upstream deletes the ledger still owes, with the part the
   retries stopped on called out separately. A `failed` row can leave a deleted document in
-  the index, so search still returns it; nothing in this build replays it by hand, so a
-  non-zero `N` is a number to report rather than one that drains on its own.
+  the index, so search still returns it. It does not drain on its own — a permanently failed
+  intent is not *due*, so no automatic pass will look at it again — but it is not a number to
+  report and leave either: `papra-suite ledger --cleanup` re-queues every `failed` row under
+  the Kreuzakt id and generation it was originally queued under, refills its attempt
+  allowance, and drives one cleanup pass there and then. It is documented under
+  [Rebuilding the index](#rebuilding-the-index), next to the commands around it.
 - `protected_name/date/notes` count the fields this bridge has stopped writing because Papra
   holds a value it cannot attribute to itself — usually a rename or a note the user typed.
   Protection is permanent and carries no record of *why* it was set, so one legitimate rename
@@ -799,7 +806,14 @@ papra-suite ledger --status                    # and again while the queue drain
 ```
 
 Without `--yes-i-mean-it` the command prints the scope it would touch — references plus unledgered
-documents — and exits `1` having changed nothing.
+documents — and exits `1`.
+
+With `--dry-run` it prints that scope and exits `0`, and it does not probe Kreuzakt either: the
+health gate belongs to the act, not to the rehearsal. What `--dry-run` promises is that **no
+ledger, queue, or settings state changes** — it is not a read-only process. Like every other
+subcommand in this build it opens the store and runs `store.migrate()` before it does anything,
+so on a store left behind by an older version a rehearsal applies the pending migrations; that is
+the one thing a dry run changes here, and the same is true of `--status`.
 
 Five properties make it safe to run against a live corpus:
 
@@ -813,8 +827,11 @@ Five properties make it safe to run against a live corpus:
    no half of the corpus is judged against the old epoch while the other half is judged against
    the new. The price is that everything is stale and already-marked-seen until the queueing
    finishes, which is why the queueing is a separate pass that pages by keyset and can be
-   resumed: `ctrl-C`, a crash, or a generation moving underneath it all end the walk with a
-   non-zero exit and the sentence telling you to finish it. Finishing it is
+   resumed. `ctrl-C` is caught and answered: the command prints
+   `ledger stopped: interrupted.` with the resume instruction, exits `1`, and prints no
+   traceback — the same shape as any other "it did not finish" from this CLI. A crash leaves
+   whatever the queue had already taken, and a generation moving underneath the walk ends it the
+   same way. Finishing it is
    `papra-suite ledger --requeue` — the queueing half on its own, which bumps nothing, because
    re-running the invalidation to complete a partial rebuild would throw away the bindings the
    first pass had already re-derived. Re-queuing a document that is already queued is absorbed by
@@ -854,7 +871,9 @@ suite's own extraction over the corpus, that is `papra-suite backfill` (Task 15)
 its own `--dry-run`.
 
 **What stays `unledgered` afterwards, and why.** `--reindex-all` prints these buckets rather than
-leaving them inside a bare count, because each one needs a different sentence:
+leaving them inside a bare count, because each one needs a different sentence. The line appears
+only when at least one of them holds a document, so a rebuild that left nothing out ends quietly
+instead of printing three zeroes that read like a warning:
 
 - **in Papra's trash** — the deletion pass owns those references; enrolling one would be
   resurrecting a document the user threw away.
@@ -879,6 +898,18 @@ Two other ledger commands, both ledger-only or debt-shaped enough to belong here
   delete whatever holds that number now — and its attempt allowance refilled, which is the part
   only an operator can decide. Then one cleanup pass runs and revalidates as it always does, so a
   stale-generation intent is reported and settled as a recorded skip rather than re-armed.
+  **It destroys data and asks for no `--yes-i-mean-it`,** unlike `--clear-marks` two lines below,
+  and that asymmetry is deliberate: the delete itself was authorised twice before this command
+  existed — the user threw the document away in Papra, and the reference count said nothing else
+  still resolves to that Kreuzakt id — and the pass re-reads *both* facts, Papra's own detail
+  endpoint and the live reference count, immediately before each `DELETE`. What the operator is
+  adding by running this is not permission but a retry allowance, which is why the command is
+  idempotent and why running it twice costs nothing.
+  One pass judges at most `CLEANUP_DUE_LIMIT` (50) queued deletes, while this command re-queues
+  **every** failed row it finds, so on a backlog larger than that one invocation settles the
+  first page and stops. The output says how many were judged and how many are still owed, and
+  exits `1` until the debt is drained; `--cleanup --dry-run` counts the rows, re-queues none of
+  them, and runs no pass at all.
 - `papra-suite ledger --clear-marks` clears `index_marks_rolling`, the rolling counter that can
   hold deletion marking for a day after a listing nobody has confirmed. It prints the value it is
   clearing and requires `--yes-i-mean-it`, and the clear is a compare-and-swap: if a pass rewrote

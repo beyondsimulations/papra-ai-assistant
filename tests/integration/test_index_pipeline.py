@@ -37,6 +37,7 @@ from papra_suite.indexing import (
     verify_once,
 )
 from papra_suite.kreuzakt_client import KreuzaktClient, KzDocument
+from papra_suite.ledger_cli import rebuild_index
 from papra_suite.mail import poll_mailbox_once
 from papra_suite.papra_client import PapraClient
 from papra_suite.pipeline import enqueue_index_job, sweep_once
@@ -512,6 +513,91 @@ async def test_a_document_that_flip_flops_twice_is_left_alone_with_one_error(del
               if record.levelno >= logging.ERROR]
     assert any("diverged more than twice in 24h" in message for message in errors), errors
     assert "reprocess" not in caplog.text
+
+
+async def test_a_reconcile_rebuilds_every_binding_from_papra_bytes(stack):
+    """The one operation in this milestone that destroys the whole index, on a real server.
+
+    Everything else in this file rebuilds one binding by hand. This drives the path an
+    operator actually runs — `rebuild_index`, which is `papra-suite ledger --reindex-all`: the
+    health gate against the live index, one generation bump that makes every bound id in the
+    corpus meaningless at once, `reconcile_generation` queueing the corpus through the intake
+    path — and then drains the queue with the same `run_index_job` the worker runs. The claim
+    is the end state: every reference resolves again under the new generation, from Papra's
+    bytes, and Papra was never asked to change.
+
+    The population is deliberately more than the ledger already knew. A document this suite
+    marked seen and never ledgered is planted too, because that is the half a rebuild over
+    references alone cannot reach, and it is the half that needs Papra to answer.
+
+    **What this leaves unproven, said because the name is grander than the run.** It is a
+    handful of documents in a throwaway store, so it measures nothing about a real corpus —
+    neither the wall-clock the README refuses to invent nor the peak `extraction-empty` count.
+    It does not wipe Kreuzakt's volume: the generation bump stands in for the wipe, which is
+    the same fence (every old id stops resolving) but not the same server state, so a rebuilt
+    Kreuzakt handing these integers out in a different order is not simulated here — only
+    papered over by the fact that these bytes dedupe onto one document each. And the enrolment
+    walk can only enrol documents this store *listed*: a Papra document that was never listed
+    stays outside the number, as it does in production.
+    """
+    markers = [f"{TEXT_LAYER_MARKER}-rebuild-{n}" for n in (1, 2, 3)]
+    document_ids = []
+    for marker in markers:
+        pdf = make_pdf(marker)
+        document = await stack.papra.create_document(stack.org_id, f"{marker}.pdf", pdf)
+        document_ids.append(document["id"])
+        # Hashed from the bytes we uploaded, not read back: `run_index_job` verifies what it
+        # downloads against this value, and a null `originalSha256Hash` on a just-created
+        # record would otherwise be a permanent failure blaming our own job.
+        enqueue_index_job(stack.store, papra_org_id=stack.org_id, document_id=document["id"],
+                          file_hash=hashlib.sha256(pdf).hexdigest(), name=document["name"],
+                          mime="application/pdf", ingested_via="sweep")
+        job = stack.store.claim_next_job("index")
+        await run_index_job(stack.kreuzakt, stack.store, job, papra=stack.papra,
+                            poll_s=0.5, wait_timeout_s=90)
+        stack.store.mark_job_done(job.id)
+
+    # The pre-handover mail population: Papra holds it, this suite has listed it, the ledger
+    # has never held it. Nothing but the enrolment walk can see it.
+    unledgered = await stack.papra.create_document(stack.org_id, "mailed-before-handover.pdf",
+                                                   make_pdf(f"{TEXT_LAYER_MARKER}-mailed"))
+    stack.store.record_document_seen(papra_org_id=stack.org_id,
+                                     papra_document_id=unledgered["id"],
+                                     name=unledgered["name"], mime="application/pdf",
+                                     ingested_via="mail")
+    bound_before = {document_id: stack.store.ledger_get(stack.org_id, document_id).kreuzakt_id
+                    for document_id in document_ids}
+    assert stack.store.ledger_stats()["unledgered"] == 1
+
+    result = await rebuild_index(stack.store, stack.kreuzakt, papra=stack.papra)
+
+    assert (result.generation, result.stale, result.requeued) == (2, 3, 3)
+    assert (result.enrolled, result.unledgered, result.complete) == (1, 0, True)
+
+    drained = 0
+    while (job := stack.store.claim_next_job("index")) is not None:
+        await run_index_job(stack.kreuzakt, stack.store, job, papra=stack.papra,
+                            poll_s=0.5, wait_timeout_s=90)
+        stack.store.mark_job_done(job.id)
+        drained += 1
+    assert drained == 4
+
+    generation = stack.store.get_generation()
+    assert generation == 2 and stack.store.ledger_needs_index(generation=generation) == []
+    for document_id in document_ids + [unledgered["id"]]:
+        ref = stack.store.ledger_get(stack.org_id, document_id)
+        assert ref.delivered_generation == generation, document_id
+        # The binding answers at the authorization boundary, and the integer it names is a
+        # document the live index will describe — not a number carried across the boundary.
+        assert [item.papra_document_id
+                for item in stack.store.ledger_resolve([ref.kreuzakt_id],
+                                                       generation=generation)] == [document_id]
+        assert (await stack.kreuzakt.get_document(ref.kreuzakt_id)).content.strip()
+    # Identical bytes, one document: the re-upload cost a Kreuzakt round trip and no second
+    # copy of anything, which is what makes a rebuild over a big corpus affordable at all.
+    assert stack.store.ledger_get(stack.org_id, unledgered["id"]).kreuzakt_id \
+        not in set(bound_before.values())
+    assert stack.papra.patches == []
 
 
 async def test_a_rebuild_can_schedule_work_for_an_already_indexed_document(stack):
