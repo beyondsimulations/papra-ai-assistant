@@ -300,3 +300,73 @@ async def test_mail_attachment_is_indexed_without_touching_papra_content(mail_st
     assert await _papra_record(stack, document_id) == before
     assert stack.papra.patches == []
     assert time.monotonic() - started < 90      # the wait we waited is the wait we set
+
+
+# --------------------------------------------------------------------------------
+# Two tracked regressions, written as the requirement rather than as today's behaviour.
+#
+# `strict=True` is what makes them tracked rather than decorative: the suite FAILS when
+# either starts passing, so a fix cannot land quietly and a marker cannot outlive its
+# reason. Both are the acceptance edges the plan says this pipeline must reach; Task 6's
+# report names an owner for each (§6.1 mail intake, §6.2 rebuild re-enqueue).
+# --------------------------------------------------------------------------------
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="mail intake still enqueues through enqueue_ocr_job, which marks the document "
+           "seen in the same call; the sweep skips seen documents, so a mail-ingested PDF "
+           "gets no ledger row and no index job. Owner: whoever switches mail.py's call "
+           "site (report §6.1).",
+)
+async def test_mail_intake_itself_creates_the_ledger_row_and_the_index_job(mail_stack):
+    """Spec §4.2's claim about intake email, driven the way mail actually arrives.
+
+    The point is that nothing here calls `enqueue_index_job`: the requirement is about
+    `poll_mailbox_once`, which is the only thing the intake address runs.
+    """
+    stack, mailbox, org = mail_stack
+    inject_message(to=mailbox.username, subject="Rechnung 5000",
+                   attachments=[("rechnung-5000.pdf", make_pdf(),
+                                 ("application", "pdf"))])
+    result = await poll_mailbox_once(stack.store, stack.papra, mailbox, org,
+                                     allowlist=ALLOW)
+    assert result.documents_uploaded == 1
+
+    documents, _count = await stack.papra.list_documents(stack.org_id,
+                                                         search_query="rechnung-5000")
+    document_id = documents[0]["id"]
+    kinds = [job.kind for job in stack.store.list_jobs()
+             if job.document_id == document_id]
+    assert "index" in kinds, kinds
+    assert stack.store.ledger_get(stack.org_id, document_id) is not None
+    assert stack.papra.patches == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="a finished index job cannot be scheduled again: jobs are idempotent on "
+           "(kind, org, document, content_hash), so a backfill enqueue returns the "
+           "finished row's id and nothing is claimable. Needs a Store-side decision "
+           "(reopen, retire, or key the job on the generation); report §6.2, Tasks 11 "
+           "and 15 depend on it.",
+)
+async def test_a_rebuild_can_schedule_work_for_an_already_indexed_document(stack):
+    """What a backfill pass calls, and what it has to get back: a job it can claim."""
+    pdf = make_pdf()
+    document = await stack.papra.create_document(stack.org_id, "reschedule.pdf", pdf)
+    document_id = document["id"]
+    enqueue_index_job(stack.store, papra_org_id=stack.org_id, document_id=document_id,
+                      file_hash=document["originalSha256Hash"] or "no-hash",
+                      name=document["name"], mime="application/pdf",
+                      ingested_via="sweep")
+    job = stack.store.claim_next_job("index")
+    await run_index_job(stack.kreuzakt, stack.store, job, papra=stack.papra,
+                        poll_s=0.5, wait_timeout_s=90)
+    stack.store.mark_job_done(job.id)
+    stack.store.bump_generation()
+
+    enqueue_index_job(stack.store, papra_org_id=stack.org_id, document_id=document_id,
+                      file_hash=job.content_hash, name=document["name"],
+                      mime="application/pdf", ingested_via="backfill")
+    assert stack.store.claim_next_job("index") is not None
+    assert stack.papra.patches == []

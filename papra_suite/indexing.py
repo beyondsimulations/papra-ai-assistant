@@ -133,13 +133,24 @@ class IndexFailed(Exception):
 
 
 class IndexTimeout(Exception):
-    """The job's own wait budget ran out while it still had an attempt left.
+    """This job's correlation budget ran out while it still had an attempt left.
+
+    `wait_timeout_s` is one cumulative budget for the job's upload-and-correlate
+    sequence rather than one per attempt, and it covers the bytes fetch that precedes
+    each upload. Two limits on what it claims:
+
+    * it is a budget checked between operations, not a cancellation of one. An upload
+      already in flight can overrun it; the job stops at the next checkpoint rather
+      than mid-request. Individual requests are bounded separately, by the client's own
+      transport timeout.
+    * it is not a handler-wide deadline. The opening Papra read and the closing
+      `get_document` stay under that same transport bound.
 
     Distinct from the client's "no queue row within Ns": that one is about a single
-    wait and is the worker's to back off. This one is about the whole job, and it
-    exists because `index_max_attempts` multiplies a wait — 3 attempts against a
-    900 s timeout would hold the only index worker for 45 minutes on one document
-    while every other document waited behind it. Retriable, like a timeout.
+    wait and is the worker's to back off. This one exists because attempts multiply a
+    wait — 3 against a 900 s timeout would hold the only index worker for 45 minutes on
+    one document while every other document waited behind it. Retriable, like a
+    timeout.
     """
 
 
@@ -296,9 +307,12 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
     * a `failed` row is a finished row, and re-running *that row* is the only thing
       `retry` accepts, so it is re-run rather than re-uploaded.
 
-    Both are bounded by `max_attempts`, and the failure that follows names the
-    condition. Falling through as "nothing to do" is the outcome this function
-    exists to make impossible: the job would be marked done with no id recorded.
+    Both are bounded by `max_attempts`, which counts the recovery actions of this run —
+    uploads and row re-runs together — while `job.attempts` is the worker's count of runs
+    of this job across the backoff; they bound different things and neither substitutes
+    for the other. The failure that follows names the condition. Falling through as
+    "nothing to do" is the outcome this function exists to make impossible: the job would
+    be marked done with no id recorded.
     """
     filename = index_upload_name(job)
     deadline = _clock() + wait_timeout_s
