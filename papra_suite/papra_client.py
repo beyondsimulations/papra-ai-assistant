@@ -119,7 +119,17 @@ class PapraClient:
 
     async def list_documents(self, org_id: str, *, page_index: int = 0, page_size: int = 100,
                              search_query: str | None = None, sort_field: str = "createdAt",
-                             sort_order: str = "desc") -> tuple[list[dict], int]:
+                             sort_order: str = "desc") -> tuple[list[dict], int | None]:
+        """One page, and the total the server declared beside it (`None` if it declared none).
+
+        The total is returned as it was answered rather than as `len(documents)` when
+        `documentsCount` is missing, because the one caller that reads it as a completeness
+        claim cannot use a substituted number at all: `rows_seen < total` is the check that a
+        listing walk finished, and a total fabricated from the page length makes it false by
+        construction. A shape change upstream would then switch the guard off quietly, which
+        is worse than a guard that refuses to run — so the absence travels to the caller, and
+        the caller aborts the pass on it. Callers that want a count of rows have `len(...)`.
+        """
         params = {
             "pageIndex": page_index, "pageSize": page_size,
             "sortField": sort_field, "sortOrder": sort_order,
@@ -130,7 +140,8 @@ class PapraClient:
             "GET", f"/api/organizations/{org_id}/documents", params=params
         )
         data = response.json()
-        return data["documents"], data.get("documentsCount", len(data["documents"]))
+        declared = data.get("documentsCount")
+        return data["documents"], declared if isinstance(declared, int) else None
 
     async def download_file(self, org_id: str, document_id: str) -> bytes:
         response = await self._request(

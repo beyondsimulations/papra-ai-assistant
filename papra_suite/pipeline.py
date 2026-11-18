@@ -184,6 +184,8 @@ class SweepResult:
     deletions_restored: int = 0
     deletions_capped: int = 0
     deletions_aborted: bool = False
+    deletions_quarantined: int = 0
+    deletions_brake: bool = False
     cleanup_attempted: int = 0
     cleanup_deleted: int = 0
     cleanup_deferred: int = 0
@@ -580,10 +582,19 @@ def _log_deletion_counts(result: SweepResult) -> None:
         logger.error(
             "sweep: deletion pass aborted, nothing was marked or queued this pass; the reason "
             "is in `papra-suite check` (a listing that could not be trusted is the usual one)")
+    elif result.deletions_brake:
+        logger.error(
+            "sweep: deletion pass hit its marks brake, so it stopped marking mid-pass or "
+            "refused to run at all; `papra-suite check` names the counter and how to clear it")
     elif result.deletions_capped:
         logger.error(
             "sweep: deletion pass capped at %d references, more remain for the next pass",
             result.deletions_capped)
+    elif result.deletions_quarantined:
+        logger.error(
+            "sweep: %d bucket(s) quarantined by the deletion pass — an operator must check that "
+            "they really are empty, because while quarantined nothing about their contents is "
+            "propagated", result.deletions_quarantined)
     elif (result.deletions_marked or result.deletions_restored or result.cleanup_attempted):
         logger.info(
             "sweep: deletions %d marked, %d queued upstream, %d restored; cleanup %d attempted, "
@@ -893,6 +904,8 @@ async def sweep_once(store: Store, papra: PapraClient,
     result.deletions_restored = deletions.restored
     result.deletions_capped = deletions.capped
     result.deletions_aborted = deletions.aborted
+    result.deletions_quarantined = deletions.quarantined
+    result.deletions_brake = deletions.brake_tripped
     cleanup = await indexing.run_cleanup(store, kreuzakt)
     result.cleanup_attempted = cleanup.attempted
     result.cleanup_deleted = cleanup.deleted

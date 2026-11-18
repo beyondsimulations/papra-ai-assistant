@@ -268,14 +268,20 @@ async def test_list_documents_plumbs_non_default_pagination():
     }
 
 
-async def test_list_documents_falls_back_when_count_missing():
+async def test_list_documents_reports_no_total_when_the_server_declares_none():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"documents": [DOC]})
 
     async with make_client(handler) as client:
         documents, count = await client.list_documents(ORG)
-    # Without documentsCount the documented fallback is len(documents).
-    assert documents == [DOC] and count == 1
+    # Deliberately inverted from the round that pinned `len(documents)` here as the documented
+    # fallback. That substitution was not a convenience, it was the hole: the delete pass
+    # compares the rows it walked against the endpoint's own total, and a total fabricated from
+    # the page length satisfies that comparison by construction, so any change to Papra's
+    # listing shape would have silenced the strongest guard in the trust predicate while the
+    # pass kept reporting success. The absence now travels to the caller, which refuses to prune
+    # on it. A caller that wants a row count has `len(documents)` in front of it.
+    assert documents == [DOC] and count is None
 
 
 async def test_download_file_returns_bytes():

@@ -329,9 +329,21 @@ def _deletion_pass_line(store) -> str:
     from papra_suite import indexing
 
     stamp = store.get_setting(indexing.LAST_DELETION_PASS_SETTING)
+    # The two things a pass can be quietly wrong about, printed beside its own verdict: buckets it
+    # has set aside because they told it nothing, and the marks counter that can make it refuse to
+    # run at all. Both are stated by the pass in its log, but `check` is where an operator looks
+    # when something is not happening, and a quarantine is exactly that.
+    extra = ""
+    quarantine = store.get_setting(indexing.DELETION_QUARANTINE_SETTING)
+    if quarantine:
+        extra += f" | set aside: {quarantine}"
+    marks = store.get_setting(indexing.MARKS_ROLLING_SETTING)
+    if marks and "|" in marks:
+        extra += f" | marks this window: {marks.split('|', 1)[1]}"
     if not stamp:
-        return "deletions: never ran (the sweep does this once per pass, with kreuzakt up)"
-    return f"deletions: {stamp}"
+        return ("deletions: never ran (the sweep does this once per pass, with kreuzakt up)"
+                + extra)
+    return f"deletions: {stamp}" + extra
 
 
 def _content_writer_line(config) -> str:

@@ -1420,81 +1420,6 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
 
 # --- delete and restore propagation ------------------------------------------------
 #
-# Task 9: Papra's trash, propagating one way. The rules below exist because the mistake
-# available here is not a wrong count — it is a document the user kept losing its index
-# entry, or a document the user deleted leaving its text in the index forever. So the pass
-# reads everything before it writes anything, treats absence as the weakest signal it is
-# given, and never destroys anything itself.
-#
-# The trust predicate for a listing, spelled out because it is the difference between
-# pruning one reference and pruning the index. A bucket's listing is untrustworthy, and the
-# whole pass is discarded, when:
-#
-#   1. `list_documents` raises at all — a paging error, a 5xx, a timeout, a transport failure.
-#      An error is not an empty bucket.
-#   2. A page contains a row that is not a document, or a document with no usable id. That is
-#      a proxy, a login redirect or an error body wearing a 200.
-#   3. The same document id is answered two different ways inside one walk. Pages shift under
-#      a live listing, so a duplicate is ordinary; a duplicate that contradicts itself means
-#      neither answer can be believed.
-#   4. The walk ends with fewer rows than the endpoint's own total. The walk is only
-#      exhaustive if the server agrees it was exhaustive; a truncated page read as a finished
-#      walk is what "everything after row two was deleted" looks like from in here.
-#   5. The listing answers empty for a bucket the ledger holds references for. This is a
-#      circuit breaker, not a proof: the last document of a bucket genuinely can be purged,
-#      and then propagation for that bucket stops until an operator looks at it. The trade is
-#      deliberate, because "empty" is also exactly what a broken listing looks like, and the
-#      cost of being wrong in that direction is every reference in the corpus.
-#   6. The walk reaches `MAX_LISTING_PAGES_PER_ORG` without ever going short. An endpoint that
-#      ignores `pageIndex` must not be walked into a mass deletion.
-#
-# And even a trustworthy listing only *proposes* candidates. Nothing is marked until Papra's
-# own detail endpoint confirms that individual document — `deleted` or a genuine 404 — so one
-# stale page, a partial listing or a correlated endpoint failure cannot delete by itself. What
-# that trust is worth is stated where it is used: it rests on Papra's 404 meaning "this
-# document does not exist", which is measured behaviour of the pinned container but is still
-# Papra's answer and not a fact we can verify.
-
-#: How many references one pass may mark deleted. A mass deletion is either a user emptying a
-#: bucket or a listing that has stopped being trustworthy, and this number is the only thing
-#: that decides which one becomes real downstream. It bounds the damage per pass, NOT in
-#: total: a persistent fault still drains the corpus at this rate, pass after pass, which is
-#: why every mark also needs Papra's own detail confirmation and the aborts above.
-MAX_DELETIONS_PER_PASS = 20
-#: How many candidates one pass may put a question to Papra about. Deliberately larger than
-#: the cap above and separately counted: a candidate Papra's detail read refuses is not a
-#: deletion, and if the two shared one budget a handful of unreachable documents could hold
-#: every deletion behind them.
-MAX_CANDIDATE_PROBES = 50
-#: Page size of the listing walk, and how far that walk may go before it is treated as a
-#: broken endpoint rather than a large bucket.
-LISTING_PAGE_SIZE = 100
-MAX_LISTING_PAGES_PER_ORG = 100
-#: How often the index is asked whether the documents our bindings name still exist. One full
-#: read costs a GET per distinct Kreuzakt id — the same profile as `verify_once` — so it runs
-#: on the scale of hours, which is the scale on which the state it looks for changes.
-LIVENESS_PROBE_INTERVAL_S = 21600
-#: How long a queued upstream delete waits between attempts, and how many it gets. The
-#: attempts ceiling is the store's (`CLEANUP_MAX_ATTEMPTS`); the interval is this pass's
-#: because it owns the schedule it writes into `cleanup_next_at`.
-CLEANUP_BACKOFF_S = 300
-#: Rows one cleanup pass drains, so a backlog cannot monopolise the sweep.
-CLEANUP_DUE_LIMIT = 50
-#: Settings keys. The probe stamp and the candidate cursor are pass state that has to
-#: outlive the pass; the last-pass summary is what `check` prints.
-LIVENESS_PROBE_STAMP_SETTING = "index_liveness_probe_at"
-DELETION_CURSOR_SETTING = "index_deletion_cursor"
-LAST_DELETION_PASS_SETTING = "index_last_deletion_pass"
-
-#: What Papra's detail read said about one candidate. `GONE` is a 404 — Papra hard-deletes, so
-#: absence from a listing plus a 404 for that specific id is the record's own answer.
-DELETED_THERE = "deleted"
-GONE = "gone"
-LIVE_THERE = "live"
-
-
-# --- delete and restore propagation ------------------------------------------------
-#
 # Task 9: Papra's trash, propagating one way. The mistake available here is not a wrong
 # count — it is a document the user kept losing its index entry, or a document the user
 # deleted leaving its text in the index forever. So this pass reads everything before it
@@ -1515,11 +1440,14 @@ LIVE_THERE = "live"
 #   4. The walk ends with fewer rows than the endpoint's own total. The walk is only
 #      exhaustive if the server agrees it was; a truncated page read as a finished walk is
 #      what "everything after row two was deleted" looks like from in here.
-#   5. The listing answers empty for a bucket the ledger holds references for. This is a
-#      circuit breaker, not a proof: the last document of a bucket genuinely can be purged,
-#      and then propagation for that bucket stops until an operator looks. Deliberate,
-#      because "empty" is also exactly what a broken listing looks like, and being wrong in
-#      that direction costs every reference in the corpus.
+#:   5. The listing answers empty for a bucket the ledger holds references for. This is a
+#:      circuit breaker, not a proof: the last document of a bucket genuinely can be purged.
+#:      Deliberate, because "empty" is also exactly what a broken listing looks like, and being
+#:      wrong in that direction costs every reference in that bucket. It is the one arm that
+#:      stops a BUCKET rather than the pass: the verdict is about this listing, and freezing the
+#:      corpus for it would let a legitimate end state (a bucket emptied and purged) stall
+#:      propagation, restores included, everywhere else. The bucket is quarantined — named in
+#:      `settings`, shouted about, and skipped — and everything else goes on.
 #   6. The walk reaches `MAX_LISTING_PAGES_PER_ORG` without ever going short. An endpoint
 #      that ignores `pageIndex` must not be walked into a mass deletion.
 #
@@ -1549,6 +1477,22 @@ MAX_LISTING_PAGES_PER_ORG = 100
 #: read costs a GET per distinct Kreuzakt id — the same profile as `verify_once` — so it runs
 #: on the scale of hours, which is the scale on which the state it looks for changes.
 LIVENESS_PROBE_INTERVAL_S = 21600
+#: How long a probe that could not judge a single id waits before trying again, and where that
+#: schedule lives. The long interval bounds the expensive walk; this one bounds the retry, so an
+#: outage does not put the corpus back under the knife every sweep and does not hide behind the
+#: long interval either.
+LIVENESS_PROBE_RETRY_INTERVAL_S = 900
+LIVENESS_PROBE_RETRY_STAMP_SETTING = "index_liveness_probe_retry_at"
+#: Ids the last walk asked about and got no answer for. The next wake-up reads those and nothing
+#: else: one id the index will not answer for must not be a reason to re-read everything else.
+LIVENESS_PROBE_UNANSWERED_SETTING = "index_liveness_probe_unanswered"
+#: How often the listing may be walked. Cheaper per page than the probe and dearer in aggregate:
+#: every bucket, every 100 documents of it, on a sweep whose default interval is five minutes.
+#: Fifteen minutes is the compromise — a deleted document stays findable for at most one extra
+#: quarter-hour on top of the sweep, and a 10k-document corpus stops costing ~100 Papra requests
+#: every five minutes next to an index worker doing real work.
+LISTING_WALK_INTERVAL_S = 900
+LISTING_WALK_STAMP_SETTING = "index_listing_walk_at"
 #: How long a queued upstream delete waits between attempts, and how many rows one pass
 #: drains. The attempt ceiling is the store's (`CLEANUP_MAX_ATTEMPTS`, imported at the top of
 #: this module rather than restated, because `ledger_cleanup_result` is what enforces it); the
@@ -1562,6 +1506,23 @@ CLEANUP_DUE_LIMIT = 50
 LIVENESS_PROBE_STAMP_SETTING = "index_liveness_probe_at"
 DELETION_CURSOR_SETTING = "index_deletion_cursor"
 LAST_DELETION_PASS_SETTING = "index_last_deletion_pass"
+#: Buckets the last pass could not read because they answered empty. A report, rewritten every
+#: pass from what the walk actually saw, so a bucket that starts listing again leaves it by
+#: itself: an operator lifting a lock that was never a lock is a second way to get this wrong.
+DELETION_QUARANTINE_SETTING = "index_deletion_quarantine"
+#: Marks are this pass's own output, so a run of them is the earliest signal available that the
+#: pipeline is wrong rather than somebody emptying a library. `MAX_DELETIONS_PER_PASS` bounds one
+#: pass and cannot see a day: twenty references every quarter-hour is nineteen hundred and twenty a
+#: day, every pass looking ordinary. This is the second brake — a day's marks, held to a tenth of
+#: the references the ledger holds, aborting loudly, with a counter an operator can clear by hand.
+#: The floor is one full pass, the least a cumulative bound can ask without contradicting the cap
+#: above it. That is also its disclosed cost: a corpus smaller than ten passes — two hundred
+#: references — can be marked out entirely in a day before anything refuses, because no cumulative
+#: rule can be stricter than the one pass that is already allowed.
+MARKS_ROLLING_WINDOW_S = 86400
+MARKS_ROLLING_LIMIT_FRACTION = 0.1
+MARKS_ROLLING_FLOOR = MAX_DELETIONS_PER_PASS
+MARKS_ROLLING_SETTING = "index_marks_rolling"
 
 #: What Papra's detail read said about one candidate. `GONE` is a 404: Papra hard-deletes, so
 #: absence from a listing plus a 404 for that specific id is the record's own answer.
@@ -1601,6 +1562,8 @@ class DeletionResult:
     aborted: bool = False
     capped: int = 0
     stale_bindings: int = 0
+    quarantined: int = 0
+    brake_tripped: bool = False     # refused by the marks brake, not by a bad read
 
 
 @dataclass(frozen=True)
@@ -1640,6 +1603,18 @@ class _ListingUntrusted(Exception):
         self.page = page
 
 
+class _ListingEmpty(_ListingUntrusted):
+    """One bucket answered empty while the ledger still holds references for it.
+
+    A separate type because the right reaction is different in size, not in kind. The verdict
+    ("do not read absence out of this bucket") is the same one the other arms reach, but only
+    this one is a state a bucket can be in legitimately — the last document really can be
+    purged — and it says nothing whatever about the other buckets. Discarding the whole pass
+    for it would let one emptied bucket stop propagation, restores included, for every bucket
+    in the corpus, permanently.
+    """
+
+
 def _shift(now: str, *, seconds: int) -> str:
     """`now` plus a delay, rendered in the store's own text form.
 
@@ -1674,11 +1649,19 @@ async def _walk_listing(papra, org_id: str, *, expected_refs: int) -> dict[str, 
     """Every document Papra lists for one bucket, as `{document_id: deleted_there}`.
 
     Raises `_ListingUntrusted` for any of the six conditions named at the top of this
-    section; the caller drops the whole pass on one. The return value is the only place the
-    walk's verdict exists, and it is deliberately a *complete* set of ids: a document missing
-    from the dict is what the caller reads as "Papra did not list this one", which is a
-    candidate, and it must not be confusable with "the walk never got this far" — that case
-    does not return.
+    section, or `_ListingEmpty` for the fifth alone. The caller discards the pass on the first
+    and quarantines the bucket on the second. The return value is the only place the walk's
+    verdict exists, and it is deliberately a *complete* set of ids: a document missing from the
+    dict is what the caller reads as "Papra did not list this one", which is a candidate, and it
+    must not be confusable with "the walk never got this far" — that case does not return.
+
+    The completeness check needs a number the endpoint volunteered, and it is picky about it on
+    purpose. A total the client invented from the page length would satisfy `rows_seen <
+    reported` by construction, so the guard would disappear exactly when the endpoint's shape
+    changed — the fault class it exists for — and it would disappear without a sound. So: a
+    walk in which no page reported an integer total is untrustworthy (there is nothing to
+    compare against), and a walk in which the total moved is untrustworthy (neither number
+    describes the walk that just happened). Both cost a pass and write nothing.
 
     `expected_refs` is what the ledger holds for this bucket, and it is what makes an empty
     answer suspicious rather than merely surprising. It counts every reference, deleted ones
@@ -1687,7 +1670,7 @@ async def _walk_listing(papra, org_id: str, *, expected_refs: int) -> dict[str, 
     """
     listed: dict[str, bool] = {}
     rows_seen = 0
-    reported: int | None = None
+    totals: list[int] = []
     page_index = 0
     while True:
         try:
@@ -1700,8 +1683,8 @@ async def _walk_listing(papra, org_id: str, *, expected_refs: int) -> dict[str, 
                 org_id=org_id, page=page_index) from error
         rows = list(documents or ())
         rows_seen += len(rows)
-        if isinstance(count, int):
-            reported = count
+        if isinstance(count, int) and not isinstance(count, bool):
+            totals.append(count)
         for document in rows:
             if not isinstance(document, dict):
                 raise _ListingUntrusted(
@@ -1727,12 +1710,23 @@ async def _walk_listing(papra, org_id: str, *, expected_refs: int) -> dict[str, 
             raise _ListingUntrusted(
                 f"{MAX_LISTING_PAGES_PER_ORG} pages in a row came back full, so the endpoint "
                 "is not paging", org_id=org_id, page=page_index)
-    if reported is not None and rows_seen < reported:
+    if not totals:
+        raise _ListingUntrusted(
+            "no page of this listing carried an integer total, so nothing can say the walk "
+            "saw every document in the bucket",
+            org_id=org_id, page=page_index)
+    if len(set(totals)) > 1:
+        raise _ListingUntrusted(
+            f"the endpoint reported {totals[0]} documents and then {totals[-1]}, so neither "
+            "number describes the walk that just happened",
+            org_id=org_id, page=page_index)
+    reported = totals[0]
+    if rows_seen < reported:
         raise _ListingUntrusted(
             f"the endpoint reported {reported} documents and served {rows_seen}",
             org_id=org_id, page=page_index)
     if not listed and expected_refs:
-        raise _ListingUntrusted(
+        raise _ListingEmpty(
             f"the listing answered empty while the ledger holds {expected_refs} "
             "reference(s) for this bucket", org_id=org_id, page=0)
     return listed
@@ -1762,6 +1756,31 @@ async def _ask_papra(papra, org_id: str, document_id: str) -> str | None:
                        org_id, document_id, type(error).__name__, error)
         return None
     return DELETED_THERE if papra_document_is_deleted(document) else LIVE_THERE
+
+
+def _marks_window(store: Store, now: str) -> tuple[str, int, int]:
+    """Where the counted window started, how many marks it holds, and the allowance against it.
+
+    A fixed window, not a sliding one: a sliding bound needs every mark remembered, and this is a
+    counter in one settings row. Say what that costs, because it cuts the wrong way — marks grouped
+    either side of the boundary fall in different windows, so a trailing 24 hours can hold close to
+    twice the allowance before anything refuses. The brake is a pause for a human rather than an
+    exact rate limit, and the alternative on offer was no cumulative bound at all; a window that
+    tumbles from the first mark it counted also cannot stall, since the next mark after expiry
+    starts a fresh one.
+    fraction of what the ledger holds today, because the question the brake answers — is this
+    normal for this corpus — has no answer that is not about the size of the corpus.
+    """
+    start = now
+    count = 0
+    raw = store.get_setting(MARKS_ROLLING_SETTING)
+    if raw and "|" in raw:
+        recorded, _, text = raw.partition("|")
+        if not _stamp_expired(recorded, interval_s=MARKS_ROLLING_WINDOW_S, now=now):
+            start, count = recorded, int(text) if text.isdigit() else 0
+    references = store.ledger_stats().get("references", 0)
+    allowance = max(MARKS_ROLLING_FLOOR, int(references * MARKS_ROLLING_LIMIT_FRACTION))
+    return start, count, allowance
 
 
 def _rotate(candidates: list[tuple[str, str]], store) -> list[tuple[str, str]]:
@@ -1839,6 +1858,12 @@ def _readmit_index_job(store: Store, ref: LedgerRef, *, reason: str) -> None:
     rule, and it is the caller's job to have made the row eligible first (an unbound row, or a
     binding that is not current). A spurious extra index job costs one idempotent upload; a
     missing one costs a document that is never found.
+
+    The branch that resets a `done` row is the common one rather than the alarming one, and it is
+    not free: the row usually finished cleanly once, so re-opening it discards that history — the
+    attempt count and any terminal error — and the job is judged again on its next run. That is
+    the price of the asymmetry above, and the log line is what records that a finished job was
+    re-used instead of a new one being created.
     """
     job_id = store.enqueue_job(
         kind="index", papra_org_id=ref.papra_org_id, document_id=ref.papra_document_id,
@@ -1964,6 +1989,70 @@ def _apply_restore(store: Store, ref: LedgerRef) -> None:
     _readmit_index_job(store, after, reason="restored in papra")
 
 
+def _unanswered_ids(store: Store) -> list[int]:
+    """The ids the last walk asked about and got no answer for.
+
+    Kept as data rather than as a reason to read everything again: the next wake-up reads these and
+    nothing else, so one id the index will not answer for costs one request instead of a GET per
+    distinct binding in the corpus.
+    """
+    raw = store.get_setting(LIVENESS_PROBE_UNANSWERED_SETTING) or ""
+    ids: list[int] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if chunk.isdigit():
+            ids.append(int(chunk))
+    return ids
+
+
+async def _probe_one(store: Store, kz, generation: int, kreuzakt_id: int) -> tuple[int, int]:
+    """Judge one id and return `(judged, references_unbound)`.
+
+    The verdict is a 404 and nothing else, and it is about the document rather than the row, so
+    every reference that still names that id follows it: leaving one bound would leave it resolving
+    to a Kreuzakt document that answers 404. `(0, 0)` on a read that did not answer is the point —
+    "there was no answer" is not evidence about a document.
+    """
+    verdict = await _index_lacks_document(kz, kreuzakt_id)
+    if verdict is None:
+        return (0, 0)
+    if verdict is not True:
+        return (1, 0)
+    affected = store.ledger_resolve([kreuzakt_id], generation=generation)
+    unbound = store.ledger_unbind(
+        expected_kreuzakt_id=kreuzakt_id, generation=generation,
+        reason=f"kreuzakt document {kreuzakt_id} answers 404 for a current binding")
+    for item in affected:
+        _readmit_index_job(store, item, reason="liveness probe found the document gone")
+    return (1, unbound)
+
+
+async def _retry_unanswered(store: Store, kz, generation: int, now: str) -> int:
+    """Re-read the ids the last walk could not judge, and only those.
+
+    Two sentences have to hold at once: a read that failed must not be filed as a re-checked
+    corpus, and it must not put the whole corpus back under the knife on the next wake-up either.
+    Both hold because the failures are remembered individually: this pass asks about those ids,
+    charges them to the short clock, and leaves the long stamp alone.
+    """
+    probed = 0
+    unbound = 0
+    still: list[int] = []
+    for kreuzakt_id in _unanswered_ids(store):
+        judged, cleared = await _probe_one(store, kz, generation, kreuzakt_id)
+        probed += judged
+        unbound += cleared
+        if not judged:
+            still.append(kreuzakt_id)
+    store.set_setting(LIVENESS_PROBE_RETRY_STAMP_SETTING, now)
+    store.set_setting(LIVENESS_PROBE_UNANSWERED_SETTING, ",".join(str(i) for i in still))
+    if unbound:
+        logger.warning(
+            "unbound %d reference(s) whose kreuzakt document answers 404 on a retry and "
+            "re-admitted their index work; they were resolving to nothing", unbound)
+    return probed
+
+
 async def probe_index_liveness(store: Store, kz, generation: int) -> int:
     """Ask the index whether the documents our bindings still name; drop the ones that do not.
 
@@ -1989,12 +2078,23 @@ async def probe_index_liveness(store: Store, kz, generation: int) -> int:
     clean corpus.
     """
     now = _store_now()
-    stamp = store.get_setting(LIVENESS_PROBE_STAMP_SETTING)
-    if not _stamp_expired(stamp, interval_s=LIVENESS_PROBE_INTERVAL_S, now=now):
-        return 0
+    unanswered = _unanswered_ids(store)
+    retry_due = _stamp_expired(store.get_setting(LIVENESS_PROBE_RETRY_STAMP_SETTING),
+                               interval_s=LIVENESS_PROBE_RETRY_INTERVAL_S, now=now)
+    # Two clocks, because the two things being bounded cost different amounts. The long one bounds
+    # the expensive read — a GET for every distinct id the ledger holds a current binding for, so
+    # the price of one pass is a property of the size of the index rather than a matter of taste.
+    # The short one bounds a retry, so an id the index would not answer for is looked at again in
+    # minutes rather than hours without putting the whole corpus back under the knife every sweep.
+    full_walk = retry_due and _stamp_expired(store.get_setting(LIVENESS_PROBE_STAMP_SETTING),
+                                             interval_s=LIVENESS_PROBE_INTERVAL_S, now=now)
+    if not full_walk:
+        if not unanswered or not retry_due:
+            return 0
+        return await _retry_unanswered(store, kz, generation, now)
     probed = 0
     unbound = 0
-    unreadable = 0
+    unreadable: list[int] = []
     seen: set[int] = set()
     after: tuple[str, str] | None = None
     while True:
@@ -2009,7 +2109,7 @@ async def probe_index_liveness(store: Store, kz, generation: int) -> int:
             seen.add(kreuzakt_id)
             verdict = await _index_lacks_document(kz, kreuzakt_id)
             if verdict is None:
-                unreadable += 1
+                unreadable.append(kreuzakt_id)
                 continue
             probed += 1
             if verdict is not True:
@@ -2025,16 +2125,25 @@ async def probe_index_liveness(store: Store, kz, generation: int) -> int:
         after = (refs[-1].papra_org_id, refs[-1].papra_document_id)
         if len(refs) < VERIFY_PAGE_SIZE:
             break
-    if not unreadable:
+    if probed or not seen:
+        # The stamp records that the walk completed, not that every read succeeded: withholding it
+        # while any id stays unreadable makes the expensive read re-run every sweep, and with the
+        # index down it fails again every sweep, so the withholding is itself the stall. The other
+        # half of the old rule — that the corpus is not thereby known to be clean — is kept as the
+        # list below, which becomes a narrow retry and a warning an operator can read.
         store.set_setting(LIVENESS_PROBE_STAMP_SETTING, now)
+    store.set_setting(LIVENESS_PROBE_UNANSWERED_SETTING, ",".join(str(i) for i in unreadable))
+    if unreadable:
+        store.set_setting(LIVENESS_PROBE_RETRY_STAMP_SETTING, now)
     if unbound:
         logger.warning(
             "unbound %d reference(s) whose kreuzakt document answers 404 and re-admitted "
             "their index work; they were resolving to nothing", unbound)
     if unreadable:
         logger.warning(
-            "liveness probe could not judge %d bound document(s) because kreuzakt did not "
-            "answer; no binding was dropped and the next pass will look again", unreadable)
+            "liveness probe could not judge %d bound document(s) because kreuzakt did not answer; "
+            "no binding was dropped, and those ids alone are re-read on the short clock",
+            len(unreadable))
     return probed
 
 
@@ -2070,13 +2179,52 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
     marked per pass, and the upstream delete waits for `run_cleanup`.
     """
     generation = store.get_generation()
+    moment = _store_now()
+    window_start, counted, allowance = _marks_window(store, moment)
+    if counted >= allowance:
+        # The brake refuses the pass before anything is read, so nothing is written either: marks,
+        # restores and the probe all ride on the same pass, and a pass that will not mark cannot be
+        # trusted to judge the rest either. Blocking a genuine restore is the cost, and it is the
+        # smaller one — a restore waits, a wrong verdict does not.
+        store.set_setting(LAST_DELETION_PASS_SETTING,
+                          f"refused by the marks brake: {counted} marks in the window against an "
+                          f"allowance of {allowance}")
+        logger.error(
+            "deletion pass refuses to run: %d references were marked within %d seconds against an "
+            "allowance of %d. Nothing was read and nothing was marked. If the run is real, write "
+            "an empty value to the settings row %s to let the pass run again; if it is not, the "
+            "listing is the suspect.", counted, MARKS_ROLLING_WINDOW_S, allowance,
+            MARKS_ROLLING_SETTING)
+        return DeletionResult(aborted=True, brake_tripped=True)
+    if not _stamp_expired(store.get_setting(LISTING_WALK_STAMP_SETTING),
+                          interval_s=LISTING_WALK_INTERVAL_S, now=moment):
+        # Nothing was read, so there is no outcome to stamp and nothing worth logging: the walk
+        # costs a page per hundred documents per bucket, and a five-minute sweep is the wrong place
+        # to pay for it. The stamp of the last pass that ran stays where it is, which is what
+        # `check` should be reading.
+        return DeletionResult()
     counts = {"refs_marked": 0, "upstream_deleted": 0, "upstream_pending": 0,
               "restored": 0, "capped": 0, "stale_bindings": 0}
     proposed: list[tuple[str, str]] = []
+    quarantined: list[str] = []
+    brake_tripped = False
+    brake_held = 0
     for org_id in store.ledger_org_ids():
         expected_refs = store.ledger_stats(org_ids=[org_id])["references"]
         try:
             listed = await _walk_listing(papra, org_id, expected_refs=expected_refs)
+        except _ListingEmpty as error:
+            # Bucket-local, and said twice because the first version of this got it wrong: the
+            # references this bucket holds are unreadable right now, so nothing may be inferred
+            # about them, and that is the whole extent of the damage. Every other bucket keeps
+            # its marks, its restores and its probe.
+            quarantined.append(org_id)
+            logger.error(
+                "deletion pass quarantines org=%s: %s — its references keep their bindings and "
+                "their index entries, and propagation for every other bucket continues; the "
+                "bucket leaves quarantine by listing something again",
+                error.org_id, error.message)
+            continue
         except _ListingUntrusted as error:
             logger.error(
                 "listing untrustworthy, skipping deletion pass entirely org=%s page=%s: %s",
@@ -2095,6 +2243,13 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
                 proposed.append((org_id, ref.papra_document_id))
             elif ref.deleted_at is not None and deleted_there is False:
                 proposed.append((org_id, ref.papra_document_id))
+    # Reaching here means every bucket was walked to its end, the only event that earns the cadence
+    # stamp: an aborted pass leaves it alone, so the next sweep may try at once rather than wait out
+    # an interval on a walk that never happened.
+    store.set_setting(LISTING_WALK_STAMP_SETTING, moment)
+    # Rewritten from what this walk actually saw, so the record cannot outlive its reason: a
+    # bucket that lists something again is simply not in the set this pass writes.
+    store.set_setting(DELETION_QUARANTINE_SETTING, ",".join(quarantined))
     marks: list[LedgerRef] = []
     restores: list[LedgerRef] = []
     for org_id, document_id in _rotate(sorted(proposed), store):
@@ -2125,9 +2280,19 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
             "repeats without anyone deleting anything, suspect the listing",
             MAX_DELETIONS_PER_PASS, len(marks) - MAX_DELETIONS_PER_PASS)
         marks = marks[:MAX_DELETIONS_PER_PASS]
-    for ref in marks:
+    for position, ref in enumerate(marks):
+        if counted >= allowance:
+            brake_tripped = True
+            brake_held = len(marks) - position
+            logger.error(
+                "marks brake holds %d of %d confirmed candidates: the allowance of %d for this "
+                "window is spent, so the rest wait and the next pass refuses outright", brake_held,
+                len(marks), allowance)
+            break
         outcome = await _apply_mark(store, kz, ref, generation=generation)
         counts["refs_marked"] += 1
+        counted += 1
+        store.set_setting(MARKS_ROLLING_SETTING, f"{window_start}|{counted}")
         if outcome == "queued":
             counts["upstream_pending"] += 1
         elif outcome == "closed":
@@ -2141,8 +2306,11 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
     store.set_setting(LAST_DELETION_PASS_SETTING,
                       "ok marked={refs_marked} queued={upstream_pending} closed="
                       "{upstream_deleted} restored={restored} stale={stale_bindings} "
-                      "capped={capped} probed={probed}".format(probed=probed, **counts))
-    return DeletionResult(**counts)
+                      "capped={capped} quarantined={quarantined} brake_held={brake_held} "
+                      "probed={probed}".format(
+                          probed=probed, quarantined=len(quarantined), brake_held=brake_held,
+                          **counts))
+    return DeletionResult(quarantined=len(quarantined), brake_tripped=brake_tripped, **counts)
 
 
 def _walk_org_refs(store: Store, org_id: str) -> list[LedgerRef]:
@@ -2264,10 +2432,24 @@ async def run_cleanup(store: Store, kz, *, now: str | None = None) -> CleanupRes
         # The document is gone, so no reference may still claim it is indexed. Unscoped on
         # purpose: the last live reference was the condition for getting here, and any row
         # still bound to this id is bound to something that no longer exists.
+        #
+        # `affected` is the veto's own read taken a second time, and the gap between the two is
+        # the reason: everything from the veto to here is `await`, and the index worker is a
+        # sibling task that can complete `ledger_set_kreuzakt_id` into it. Such a row is live, so
+        # the unbind below clears it — and a live row that ends up unbound with nothing queued is
+        # invisible to every later pass, because `sweep_once` enqueues documents it has never
+        # seen. Naming the rows before clearing them is what makes re-admitting them possible;
+        # the liveness probe does the same thing for the same reason.
+        affected = store.ledger_resolve([kreuzakt_id], generation=current)
         store.ledger_unbind(
             expected_kreuzakt_id=kreuzakt_id,
             generation=ref.cleanup_generation if ref.cleanup_generation is not None
             else current,
             reason=f"kreuzakt document {kreuzakt_id} deleted by the cleanup pass")
+        for item in affected:
+            _readmit_index_job(
+                store, item,
+                reason="the cleanup pass deleted the index entry this row was bound to while "
+                       "the delete was in flight")
     return CleanupResult(attempted=attempted, deleted=deleted, deferred=deferred,
                          failed=failed)

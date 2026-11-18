@@ -84,6 +84,7 @@ class FakePapra:
         self.raise_on_list: Exception | None = None
         self.raise_on_get: dict[str, Exception] = {}
         self.count_override: int | None = None      # the server's own total disagrees
+        self.total_pages: list[int | None] | None = None   # per-page declared totals
         self.malformed_page: list | None = None     # rows that are not documents
         self.endless = False                        # every page is a full page, forever
         self.conflicting_id: str | None = None      # one id, two answers, one walk
@@ -132,6 +133,11 @@ class FakePapra:
                     else len(rows) + 1)
         page = rows[page_index * page_size:(page_index + 1) * page_size]
         total = self.count_override if self.count_override is not None else len(rows)
+        if self.total_pages is not None:
+            # What the endpoint declares about THIS page. `None` is a server that answers no
+            # total at all; a list whose entries differ is a total that moves mid-walk. Both
+            # are arms of the trust predicate, and neither can be built out of one number.
+            total = self.total_pages[min(page_index, len(self.total_pages) - 1)]
         return [self._as_listed(doc) for doc in page], total
 
     def _as_listed(self, document: dict) -> dict:
@@ -188,6 +194,7 @@ class FakeIndex(FakeKreuzakt):
         self.delete_failures: dict[int, object] = {}
         self.all_deletes_fail: object = _MISSING
         self.unreachable = False
+        self.unreadable: set[int] = set()   # these ids alone stop answering
 
     def fail_delete(self, document_id, status: int | None = 500) -> None:
         """Make a DELETE fail. `None` clears every scripted failure, as the sketch does."""
@@ -220,6 +227,11 @@ class FakeIndex(FakeKreuzakt):
         self.all_deletes_fail = None
 
     def _document(self, document_id: int):
+        if document_id in self.unreadable:
+            # A partial outage: this id, and only this id, stops answering. `unreachable` is the
+            # whole index down; the difference matters because one unanswerable id is neither a
+            # verdict about the document nor a reason to read the whole corpus again.
+            raise httpx.ConnectError(f"connection refused for {document_id}")
         if self.unreachable:
             raise httpx.ConnectError("connection refused")
         if document_id not in self.documents \
@@ -316,6 +328,29 @@ def small_pages(monkeypatch):
     the endpoint harder.
     """
     monkeypatch.setattr(indexing, "LISTING_PAGE_SIZE", 2)
+
+
+@pytest.fixture(autouse=True)
+def walks_are_always_due(monkeypatch):
+    """Turn the listing walk's own cadence off for the rest of this module.
+
+    Most tests here ask what the pass decides when it looks, and several look twice in the same
+    instant. With the production gate in place the second look would be skipped, and a test suite
+    that quietly asserts on skipped passes is worse than none. The cadence is pinned where it
+    belongs — in the two tests that name it — and everything else asks its own question.
+    """
+    monkeypatch.setattr(indexing, "LISTING_WALK_INTERVAL_S", 0)
+
+
+def later(seconds: int) -> str:
+    """A timestamp `seconds` from now, for tests that need one of the clocks to turn."""
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat()
+
+
+def document_reads(index) -> int:
+    """How many Kreuzakt documents this fake was asked about — the cost of a walk."""
+    return sum(1 for method, route in index.calls
+               if method == "GET" and route.startswith("/api/documents/"))
 
 
 def due(store, *, n: int = 1) -> str:
@@ -741,21 +776,25 @@ async def test_a_short_page_the_servers_own_count_disputes_aborts_the_pass(store
     assert store.ledger_get(ORG, DOC_ID).deleted_at is None
 
 
-async def test_an_empty_listing_for_a_populated_bucket_aborts_the_pass(store, papra, index):
+async def test_an_empty_listing_for_a_populated_bucket_is_never_read_as_a_purge(store, papra,
+                                                                                index):
     """A bucket the ledger populated cannot answer empty and be believed.
 
-    This is a circuit breaker, not a proof: the last document of a bucket really can be
-    purged, and then deletion propagation for that bucket stops until an operator looks.
-    The trade is deliberate — a purge of everything is exactly the shape a broken listing
-    takes, and the cost of being wrong in that direction is the corpus.
+    This is a circuit breaker, not a proof: the last document of a bucket really can be purged,
+    and then that bucket's propagation stops until its listing answers again. The trade is
+    deliberate — a purge of everything is exactly the shape a broken listing takes, and being
+    wrong in that direction costs the bucket's whole index. How wide the stop reaches is the
+    subject of the next tests; what this one pins is that the references in the unreadable bucket
+    keep their bindings and their index entries whatever else the pass does.
     """
     seed_reference(store, papra, kreuzakt_id=7)
     papra.documents.clear()                     # Papra has hard-deleted it, all of it
 
     result = await indexing.reconcile_deletions(store, papra, index)
 
-    assert result.aborted is True and result.refs_marked == 0
+    assert result.refs_marked == 0
     assert store.ledger_get(ORG, DOC_ID).deleted_at is None
+    assert store.ledger_get(ORG, DOC_ID).kreuzakt_id == 7, "nothing was unbound either"
     assert store.ledger_stats()["cleanup_pending"] == 0
 
 
@@ -1314,3 +1353,383 @@ async def test_a_restore_into_a_rebuilt_index_comes_back_stale_not_falsely_curre
     assert ref.delivered_generation != store.get_generation()
     assert [r.papra_document_id for r in
             store.ledger_needs_index(generation=store.get_generation())] == [DOC_ID]
+
+
+# --- review round 2: the completeness arm has to fail closed -----------------------
+
+async def test_a_listing_that_never_reports_a_total_aborts_the_pass(store, papra, index,
+                                                                    caplog):
+    """A walk nobody gave a total cannot claim it saw everything, so it may not prune.
+
+    This is the arm that used to be able to vanish. The client answered a missing
+    `documentsCount` with the length of the page it had just returned, so `rows_seen <
+    reported` was permanently false and the truncation guard — the strongest one in the trust
+    predicate — disappeared at exactly the moment it was needed: an upstream change to the
+    listing's shape. The failure was silent because the pass still reported `ok`, and the
+    marks it went on to make were each "confirmed" by the same endpoint that had stopped
+    listing the rest of the corpus.
+
+    So the client reports what the server declared, which may be nothing, and the walk that
+    heard nothing refuses. Nothing here is inferred from an absence the server never denied.
+    """
+    seed_reference(store, papra, document_id="doc-1", kreuzakt_id=7)
+    papra.stale_listing = {"doc-1"}                 # a candidate the abort must protect
+    papra.total_pages = [None]                      # no page declares a total at all
+    caplog.set_level(logging.ERROR, logger="papra_suite.indexing")
+
+    result = await indexing.reconcile_deletions(store, papra, index)
+
+    assert result.aborted is True and result.refs_marked == 0
+    assert store.ledger_get(ORG, "doc-1").deleted_at is None
+    assert store.ledger_stats()["cleanup_pending"] == 0
+    assert any("total" in record.getMessage() for record in caplog.records)
+
+
+async def test_a_total_that_moves_between_pages_aborts_the_pass(store, papra, index,
+                                                                small_pages):
+    """Two totals from one walk is not a total; it is two different walks.
+
+    The number is what the completeness arm compares the walk against, so a listing that says
+    five and then two has not told us anything we can check. This one shrinks, which is the
+    direction that the old `rows_seen < reported` comparison could not see at all: three rows
+    served against a final total of two looks like a walk that finished with room to spare.
+    """
+    seed_reference(store, papra, document_id="doc-1", kreuzakt_id=7)
+    seed_reference(store, papra, document_id="doc-2", file_hash="ab" * 32, kreuzakt_id=8)
+    seed_reference(store, papra, document_id="doc-3", file_hash="cd" * 32, kreuzakt_id=9)
+    papra.stale_listing = {"doc-1"}
+    papra.total_pages = [5, 2]                      # page 1 says five, page 2 says two
+
+    result = await indexing.reconcile_deletions(store, papra, index)
+
+    assert result.aborted is True and result.refs_marked == 0
+    for document_id in ("doc-1", "doc-2", "doc-3"):
+        assert store.ledger_get(ORG, document_id).deleted_at is None
+
+
+# --- review round 2: the empty-bucket breaker is one bucket wide -------------------
+
+async def test_an_empty_listing_stops_its_own_bucket_and_no_other(store, papra, index, caplog):
+    """A bucket that answers empty stops being readable; the corpus next door does not.
+
+    The verdict is the same one the other arms reach — absence may not be read out of this
+    listing — but only this arm describes a state a bucket can be in legitimately, and it says
+    nothing whatever about the others. Aborting the whole pass for it let one emptied bucket
+    freeze propagation for every bucket in the corpus, permanently, while both copies of the
+    prose promised that only that bucket had stopped.
+
+    So this bucket is quarantined and named, and the rest of the pass runs: the trashed
+    document in the healthy bucket is marked exactly as it would have been if nothing was wrong
+    anywhere.
+    """
+    seed_reference(store, papra, org=ORG, document_id="doc-stay", file_hash="ab" * 32)
+    seed_reference(store, papra, org=ORG, document_id="doc-gone", file_hash="cd" * 32,
+                   kreuzakt_id=7, deleted=True)
+    seed_ledger(store, org=OTHER_ORG, document_id="doc-orphan", file_hash="ef" * 32,
+                kreuzakt_id=9)                       # and Papra lists nothing for that bucket
+    caplog.set_level(logging.ERROR, logger="papra_suite.indexing")
+
+    result = await indexing.reconcile_deletions(store, papra, index)
+
+    assert result.aborted is False, "one empty bucket is not a reason to stop the corpus"
+    assert result.quarantined == 1
+    assert store.ledger_get(ORG, "doc-gone").deleted_at is not None
+    assert store.ledger_get(ORG, "doc-stay").deleted_at is None
+    assert store.ledger_get(OTHER_ORG, "doc-orphan").deleted_at is None, \
+        "a bucket nobody could read must not have its references pruned"
+    assert OTHER_ORG in (store.get_setting(indexing.DELETION_QUARANTINE_SETTING) or "")
+    assert any("quarantin" in record.getMessage() for record in caplog.records)
+
+
+async def test_a_quarantined_bucket_does_not_stop_another_buckets_restore(store, papra, index):
+    """The half the old behaviour lost quietly: restores were stopped by it too.
+
+    A document that came back from the trash is still in a healthy bucket, and the damage a
+    stalled restore does is permanent-looking — the row stays bound to whatever the index filed
+    while it was in the trash. One unreadable bucket had no business holding that up.
+    """
+    seed_reference(store, papra, org=ORG, document_id="doc-back", kreuzakt_id=7, deleted=True)
+    seed_ledger(store, org=OTHER_ORG, document_id="doc-orphan", file_hash="ef" * 32,
+                kreuzakt_id=9)
+    await indexing.reconcile_deletions(store, papra, index)      # the row goes deleted upstream
+    papra.documents[(ORG, "doc-back")]["isDeleted"] = False
+    papra.documents[(ORG, "doc-back")]["deletedAt"] = None       # and then it comes back
+
+    result = await indexing.reconcile_deletions(store, papra, index)
+
+    assert (result.quarantined, result.restored) == (1, 1)
+    assert store.ledger_get(ORG, "doc-back").deleted_at is None
+    assert store.ledger_get(OTHER_ORG, "doc-orphan").deleted_at is None
+
+
+async def test_a_bucket_leaves_quarantine_by_answering_again(store, papra, index):
+    """The record is a report, not a lock: nobody has to clear it for traffic to resume.
+
+    An operator lifting a quarantine by hand is a second way to get it wrong, so the set is
+    rewritten from what the last pass actually saw. A bucket that starts listing again is
+    readable again, and the settings row says so without being touched.
+    """
+    seed_ledger(store, org=OTHER_ORG, document_id="doc-orphan", file_hash="ef" * 32,
+                kreuzakt_id=9)
+    await indexing.reconcile_deletions(store, papra, index)
+    assert OTHER_ORG in (store.get_setting(indexing.DELETION_QUARANTINE_SETTING) or "")
+
+    papra.add("doc-orphan", org=OTHER_ORG)
+    result = await indexing.reconcile_deletions(store, papra, index)
+
+    assert result.quarantined == 0
+    assert OTHER_ORG not in (store.get_setting(indexing.DELETION_QUARANTINE_SETTING) or "")
+
+
+# --- review round 2: the same-pass case, and the bucket nobody registered -----------
+
+async def test_two_references_to_one_document_vanishing_in_one_pass_queue_one_delete(
+        store, papra, index):
+    """The dangerous case in a single pass, which is the case the count is taken for.
+
+    Two buckets holding identical bytes share one index document, and nothing says the two
+    references have to reach the trash in different passes — a user emptying two buckets, or one
+    bucket and one mail rule, produce exactly this. Both rows go soft-deleted in one walk, one
+    after the other, so the second marking statement must count what the first already wrote:
+    the count lives inside the same transaction as the soft-delete precisely so that the pair
+    cannot both read "one left" and both decide the document is still wanted.
+
+    Getting that wrong in the permissive direction destroys a document the user kept; getting it
+    wrong the other way leaks the index entry forever. So both halves are asserted here, plus the
+    single upstream delete this pass is allowed to authorise.
+    """
+    queued: list[dict] = []
+    original = store.ledger_queue_cleanup
+
+    def spy(**kwargs):
+        queued.append(kwargs)
+        return original(**kwargs)
+
+    store.ledger_queue_cleanup = spy
+    seed_reference(store, papra, org=ORG, document_id="doc-1", kreuzakt_id=7, deleted=True)
+    seed_reference(store, papra, org=OTHER_ORG, document_id="doc-2",
+                   file_hash=HASH, kreuzakt_id=7, deleted=True)
+
+    result = await indexing.reconcile_deletions(store, papra, index)
+
+    assert (result.refs_marked, result.upstream_pending) == (2, 1)
+    assert [call["kreuzakt_id"] for call in queued] == [7], \
+        "one shared document is one queued delete, whichever order the rows were marked in"
+    assert store.ledger_get(ORG, "doc-1").cleanup_state == "none", \
+        "the first reference gone still left a live one"
+    assert store.ledger_get(OTHER_ORG, "doc-2").cleanup_state == "pending"
+
+    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+
+    assert (cleanup.deleted, index.deleted) == (1, [7])
+    assert store.ledger_resolve([7], generation=store.get_generation()) == []
+
+
+async def test_an_orphan_buckets_index_entry_is_still_reclaimed(store, papra, index):
+    """A bucket that left `orgs` still owes the index its cleanup, and `orgs` cannot say so.
+
+    The pass walks `ledger_org_ids()` rather than `list_orgs()` for exactly this: an operator can
+    remove a bucket, or a store can be copied without one, and its references and their Kreuzakt
+    documents are still there. Driven from `orgs`, those index entries outlive every record of
+    why they exist — nothing ever looks at them again, and nothing says so. The hazard is not a
+    missing count, it is an index entry nobody will ever reclaim.
+    """
+    orphan = "org-removed-from-orgs"
+    assert [org.papra_org_id for org in store.list_orgs()] == [ORG]
+    seed_reference(store, papra, org=orphan, document_id="doc-orphan", file_hash="ab" * 32,
+                   kreuzakt_id=7, deleted=True)
+
+    result = await indexing.reconcile_deletions(store, papra, index)
+    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+
+    assert (result.refs_marked, result.upstream_pending) == (1, 1)
+    assert cleanup.deleted == 1 and index.deleted == [7]
+    assert store.ledger_get(orphan, "doc-orphan").cleanup_state == "done"
+
+
+# --- review round 2: the post-delete unbind must not strand a live row --------------
+
+async def test_a_reference_bound_inside_the_delete_window_is_unbound_and_readmitted(store,
+                                                                                    papra):
+    """The cleanup pass may not clear a binding it did not make and then walk away.
+
+    The four vetoes run before the request, and the request is an `await`. The index worker is a
+    sibling task in the same process, so a second bucket can finish `ledger_set_kreuzakt_id` onto
+    this very id after the pass last looked and before the delete lands. The unbind that follows a
+    successful delete is unscoped on purpose — every row still pointing at a destroyed document is
+    wrong — so it clears that row too, and a row that is live, unbound and never enqueued is the
+    state this task refuses to leave elsewhere: `sweep_once` only enqueues documents it has never
+    seen, so nothing will ever ask for that work again.
+
+    So the pass names the rows it is about to clear and re-admits the live ones, exactly as the
+    liveness probe already does.
+    """
+    seed_reference(store, papra, kreuzakt_id=7, deleted=True)
+
+    class BindsOnDelete(FakeIndex):
+        """The index worker, finishing its own write inside the delete's await window."""
+
+        async def delete_document(self, kreuzakt_id):
+            seed_ledger(store, org=OTHER_ORG, document_id="doc-sibling", file_hash=HASH)
+            store.ledger_set_kreuzakt_id(papra_org_id=OTHER_ORG,
+                                         papra_document_id="doc-sibling",
+                                         kreuzakt_id=kreuzakt_id,
+                                         generation=store.get_generation())
+            return await super().delete_document(kreuzakt_id)
+
+    raced = BindsOnDelete()
+    try:
+        await indexing.reconcile_deletions(store, papra, raced)
+        assert store.ledger_get(ORG, DOC_ID).cleanup_state == "pending"
+
+        cleanup = await indexing.run_cleanup(store, raced, now=due(store))
+    finally:
+        await raced.aclose()
+
+    assert (cleanup.deleted, raced.deleted) == (1, [7])
+    assert store.ledger_get(OTHER_ORG, "doc-sibling").kreuzakt_id is None, \
+        "a live row must not keep a binding to a destroyed document"
+    claimed = store.claim_next_job("index")
+    assert claimed is not None and claimed.document_id == "doc-sibling", \
+        "unbound but never enqueued is eligible in a sense nobody can act on"
+
+
+# --- review round 2: the expensive reads have clocks of their own --------------------
+
+async def test_the_listing_walk_is_not_repeated_on_every_sweep(store, papra, index, monkeypatch):
+    """The walk costs a page per hundred documents per bucket, so it needs a clock of its own.
+
+    A sweep defaults to five minutes, and this is the most frequent full read in the process while
+    the state it looks for does not change on that timescale. The gate is one interval, and an
+    operator waiting for a deletion to propagate has to be able to read which interval that is.
+    """
+    monkeypatch.setattr(indexing, "LISTING_WALK_INTERVAL_S", 900)
+    seed_reference(store, papra, kreuzakt_id=7, deleted=True)
+
+    await indexing.reconcile_deletions(store, papra, index)
+    listed = papra.list_calls
+    assert listed >= 1
+
+    await indexing.reconcile_deletions(store, papra, index)
+    assert papra.list_calls == listed, "the corpus was re-listed inside its own interval"
+
+    monkeypatch.setattr(indexing, "_store_now",
+                        lambda: later(indexing.LISTING_WALK_INTERVAL_S + 10))
+    await indexing.reconcile_deletions(store, papra, index)
+    assert papra.list_calls > listed, "the walk never came back around"
+
+
+async def test_a_walk_that_did_not_finish_is_not_recorded_as_done(store, papra, index,
+                                                                  monkeypatch):
+    """An aborted walk earns no cadence stamp, so the next sweep is free to try again.
+
+    Stamping an unfinished walk would turn one bad page into a quarter-hour of silence about a
+    corpus that was never read, which is the opposite of what the interval is for.
+    """
+    monkeypatch.setattr(indexing, "LISTING_WALK_INTERVAL_S", 900)
+    seed_reference(store, papra, kreuzakt_id=7, deleted=True)
+    papra.raise_on_list = httpx.ConnectError("papra is down")
+
+    result = await indexing.reconcile_deletions(store, papra, index)
+    assert result.aborted is True
+    assert store.get_setting(indexing.LISTING_WALK_STAMP_SETTING) is None
+
+    papra.raise_on_list = None
+    result = await indexing.reconcile_deletions(store, papra, index)
+    assert result.aborted is False
+    assert store.get_setting(indexing.LISTING_WALK_STAMP_SETTING) is not None
+
+
+async def test_a_probe_that_judged_nothing_leaves_the_interval_stamp_unwritten(store, papra,
+                                                                              index, monkeypatch):
+    """An outage is not a re-check, and it is not a licence to re-read everything either.
+
+    The anti-stall rule is one sentence with two halves that pull against each other: a failed read
+    may not be filed as a completed re-check, and the next wake-up may not put the whole corpus back
+    under the knife. Both hold only if the failure is remembered as something narrow, which is why
+    the two clocks are asserted separately here.
+    """
+    seed_reference(store, papra, kreuzakt_id=7)
+    index.make_unreachable()
+    generation = store.get_generation()
+
+    assert await indexing.probe_index_liveness(store, index, generation) == 0
+    assert store.get_setting(indexing.LIVENESS_PROBE_STAMP_SETTING) is None
+    assert store.get_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING) == "7"
+
+    reads = document_reads(index)
+    assert await indexing.probe_index_liveness(store, index, generation) == 0
+    assert document_reads(index) == reads, \
+        "the whole corpus went back under the knife one sweep later"
+
+    monkeypatch.setattr(indexing, "_store_now",
+                        lambda: later(indexing.LIVENESS_PROBE_RETRY_INTERVAL_S + 10))
+    await indexing.probe_index_liveness(store, index, generation)
+    assert document_reads(index) > reads, "a failed read was never tried again"
+
+
+async def test_a_walk_that_finished_around_an_unreadable_id_retries_only_that_id(store, papra,
+                                                                                index, monkeypatch):
+    """Some reads failed: the walk still counts as completed, and the failures are retried alone.
+
+    This is the shape the amplification came from — a partial outage that withheld the interval
+    stamp and so re-read every distinct binding every sweep — and the shape the old anti-stall rule
+    was protecting: ids that did not answer must not be filed as answered just because the walk
+    ended.
+    """
+    seed_reference(store, papra, kreuzakt_id=7)
+    seed_reference(store, papra, document_id="doc-two", file_hash="hash-two", kreuzakt_id=9)
+    index.unreadable.add(9)
+    generation = store.get_generation()
+
+    assert await indexing.probe_index_liveness(store, index, generation) == 1
+    assert store.get_setting(indexing.LIVENESS_PROBE_STAMP_SETTING) is not None
+    assert store.get_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING) == "9"
+    assert store.ledger_get(ORG, "doc-two").kreuzakt_id == 9, "an unanswered id is not a verdict"
+
+    reads = document_reads(index)
+    assert await indexing.probe_index_liveness(store, index, generation) == 0
+    assert document_reads(index) == reads
+
+    monkeypatch.setattr(indexing, "_store_now",
+                        lambda: later(indexing.LIVENESS_PROBE_RETRY_INTERVAL_S + 10))
+    before = document_reads(index)
+    await indexing.probe_index_liveness(store, index, generation)
+    assert document_reads(index) - before == 1, \
+        "the retry re-read the corpus instead of the failure"
+
+
+# --- review round 2: a run of marks is a signal, not a queue -------------------------
+
+async def test_a_day_of_marks_past_a_tenth_of_the_corpus_stops_the_pass(store, papra, index,
+                                                                        monkeypatch):
+    """Marks that keep coming are a bad signal about the pipeline, not work to grind through.
+
+    The per-pass cap bounds one pass and is silent about the day: twenty references every five
+    minutes is several thousand a day with every individual pass looking ordinary. So the second
+    brake is a fraction of the references the ledger holds — "is this normal" has no answer that is
+    not about the size of the corpus — and when it trips the pass stops reading instead of working
+    the queue down, because reading is how a wrong verdict gets confirmed. The floor is lowered here
+    because ten references is not a corpus the production floor is meant for.
+    """
+    monkeypatch.setattr(indexing, "MARKS_ROLLING_FLOOR", 2)
+    for number in range(10):
+        seed_reference(store, papra, document_id=f"doc-{number}", file_hash=f"hash-{number}",
+                       kreuzakt_id=number + 1, deleted=True)
+
+    first = await indexing.reconcile_deletions(store, papra, index)
+    assert first.refs_marked == 2, "one reference in ten is the allowance for ten references"
+    assert first.brake_tripped is True
+    assert first.aborted is False
+
+    listed = papra.list_calls
+    second = await indexing.reconcile_deletions(store, papra, index)
+    assert second.aborted is True and second.brake_tripped is True
+    assert papra.list_calls == listed, "a braked pass still went and read the whole corpus"
+    stamp = store.get_setting(indexing.LAST_DELETION_PASS_SETTING)
+    assert "marks brake" in stamp, stamp
+
+    # Not a ratchet: an operator who has established that the run was real clears one row.
+    store.set_setting(indexing.MARKS_ROLLING_SETTING, "")
+    third = await indexing.reconcile_deletions(store, papra, index)
+    assert third.aborted is False and third.refs_marked == 2

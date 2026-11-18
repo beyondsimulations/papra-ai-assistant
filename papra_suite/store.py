@@ -76,8 +76,9 @@ DEFAULT_GENERATION = 1
 REPAIR_WINDOW_H = 24
 
 # How many failed upstream deletes `ledger_cleanup_result` tolerates before it
-# stops retrying and leaves the row for `papra-suite ledger --cleanup`. Five is
-# "the outage is not a blip" without being "we gave up on the operator's data".
+# stops retrying and leaves the row in `cleanup_state='failed'`, which no automatic
+# pass will touch again. Five is "the outage is not a blip" without being "we gave up
+# on the operator's data".
 CLEANUP_MAX_ATTEMPTS = 5
 
 # The three fields we may write into Papra, and therefore the only fields that
@@ -1854,9 +1855,12 @@ class Store:
           `pending` would fall to 0 exactly when automatic retry stops — the
           operator's number going quiet while the debt turns permanent.
         * `cleanup_failed` — the subset of `cleanup_pending` the retries have
-          stopped on, i.e. the rows that wait for `papra-suite ledger --cleanup`.
-          `cleanup_pending - cleanup_failed` are still being retried. Rows
-          `skipped` by the cleanup pass are in neither: nothing is owed on them.
+          stopped on. Nothing in this build takes those rows back: the route is
+          `papra-suite ledger --cleanup`, which the plan gives to Task 11, so
+          until that lands the number is a count of debt an operator can see and
+          cannot settle from the CLI. `cleanup_pending - cleanup_failed` are still
+          being retried. Rows `skipped` by the cleanup pass are in neither: nothing
+          is owed on them.
 
         `org_ids=[]` is "no buckets", not "no filter": a token with nothing
         granted must not receive corpus-wide counts.
@@ -1913,9 +1917,11 @@ class Store:
         document deleted, restored, deleted again), and if every re-queue refilled
         the allowance a permanently failing delete would get five fresh attempts
         forever and never reach `failed`. So the counter survives by default, and
-        `reset_attempts=True` exists for the one caller that is entitled to refill
-        it — `papra-suite ledger --cleanup`, where the operator is saying "the
-        outage is over, try again". Without that, his forced pass got exactly one
+        `reset_attempts=True` exists for the one caller entitled to refill it: an
+        operator saying "the outage is over, try again". That caller is Task 11's
+        `papra-suite ledger --cleanup` and is not in this build, so today a row that
+        reaches `failed` stays there and is visible in `ledger_stats` as debt. The
+        parameter stays because without it a forced pass would get exactly one
         attempt: the row is already at the maximum, so the first failure wrote
         `failed` again even with Kreuzakt healthy.
         """
@@ -2028,10 +2034,11 @@ class Store:
         with self._lock:
             # BEGIN IMMEDIATE: reading `cleanup_attempts` and `cleanup_state` and
             # writing them back is one decision. Outside the write lock, the
-            # daemon's cleanup pass and an operator's forced `ledger --cleanup` can
-            # both read attempt 4, both write 5, lose an increment, and announce the
-            # permanent failure twice — which breaks the one thing that log line is
-            # for: being countable.
+            # daemon's cleanup pass and a second writer of the same row — a second
+            # process, or Task 11's operator-forced retry — can both read attempt 4,
+            # both write 5, lose an increment, and announce the permanent failure
+            # twice — which breaks the one thing that log line is for: being
+            # countable.
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._read_cleanup_row(papra_org_id, papra_document_id)
