@@ -24,6 +24,14 @@ those two is exactly the thing an operator gets wrong at 23:00.
 rather than as one number: a rehearsal that reports a different scope than the real run
 would cover is worse than no rehearsal, and per-field counts are what both commands can
 state exactly without inventing a query that guesses at the union.
+
+One thing it is not: a preview through a shut gate. The delivery pass checks
+`index_metadata_delivery` before it walks anything and exits `2` when the flag is off, so the
+pre-flight this command offers is the one you run *after* the flip, with the flag on, in a
+test deployment if the real one is not ready — `check` is what answers the earlier question,
+"who owns these fields today". Putting `dry_run` into the gate test instead would let a
+flag-off process read every document in the corpus, which is the door the gate exists to shut
+and the one property that made the `OCR_LANGUAGES` mistake invisible.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ from papra_suite.indexing import (
     METADATA_FIELDS,
     METADATA_PROTECTED,
     METADATA_WRITTEN,
+    DeliveryDisabled,
     IndexFailed,
     deliver_metadata,
 )
@@ -296,6 +305,10 @@ async def _walk(store: Store, refs, *, fields, force: bool, dry_run: bool, confi
     `asyncio.run` has already closed that loop by the time `run_metadata` returns. Injected
     clients stay the caller's, which is what lets a test inject one broken client and two
     working ones.
+
+    A gate that closes mid-walk is different from an unreadable row and stops the run: the
+    flag is one setting, so every remaining reference answers the same way, and the honest
+    report is "stopped here" with what came before it, not one line per document.
     """
     own_clients = papra is None or kreuzakt is None
     if own_clients:
@@ -306,6 +319,8 @@ async def _walk(store: Store, refs, *, fields, force: bool, dry_run: bool, confi
     overrode = 0
     unreadable = 0
     refused = 0
+    walked = 0
+    gate_closed = ""
     try:
         for ref in refs:
             # The flags as they stand before this call, so "how many human values did this
@@ -332,6 +347,15 @@ async def _walk(store: Store, refs, *, fields, force: bool, dry_run: bool, confi
                 refused += 1
                 print(f"{ref.papra_org_id}/{ref.papra_document_id}  not written: {error}")
                 continue
+            except DeliveryDisabled as error:
+                # The gate closed under the walk: another process flipped the flag, or the
+                # settings row changed underneath it. Every remaining reference answers
+                # identically, so continuing would spend one line per document and stop
+                # nowhere, and letting it escape would cost the operator the report of what
+                # this run already wrote — which after a partial `--force` is the whole point
+                # of the command. So: stop, and say exactly where.
+                gate_closed = str(error)
+                break
             actions = {field: _action(result, field) for field in METADATA_FIELDS}
             written += sum(1 for action in actions.values()
                            if action == METADATA_WRITTEN)
@@ -340,6 +364,7 @@ async def _walk(store: Store, refs, *, fields, force: bool, dry_run: bool, confi
             overrode += any(before[field] and actions[field] == METADATA_WRITTEN
                             for field in METADATA_FIELDS)
             print(_line(ref, actions, fields))
+            walked += 1          # completed, so a stop can report how far the run actually got
     finally:
         if own_clients:
             await papra.aclose()
@@ -352,11 +377,14 @@ async def _walk(store: Store, refs, *, fields, force: bool, dry_run: bool, confi
         summary += f", {unreadable} unreadable"
     if refused:
         summary += f", {refused} refused by papra"
+    if gate_closed:
+        summary += (f", gate closed after {walked} of {len(refs)} references; the rest were "
+                    "not attempted")
     print(("dry run: " if dry_run else "") + summary)
     if dry_run and protected:
         print("protected fields are a human's; `papra-suite metadata --restore-auto "
               "[--field F]` hands them back to automatic delivery")
-    return EXIT_INCOMPLETE if (unreadable or refused) else EXIT_OK
+    return EXIT_INCOMPLETE if (unreadable or refused or gate_closed) else EXIT_OK
 
 
 def _action(result, field: str) -> str:

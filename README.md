@@ -460,7 +460,7 @@ questions an operator asks — "how far did this get" and "should I have restart
 one question. The lines are appended to what `check` already prints:
 
 ```
-index: 118 refs, 112 current, 96 delivered, 3 extraction-empty, 0 repairs(24h), 0 cleanup-pending (failed 0)
+index: 118 refs, 112 current, 96 delivered, 3 extraction-empty, protected_name=4 protected_date=61 protected_notes=2, 0 repairs(24h), 0 cleanup-pending (failed 0)
 content writer: suite ocr worker (legacy)
 metadata writer: suite title worker (legacy)
 ```
@@ -487,6 +487,13 @@ metadata writer: suite title worker (legacy)
   retries stopped on called out separately. A `failed` row can leave a deleted document in
   the index, so search still returns it; nothing in this build replays it by hand, so a
   non-zero `N` is a number to report rather than one that drains on its own.
+- `protected_name/date/notes` count the fields this bridge has stopped writing because Papra
+  holds a value it cannot attribute to itself — usually a rename or a note the user typed.
+  Protection is permanent and carries no record of *why* it was set, so one legitimate rename
+  and a corpus-wide lock read identically from anywhere else; these three numbers are the
+  only place the difference is visible without reading `metadata --dry-run` line by line. A
+  `protected_date` in the tens is normal (Papra fills `documentDate` on upload). A
+  `protected_name` count that jumps after a flag flip is not: see the metadata handover.
 
 `content writer:` then names the arrangement you are actually running, in one of three
 strings:
@@ -523,13 +530,24 @@ field is protected and we stop touching it, which is recoverable with
 `papra-suite metadata --restore-auto`; two writers of `content` can put a blank page over a
 year of text. Refusing the combination would also forbid the only workable order, because
 `legacy_workers` has to stay on while the queues drain and the flag that drains them is the
-one being set. And the second writer is on a path this flag does switch off: while metadata
-delivery is on, `on_job_done` stops enqueuing the `title` job that an OCR completion used to
-produce, for documents from every intake path, sweep and mailbox alike. So what is left in
-that state is title work already in flight — it drains, and the path this flag governs cannot
-refill it. The line is printed anyway, because in flight is not zero: those jobs do write
-Papra's `name`, the ledger reads the write as a human edit, and the documents they touch come
-out protected.
+one being set. And the second writer is on a path this flag switches off **twice**: while
+metadata delivery is on, `on_job_done` stops enqueuing the `title` job that an OCR completion
+used to produce, for documents from every intake path, sweep and mailbox alike, and
+`run_title_job` refuses the ones already sitting in the queue — it skips them and marks them
+done, exactly as it skips a job whose content has moved on.
+
+Both halves are needed, and the consumer half is what this section got wrong when it was first
+written. Stopping only the producer leaves the `title` rows already `pending` or `running` at
+the moment of the flip still claimed, and a title that worker writes is recorded nowhere in the
+ledger: the next metadata pass finds a `name` that is neither the one we wrote nor the one
+Papra had at first sight, calls it a human edit, and protects the field **permanently** —
+byte-identical to a genuine rename, because protection is one bit with no provenance, and the
+only bulk recovery is `metadata --force --yes-i-mean-it`, which overwrites every real rename in
+scope. With both halves in place the state is harmless, and the line is printed anyway because
+the two flags really do name two writers until `PAPRA_LEGACY_WORKERS` goes off. What can still
+cross the flip are jobs that got past their gate check before the flag moved and are still
+mid-flight — hashing Papra's content, or waiting on the model, with the PATCH not yet sent; the
+not-ours verdict above is the containment for those writes.
 
 ### Handing the title, date and note over
 
@@ -582,6 +600,18 @@ found in *Papra* is likewise never treated as ours to overwrite. The pinned cont
 test stack is exactly this keyless configuration, which is why the guard is covered against
 the live service rather than only against a double.
 
+**The two sides of that guard are not the same size, because only one of them is reversible.**
+The recogniser matches a shape, not a registry, so it also refuses genuine names that end in an
+eight-character hex-ish run: `Papra-Rechnung-20250101` looks like our upload suffix and will not
+be delivered as a title.
+
+On the candidate side that costs one skipped title and nothing else: the verdict is `skipped`,
+no flag is set, and a narrower recogniser in a later build writes it.
+
+On the Papra side the same shape answers `protected`, which is permanent: the bridge decides
+somebody else owns that field and stops writing `name` on that document for good, until
+`papra-suite metadata --restore-auto --field name` says otherwise.
+
 The order, which is its own because the flags are separate and each reversible until the code
 comes out:
 
@@ -595,16 +625,41 @@ comes out:
 3. Set `PAPRA_INDEX_METADATA_DELIVERY=true` and restart, leaving `PAPRA_LEGACY_WORKERS` as it
    is. `check` prints `metadata writer: two writers (title queue draining)`, and that is the
    arrangement you want for a minute: the flag has to be on before the queue can stop being
-   fed, because while it is off every OCR completion enqueues another title job. Draining
-   before the flip is the mistake this step exists to prevent — the count reads zero, the flip
-   refills it, and the proof proved nothing.
+   fed, because while it is off every OCR completion enqueues another title job.
 
-   What you accept by flipping first, stated because waiting does not undo it: title jobs that
-   were already queued or running still run, and each one writes Papra's `name`. The ledger
-   reads back a title it never wrote and protects that field, so those documents keep the legacy
-   worker's title until an operator says otherwise. `papra-suite metadata --dry-run` names them
-   — `name=protected` on documents you had no reason to think were protected — and the order to
-   put them right is in "A human renamed it, and now the bridge will not".
+   Flipping with rows still in the queue costs far less than it used to: a `title` job that
+   *observes* the enabled flag skips, marks itself done and writes nothing, so those documents
+   keep whatever title they had. The whole residual is that word "observes". A job that read the
+   flag while it was still off and is mid-flight — hashing Papra's content, or waiting on the
+   model, PATCH not yet sent — can land its write after the flip, and more than one job can be in
+   that state. The window closes when the process actually stops, because a restart rewinds
+   `running` rows to `pending` and the new process reads the flag first, so what gets through is
+   what was already near its PATCH at the moment of the flip. The not-ours verdict is the
+   containment for those writes, and `check`'s `protected_name` is how you see whether any landed.
+
+   Draining **before** the flip lowers the chance of that race — in steady state the queue
+   empties between OCR completions — but it is not a guarantee, because observing zero is not
+   atomic with the next OCR completion enqueueing a title job and a worker claiming it before the
+   restart. So the pre-flip drain is worth doing and proves nothing by itself. What no pre-flip
+   count can do is *prove* zero: while the flag is off the queue refills behind you, so a count
+   taken a minute early reads clean and means nothing. The proof is step 4, taken after the flip.
+
+   **If content is already handed over** — you followed that section first, so
+   `PAPRA_LEGACY_WORKERS` is `false` — one flag cannot satisfy both sections, and step 3's
+   `two writers (title queue draining)` is not what you will see: `check` prints
+   `metadata writer: index bridge`, because the loops that claimed `title` rows are gone. A
+   restart does not bring them back and does not run the leftovers either; it only rewinds
+   `running` rows to `pending`. Anything still queued is therefore inert, and step 4's count
+   will never reach zero while it sits there. Delete it, the same way content's step 3 treats
+   its own leftovers:
+
+   ```bash
+   sqlite3 "$DATA_DIR/state.db" \
+     "DELETE FROM jobs WHERE kind='title' AND status IN ('pending','running');"
+   ```
+
+   Deleting is tidiness, not safety: with the flag on, a claimed title job would skip and mark
+   itself done anyway. Leaving the rows costs nothing but a number that never drains.
 
 4. Prove the second writer is out of work, counting only the rows that are still work:
 
@@ -615,9 +670,11 @@ comes out:
 
    Two zeroes a minute apart. Counting every status proves nothing, because `completed` rows
    accumulate forever and that total never reaches zero. With the flag on,
-   `on_job_done` refuses the ocr-done-to-title transition, so nothing this pipeline owns
-   refills the queue; a count that keeps *growing* means something else is still enqueueing
-   title jobs, and the thing to look at is a legacy loop running for other reasons.
+   `on_job_done` refuses the ocr-done-to-title transition and `run_title_job` drops anything it
+   still claims, so nothing this pipeline owns refills the queue. Two other readings are both
+   ordinary: a count that keeps *growing* means something outside this pipeline is enqueueing
+   `title` jobs, and a small count that never moves and never empties is the
+   already-handed-over case above — rows no loop will ever claim again.
 
    `check` still prints `two writers` after this, and that is not a contradiction: the line is
    computed from the two flags, not from the queue, and while the legacy loops run they could
@@ -680,7 +737,7 @@ exits `1` unless you add `--yes-i-mean-it`. `--org-id`, `--document-id` and `--f
 either command; `--field` takes `name`, `date` or `notes` and nothing else — `content` is not
 a metadata field and has its own flag, its own gate and its own handover section.
 
-Two limits worth stating plainly, because both look like bugs on the day they happen:
+Three limits worth stating plainly, because all three look like bugs on the day they happen:
 
 - **Papra's own enrichment keeps running.** No flag here stops it, and it can rewrite a title
   after our delivery. The next pass then reads a value that is not ours and protects the field:
@@ -691,3 +748,14 @@ Two limits worth stating plainly, because both look like bugs on the day they ha
   than a retry. Changing a column resurrects a trashed document, so "helpfully" delivering
   metadata into one would un-delete something the user threw away. The delete propagation pass
   owns those references, not this one.
+- **A permanent refusal fails the `index` job, and that job slot is the document's only way
+  back into the index.** There is no separate metadata job kind: this pass runs inside the
+  `index` job, so a permanent verdict here leaves an `index` row in `failed`. The queue is
+  idempotent on `(kind, organization, document, content_hash)` and `INSERT OR IGNORE`d, so
+  every later request to index those same bytes is silently ignored while that row sits there
+  — and a restore, an unbind or a backfill works by making exactly such a request, so it can
+  report success and enqueue nothing. Escape: reset that row (`jobs --reset`, whose command is
+  still to come; until it exists this is a hand edit of the `jobs` table), with the partial
+  jobs index of Task 11 as the durable fix. `check` cannot see it, because its counters are all
+  ledger-derived and a job moving from `done` to `failed` changes none of them; the worker's
+  ERROR line is what names it.

@@ -107,17 +107,21 @@ def metadata_writer_state(delivery: bool, legacy: bool) -> str:
     of `content` is refused at startup, two writers of `name` is only reported.
 
     The difference is what each state does to the other writer. The legacy title chain is
-    switched off at its own transition — `on_job_done` stops enqueueing `title` jobs while
-    metadata delivery is on, for documents from every intake path, sweep and mail alike — so
-    what remains in the `two writers` state is the title work already in flight. It drains,
-    and it cannot be refilled by the path this flag governs. Refusing the combination would
-    forbid the only order of operations that works: `legacy_workers` has to stay on while the
-    queues drain, and the flag that drains them is the flag being set.
+    switched off twice while metadata delivery is on: `on_job_done` stops enqueueing `title`
+    jobs, for documents from every intake path, sweep and mail alike, and `run_title_job`
+    refuses the rows already queued when the flag flipped — it skips them, marks them done and
+    writes nothing, the way it skips a job whose content moved on. The second half is what
+    makes the state safe: producer-only gating left those rows claimed, writing a `name` the
+    ledger had no record of, which the next pass read as a human edit and protected permanently.
+    Refusing the combination would still forbid the only order of operations that works:
+    `legacy_workers` has to stay on while the queues drain, and the flag that drains them is the
+    flag being set. One job already past its gate check when the flag flips can land its write;
+    the ledger's not-ours verdict is the containment for that case.
 
-    It is still printed, because in-flight title jobs really do write Papra's `name`, and the
-    ledger reads the worker's write as a human edit and protects the field. So the state is
-    not merely cosmetic: the documents it touches end up with titles the bridge will not touch
-    again until an operator says so. The proof that it has passed is the actionable queue,
+    It is still printed, because the string reports the two flags rather than what they now
+    permit: with `legacy_workers` on, the loops are running and the configuration really does
+    name two writers, even though the second one refuses its own work. The proof that the state
+    has passed is the actionable queue,
     read twice a minute apart while the loops are still running:
 
         sqlite3 "$DATA_DIR/state.db" "SELECT count(*) FROM jobs WHERE kind='title'
@@ -232,8 +236,11 @@ def on_job_done(store: Store, job: Job, *, ocr_result: str) -> None:
     if job.kind != "ocr":
         return
     if store.settings_flag("index_metadata_delivery"):
-        # Once each time is enough: this is the transition, not a retry loop.
-        logger.info("title job skipped: papra=%s — Papra's title belongs to the index "
+        # Once each time is enough: this is the transition, not a retry loop. Wording differs
+        # from `run_title_job`'s skip on purpose: this row was never created, that one existed
+        # before the flip and was dropped. `run_title_job` refuses those too, so a log line
+        # here and one there describe two different things.
+        logger.info("title job not enqueued: papra=%s — Papra's title belongs to the index "
                     "bridge while index_metadata_delivery is on", job.document_id)
         return
     content_hash = hashlib.sha256(ocr_result.encode()).hexdigest()
@@ -247,14 +254,31 @@ def on_job_done(store: Store, job: Job, *, ocr_result: str) -> None:
     )
 
 
-async def run_title_job(papra: PapraClient, title_llm: LLMClient, job: Job) -> None:
+async def run_title_job(papra: PapraClient, title_llm: LLMClient, job: Job, *,
+                        store: Store) -> None:
     """Generate and write a title — unless the document moved on (decisions §2).
 
     A stale title job (content v1, still in backoff) must never overwrite a
     title that a newer job (v2) already wrote from newer content: hash the
     document's CURRENT content and compare to the job's content_hash first;
     on mismatch, skip silently (the worker still marks the job done).
+
+    **The metadata gate is checked before anything else, and it is the consumer half of the
+    handover.** `on_job_done` stops producing `title` rows while `index_metadata_delivery`
+    is on, but the rows already `pending` or `running` when an operator flips the flag are
+    still claimed here, and a title written by this path is recorded nowhere in the ledger.
+    The next metadata pass then finds a `name` that is neither `written_name` nor
+    `papra_original_name`, answers *not ours*, and sets `name_protected = 1` — permanently,
+    and byte-identical to a genuine human rename, because protection is one bit with no
+    provenance. The recovery for that is `metadata --force --yes-i-mean-it`, which overwrites
+    every genuine rename in scope. So while the metadata gate is on this writer skips, exactly
+    as it skips a stale job: nothing asked of the model, nothing sent to Papra, and the row
+    ends `done` so the drain the handover asks for can actually reach zero.
     """
+    if store.settings_flag("index_metadata_delivery"):
+        logger.info("title job skipped: papra=%s job=%s — Papra's title belongs to the index "
+                    "bridge while index_metadata_delivery is on", job.document_id, job.id)
+        return
     document = await papra.get_document(job.papra_org_id, job.document_id)
     current_content = document.get("content") or ""
     current_hash = hashlib.sha256(current_content.encode()).hexdigest()
@@ -364,7 +388,7 @@ async def serve(config, *, stop: asyncio.Event | None = None,
             ), name="ocr-worker"))
         tasks.append(asyncio.create_task(worker_loop(
             store, kind="title",
-            handler=lambda job: run_title_job(papra, title_llm, job),
+            handler=lambda job: run_title_job(papra, title_llm, job, store=store),
         ), name="title-worker"))
     # ONE index worker, on purpose. Correlating an upload needs its queue row inside
     # the newest-100 window, so uploads are serial by construction: a second worker
@@ -647,6 +671,21 @@ async def worker_loop(store: Store, *, kind: str, handler,
                 )
                 if permanent:
                     store.mark_job_failed(job.id, str(error), max_attempts=1)
+                    if kind == "index":
+                        # Stated because nothing else says it. `check`'s counters are all
+                        # ledger-derived, so this job flipping `done` -> `failed` moves no
+                        # number an operator reads, and `enqueue_job` is `INSERT OR IGNORE`
+                        # against the unique idempotency index: the failed row now absorbs
+                        # every later request to index these same bytes, which is what a
+                        # restore or a backfill does to bring a document back.
+                        logger.error(
+                            "index job %s for papra document %s failed permanently at "
+                            "content %s: the queue row is the idempotency key, so every later "
+                            "enqueue for these same bytes is ignored until that row is reset — "
+                            "by `jobs --reset` once Task 15 ships that command, by a hand edit "
+                            "of the `jobs` table until then. A restore or backfill that reports "
+                            "success and enqueues nothing has met this row.",
+                            job.id, job.document_id, job.content_hash[:12])
                 elif max_attempts is None:
                     store.mark_job_failed(job.id, str(error))
                 else:

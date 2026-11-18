@@ -284,6 +284,13 @@ def _index_line(store) -> str:
     * `cleanup-pending (failed N)` is the debt of upstream deletes still owed, with the
       part the retries have stopped on called out: a counter that watched only `pending`
       would fall to zero exactly when automatic retry stops.
+    * `protected_name/date/notes` are the fields the bridge has stopped writing because Papra
+      holds a value it cannot attribute — a human rename, or a write the ledger never
+      recorded. Protection is permanent and carries no provenance, so a corpus-wide lock and
+      one legitimate rename look identical from the outside, and the only other reader of
+      these three numbers is `metadata --dry-run`, which an operator has to already suspect
+      the answer to run. That is why they are on the line an operator runs when something is
+      wrong: `check` is the command the README names for "why did nothing change".
 
     It never fails `check`, for the same reason the events line does: an empty store is not
     a configuration error, and a check that exits non-zero on one trains people to stop
@@ -301,6 +308,9 @@ def _index_line(store) -> str:
         return f"index: unavailable ({type(error).__name__})"
     return (f"index: {stats['references']} refs, {stats['indexed_current']} current, "
             f"{stats['delivered']} delivered, {stats['extraction_empty']} extraction-empty, "
+            f"protected_name={stats['protected_name']} "
+            f"protected_date={stats['protected_date']} "
+            f"protected_notes={stats['protected_notes']}, "
             f"{stats['repairs_24h']} repairs(24h), {stats['cleanup_pending']} "
             f"cleanup-pending (failed {stats['cleanup_failed']})")
 

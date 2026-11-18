@@ -161,6 +161,11 @@ def _seed_index_corpus(tmp_path):
       repairs inside the window.
     * `doc-2` — indexed, never delivered, and owed an upstream delete.
     * `doc-3` — never indexed, and a delete the retries have given up on.
+
+    Three fields are also protected, one per field and with different counts, because
+    `protected_*` is the part of this line that tells an operator whether a corpus-wide lock
+    exists: the numbers already come out of `ledger_stats`, and today the metadata CLI is the
+    only other reader of them.
     """
     from papra_suite.store import EMPTY_EXTRACTION_SHA, Store
 
@@ -186,6 +191,11 @@ def _seed_index_corpus(tmp_path):
     with store._conn:      # the gave-up-on state a cleanup pass reaches after its cap
         store._conn.execute("UPDATE index_ledger SET cleanup_state = 'failed'"
                             " WHERE papra_document_id = 'doc-3'")
+    for document_id in ("doc-1", "doc-2"):
+        store.ledger_protect(papra_org_id="org_1", papra_document_id=document_id,
+                             field="name")
+    store.ledger_protect(papra_org_id="org_1", papra_document_id="doc-1", field="date")
+    store.ledger_protect(papra_org_id="org_1", papra_document_id="doc-3", field="notes")
     store.close()
 
 
@@ -208,6 +218,7 @@ def test_check_prints_the_index_counts(monkeypatch, tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert ("index: 3 refs, 2 current, 1 delivered, 1 extraction-empty, "
+            "protected_name=2 protected_date=1 protected_notes=1, "
             "2 repairs(24h), 2 cleanup-pending (failed 1)") in out
 
 
@@ -221,6 +232,7 @@ def test_check_counts_an_empty_corpus_without_hiding_it(monkeypatch, tmp_path, c
     assert main() == 0
 
     assert ("index: 0 refs, 0 current, 0 delivered, 0 extraction-empty, "
+            "protected_name=0 protected_date=0 protected_notes=0, "
             "0 repairs(24h), 0 cleanup-pending (failed 0)") in capsys.readouterr().out
 
 

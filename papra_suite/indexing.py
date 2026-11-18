@@ -775,7 +775,11 @@ async def deliver_metadata(papra, store: Store, ref: LedgerRef, kz_doc: KzDocume
         raise IndexFailed(
             f"no ledger reference for papra://{ref.papra_org_id}/{ref.papra_document_id}: "
             "refusing to deliver metadata from a caller's snapshot, because the record of "
-            "which fields are ours is gone", permanent=True)
+            "which fields are ours is gone. Permanent, so the index job for these bytes ends "
+            "failed, and a failed index row absorbs every later enqueue for the same hash "
+            "until that row is reset — by `jobs --reset` once Task 15 ships it, by a hand edit "
+            "of the `jobs` table until then — or by the queue being made re-schedulable",
+            permanent=True)
 
     actions: dict[str, str] = {}
     body: dict[str, str] = {}
@@ -839,8 +843,18 @@ async def deliver_metadata(papra, store: Store, ref: LedgerRef, kz_doc: KzDocume
                          ref.papra_document_id, error)
             raise
     if recorded:
-        store.ledger_record_metadata(papra_org_id=ref.papra_org_id,
-                                     papra_document_id=ref.papra_document_id, **recorded)
+        try:
+            store.ledger_record_metadata(papra_org_id=ref.papra_org_id,
+                                         papra_document_id=ref.papra_document_id,
+                                         **recorded)
+        except Exception as error:  # noqa: BLE001 - re-raised; this line is the recovery
+            logger.error(
+                "metadata landed on papra://%s/%s but the ledger could not record it (%s): "
+                "the next pass reads Papra's new value as somebody else's and protects the "
+                "field. Put the history back by hand with these exact values: %s",
+                ref.papra_org_id, ref.papra_document_id, error,
+                ", ".join(f"{field}={value!r}" for field, value in sorted(recorded.items())))
+            raise
     if body:
         logger.info("metadata delivered papra=%s kreuzakt=%s fields=%s",
                     ref.papra_document_id, kz_doc.id, ", ".join(sorted(body)))

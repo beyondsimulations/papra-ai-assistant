@@ -26,8 +26,10 @@ Also measured against the pinned Papra and encoded rather than guessed:
 empty `name` is a 400. The wire names are `name`, `documentDate`, `notes`.
 """
 
+import hashlib
 import json
 import logging
+import sqlite3
 import sys
 from dataclasses import replace
 from types import SimpleNamespace
@@ -175,6 +177,23 @@ class MetadataPapra(FakePapra):
             stored["documentDate"] = f"{stored['documentDate'][:10]}T00:00:00.000Z"
         self.documents[(org_id, document_id)].update(stored)
         return self.documents[(org_id, document_id)]
+
+
+class GateClosingIndex(ScriptedIndex):
+    """The delivery flag flips off in another process while the CLI walks the scope.
+
+    Flips between the first and the second reference, so the walk has already written one
+    document by the time it meets the closed gate — the case whose report must survive.
+    """
+
+    def __init__(self, store, document=None) -> None:
+        super().__init__(document)
+        self.store = store
+
+    async def get_document(self, document_id: int) -> KzDocument:
+        if len(self.reads) == 1:
+            self.store.set_setting("index_metadata_delivery", "false")
+        return await super().get_document(document_id)
 
 
 class WirePapra:
@@ -412,6 +431,37 @@ async def test_a_refused_patch_records_nothing_and_leaves_the_field_retriable(st
     assert store.ledger_get(ORG, DOC_ID).written_name == "Rechnung 4711"
 
 
+async def test_a_lost_record_after_a_landed_patch_names_the_values_it_lost(store, fake_papra,
+                                                                          caplog):
+    """The one ordering hole left: Papra has the values, the ledger never heard about them.
+
+    If `ledger_record_metadata` fails after the PATCH landed, the next pass reads our own
+    write as somebody else's and protects the field for good. This test pins the recovery
+    rather than the damage: the ERROR line has to name the values, because the only way back
+    is writing that history by hand, and a log line that says "recording failed" cannot be
+    acted on.
+
+    The exception still travels. Nothing here pretends to have made the write durable, and no
+    provisional "maybe delivered" state is invented: a column that claimed a value might be
+    ours is a licence to overwrite a human's, which is the one unrecoverable act on this path.
+    """
+    open_gate(store)
+
+    def lose(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    store.ledger_record_metadata = lose
+    caplog.set_level(logging.ERROR, logger="papra_suite.indexing")
+
+    with pytest.raises(sqlite3.OperationalError):
+        await deliver_metadata(fake_papra, store, ref_with(), kz_doc())
+
+    assert fake_papra.patch_calls == 1          # Papra really was written
+    assert store.ledger_get(ORG, DOC_ID).written_name is None
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Rechnung 4711" in text and NOTE in text and "2025-10-01" in text, text
+
+
 # --------------------------------------------------------------------------------
 # Step 1d: `name` — the one field a human definitely edits
 # --------------------------------------------------------------------------------
@@ -511,6 +561,74 @@ async def test_the_ledger_row_is_required_rather_than_the_callers_memory(store, 
         await deliver_metadata(fake_papra, store, orphan, kz_only(title="Rechnung 4711"))
 
     assert fake_papra.patch_calls == 0
+
+
+def test_a_permanently_failed_index_row_makes_the_next_enqueue_a_noop(store):
+    """Today's trap, pinned so Task 11's migration has to invert it on purpose.
+
+    The job kind this path fails is `index` — there is no metadata job kind — and the verdict
+    above is permanent, which `worker_loop` writes as `status='failed'` via
+    `mark_job_failed(..., max_attempts=1)`. `enqueue_job` is `INSERT OR IGNORE` against the
+    *unique* `idx_jobs_idempotency (kind, org, document, content_hash)`, so from that moment
+    every later enqueue for those same bytes is a silent no-op returning the failed row's id.
+    Every re-admission move works by enqueuing exactly that tuple — Task 9's restore and
+    unbind, Task 15's backfill — so a restore can report success and enqueue nothing.
+
+    The durable fix is Task 11's partial unique index; until it lands the escape is
+    `jobs --reset` on that row. This test describes the trap, not the intended behaviour.
+    """
+    job_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
+                               content_hash=HASH, payload={"file_hash": HASH})
+    store.mark_job_failed(job_id, "no ledger reference", max_attempts=1)
+    assert store.get_job(job_id).status == "failed"
+
+    again = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
+                              content_hash=HASH, payload={"file_hash": HASH,
+                                                          "ingested_via": "restore"})
+
+    assert again == job_id, "a new id would imply a new row that nobody can claim"
+    assert store.get_job(again).status == "failed"
+    assert store.claim_next_job("index") is None
+    assert len([job for job in store.list_jobs() if job.kind == "index"]) == 1
+
+
+async def test_a_permanently_failed_index_job_names_the_lock_it_leaves(store, caplog):
+    """The consequence has to be in the log, not only in a plan document.
+
+    `check`'s counters are all ledger-derived, so a `done` job flipping to `failed` moves no
+    number an operator reads; the ERROR line is the only place this failure is written down.
+    It must therefore say what the failure costs — that this document cannot be re-enrolled
+    until the row is reset — otherwise the operator reads "failed" as "it will try again".
+    """
+    from papra_suite.pipeline import worker_loop
+
+    job_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
+                               content_hash=HASH, payload={"file_hash": HASH})
+
+    async def handler(job):
+        raise indexing.IndexFailed("no ledger reference: history is gone", permanent=True)
+
+    original_claim = store.claim_next_job
+    claims = {"n": 0}
+
+    def claim(kind):
+        claims["n"] += 1
+        if claims["n"] > 1:
+            raise _StopWorkerLoop()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    caplog.set_level(logging.ERROR, logger="papra_suite.pipeline")
+    try:
+        with pytest.raises(_StopWorkerLoop):
+            await worker_loop(store, kind="index", handler=handler)
+    finally:
+        store.claim_next_job = original_claim
+
+    assert store.get_job(job_id).status == "failed"
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "jobs --reset" in text, text
+    assert DOC_ID in text
 
 
 async def test_a_stale_snapshot_does_not_block_a_field_the_ledger_still_owns(store,
@@ -1018,10 +1136,10 @@ def test_check_names_both_metadata_writers_while_the_title_queue_drains(monkeypa
     It cannot be refused the way two content writers are: `legacy_workers` has to stay on
     while the queues drain, and the flag that drains them is the one being set. The second
     writer stops being fed — `on_job_done` refuses the ocr-done-to-title transition while
-    metadata is ours, for every intake path — but "stops being fed" is not "empty": the
-    title jobs already in flight do write Papra's `name`, and the ledger reads that as a human
-    edit. So the state is legible rather than refused, and `metadata_writer_state` carries the
-    whole argument.
+    metadata is ours, for every intake path — and `run_title_job` refuses the rows already in
+    the queue instead of writing a `name` the ledger would read as a human edit. "Stops being
+    fed" is not "empty", though, so the state is legible rather than refused, and
+    `metadata_writer_state` carries the whole argument.
     """
     from papra_suite.__main__ import main
 
@@ -1087,6 +1205,101 @@ def test_the_title_chain_is_still_fed_while_metadata_is_off(store):
     on_job_done(store, ocr_job, ocr_result="Rechnung ueber 1.234,56 Euro")
 
     assert _queued_kinds(store, "doc-new") == ["index", "ocr", "title"]
+
+
+class _StopWorkerLoop(BaseException):
+    """Stop seam for `worker_loop`. BaseException because the loop swallows Exception."""
+
+
+_TITLE_CONTENT = "Rechnung Nr. 42 – aktuell archivierter Inhalt"
+
+
+def _queued_title_job(store, papra, *, document_id: str = "doc_1"):
+    """Queue a title job whose `content_hash` really matches what Papra holds.
+
+    The hash has to match, or the job is skipped for staleness and the test proves nothing
+    about the metadata gate: `run_title_job`'s first guard already returns quietly.
+    """
+    papra.documents[ORG][document_id] = {"id": document_id, "name": "rechnung.pdf",
+                                         "mimeType": "application/pdf",
+                                         "content": _TITLE_CONTENT}
+    job_id = store.enqueue_job(kind="title", papra_org_id=ORG, document_id=document_id,
+                               content_hash=hashlib.sha256(
+                                   _TITLE_CONTENT.encode()).hexdigest(),
+                               payload={"name": "rechnung.pdf",
+                                        "excerpt": "Rechnung ueber 1.234,56 Euro"})
+    return store.get_job(job_id)
+
+
+async def _run_title_worker_once(store, papra, llm) -> None:
+    """Let the legacy title worker claim and finish one job, then stop it.
+
+    Driven through `worker_loop` rather than by calling the handler, because half of what
+    the skip has to achieve is that the row ends `done`: a skip that leaves the job
+    `pending` never lets the handover's drain proof reach zero.
+    """
+    from papra_suite.pipeline import run_title_job, worker_loop
+
+    original_claim = store.claim_next_job
+    claims = {"n": 0}
+
+    def claim(kind):
+        claims["n"] += 1
+        if claims["n"] > 1:
+            raise _StopWorkerLoop()
+        return original_claim(kind)
+
+    store.claim_next_job = claim
+    try:
+        with pytest.raises(_StopWorkerLoop):
+            await worker_loop(store, kind="title",
+                              handler=lambda job: run_title_job(papra, llm, job, store=store))
+    finally:
+        # Restore, or a second call re-wraps this wrapper and stops on its very first claim.
+        store.claim_next_job = original_claim
+
+
+async def test_a_queued_title_job_stops_writing_names_once_the_gate_is_open(store, caplog):
+    """Critical #1's consumer half: stopping the producer leaves the queue's leftovers live.
+
+    `on_job_done` refuses to *create* a title job while metadata delivery is ours, but the
+    rows already `pending` when an operator flips `PAPRA_INDEX_METADATA_DELIVERY` are still
+    claimed by the legacy title worker, and every one of them PATCHes Papra's `name` while
+    recording nothing in the ledger. The next metadata pass reads back a title it never
+    wrote, answers *not ours*, and sets `name_protected = 1` — permanently, and
+    byte-identical to a genuine human rename because protection is one bit with no
+    provenance. Bulk recovery is then `metadata --force --yes-i-mean-it`, which overwrites
+    every real rename in scope, and `--restore-auto` is a no-op for exactly these rows.
+
+    So the worker skips the job the way it already skips a stale one: nothing asked of the
+    LLM, nothing sent to Papra, and the row marked done so the drain proof can reach zero.
+    The second half flips the gate shut and shows the same worker still writing, which is
+    what kills a mutant that skips unconditionally.
+    """
+    from tests.test_workers import StubPapra, make_llm
+
+    open_gate(store)
+    papra = StubPapra()
+    llm, calls = make_llm(["Rechnung 42 – Möbel"])
+    job = _queued_title_job(store, papra)
+    caplog.set_level(logging.INFO, logger="papra_suite.pipeline")
+
+    await _run_title_worker_once(store, papra, llm)
+
+    assert papra.content_updates == [], "the legacy writer renamed a document we own"
+    assert papra.documents[ORG]["doc_1"]["name"] == "rechnung.pdf"
+    assert calls["n"] == 0, "a skipped title job still asked the model for a title"
+    assert store.get_job(job.id).status == "done"
+    assert sum("title job skipped" in r.getMessage() for r in caplog.records) == 1
+
+    # The pair: with the gate shut the same worker still titles documents, unchanged.
+    store.set_setting("index_metadata_delivery", "false")
+    still_ours = _queued_title_job(store, papra, document_id="doc_2")
+
+    await _run_title_worker_once(store, papra, llm)
+
+    assert papra.content_updates == [("doc_2", "Rechnung 42 – Möbel", None)]
+    assert store.get_job(still_ours.id).status == "done"
 
 
 def cli_args(**over):
@@ -1209,9 +1422,18 @@ def test_dry_run_prints_per_field_verdicts_and_patches_nothing(store, fake_papra
                                                               capsys):
     """All four verdicts, one line each per reference, and `patch_calls` empty.
 
-    The quiet half of the CLI's contract: `--dry-run` is what an operator reads before
-    letting the pass touch anything, so a dry run that writes is worse than a dry run
-    that lies.
+    The quiet half of the CLI's contract: `--dry-run` is what an operator reads after the
+    gate is open and before letting the pass touch anything, so a dry run that writes is
+    worse than a dry run that lies — and the write that matters here is not the PATCH.
+    A `protected` verdict sets a durable flag, permanently, and protection is the one thing
+    in this feature no later pass can undo. So the ledger row is asserted too: a rehearsal
+    that quietly protected the field it was rehearsing would be the worst mutation this path
+    can carry, and `patch_calls == 0` alone does not see it.
+
+    `date` cannot be covered by this fixture and does not need to be: the scripted index
+    carries no date, so its verdict is `skipped` and the protection branch is never reached.
+    Reaching a second `protected` verdict here would cost the `skipped` half of the
+    four-verdict assertion below.
     """
     from papra_suite.metadata_cli import run_metadata
 
@@ -1231,7 +1453,10 @@ def test_dry_run_prints_per_field_verdicts_and_patches_nothing(store, fake_papra
     assert code == 0
     out = capsys.readouterr().out
     assert fake_papra.patch_calls == 0
-    assert store.ledger_get(ORG, DOC_ID).written_name is None
+    row = store.ledger_get(ORG, DOC_ID)
+    assert row.written_name is None
+    flags = (row.name_protected, row.date_protected, row.notes_protected)
+    assert flags == (False, False, False), f"a dry run wrote a protection flag: {flags}"
     assert DOC_ID in out and quiet in out
     for verdict in ("written", "protected", "skipped", "unchanged"):
         assert verdict in out, f"{verdict} missing from:\n{out}"
@@ -1307,6 +1532,38 @@ def test_an_unreachable_index_row_is_counted_and_does_not_end_the_run(store, fak
     assert "unreadable" in out
     # the walk went on: the second reference really was renamed
     assert fake_papra.documents[(ORG, second)]["name"] == "Rechnung 4711"
+
+
+def test_the_gate_closing_mid_walk_stops_the_run_and_keeps_its_report(store, fake_papra,
+                                                                     tmp_path, capsys):
+    """The flag can close under a run that already started, and that is not a crash.
+
+    `deliver_metadata` re-reads the gate for every reference — that is the point of it — so a
+    flip in another process raises `DeliveryDisabled` from the middle of the walk. It was not
+    in the tuple that catches Papra's refusals, so it escaped `_walk`: the operator lost the
+    summary of what had already been written, which after a partial `--force` is the one thing
+    they need. Counting it as one more refusal per reference would be no better: every
+    remaining document answers identically, so the run grinds out a line each and stops
+    nowhere. It stops here, and says where.
+    """
+    from papra_suite.metadata_cli import run_metadata
+
+    open_gate(store)
+    for document_id, kreuzakt_id in (("doc-2", 8), ("doc-3", 9)):
+        seed_reference(store, document_id=document_id, kreuzakt_id=kreuzakt_id)
+        seed_papra_document(fake_papra, document_id, name=NAME)
+
+    index = GateClosingIndex(store)
+    code = run_metadata(configuration(tmp_path), cli_args(), store=store, papra=fake_papra,
+                        kreuzakt=index)
+
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "gate closed" in out, out
+    assert "1 of 3" in out, out
+    assert index.reads == [7, 8], "the walk kept going after the gate shut"
+    assert fake_papra.documents[(ORG, DOC_ID)]["name"] == "Rechnung 4711"   # already done
+    assert fake_papra.documents[(ORG, "doc-3")]["name"] == NAME             # never touched
 
 
 def test_the_cli_is_wired_into_the_entry_point(tmp_path, monkeypatch):

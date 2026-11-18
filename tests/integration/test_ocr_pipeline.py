@@ -89,7 +89,9 @@ async def test_ocr_and_title_end_to_end(stack):
         assert document_id in {d["id"] for d in documents}
 
         # title worker
-        await run_title_job(papra, title_llm, title_jobs[0])
+        # title worker. The metadata gate is at its default (off), so the legacy writer still
+        # owns `name` here; the gate's refusal is pinned in tests/test_metadata_delivery.py.
+        await run_title_job(papra, title_llm, title_jobs[0], store=store)
         updated = await papra.get_document(org_id, document_id)
         assert updated["name"] == "Rechnung 42 – Bestellung"
 

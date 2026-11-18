@@ -295,7 +295,7 @@ async def test_run_title_job_writes_generated_name(store):
     job = make_job(store, kind="title", content_hash=content_hash,
                    payload={"name": "rechnung.pdf", "excerpt": "Rechnung Nr. 42"})
 
-    await run_title_job(papra, llm, job)
+    await run_title_job(papra, llm, job, store=store)
 
     assert papra.content_updates == [("doc_1", "Rechnung 42 – Möbel", None)]
 
@@ -310,7 +310,7 @@ async def test_stale_title_job_skipped(store):
     job = make_job(store, kind="title", content_hash=stale_hash,
                    payload={"name": "rechnung.pdf", "excerpt": "alter Inhalt v1"})
 
-    await run_title_job(papra, llm, job)
+    await run_title_job(papra, llm, job, store=store)
 
     assert papra.content_updates == []  # nothing overwritten
     assert calls["n"] == 0  # no LLM call either
@@ -328,7 +328,7 @@ async def test_run_title_job_missing_content_is_treated_as_empty(store):
     job = make_job(store, kind="title", content_hash="hash-of-real-content",
                    payload={"name": "rechnung.pdf", "excerpt": "x"})
 
-    await run_title_job(papra, llm, job)  # must not raise AttributeError
+    await run_title_job(papra, llm, job, store=store)  # must not raise AttributeError
 
     assert papra.content_updates == []  # empty current content != the job's hash
     assert calls["n"] == 0  # skipped quietly, exactly like a stale job
