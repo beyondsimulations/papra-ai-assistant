@@ -992,6 +992,19 @@ v1's `deliver_content` returned early when Kreuzakt's hash equalled `delivered_s
   then the delivery flags). Remove the xfail marker in the same commit that flips it; a strict xfail that
   starts passing is a failing build, by design.
 
+- **Also owns (added after Task 6, because the whole redesign depends on it and nothing enforced it): a
+  startup refusal for two concurrent writers of `content`.** The measured root cause of the original
+  intermittency was Papra's own OCR worker and our writer both putting text in the same column. The handover
+  sequence below gets the order right **only if a human follows it**; the default is
+  `PAPRA_LEGACY_WORKERS=true`, so an operator who sets `PAPRA_INDEX_CONTENT_DELIVERY=true` and recreates the
+  container gets both writers back and the race returns with no new symptom to look at. Refuse to start when
+  `settings_flag("index_content_delivery")` is on **and** `legacy_workers` is true, with a message naming both
+  variables and the required order (legacy off, quiescence proven, delivery on). Do **not** refuse the opposite
+  combination — legacy off with delivery off is legitimate and temporary during the drain window — but log it
+  at error level and have `check` print `content writer: none (handover window)` so it cannot persist silently.
+  Both branches need tests; the refusal must be reachable before any network call, so a misconfigured container
+  fails at startup rather than after half-indexing a corpus.
+
 - Also produces (added after Task 4, which found the gap): `Store.ledger_delivered_refs(*, org_ids=None, limit=100) -> list[LedgerRef]` for the verification walk, and **this** is the task that writes `EMPTY_EXTRACTION_SHA` into `delivered_sha` — until it does, `ledger_stats()["extraction_empty"]` is a convincing `0` that means nothing, so a test must assert the counter moves.
 - Produces:
   - `async def deliver_content(papra, store, ref, kz_doc, *, generation) -> str` → `"delivered" | "skipped-empty" | "skipped-current"`
