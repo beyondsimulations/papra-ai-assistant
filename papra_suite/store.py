@@ -1659,6 +1659,47 @@ class Store:
                 raise
         return count
 
+    def ledger_repairs_in_window(
+        self, *, papra_org_id: str, papra_document_id: str,
+    ) -> int:
+        """How many repairs this reference has ALREADY spent inside the rolling window.
+
+        The read-only twin of `ledger_bump_repair`, and the reason it exists is a Task 7
+        review finding: when the convergence pass bumped before it wrote, a PATCH Papra
+        refused still cost a unit. A document whose write Papra persistently rejects (413,
+        403, a persistent 5xx) therefore walked itself into suppression without ever
+        having repaired once, and the suppression line then told the operator that two
+        writers were competing for the column — sending them to look for a writer that was
+        never there, because the real fault was a write that never landed. It is sticky
+        too: the bump refreshes `last_repair_at`, so every pass renewed the window it was
+        supposed to be escaping.
+
+        So the ceiling is answered here and spent by `ledger_bump_repair` only once the
+        text has actually been written. The ceiling still counts attempts rather than
+        successes in the sense the plan wanted — a repair that lands and diverges again an
+        hour later is the second loss whether or not Papra's answer was pleasant — but an
+        attempt that wrote nothing is not a loss, it is a refusal, and it is reported as
+        one.
+
+        Answers one less than `ledger_bump_repair` would in the same state (0 where the
+        bump returns 1), because the caller's repair is not in the number yet. Raises for
+        a reference that does not exist, on the same rule as the bump: the row is the only
+        thing that makes a repair countable, and answering 0 for a row we never saw would
+        let a caller write to a document it cannot vouch for.
+        """
+        cutoff = _iso(datetime.now(UTC) - timedelta(hours=REPAIR_WINDOW_H))
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT repair_count, last_repair_at FROM index_ledger"
+                " WHERE papra_org_id = ? AND papra_document_id = ?",
+                (papra_org_id, papra_document_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown ledger reference: {papra_org_id}/{papra_document_id}")
+        if row["last_repair_at"] is None or row["last_repair_at"] < cutoff:
+            return 0
+        return int(row["repair_count"])
+
     def ledger_stats(self, *, org_ids: list[str] | None = None) -> dict[str, int]:
         """Corpus counts for `check` and `index_status`.
 
@@ -1669,7 +1710,11 @@ class Store:
         * `indexed_current` — has an id in the current generation. Everything that
           answers "is the index healthy?" is generation-scoped, because after a
           rebuild a stale row is not indexed, it is backlog.
-        * `delivered` — we wrote text into Papra for it, in the current generation.
+        * `delivered` — we recorded a write for it in the current generation, blank
+          extraction included. It is a receipt for what we say we sent, not a statement
+          about what Papra's column holds now; only the convergence pass can say that.
+          Counted by `delivered_at IS NOT NULL`, which is why an `EMPTY_EXTRACTION_SHA`
+          row is inside it: `ledger_record_delivery` is the stamp for both.
 
         `indexed_current` and `delivered` count soft-deleted rows too: both answer
         "does a binding with this meaning exist in the index?", which a row still

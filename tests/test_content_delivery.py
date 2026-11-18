@@ -31,6 +31,7 @@ import pytest
 
 from papra_suite.indexing import (
     DeliveryDisabled,
+    IndexFailed,
     deliver_content,
     run_index_job,
     truncate_notes,
@@ -98,6 +99,30 @@ def add_papra_document(fake_papra, document_id: str, *, org: str = ORG,
         "mimeType": "application/pdf", "content": content,
         "originalSha256Hash": HASH, "isDeleted": False, "deletedAt": None,
     }
+
+
+class SelectivelyRefusingPapra(FakePapra):
+    """Papra that refuses the write for one document and answers normally for the rest.
+
+    `FakePapra.raise_on_update` is corpus-wide, which is the right shape for the worker
+    tests and useless for the convergence pass: the property worth pinning there is that
+    one document Papra refuses does not end the walk over the other four hundred. So the
+    refusal has to be addressable.
+    """
+
+    def __init__(self, *, refusing: str, error: PapraError) -> None:
+        super().__init__()
+        self.refusing = refusing
+        self.error = error
+
+    async def update_document(self, org_id: str, document_id: str, **body) -> dict:
+        if document_id != self.refusing:
+            return await super().update_document(org_id, document_id, **body)
+        # Recorded before the raise, exactly as the parent does: the write was attempted.
+        self.patch_calls += 1
+        self.patched.append((org_id, document_id, body))
+        raise self.error
+
 
 
 @pytest.fixture
@@ -345,6 +370,160 @@ async def test_the_extraction_empty_counter_moves(store, fake_papra):
     assert stats["delivered"] == 1              # the row is still of the current generation
 
 
+# --- a refused write, and a walk that survives one -------------------------------
+
+async def test_a_refused_write_does_not_spend_the_repair_budget(store, fake_kz, caplog):
+    """The document Papra will not take is not a document we keep losing to.
+
+    The suppression budget answers "how many times did we write this column and see it
+    change back". A PATCH Papra refused wrote nothing, so counting it means a document
+    whose upload Papra persistently rejects (413, 403, a persistent 5xx) reaches
+    suppression having never repaired once, and the pass then reports a second writer that
+    does not exist while the real fault is a write that never landed. Because a bump also
+    refreshes `last_repair_at`, that state is sticky across passes.
+    """
+    open_gate(store)
+    caplog.set_level(logging.INFO, logger="papra_suite.indexing")
+    papra = SelectivelyRefusingPapra(refusing=DOC_ID,
+                                     error=PapraError("PATCH document failed: 413 too large", 413))
+    indexed(store, fake_kz)
+    papra.document["content"] = PAPRA_TEXT
+
+    for _ in range(3):
+        result = await verify_once(store, papra, fake_kz)
+
+    assert (result.diverged, result.repaired, result.suppressed) == (1, 0, 0)
+    assert result.lookup_errors == 1
+    assert papra.patch_calls == 3
+    assert store.ledger_get(ORG, DOC_ID).repair_count == 0
+    assert store.ledger_stats()["repairs_24h"] == 0
+    # and the operator is never sent hunting for a writer that is not there
+    assert "diverged more than twice in 24h" not in caplog.text
+
+
+async def test_a_refusal_on_one_document_does_not_end_the_walk(store, fake_kz):
+    """One refused PATCH must cost one document, not the corpus.
+
+    Before this, `deliver_content` was awaited outside any `try`, so the PapraError left
+    `verify_once` entirely: every reference after the refused one was skipped and the
+    pass's whole `VerifyResult` was thrown away by the loop's blanket handler, leaving one
+    log line as the only evidence. The pass covers a few hundred documents, so that is a
+    corpus-wide blind spot caused by one bad document.
+    """
+    open_gate(store)
+    refusal = PapraError("PATCH document failed: 502 bad gateway", 502)
+    papra = SelectivelyRefusingPapra(refusing="doc-001", error=refusal)
+    for document_id in ("doc-001", "doc-002"):
+        seed_ref(store, document_id=document_id)
+        add_papra_document(papra, document_id)
+    fake_kz.document = kz_doc()
+
+    result = await verify_once(store, papra, fake_kz)
+
+    assert (result.scanned, result.diverged, result.repaired) == (2, 2, 1)
+    assert result.lookup_errors == 1
+    assert papra.documents[(ORG, "doc-001")]["content"] == PAPRA_TEXT   # refused, untouched
+    assert papra.documents[(ORG, "doc-002")]["content"] == KZ_TEXT
+    assert store.ledger_get(ORG, "doc-002").repair_count == 1
+    assert store.ledger_get(ORG, "doc-001").repair_count == 0
+
+
+# --- a document the user deleted in Papra ----------------------------------------
+
+async def test_a_document_in_the_papra_trash_is_neither_repaired_nor_charged(
+        store, fake_papra, fake_kz):
+    """Writing into a deleted document resurrects it by side effect, so we do not write.
+
+    `run_index_job` already refuses deleted documents for exactly this reason, and the
+    walk's own SQL excludes `deleted_at` rows for the same reason, but neither the pass's
+    fresh read nor the shared writer looked at Papra's own flag: with the ledger still
+    calling a trashed document live — which is every soft-deleted document until Task 9's
+    `reconcile_deletions` lands — the pass PATCHed the trash twice and then emitted the
+    suppression ERROR, spending `repairs(24h)` on a document nobody is fighting over.
+    """
+    open_gate(store)
+    indexed(store, fake_kz)
+    fake_papra.document["content"] = PAPRA_TEXT
+    fake_papra.document["isDeleted"] = True
+    fake_papra.document["deletedAt"] = "2026-11-18 09:00:00"
+
+    result = await verify_once(store, fake_papra, fake_kz)
+
+    assert (result.scanned, result.diverged, result.repaired, result.suppressed) == (
+        1, 0, 0, 0)
+    assert fake_papra.patch_calls == 0
+    assert store.ledger_get(ORG, DOC_ID).repair_count == 0
+    assert fake_papra.document["content"] == PAPRA_TEXT
+
+
+async def test_the_writer_refuses_a_document_papra_has_deleted(store, fake_papra, fake_kz):
+    """The same guard in `deliver_content`, because that is the shared write boundary.
+
+    The pass checks on its own read, and the worker checks at the top of the job; both
+    can be raced by a deletion between the two reads, and a future inbound trigger has no
+    such read at all. The permanent flag is the point: a retry answers the same way.
+    """
+    open_gate(store)
+    indexed(store, fake_kz)
+    ref = store.ledger_get(ORG, DOC_ID)
+    fake_papra.document["content"] = PAPRA_TEXT
+    fake_papra.document["deletedAt"] = "2026-11-18 09:00:00"
+
+    with pytest.raises(IndexFailed) as excinfo:
+        await deliver_content(fake_papra, store, ref, kz_doc(), generation=1)
+
+    assert excinfo.value.permanent is True
+    assert fake_papra.patch_calls == 0
+    assert store.ledger_get(ORG, DOC_ID).delivered_sha is None
+
+
+class DeletingOnSecondReadPapra(FakePapra):
+    """Papra where the user deletes the document between the pass's read and the writer's.
+
+    The shape of the race the shared-writer guard exists for: the pass looked at a live
+    record, so its own check cannot be the last word, and the refusal arrives from inside
+    the repair. What is worth pinning is not the refusal but the walk surviving it.
+    """
+
+    def __init__(self, *, deleting: str) -> None:
+        super().__init__()
+        self.deleting = deleting
+        self.reads: dict[str, int] = {}
+
+    async def get_document(self, org_id: str, document_id: str) -> dict:
+        document = await super().get_document(org_id, document_id)
+        if document_id != self.deleting:
+            return document
+        self.reads[document_id] = self.reads.get(document_id, 0) + 1
+        if self.reads[document_id] > 1:      # live to the pass, trashed to the writer
+            document["deletedAt"] = "2026-11-18 09:00:00"
+        return document
+
+
+async def test_a_deletion_between_the_two_reads_costs_one_document_not_the_pass(
+        store, fake_kz):
+    """The raced deletion is contained like any other refused repair.
+
+    A document deleted between the pass's read and the writer's raises out of
+    `deliver_content`, and an uncaught exception there is the Important-#1 failure again:
+    the remaining references skipped and the whole `VerifyResult` thrown away. So the pass
+    records one document and keeps walking.
+    """
+    open_gate(store)
+    papra = DeletingOnSecondReadPapra(deleting="doc-001")
+    for document_id in ("doc-001", "doc-002"):
+        seed_ref(store, document_id=document_id)
+        add_papra_document(papra, document_id)
+    fake_kz.document = kz_doc()
+
+    result = await verify_once(store, papra, fake_kz)
+
+    assert (result.scanned, result.diverged, result.repaired) == (2, 2, 1)
+    assert papra.documents[(ORG, "doc-001")]["content"] == PAPRA_TEXT
+    assert papra.documents[(ORG, "doc-002")]["content"] == KZ_TEXT
+    assert store.ledger_get(ORG, "doc-001").repair_count == 0
+
+
 # --- the convergence pass ---------------------------------------------------------
 
 async def test_papra_overwriting_us_is_detected_and_repaired(store, fake_papra, fake_kz):
@@ -437,10 +616,12 @@ async def test_repair_suppressed_after_two_divergences_in_24h(store, fake_papra,
     same fight burns a VLM round trip and a PATCH to lose the text again. So the pass
     counts the fight, stops joining it, and says so at ERROR.
 
-    The wording is pinned as well as the behaviour: it names the observable and the
-    document, never a culprit. Pointing at Kreuzakt's reprocess endpoint from a log line
-    would send the operator to restart the index over a race between two writers, which
-    is the opposite of the fix.
+    The wording is pinned as well as the behaviour, and in both directions: the line names
+    the observable and the document and no culprit, because the same counter is reached by
+    a second writer, by Papra's own extraction landing again after our write, and by a
+    delivery that raced a job nobody is fighting over. Pointing at Kreuzakt's reprocess
+    endpoint — or at "two writers" — sends the operator to look for a thing that may not
+    exist, which is the opposite of the fix.
     """
     open_gate(store)
     caplog.set_level(logging.INFO, logger="papra_suite.indexing")
@@ -458,6 +639,8 @@ async def test_repair_suppressed_after_two_divergences_in_24h(store, fake_papra,
     assert fake_papra.document["content"] == PAPRA_TEXT
     assert any("diverged more than twice in 24h" in record.getMessage()
                for record in caplog.records)
+    assert "this pass cannot say who wrote it" in caplog.text   # the neutral wording
+    assert "two writers are competing" not in caplog.text      # and no verdict
     assert "reprocess" not in caplog.text
     assert DOC_ID in caplog.text
 
@@ -628,6 +811,30 @@ async def test_the_walk_pages_the_ledger_and_sees_every_reference_once(store, fa
 
 
 # --- the notes cap, shipped here because Task 8 writes the field ------------------
+
+async def test_the_extraction_empty_counter_moves_with_the_gate_shut(store, fake_papra,
+                                                                     job, fake_kz):
+    """`extraction-empty` has to mean something in the configuration every deployment is in.
+
+    Until now the sentinel was written only on the delivery paths, and `verify_once`
+    returns the moment the gate is shut — so with `PAPRA_INDEX_CONTENT_DELIVERY=false`,
+    which is every deployment until the handover and the state README steps 1-2 tell the
+    operator to occupy for days, the number `check` advertises as "the count to look at
+    when a document should have been OCR'd and wasn't" could only ever read 0. Recording
+    emptiness is a ledger observation about the index, not a delivery, so the gate does
+    not govern it.
+    """
+    store.set_setting("index_content_delivery", "false")     # the default; said out loud
+    fake_kz.document = kz_doc(content="   \n")
+
+    outcome = await run_index_job(fake_kz, store, job, papra=fake_papra,
+                                  poll_s=0, wait_timeout_s=5)
+
+    assert outcome.delivered is False
+    assert fake_papra.patch_calls == 0
+    assert store.ledger_stats()["extraction_empty"] == 1
+    assert store.ledger_get(ORG, DOC_ID).delivered_sha == EMPTY_EXTRACTION_SHA
+
 
 def test_short_notes_are_returned_unchanged():
     assert truncate_notes("Rechnung über 1.234,56 €") == "Rechnung über 1.234,56 €"

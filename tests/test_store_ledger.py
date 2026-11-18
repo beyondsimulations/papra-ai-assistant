@@ -555,6 +555,49 @@ def test_repair_counter_is_per_reference(store):
     assert store.ledger_get("org-b", "doc-2").repair_count == 1
 
 
+def test_repairs_in_window_reads_the_window_without_spending_it(store):
+    """The read-only twin of `ledger_bump_repair`, for a ceiling checked before writing.
+
+    Task 7's review found that bumping before the PATCH let a write Papra *refused* spend
+    the suppression budget: a document whose upload Papra persistently rejects reached
+    suppression without ever having been repaired once, and the pass then blamed a second
+    writer. So the pass asks this question first and spends the unit only when the text
+    landed. It must therefore answer one thing exactly: what `ledger_bump_repair` would
+    return, minus the unit the caller has not spent yet — 0 in the state where the bump
+    returns 1.
+    """
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    assert store.ledger_repairs_in_window(papra_org_id="o", papra_document_id="d") == 0
+
+    assert store.ledger_bump_repair(papra_org_id="o", papra_document_id="d") == 1
+    assert store.ledger_repairs_in_window(papra_org_id="o", papra_document_id="d") == 1
+    assert store.ledger_bump_repair(papra_org_id="o", papra_document_id="d") == 2
+    assert store.ledger_repairs_in_window(papra_org_id="o", papra_document_id="d") == 2
+
+    # Reading is not spending: the bump's own arithmetic is untouched.
+    assert store.ledger_bump_repair(papra_org_id="o", papra_document_id="d") == 3
+
+
+def test_repairs_in_window_forgets_a_window_that_rolled_over(store):
+    """Same rolling rule as the bump, so a bad week cannot suppress a document forever."""
+    store.ledger_upsert_reference(papra_org_id="o", papra_document_id="d",
+                                  file_hash=H, papra_original_name="d.pdf")
+    store.ledger_bump_repair(papra_org_id="o", papra_document_id="d")
+    store.ledger_bump_repair(papra_org_id="o", papra_document_id="d")
+    assert store.ledger_repairs_in_window(papra_org_id="o", papra_document_id="d") == 2
+
+    store._conn.execute("UPDATE index_ledger SET last_repair_at = '2000-01-01T00:00:00+00:00'")
+    store._conn.commit()
+    assert store.ledger_repairs_in_window(papra_org_id="o", papra_document_id="d") == 0
+
+
+def test_repairs_in_window_on_unknown_reference_raises(store):
+    """The same fail-closed rule as `ledger_bump_repair`: a row we never saw is a caller bug."""
+    with pytest.raises(ValueError, match="unknown ledger reference"):
+        store.ledger_repairs_in_window(papra_org_id="o", papra_document_id="missing")
+
+
 def test_bump_repair_on_unknown_reference_raises(store):
     with pytest.raises(ValueError, match="unknown ledger reference"):
         store.ledger_bump_repair(papra_org_id="o", papra_document_id="missing")

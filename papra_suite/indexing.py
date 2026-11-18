@@ -230,9 +230,11 @@ async def _read_binding(kz, document_id: int) -> KzDocument | None:
 #: references can change between two pages of one walk. It is not a tuning knob.
 VERIFY_PAGE_SIZE = 100
 #: How many repairs one reference may lose inside `store.REPAIR_WINDOW_H` before the pass
-#: stops joining the fight and says so at ERROR. Two writers on one column cannot be won
-#: by writing harder; the third attempt costs a PATCH and a VLM round trip to lose the
-#: text again.
+#: stops joining the fight and says so at ERROR. Two writers on one column cannot be won by
+#: writing harder; the third attempt costs a PATCH and a VLM round trip to lose the text
+#: again. This is the number of repairs ALREADY SPENT that stops the pass, and a repair
+#: counts only when the write landed — `Store.ledger_repairs_in_window` is the read that
+#: answers it, precisely so that a write Papra refused cannot spend its way to suppression.
 MAX_REPAIRS_IN_WINDOW = 2
 #: Papra's own ceiling on the `notes` field. Asking for more does not produce a longer
 #: note, it produces a 4xx and a failed job.
@@ -245,6 +247,20 @@ TRUNCATION_MARKER = "…"
 DELIVERED = "delivered"
 SKIPPED_EMPTY = "skipped-empty"
 SKIPPED_CURRENT = "skipped-current"
+
+
+def papra_document_is_deleted(document: dict) -> bool:
+    """Is this Papra record in the trash? Papra answers; we do not infer.
+
+    One definition, used by the index job, the vanished-row branch, the convergence pass
+    and the writer itself, because the consequence of the two readings disagreeing is a
+    write into a document the user deleted: Papra resurrects it when the column changes,
+    so a "helpful" repair un-deletes something on purpose. Nothing on this branch sets the
+    ledger's own `deleted_at` — Task 9 owns `reconcile_deletions` — so for every
+    soft-deleted Papra document the ledger still considers live, the writer is the only
+    thing standing between the pass and the trash.
+    """
+    return bool(document.get("isDeleted") or document.get("deletedAt"))
 
 
 def sha_of(text: str) -> str:
@@ -325,6 +341,12 @@ async def deliver_content(papra, store: Store, ref: LedgerRef, kz_doc: KzDocumen
     does overwrite us afterwards, which is what `verify_once` is for. The write and the
     record are deliberately in that order — a refusal from Papra must leave the ledger
     claiming nothing.
+
+    A document Papra says it has deleted is refused here as well as upstream, and
+    permanently: this is the shared write boundary, so the caller that reaches it with a
+    stale read — the convergence pass, an inbound trigger, anything added later — gets the
+    same answer the index job gives. A retry cannot help, because the trash is not going
+    to un-delete itself.
     """
     if not store.settings_flag("index_content_delivery"):
         raise DeliveryDisabled(
@@ -339,6 +361,10 @@ async def deliver_content(papra, store: Store, ref: LedgerRef, kz_doc: KzDocumen
 
     sha = sha_of(kz_doc.content)
     current = await papra.get_document(ref.papra_org_id, ref.papra_document_id)
+    if papra_document_is_deleted(current):
+        raise IndexFailed(
+            f"document deleted in papra, not writing: {ref.papra_document_id}",
+            permanent=True)
     papra_content = current.get("content") or ""
     if sha == sha_of(papra_content):
         if ref.delivered_sha != sha:
@@ -375,8 +401,14 @@ class VerifyResult:
 
     `diverged` counts references where the two sides disagreed AND the index had text to
     give: a blank extraction that differs from Papra's text is reported in `empty`, not
-    as a divergence we cannot repair. `suppressed` is the subset we deliberately left
-    alone, and it is the number that says "go and find out who else is writing".
+    as a divergence we cannot repair. `suppressed` counts the references left alone because
+    they had already reached the ceiling of landed repairs inside the window — a count of
+    references, not a diagnosis of why the text keeps changing; the ERROR line beside each
+    one carries the document and the count, and nothing here can name the hand that
+    overwrote us. `lookup_errors` counts references this pass could not finish, for either
+    reason: a side that would not answer, or a repair Papra refused mid-write. Both mean
+    "this document was not converged by this pass", which is the only decision the loop
+    makes with it.
     """
 
     scanned: int = 0
@@ -402,6 +434,13 @@ async def verify_once(store: Store, papra, kz) -> VerifyResult:
     re-reads Papra on the repair path rather than trusting the value read here, because it
     is the shared write boundary and a caller's read is not its read; one extra GET on a
     document that already diverged is the cheaper side of that.
+
+    Two failures this pass must not commit, both found in review and both about what the
+    numbers it reports mean. It must not end because one document was refused: a
+    `PapraError` escaping here loses the whole `VerifyResult` and every reference after the
+    refused one, which turns one bad document into a corpus-wide blind spot. And a write
+    that never landed must not spend the repair budget: the ceiling answers "how many times
+    did we write this column and lose it again", and a refusal wrote nothing.
     """
     if not store.settings_flag("index_content_delivery"):
         # Not an error, and not a read either: a gate that queries first and refuses second
@@ -431,6 +470,16 @@ async def verify_once(store: Store, papra, kz) -> VerifyResult:
                 counts["lookup_errors"] += 1
                 continue
 
+            if papra_document_is_deleted(papra_document):
+                # Not a divergence, and not ours to repair. The ledger row is still live
+                # because nothing on this branch sets `deleted_at` — Task 9 owns
+                # `reconcile_deletions` — so every soft-deleted Papra document the ledger
+                # still considers live would otherwise be written into twice and then
+                # reported as a fight, spending `repairs(24h)` on the trash.
+                logger.info("papra=%s is deleted there, not repairing: the deletion pass "
+                            "owns this reference", ref.papra_document_id)
+                continue
+
             if extraction_is_empty(kz_doc.content):
                 counts["empty"] += 1
                 # Refused, not failed: spending the suppression budget here would mean a
@@ -450,22 +499,56 @@ async def verify_once(store: Store, papra, kz) -> VerifyResult:
                 continue
 
             counts["diverged"] += 1
-            # Bumped and READ before the repair, because the ceiling is about attempts
-            # rather than successes: a repair that diverged again an hour later is the
-            # second loss whether or not the PATCH came back 200.
-            repairs = store.ledger_bump_repair(papra_org_id=ref.papra_org_id,
-                                               papra_document_id=ref.papra_document_id)
-            if repairs > MAX_REPAIRS_IN_WINDOW:
+            # READ before the repair, spent after it lands. The ceiling is about repairs
+            # rather than about successes — a repair that diverged again an hour later is
+            # the second loss whether or not the PATCH was pleasant about it — but a write
+            # Papra refused landed nothing, and charging it walked persistently-refused
+            # documents into suppression while blaming a second writer that was never
+            # there. `store.ledger_repairs_in_window` is the read-only half of that.
+            repairs = store.ledger_repairs_in_window(papra_org_id=ref.papra_org_id,
+                                                     papra_document_id=ref.papra_document_id)
+            if repairs >= MAX_REPAIRS_IN_WINDOW:
                 counts["suppressed"] += 1
+                # The observable and the document, never a verdict: a second writer, this
+                # suite's own OCR landing after us, and a delivery that raced a job all
+                # reach this line, and the first is not more likely than the others.
                 logger.error(
                     "content diverged more than twice in 24h, leaving papra=%s alone "
-                    "(%d repairs this window); two writers are competing for this column",
+                    "(%d repairs this window); Papra no longer holds what we sent, and "
+                    "this pass cannot say who wrote it",
                     ref.papra_document_id, repairs)
                 continue
 
-            outcome = await deliver_content(papra, store, ref, kz_doc,
-                                            generation=generation)
+            try:
+                outcome = await deliver_content(papra, store, ref, kz_doc,
+                                                generation=generation)
+            except IndexFailed as error:
+                # The document reached the trash between this pass's read and the writer's
+                # own, and the writer refused it permanently. `diverged` already counted it,
+                # and that stays: at the moment we read it, the two sides really did
+                # disagree. What it does not cost is a repair unit or a lookup-error claim,
+                # and the walk moves on — which is the whole point of containing the repair
+                # rather than letting one document end the pass.
+                logger.info("papra=%s was deleted behind the pass: %s",
+                            ref.papra_document_id, error)
+                continue
+            except (PapraError, KreuzaktError) as error:
+                # The repair itself can fail after both sides answered — Papra refuses the
+                # PATCH, or one side is gone by the time the writer re-reads it. That is
+                # the same fact as a lookup error and gets the same treatment: counted, no
+                # budget spent, and the walk goes on to the next reference. `DeliveryDisabled`
+                # deliberately travels: the gate changed under a pass that had already
+                # promised not to write, which is news about the pass, not about a document.
+                logger.warning("verification could not repair papra=%s kreuzakt=%s: %s",
+                               ref.papra_document_id, ref.kreuzakt_id, error)
+                counts["lookup_errors"] += 1
+                continue
+
             if outcome == DELIVERED:
+                # Spent here, after the write landed and was recorded: the only event that
+                # deserves the unit, and the reason a refusal cannot reach suppression.
+                store.ledger_bump_repair(papra_org_id=ref.papra_org_id,
+                                         papra_document_id=ref.papra_document_id)
                 counts["repaired"] += 1
             elif outcome == SKIPPED_EMPTY:
                 # Unreachable under the check above, kept because the two definitions of
@@ -485,12 +568,21 @@ async def _outcome(papra, store: Store, job: Job, ref: LedgerRef, kreuzakt_id: i
     """Report what the index holds, and hand the text to Papra when the gate is open."""
     empty = extraction_is_empty(kz_doc.content)
     delivering = store.settings_flag("index_content_delivery")
-    if empty and not delivering:
-        # Reported, not interpreted: "extraction-empty" is a fact about the index,
-        # "legitimately blank" is a fact about the document, and nothing here can
-        # establish the second one. While the gate is open `deliver_content` logs the
-        # same fact as the reason it wrote nothing, and two lines per document is noise.
-        logger.info("extraction-empty papra=%s kreuzakt=%s", job.document_id, kreuzakt_id)
+    if empty:
+        # Recorded whatever the gate says. "extraction-empty" is a fact about the index and
+        # a line in the ledger, not a delivery, and gating it is how the count stayed a
+        # convincing zero in the one configuration every deployment is in until the
+        # handover: `check` advertises it as the number to look at when a document should
+        # have been OCR'd and wasn't, while steps 1-2 of the handover keep the gate shut for
+        # days. `deliver_content` stamps the same sentinel when it refuses for this reason,
+        # so both paths write the one value.
+        _record_extraction_empty(store, ref, kz_doc, generation)
+        if not delivering:
+            # Reported, not interpreted: "legitimately blank" is a fact about the document,
+            # and nothing here can establish it. While the gate is open `deliver_content`
+            # logs the same fact as the reason it wrote nothing, and two lines per document
+            # is noise.
+            logger.info("extraction-empty papra=%s kreuzakt=%s", job.document_id, kreuzakt_id)
     delivered = False
     if delivering:
         outcome = await deliver_content(papra, store, ref, kz_doc, generation=generation)
@@ -571,7 +663,7 @@ async def _papra_holds_document(papra, job: Job) -> bool:
         if error.status == 404:
             return False
         raise
-    return not (document.get("isDeleted") or document.get("deletedAt"))
+    return not papra_document_is_deleted(document)
 
 
 def _first_sight(store: Store, job: Job, document: dict) -> LedgerRef:
@@ -618,7 +710,7 @@ async def run_index_job(kz, store: Store, job: Job, *, papra,
     generation = store.get_generation()
 
     document = await papra.get_document(job.papra_org_id, job.document_id)
-    if document.get("isDeleted") or document.get("deletedAt"):
+    if papra_document_is_deleted(document):
         raise IndexFailed(f"document deleted in papra: {job.document_id}", permanent=True)
     current_hash = document.get("originalSha256Hash") or job.content_hash
     if current_hash != job.content_hash:

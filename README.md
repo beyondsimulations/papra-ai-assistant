@@ -405,9 +405,21 @@ ordered operation:
 
 1. Deploy the build with both flags off. Nothing about Papra's records changes; documents
    are indexed and the index fills.
-2. Let the corpus index. The sweep is the backfill: every document the ledger has never
-   held is queued as an `index` job. `check`'s `refs`/`current` counts are how far it has
-   got, and the queue's own state is in `state.db`:
+2. Let the corpus index. For what the sweep can see, the sweep is the backfill: every
+   document the ledger has never held is queued as an `index` job, and `check`'s
+   `refs`/`current` counts are how far it has got. Read the limit before trusting the
+   number. The sweep skips documents this suite has already marked *seen*, and
+   seen-with-no-ledger-row is a real population: every PDF emailed into the intake address
+   while the legacy writers were in charge was marked seen by the legacy OCR enqueue and
+   never ledgered, and oversized skips are marked the same way. Those documents appear in
+   **neither** `refs` **nor** `current`, and `check` cannot currently reveal them — it has
+   no count of Papra documents the ledger has never held. So it is possible to follow these
+   steps, read `112 current`, and still have months of emailed invoices outside the index.
+   The enrolment path is `papra-suite backfill`, which is Task 15 and not in this build;
+   Task 12 gives `check` an `unledgered=N` count so this blind spot becomes a number
+   instead of a paragraph. Until both exist, treat the indexed corpus as "everything
+   uploaded or discovered since the ledger started watching", and write that into the
+   handover notes rather than a bare `current` count.
 
    ```bash
    sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs GROUP BY 1, 2;"
@@ -452,17 +464,23 @@ content writer: suite ocr worker (legacy)
 ```
 
 - `refs` counts every row the ledger has ever held, deletions and stale bindings included;
-  `current` those bound to the live index generation; `delivered` those whose text Papra
-  holds as we last sent it. `current` below `refs` is stale bindings plus documents queued
-  for cleanup, which is what the last two fields split apart; `delivered` below `current`
-  means documents waiting for the flip or for a delivery that has not run.
+  `current` those bound to the live index generation; `delivered` those we last recorded
+  sending text for. `delivered` is a receipt for what this bridge says it sent, *including
+  the blank extractions it deliberately sent nothing for* — it is not a statement about what
+  Papra's column holds now, because Papra's own extraction can overwrite us afterwards. The
+  convergence pass, not this number, is what says Papra holds the text. `current` below
+  `refs` is stale bindings plus documents queued for cleanup, which is what the last two
+  fields split apart; `delivered` below `current` means documents waiting for the flip or
+  for a delivery that has not run.
 - `extraction-empty` counts documents the index holds *no* text for — a scanned page with
   nothing on it, or an extraction that failed. These are deliberately never written, so
   this is not a queue to drain. It is the count to look at when a document "should have
   been OCR'd and wasn't".
-- `repairs(24h)` is how often the convergence pass found Papra holding something else.
-  Non-zero right after the handover is expected once and then should go quiet; sustained
-  non-zero means a second writer is alive somewhere.
+- `repairs(24h)` is how often the convergence pass wrote Papra's text back inside a rolling
+  day — a count of repairs spent, not of divergences noticed, so a document Papra refuses
+  to accept writes for does not inflate it and a document the pass has stopped fighting does
+  not add to it either. Non-zero right after the handover is expected once and then should
+  go quiet; sustained non-zero means the text we send is not the text that stays.
 - `cleanup-pending (failed N)` is upstream deletes the ledger still owes, with the part the
   retries stopped on called out separately. A `failed` row can leave a deleted document in
   the index, so search still returns it; nothing in this build replays it by hand, so a

@@ -288,8 +288,10 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     if config.legacy_workers:
         # With the legacy writers switched off these loops are what keeps claiming from a
         # queue nobody is filling any more, and a drain is only provable when the loops are
-        # gone rather than merely idle: `jobs --kind ocr --status pending` empty twice a
-        # minute apart is the evidence the handover asks for.
+        # gone rather than merely idle. The evidence the handover asks for is the state
+        # database reading empty twice a minute apart:
+        # `sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs
+        # GROUP BY 1, 2;"` — no `ocr` row in `pending` or `running`, both times.
         for _ in range(config.ocr_concurrency):
             tasks.append(asyncio.create_task(worker_loop(
                 store, kind="ocr",
@@ -504,7 +506,7 @@ async def _verification_loop(store: Store, papra: PapraClient, kz, *,
                 # every six hours. Anything else is the record of the column drifting.
                 logger.info(
                     "verification: %d scanned, %d diverged, %d repaired, %d suppressed, "
-                    "%d extraction-empty, %d unreadable",
+                    "%d extraction-empty, %d read/repair errors",
                     result.scanned, result.diverged, result.repaired, result.suppressed,
                     result.empty, result.lookup_errors)
         except asyncio.CancelledError:

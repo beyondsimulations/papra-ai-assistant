@@ -29,8 +29,14 @@ import httpx
 import pytest
 
 from papra_suite.allowlist import parse_allowlist
-from papra_suite.indexing import index_upload_name, run_index_job, verify_once
-from papra_suite.kreuzakt_client import KreuzaktClient
+from papra_suite.indexing import (
+    SKIPPED_EMPTY,
+    deliver_content,
+    index_upload_name,
+    run_index_job,
+    verify_once,
+)
+from papra_suite.kreuzakt_client import KreuzaktClient, KzDocument
 from papra_suite.mail import poll_mailbox_once
 from papra_suite.papra_client import PapraClient
 from papra_suite.pipeline import enqueue_index_job, sweep_once
@@ -360,12 +366,14 @@ async def test_mail_intake_itself_creates_the_ledger_row_and_the_index_job(mail_
 # content claim below is "Papra's column equals what the index holds for that document",
 # which is the transport property the design actually promises.
 #
-# One requirement is deliberately NOT tested here: the blank-page rule. Driving it needs a
-# page this Kreuzakt configuration extracts to nothing, and that behaviour has never been
-# measured on the pinned image — an integration test for it would fail or pass depending on
-# what a model does with a blank scan, which is the opposite of what a stack test is for. It
-# is pinned in `tests/test_content_delivery.py` (four tests) and survives mutation by
-# deleting the guard.
+# The blank-page rule is tested here too, against a real document, and NOT by asking
+# Kreuzakt to extract nothing. That distinction matters: the half of the rule that depends
+# on a model returning an empty string for a text-less page is Kreuzakt's behaviour on a
+# pinned image where it was never measured, and asserting it would make a stack test depend
+# on a decoder we do not own. The half this task owns is ours and needs no model at all:
+# given empty index-side text and a real Papra record that holds text, no PATCH leaves. So
+# the document below is real and the empty text is fabricated — `deliver_content` takes the
+# index's text as an argument, which is exactly the seam the rule is written at.
 # --------------------------------------------------------------------------------
 
 @pytest.fixture
@@ -404,7 +412,6 @@ async def delivered(stack):
 
 async def test_a_delivery_replaces_papras_text_with_the_indexs(delivered, stack):
     """The phase-two promise, end to end: Papra's `content` becomes the index's text.
-
     `TEXT_LAYER_MARKER` is in both texts, so this is not a test that Papra's extraction is
     good; it is a test that the bytes Kreuzakt holds travelled into Papra intact, and that
     the ledger's `delivered_sha` describes exactly those bytes rather than something else
@@ -420,6 +427,38 @@ async def test_a_delivery_replaces_papras_text_with_the_indexs(delivered, stack)
     # mode, arriving as a surprise in Task 7.
     assert delivered["delivery_patches"] == [(delivered["document_id"],
                                               {"content": delivered["kz_content"]})]
+
+
+async def test_an_empty_extraction_leaves_a_real_papra_record_alone(delivered, stack):
+    """The blank-page rule against a real record: no PATCH, and the column byte-identical.
+
+    The text handed to the writer is fabricated empty on purpose. Asking Kreuzakt to
+    produce nothing needs a page this configuration extracts to nothing, which has never
+    been measured on the pinned image — that half of the rule belongs to a model, and a
+    stack test may not depend on it. What this task owns is entirely ours and needs no
+    model: with empty index-side text and a Papra document that really holds text, the
+    writer must refuse, must not even ask, and must leave Papra's bytes exactly as they
+    were. The guard is the one thing between a blank scan and a year of a document's text,
+    so it is proven against the real service and not only against a fake.
+
+    Two blanks are run, `""` and whitespace-only, because the classification is one function
+    over both and the second is the case a scanned page actually produces.
+    """
+    held = (await _papra_record(stack, delivered["document_id"]))["content"]
+    assert held == delivered["kz_content"]     # the fixture's delivery is what is there
+
+    for number, blank_text in enumerate(("", "   \n"), start=1):
+        blank = KzDocument(id=delivered["ref"].kreuzakt_id, title=f"blank-{number}",
+                           description="", content=blank_text, document_date=None,
+                           original_filename="papra-blank.pdf", updated_at=None)
+
+        result = await deliver_content(stack.papra, stack.store, delivered["ref"], blank,
+                                       generation=stack.store.get_generation())
+
+        assert result == SKIPPED_EMPTY, blank_text
+        assert stack.papra.patches == [], blank_text   # not even an attempt, let alone a write
+        document = await stack.papra.get_document(stack.org_id, delivered["document_id"])
+        assert document["content"] == held, blank_text  # byte for byte what it held
 
 
 async def test_a_late_papra_write_converges_back_on_the_next_pass(delivered, stack):
