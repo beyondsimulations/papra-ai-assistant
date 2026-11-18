@@ -1175,6 +1175,17 @@ Commit as `feat(index): content delivery and divergence-visible convergence`.
   - `async def deliver_metadata(papra, store, ref, kz_doc) -> MetadataResult(name_action, date_action, notes_action)`, each `"written" | "protected" | "unchanged" | "skipped"`
   - CLI `papra-suite metadata (--restore-auto | --force) [--org-id ID] [--document-id ID] [--field name|date|notes] [--dry-run]`
 
+- **Never deliver a synthetic name as a title (added after Task 7, because the test stack makes this
+  reachable).** Kreuzakt derives a title from the filename when it has no vision model configured, and every
+  filename it sees is our own `papra-<documentId>-<hash8>.pdf`. So on a keyless deployment the model title
+  *is* our upload name, and a naive metadata pass would push that string into the human-visible `name` field of
+  every document in the corpus — a corpus-wide rename to garbage, with `written_name` then recording it as ours
+  and every later pass treating it as authoritative. Refuse it before the ownership question is even asked: if
+  the candidate title matches the synthetic upload name for that document (exact, or with a ` (N)` collision
+  suffix), the verdict is `skipped`, nothing is PATCHed, and nothing is recorded. This is testable against the
+  live container precisely because the container is keyless — an integration test here is free, not
+  model-dependent.
+
 - [ ] **Step 1: Write the failing tests, including the baseline rules the review demanded**
 
 ```python
