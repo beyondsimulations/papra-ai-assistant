@@ -322,6 +322,24 @@ def _content_writer_line(config) -> str:
     return f"content writer: {content_writer_state(delivery, config.legacy_workers)}"
 
 
+def _metadata_writer_line(config) -> str:
+    """`metadata writer: ...` — who writes Papra's name, date and notes under this config.
+
+    Its own line rather than a clause on the content writer's, because the two columns
+    change hands on different flags, in different orders, and one can be handed over while
+    the other is not. The arrangement an operator has to be able to see is the one they set
+    by accident: delivery on with the legacy title worker still running, which prints
+    `two writers` rather than refusing, and stays true for exactly as long as the `ocr` and
+    `title` queues take to starve — see `metadata_writer_state`.
+    """
+    from papra_suite import indexing
+    from papra_suite.pipeline import metadata_writer_state
+
+    delivery = bool(config.index_metadata_delivery
+                    and indexing.METADATA_DELIVERY_IMPLEMENTED)
+    return f"metadata writer: {metadata_writer_state(delivery, config.legacy_workers)}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="papra-suite")
     parser.add_argument("--version", action="version", version=__version__)
@@ -358,6 +376,10 @@ def main() -> int:
                         help="only rows at or after that UTC date")
     events.add_argument("--json", action="store_true",
                         help="emit the records as JSON instead of one line each")
+
+    from papra_suite import metadata_cli
+
+    metadata_cli.add_subparser(sub)
 
     args = parser.parse_args()
 
@@ -401,6 +423,7 @@ def main() -> int:
         print(recent_events)
         print(index_line)
         print(_content_writer_line(config))
+        print(_metadata_writer_line(config))
         return 0
 
     if args.command == "replay":
@@ -442,6 +465,13 @@ def main() -> int:
 
     if args.command == "events":
         return _run_events(config, args)
+
+    if args.command == "metadata":
+        # Reached through the module, not by value: `tests/test_metadata_delivery.py` swaps
+        # `metadata_cli.run_metadata` to prove this dispatch exists, and a `from ... import
+        # run_metadata` here would bind the original at import time and make that test
+        # assert about a name nothing calls.
+        return metadata_cli.run_metadata(config, args)
 
     if args.command == "serve":
         import asyncio

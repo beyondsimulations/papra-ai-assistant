@@ -37,6 +37,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import date
 
 from papra_suite.kreuzakt_client import (
     AmbiguousCorrelation,
@@ -45,7 +46,13 @@ from papra_suite.kreuzakt_client import (
     KzDocument,
 )
 from papra_suite.papra_client import PapraError
-from papra_suite.store import EMPTY_EXTRACTION_SHA, Job, LedgerRef, Store
+from papra_suite.store import (
+    EMPTY_EXTRACTION_SHA,
+    PROTECTION_FIELDS,
+    Job,
+    LedgerRef,
+    Store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,16 +84,84 @@ def _stem(value: str) -> str:
     return collapsed
 
 
-def index_upload_name(job: Job) -> str:
-    """The name this job's bytes are uploaded under: `papra-<docId>-<hash8>.pdf`.
+def synthetic_upload_name(document_id: str, file_hash: str) -> str:
+    """The name this bridge uploads a document under: `papra-<docId>-<hash8>.pdf`.
 
     Deterministic, so a re-upload of the same document lands on the same name and
-    Kreuzakt's dedup keeps one document, and self-describing, so a row in the
-    queue can be traced to a Papra document by eye. The alphabet is `[a-z0-9.-]`
-    plus `.pdf` and nothing else — see `_stem`.
+    Kreuzakt's dedup keeps one document, and self-describing, so a row in the queue can be
+    traced to a Papra document by eye. The alphabet is `[a-z0-9.-]` plus `.pdf` and nothing
+    else — see `_stem`.
+
+    Named for what it is to the user, not only for how it is built: this string is the
+    reason `is_synthetic_upload_name` exists. A title derived from it is our own text
+    arriving back at us, and delivering it into Papra's human-visible `name` renames the
+    corpus to garbage. See `deliver_metadata`.
     """
-    stem = f"papra-{_stem(job.document_id)}-{_stem(job.content_hash)[:8]}"
-    return f"{stem}.pdf"
+    return f"papra-{_stem(document_id)}-{_stem(file_hash)[:8]}.pdf"
+
+
+def index_upload_name(job: Job) -> str:
+    """The upload name for one job's bytes — `synthetic_upload_name` seen from a job."""
+    return synthetic_upload_name(job.document_id, job.content_hash)
+
+
+_COLLISION_SUFFIX = re.compile(r"\s*\(\d+\)$")
+_SEPARATORS_OUT = re.compile(r"[\s_.\-]+")
+#: Our own shape with any document id and any hash: `papra-<id>-<8 hex>`. The id may
+#: contain separators of its own (Papra's are uuids), so the only reliable anchor is the
+#: prefix and the eight hex digits at the end.
+_SYNTHETIC_SHAPE = re.compile(r"^papra-.+-[0-9a-f]{8}$", re.IGNORECASE)
+
+
+def _upload_stem(name: str) -> str:
+    """A name reduced to the form our upload stem arrives in, for comparison only.
+
+    Two transformations have to be undone before a title can be compared with our upload
+    name at all. Both servers append ` (1)`, ` (2)`… when a name collides, and they put it
+    BEFORE the extension (`papra-doc-1-a1b2c3d4 (1).pdf`), so the extension comes off first
+    and the suffix second — the other order leaves the suffix in and the guard misses every
+    second copy of a document, which is the case a synthetic name is most likely to be
+    found in. And the title a keyless Kreuzakt derives from a filename is the *prettified*
+    filename: measured on the pinned container, `papra-doc-1-a1b2c3d4.pdf` comes back as
+    `Papra Doc 1 A1b2c3d4`. So separators — space, dot, underscore, hyphen — collapse to one
+    form, and case is folded away at the call site because prettifying capitalises words.
+    """
+    stem = (name or "").strip()
+    if stem.lower().endswith(".pdf"):
+        stem = stem[:-4]
+    stem = _COLLISION_SUFFIX.sub("", stem)
+    return _SEPARATORS_OUT.sub("-", stem).strip("-")
+
+
+def is_synthetic_upload_name(name: str, *, document_id: str, file_hash: str) -> bool:
+    """Is `name` our own upload name for THIS document, in any form it reaches us in?
+
+    Exact, with or without `.pdf`, with a ` (N)` collision suffix, or prettified into a
+    title. All four are the same string by the time the servers are done with it, and a
+    guard that caught only one of them would be a guard an operator could step over by
+    uploading twice.
+    """
+    if not (name or "").strip():
+        return False
+    ours = _upload_stem(synthetic_upload_name(document_id, file_hash))
+    return _upload_stem(name).casefold() == ours.casefold()
+
+
+def looks_like_synthetic_upload_name(name: str) -> bool:
+    """Does `name` have our shape, whatever document it belongs to?
+
+    The pair to `is_synthetic_upload_name`, and needed because the two answers differ in
+    the direction that matters. A reference can point at a Papra document whose name is
+    our upload name for a *different* hash — a document re-ingested after its bytes moved,
+    or a row whose ledger hash is behind — and that string is no more ours to deliver as a
+    title than our own is.
+
+    It errs the other way on purpose: a genuine name that happens to end in eight
+    hex-looking characters (`Papra-Rechnung-20250101`) is refused as a rename target, which
+    costs a title, while the reverse error costs a corpus-wide rename. Refusing is the
+    cheap side of that trade.
+    """
+    return bool(_SYNTHETIC_SHAPE.match(_upload_stem(name)))
 
 
 # --- the handler ------------------------------------------------------------------
@@ -99,6 +174,16 @@ def index_upload_name(job: Job) -> str:
 # `from papra_suite.indexing import CONTENT_DELIVERY_IMPLEMENTED`), so the documented way
 # of exercising a build without the path still works from a test.
 CONTENT_DELIVERY_IMPLEMENTED = True
+
+#: Whether THIS build can write Kreuzakt's title, date and note into Papra. The same seam
+#: as above and a sharper need: `PAPRA_INDEX_METADATA_DELIVERY` was advertised in the
+#: README as configurable while nothing in the build read it, which is the `OCR_LANGUAGES`
+#: shape — an operator sets a flag, sees nothing happen, and has nothing to blame but the
+#: documentation. Seeding the setting from this attribute is what stops that repeating: a
+#: build without the path keeps the legacy title writer in charge and says so in the log,
+#: rather than promising renames and delivering silence. Read as an attribute OF THIS
+#: MODULE, never imported by value, so the documented way to exercise such a build works.
+METADATA_DELIVERY_IMPLEMENTED = True
 
 DEFAULT_POLL_S = 2.0
 DEFAULT_WAIT_TIMEOUT_S = 900.0
@@ -139,6 +224,11 @@ class IndexOutcome:
     content_len: int
     empty_content: bool
     delivered: bool
+    #: What this job delivered into `name`/`documentDate`/`notes`, or None when the metadata
+    #: gate was shut. Kept apart from `delivered` because the columns have separate gates:
+    #: `delivered=True, metadata=None` is a normal configuration (the text ours, the titles
+    #: not), and collapsing the two would make the metadata flip unauditable from the log.
+    metadata: MetadataResult | None = None
 
 
 class IndexFailed(Exception):
@@ -177,7 +267,11 @@ class IndexTimeout(Exception):
 
 
 class DeliveryDisabled(Exception):
-    """The `index_content_delivery` gate is shut, so this write is refused.
+    """A delivery gate is shut, so this write is refused.
+
+    Raised by both writers — `index_content_delivery` for `content`, `index_metadata_delivery`
+    for `name`/`documentDate`/`notes` — because both are asked the same question by the same
+    callers.
 
     An exception rather than a `False`: the callers that reach this with the gate shut are
     the ones that were not told to check it — the convergence pass, an inbound trigger, a
@@ -187,7 +281,8 @@ class DeliveryDisabled(Exception):
 
     The index worker is the one caller that does not raise, and it does not need to: for a
     worker a shut gate is the normal configuration rather than an incident, so it reports
-    `delivered=False` instead of failing a job nobody asked to have failed.
+    `delivered=False` and no metadata result instead of failing a job nobody asked to have
+    failed.
     """
 
 
@@ -395,6 +490,363 @@ async def deliver_content(papra, store: Store, ref: LedgerRef, kz_doc: KzDocumen
     return DELIVERED
 
 
+# --- metadata delivery -------------------------------------------------------------
+
+#: The three fields this pass may write, which are exactly the three that can be
+#: protected. One list, imported from the store rather than repeated here: a fourth
+#: writable column would otherwise have to be added in two places, and the second one is a
+#: `ValueError` from `ledger_protect` far away from the cause.
+METADATA_FIELDS = PROTECTION_FIELDS
+
+#: What one field's verdict was. Four, because three different nothings have to be told
+#: apart by whoever reads the CLI's output: `protected` is "a human owns this now",
+#: `skipped` is "the index has nothing to say", `unchanged` is "Papra already holds it".
+METADATA_WRITTEN = "written"
+METADATA_PROTECTED = "protected"
+METADATA_UNCHANGED = "unchanged"
+METADATA_SKIPPED = "skipped"
+
+#: Where each field lives, in the three vocabularies it passes through: Papra's record as
+#: read, `PapraClient.update_document`'s keyword, and Papra's request body. The middle one
+#: differs on exactly one field (`document_date` → `documentDate`), which is why all three
+#: are written down rather than derived by guesswork.
+_PAPRA_FIELD = {"name": "name", "date": "documentDate", "notes": "notes"}
+_CLIENT_FIELD = {"name": "name", "date": "document_date", "notes": "notes"}
+
+_ISO_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+def normalize_date(value: str | None) -> str | None:
+    """The index's date as Papra's `documentDate` input: ISO `YYYY-MM-DD`, or None.
+
+    Nothing else is accepted, and the reason is a measured 400 rather than taste. Sending
+    `1. Oktober 2025` does not lose the date, it fails the whole PATCH — and the date
+    shares that request with the title and the note, so one free-text date from the model
+    would cost the other two fields their delivery and fail the job. So:
+
+    * `2025-10-01` (with surrounding whitespace tolerated) → `2025-10-01`;
+    * a real-looking impossibility (`2025-02-30`, `2025-13-01`) → None, because Papra would
+      answer 400 for those too;
+    * empty, missing, or prose → None.
+
+    None means *skip the field*, which is not the same as protecting it: the model's
+    silence says nothing about who owns the column, and a pass that protected fields it had
+    nothing to write would freeze the whole corpus on the first document with no date.
+
+    Papra's own stored form (`2025-10-01T00:00:00.000Z`) is deliberately not accepted here:
+    this reads what the index holds. What Papra holds is read by `_stored_date`.
+    """
+    text = (value or "").strip()
+    match = _ISO_DATE.fullmatch(text)
+    if not match:
+        return None
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        date(year, month, day)
+    except ValueError:
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _stored_date(value) -> str | None:
+    """Papra's `documentDate` as a bare ISO day, or None when it is not a day we recognise.
+
+    Measured on the pinned container: a date we send as `2025-10-01` is stored and read
+    back as `2025-10-01T00:00:00.000Z`. Comparing raw strings would therefore call our own
+    write a human edit, and protection is permanent — one pass would protect `date` on
+    every document in the corpus and never write it again. That is worse than the error it
+    guards against, so the comparison happens at day resolution.
+
+    A value that is not a recognisable day comes back None as well, and the caller treats
+    that as *protected*: an unparseable date is still a value somebody put there, and this
+    pass has no business overwriting it.
+    """
+    text = str(value or "").strip()
+    return normalize_date(text[:10]) if len(text) >= 10 else None
+
+
+def _comparable(field: str, value) -> str:
+    """One field's value in the form used for "did anything change?".
+
+    Dates compare as days for the reason in `_stored_date`; text compares with surrounding
+    whitespace gone, because a trailing space in a title is not a human edit and Pretend
+    it is protects a field over a difference nobody can see.
+    """
+    if field == "date":
+        return _stored_date(value) or str(value or "").strip()
+    return str(value or "").strip()
+
+
+@dataclass(frozen=True)
+class OwnershipVerdict:
+    """Whether a field is ours to write, and if not, which rule says so.
+
+    `reason` names the rule rather than carrying prose, because the log line and the CLI's
+    count both need to distinguish "a human renamed this" from "Papra had already inferred
+    a date" — those two send an operator to different places.
+    """
+
+    owned: bool
+    reason: str
+
+
+def ownership(ref, *, field: str, current) -> OwnershipVerdict:
+    """Is this field ours to write? A heuristic, not a compare-and-swap.
+
+    Papra offers no conditional write, so a rename landing between our read and our write
+    is overwritten; the worst case is one lost rename, never lost text. Given that, the
+    order below is a ranking of what this pass is willing to be wrong about, and each
+    refusal names itself:
+
+    * `protected` — a human took this field once, and the flag is durable. Nothing further
+      down can override it; `papra-suite metadata --restore-auto` is the way back.
+    * `synthetic-name` — our own upload name in Papra's `name` proves nothing about a human
+      leaving it alone, so it is not ours to overwrite either. Checked before the baseline
+      deliberately: a reference whose `papra_original_name` came in looking like our upload
+      name would otherwise read as "Papra still holds what we first saw".
+    * `not-ours` — we wrote a value here and Papra no longer holds it.
+    * the baseline, per field. For `name` that is `papra_original_name`, which is Papra's
+      own name for the document at the moment we first saw it. **Kreuzakt's
+      `original_filename` is not consulted anywhere in this function**: it holds our
+      `papra-<documentId>-<hash8>.pdf` for every document in the corpus, because we named
+      the file when we uploaded it, so measuring a human's rename against it measures
+      nothing at all. For `date` and `notes` there is no baseline to have, so the first
+      write requires an empty Papra value: `empty-required` says a value we cannot attribute
+      might be a human's, and Papra does run its own date detection.
+
+    `current` is Papra's value as read, in whatever form Papra stores it.
+    """
+    if getattr(ref, f"{field}_protected"):
+        return OwnershipVerdict(False, "protected")
+    if field == "name" and (
+        is_synthetic_upload_name(current or "", document_id=ref.papra_document_id,
+                                 file_hash=ref.file_hash)
+        or looks_like_synthetic_upload_name(current or "")
+    ):
+        return OwnershipVerdict(False, "synthetic-name")
+    ours = getattr(ref, f"written_{field}", None)
+    if ours is not None:
+        if _comparable(field, current) == _comparable(field, ours):
+            return OwnershipVerdict(True, "")
+        return OwnershipVerdict(False, "not-ours")
+    if field == "name":
+        if _comparable(field, current) == _comparable(field, ref.papra_original_name):
+            return OwnershipVerdict(True, "")
+        return OwnershipVerdict(False, "no-baseline")
+    return OwnershipVerdict(not _comparable(field, current),
+                            "" if not _comparable(field, current) else "empty-required")
+
+
+def _metadata_candidate(field: str, kz_doc: KzDocument) -> str | None:
+    """What the index has to say about one field, or None when it has nothing to say.
+
+    None means *skip*, and it is a different answer from the empty string: silence about a
+    field says nothing about who owns it, while a value Papra holds is a claim somebody
+    made. Conflating them is how a document with no date ends up with its date protected.
+
+    `notes` is truncated here rather than at the write, so the comparison, the request body
+    and the ledger record are all the same string. Truncating only when sending would leave
+    `written_notes` holding text Papra never received, and the next pass would then read a
+    human's shorter note as an edit — the truncation itself would look like vandalism.
+    """
+    if field == "name":
+        return (kz_doc.title or "").strip() or None
+    if field == "date":
+        return normalize_date(kz_doc.document_date)
+    return truncate_notes((kz_doc.description or "").strip()) or None
+
+
+@dataclass(frozen=True)
+class MetadataResult:
+    """What one metadata delivery did, as one verdict per field.
+
+    Per field rather than one boolean, because the three fields have three different
+    histories on the same document — a renamed file, a date Papra inferred, a note the user
+    typed — and an operator deciding whether to run `--restore-auto` needs to know which
+    one the pass refused and why. `skipped` on all three is a different situation from
+    `protected` on all three, and only the field-level view can say which.
+    """
+
+    name_action: str
+    date_action: str
+    notes_action: str
+
+
+def _result(actions: dict) -> MetadataResult:
+    """Build the result from the per-field verdicts this pass collected.
+
+    A function for one line, because the keys are the field names while the dataclass's are
+    `name_action`, `date_action`, `notes_action`, and `MetadataResult(**actions)` is a
+    `TypeError` at the end of a delivery that already wrote to Papra. Deriving the suffix
+    once here keeps the four verdict constants and the three field names as the only two
+    vocabularies in this module.
+    """
+    return MetadataResult(**{f"{field}_action": actions[field]
+                             for field in METADATA_FIELDS})
+
+
+async def deliver_metadata(papra, store: Store, ref: LedgerRef, kz_doc: KzDocument, *,
+                           fields=None, force: bool = False,
+                           dry_run: bool = False) -> MetadataResult:
+    """Write Kreuzakt's title, date and note into Papra, unless a human owns the field.
+
+    The gate is checked here, in the writer, for the same reason `deliver_content` checks
+    its own: the scheduler is not the only door, and a flag that only the loop consults is
+    bypassed by the CLI, the convergence pass and whatever path gets added next. It is
+    checked before the document is read, so a refused call leaves no GET on a record it was
+    not allowed to touch.
+
+    **A synthetic title is refused before the ownership question is asked.** A keyless
+    Kreuzakt derives a title from the filename, and the filename is always ours, so the
+    model's "title" for such a deployment is `papra-doc-1-a1b2c3d4` — and Papra's prettified
+    version of it, `Papra Doc 1 A1b2c3d4`, is what a real pass would read back as the
+    current name. Delivering that renames every document in the corpus to our own upload
+    garbage and then records it in `written_name` as authoritative, so every later pass
+    defends the garbage. The verdict is `skipped`: not a human edit, so it must not protect,
+    and not a write, so it must not record.
+
+    **The ledger row is the authority on ownership, not the reference this caller is holding.**
+    `deliver_metadata` re-reads it, and refuses outright when no row answers: every caller
+    obtains its reference from that table, so a row that has disappeared means the history
+    saying which fields are ours was removed on purpose. A reference is an address here, not a
+    record of the past.
+
+    One PATCH for all the fields that changed, and nothing else in its body: `content` is
+    Task 7's column with its own gate, and a request that mixed them would make a title
+    change cost a text rewrite. The write is recorded only after Papra accepts it, so a 400
+    or a 500 claims nothing and every field stays retriable. `written_*` is then stamped with
+    the string this pass sent — and, for a field that needed no write, with the identical
+    string it checked and endorses. Never with the model's longer pre-truncation original:
+    the column exists to answer "is Papra still holding what we sent?", and a value Papra
+    never received cannot answer that — recording it would make our own truncation look like
+    a human edit on the next pass.
+
+    `fields` scopes the pass (the CLI's `--field`); fields outside the scope are reported
+    `skipped` and are neither compared nor written. `force` overrides protection for this run
+    only — the durable flag stays set, because `--restore-auto` is the command that means
+    "forever". `dry_run` answers with the verdicts and changes neither Papra nor the ledger,
+    including the protection flags: a dry run that sets a flag is not a rehearsal.
+    """
+    if not store.settings_flag("index_metadata_delivery"):
+        raise DeliveryDisabled(
+            f"metadata delivery is off (PAPRA_INDEX_METADATA_DELIVERY), so papra://"
+            f"{ref.papra_org_id}/{ref.papra_document_id} was not touched")
+
+    scope = METADATA_FIELDS if fields is None else tuple(fields)
+    unknown = sorted(set(scope) - set(METADATA_FIELDS))
+    if unknown:
+        raise ValueError(
+            f"not metadata fields: {', '.join(unknown)}; this pass writes only "
+            f"{', '.join(METADATA_FIELDS)}")
+
+    document = await papra.get_document(ref.papra_org_id, ref.papra_document_id)
+    if papra_document_is_deleted(document):
+        # The same containment `deliver_content` applies, from the same single definition of
+        # "deleted": Papra resurrects a trashed document when a column changes, so a
+        # metadata write into one un-deletes it deliberately. The ledger still calls this
+        # reference live until Task 9's pass owns deletes, so nothing upstream would have
+        # noticed.
+        raise IndexFailed(
+            f"document deleted in papra, not writing metadata: {ref.papra_document_id}",
+            permanent=True)
+
+    # The ledger row, read now, is the authority on this reference's field history — not the
+    # snapshot the caller is holding. The worker's `ref` was read when its job started and the
+    # CLI's may come from another process entirely, and staleness cuts both ways, which is why
+    # this is a re-read rather than a conservative merge:
+    #
+    # * a protection flag the caller does not know about must stop the write, because
+    #   overwriting a human's value is the one unrecoverable act available here;
+    # * a `written_*` the caller still believes in may already have been superseded by another
+    #   delivery, and Papra holding that older value is then a change nobody here accounted
+    #   for — possibly a human putting a previous title back. Trusting the stale column would
+    #   call it ours and overwrite it.
+    #
+    # So the row wins in both directions, and a `--restore-auto` that cleared a protection in
+    # another process is honoured rather than second-guessed.
+    #
+    # And when no row answers, this refuses rather than falling back to the snapshot. Every
+    # caller reads its reference out of this same table, so a row that has gone away means
+    # someone deleted the reference — the cleanup pass, or an operator — and the history that
+    # authorises a write went with it. Writing on from the caller's `ref` at that moment would
+    # be writing on the strength of history that was deliberately removed.
+    current_ref = store.ledger_get(ref.papra_org_id, ref.papra_document_id)
+    if current_ref is None:
+        raise IndexFailed(
+            f"no ledger reference for papra://{ref.papra_org_id}/{ref.papra_document_id}: "
+            "refusing to deliver metadata from a caller's snapshot, because the record of "
+            "which fields are ours is gone", permanent=True)
+
+    actions: dict[str, str] = {}
+    body: dict[str, str] = {}
+    recorded: dict[str, str] = {}
+
+    for field in METADATA_FIELDS:
+        candidate = _metadata_candidate(field, kz_doc) if field in scope else None
+        if candidate is None:
+            # Either nothing to deliver or out of scope; both are "not this pass's business".
+            actions[field] = METADATA_SKIPPED
+            continue
+        if field == "name" and (
+            is_synthetic_upload_name(candidate, document_id=ref.papra_document_id,
+                                    file_hash=ref.file_hash)
+            or looks_like_synthetic_upload_name(candidate)
+        ):
+            logger.info("not delivering our own upload name as a title: papra=%s title=%s",
+                        ref.papra_document_id, candidate)
+            actions[field] = METADATA_SKIPPED
+            continue
+
+        held = document.get(_PAPRA_FIELD[field])
+        verdict = ownership(current_ref, field=field, current=held)
+        if not verdict.owned and not force:
+            actions[field] = METADATA_PROTECTED
+            if not dry_run and not getattr(current_ref, f"{field}_protected"):
+                # Set the flag first, then say so: the flag is the memory, so "once" is
+                # structural rather than a promise about log volume. Three passes over the
+                # same human rename cost one line each the first time and nothing after.
+                store.ledger_protect(papra_org_id=ref.papra_org_id,
+                                     papra_document_id=ref.papra_document_id, field=field)
+                logger.warning("protecting %s on papra=%s kreuzakt=%s: %s (papra holds %r)",
+                               field, ref.papra_document_id, kz_doc.id, verdict.reason,
+                               str(held or "")[:80])
+            continue
+
+        if _comparable(field, held) == _comparable(field, candidate):
+            # Papra already holds this exact value. Only the ledger's memory can be behind,
+            # so it is caught up without a PATCH — the same reasoning that keeps a flag flip
+            # from rewriting five hundred documents.
+            actions[field] = METADATA_UNCHANGED
+            recorded[field] = candidate
+            continue
+
+        actions[field] = METADATA_WRITTEN
+        body[_CLIENT_FIELD[field]] = candidate
+        recorded[field] = candidate
+
+    if dry_run:
+        return _result(actions)
+
+    if body:
+        try:
+            await papra.update_document(ref.papra_org_id, ref.papra_document_id, **body)
+        except Exception as error:  # noqa: BLE001 - re-raised; this line is the operator's record
+            # Nothing is recorded, so the ledger keeps claiming only what Papra has: every
+            # field in that refused body stays retriable, and none of them is remembered as
+            # ours. `verify_once` cannot converge a title either, so this line is the only
+            # trace the attempt left.
+            logger.error("metadata delivery to papra=%s failed: %s",
+                         ref.papra_document_id, error)
+            raise
+    if recorded:
+        store.ledger_record_metadata(papra_org_id=ref.papra_org_id,
+                                     papra_document_id=ref.papra_document_id, **recorded)
+    if body:
+        logger.info("metadata delivered papra=%s kreuzakt=%s fields=%s",
+                    ref.papra_document_id, kz_doc.id, ", ".join(sorted(body)))
+    return _result(actions)
+
+
 @dataclass(frozen=True)
 class VerifyResult:
     """What one convergence pass did, counted in references rather than in queries.
@@ -565,7 +1017,14 @@ async def verify_once(store: Store, papra, kz) -> VerifyResult:
 
 async def _outcome(papra, store: Store, job: Job, ref: LedgerRef, kreuzakt_id: int,
                    kz_doc: KzDocument, generation: int) -> IndexOutcome:
-    """Report what the index holds, and hand the text to Papra when the gate is open."""
+    """Report what the index holds, and hand the text and the metadata over when the gates
+    are open.
+
+    Two gates, two calls, text first: the text is the expensive column and the one whose
+    loss the user cannot reconstruct, and a job that fails on it should fail before it has
+    renamed anything. Two PATCHes when both are open is the price of keeping the gates
+    separate, and it is the right price — see `deliver_metadata`.
+    """
     empty = extraction_is_empty(kz_doc.content)
     delivering = store.settings_flag("index_content_delivery")
     if empty:
@@ -589,8 +1048,17 @@ async def _outcome(papra, store: Store, job: Job, ref: LedgerRef, kreuzakt_id: i
         # "delivered" is a claim about Papra's column, which is why a refusal to write an
         # empty extraction is not one: `check` reads this on the index worker's output.
         delivered = outcome in (DELIVERED, SKIPPED_CURRENT)
+    metadata = None
+    if store.settings_flag("index_metadata_delivery"):
+        # Read from the store, like the content gate above, because this is the path that
+        # runs unattended for days at a stretch. A flag honoured only by the CLI is a
+        # setting that renames nothing while the daemon renames everything, which is the
+        # complaint this flag used to deserve. A shut gate is not an incident for a worker,
+        # so the setting is tested rather than the exception caught: `metadata=None` means
+        # "not this job's business", which is exactly what a shut gate means here.
+        metadata = await deliver_metadata(papra, store, ref, kz_doc)
     return IndexOutcome(kreuzakt_id=kreuzakt_id, content_len=len(kz_doc.content),
-                        empty_content=empty, delivered=delivered)
+                        empty_content=empty, delivered=delivered, metadata=metadata)
 
 
 def _require_budget(deadline: float, wait_timeout_s: float, job: Job, attempts_done: int,

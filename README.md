@@ -41,7 +41,7 @@ papra-suite serve
 | `OCR_MAX_PAGES`, `OCR_PAGE_PIXEL_BUDGET`, `OCR_DPI`, `OCR_CONCURRENCY`, `SWEEP_INTERVAL_S` | optional tuning |
 | `PAPRA_KREUZAKT_URL` | the Kreuzakt index, e.g. `http://kreuzakt:3000`; unset means no index, search falls back to Papra |
 | `PAPRA_INDEX_CONTENT_DELIVERY` | default `false` — see "Handing the `content` column over" |
-| `PAPRA_INDEX_METADATA_DELIVERY` | default `false`, and **inert**: nothing reads it yet, so turning it on changes nothing at all |
+| `PAPRA_INDEX_METADATA_DELIVERY` | default `false` — see "Handing the title, date and note over" |
 | `PAPRA_LEGACY_WORKERS` | default `true` — this suite's OCR and title workers keep writing; flipping it off is the handover |
 | `PAPRA_INDEX_MAX_ATTEMPTS`, `PAPRA_INDEX_POLL_INTERVAL_S`, `PAPRA_INDEX_WAIT_TIMEOUT_S`, `PAPRA_INDEX_QUERY_MAX_CHARS`, `PAPRA_INDEX_SEARCH_SCAN_ROWS` | optional tuning of the index pipeline |
 
@@ -79,6 +79,7 @@ trust boundary is verified for a specific provider.
 | `papra-suite serve` | pollers, OCR and title workers, sweep loop |
 | `papra-suite replay --mailbox-id ID [--from-uid N] [--dry-run]` | rewind the poll cursor |
 | `papra-suite events [--limit N] [--mailbox-id ID] [--kind K] [--since YYYY-MM-DD] [--json]` | why messages and attachments were **not** ingested |
+| `papra-suite metadata [--restore-auto \| --force] [--org-id ID] [--document-id ID] [--field name\|date\|notes] [--dry-run]` | deliver Kreuzakt's title, date and note into Papra, or hand a protected field back to automatic delivery |
 
 `check` ends with one line — `events (last 24h): sender_denied=3, upload_failed=1`
 — because `check` is the command an operator already runs when something is wrong,
@@ -391,7 +392,7 @@ is what applies it.
 |---|---|---|
 | `PAPRA_INDEX_CONTENT_DELIVERY` | `false` | the bridge indexes documents and never writes `content` |
 | `PAPRA_LEGACY_WORKERS` | `true` | this suite's OCR worker and title writer stay in charge, and new documents still enter the `ocr` queue. It does not touch Papra's own extraction, which no flag here stops |
-| `PAPRA_INDEX_METADATA_DELIVERY` | `false` | nothing today: the flag is seeded and read by no code, so setting it true changes neither tags nor titles. Papra's enrichment keeps writing them and the legacy title writer is stopped by `PAPRA_LEGACY_WORKERS`, not by this flag — do not plan a handover step around it |
+| `PAPRA_INDEX_METADATA_DELIVERY` | `false` | the bridge indexes documents and never writes `name`, `documentDate` or `notes`. On means it writes all three — but only where it can prove the field is still ours, see "Handing the title, date and note over". Papra's own enrichment keeps running regardless: no flag here stops it |
 
 **Drain the legacy queue before you flip, and not for tidiness.** Three things write
 Papra's `content`: this suite's OCR worker, this bridge, and Papra's own extraction, which
@@ -461,6 +462,7 @@ one question. The lines are appended to what `check` already prints:
 ```
 index: 118 refs, 112 current, 96 delivered, 3 extraction-empty, 0 repairs(24h), 0 cleanup-pending (failed 0)
 content writer: suite ocr worker (legacy)
+metadata writer: suite title worker (legacy)
 ```
 
 - `refs` counts every row the ledger has ever held, deletions and stale bindings included;
@@ -502,3 +504,190 @@ before the clients are constructed, so nothing is sent to Papra or the index on 
 out. A `none (handover window)` is logged as an error by `serve` and is still allowed to
 run, because search and the ledger keep working and a restart with the flags corrected is
 all it takes; that window is a state you pass through, not one you configure on purpose.
+
+`metadata writer:` is the second line, and it names who writes Papra's `name`,
+`documentDate` and `notes`. Those three change hands on their own flag, in their own order,
+and one of the four arrangements is deliberately **not** refused:
+
+| Printed | Means |
+|---|---|
+| `suite title worker (legacy)` | this suite's title worker writes the title; the bridge does not (the default) |
+| `index bridge` | the bridge writes all three fields and the legacy loops are not running |
+| `none (handover window)` | neither of our two writers writes them, so a document keeps whatever Papra's own enrichment makes of it |
+| `two writers (title queue draining)` | delivery is on while the legacy worker is still running: a state to pass through, not one to settle into |
+
+The fourth is reported rather than refused, unlike two writers of `content`, for three
+reasons. Two writers of a title cost a guess at a title, and the ledger converts the race
+into a decision on the next pass — the worker's write differs from what we recorded, so the
+field is protected and we stop touching it, which is recoverable with
+`papra-suite metadata --restore-auto`; two writers of `content` can put a blank page over a
+year of text. Refusing the combination would also forbid the only workable order, because
+`legacy_workers` has to stay on while the queues drain and the flag that drains them is the
+one being set. And the second writer is on a path this flag does switch off: while metadata
+delivery is on, `on_job_done` stops enqueuing the `title` job that an OCR completion used to
+produce, for documents from every intake path, sweep and mailbox alike. So what is left in
+that state is title work already in flight — it drains, and the path this flag governs cannot
+refill it. The line is printed anyway, because in flight is not zero: those jobs do write
+Papra's `name`, the ledger reads the write as a human edit, and the documents they touch come
+out protected.
+
+### Handing the title, date and note over
+
+The index holds a title, a date and a note for every indexed document, produced by the model
+sitting behind the index. `PAPRA_INDEX_METADATA_DELIVERY=true` puts them into Papra's
+human-visible `name`, `documentDate` and `notes`. It is a separate flag from content delivery
+on purpose: the text is a machine's transcription nobody reads in the UI, while the title is
+the thing the user renamed last Tuesday, and the two are handed over on different days.
+
+**What "on" means per field is: write it only where we can prove the field is still ours.**
+Papra offers no conditional write, so everything rests on what the ledger remembers, and the
+rules are worth knowing before you flip because they decide what you will see in the logs:
+
+- The baseline for `name` is **Papra's own name for the document at the moment we first saw
+  it**, stored in the ledger as `papra_original_name`. It is *not* Kreuzakt's
+  `original_filename`, which holds our own upload name for every document in the corpus — we
+  named the file when we uploaded it, so measuring a human's rename against it measures
+  nothing. For `date` and `notes` there is no baseline to have, so the first write requires
+  the Papra value to be **empty**: Papra runs its own date detection, and a date we cannot
+  attribute might be the user's or Papra's.
+- A field we wrote and Papra no longer holds, or a value that was there before we ever wrote
+  one, is **protected**: we stop writing it, permanently. Nothing in the delivery path ever
+  lifts a protection, and the protection is logged once per field, when it is set.
+- Dates are compared as days, because a `documentDate` we send as `2025-10-01` is stored and
+  read back as `2025-10-01T00:00:00.000Z`. A model date that is not a bare ISO day is
+  skipped rather than sent — Papra answers 400 for free text, and that 400 would take the
+  title and the note down with it. What this suite checks is the **shape**, not the source: it
+  does not know whether a given day was read off the scan or stamped when the index finished the
+  document, and it has no opinion about which one deserves to be the user's date field. So
+  before the flip, read `papra-suite metadata --dry-run` and count the `date=written` lines —
+  that is how many documents are about to receive a date they never had.
+- `notes` is truncated to this suite's own limit before it is compared, sent and recorded.
+  What the ledger remembers is the string Papra received, not the model's longer original;
+  recording the original would make our own truncation look like a human edit on the next
+  pass.
+- One PATCH per reference, carrying only the fields that changed, and never `content`: that
+  column has its own gate and its own flag. A write Papra refuses records nothing, so every
+  field in a refused request stays retriable.
+**Our own upload name is never delivered as a title, on either side of the comparison.** A
+Kreuzakt with no vision model configured derives the title from the filename, and the
+filename is always ours: every document this bridge uploads arrives as
+`papra-<documentId>-<hash8>.pdf`. On such a deployment the model's "title" *is* that string —
+and measured on the pinned container, Papra's prettified version of it, so
+`papra-doc-1-a1b2c3d4.pdf` comes back as `Papra Doc 1 A1b2c3d4`, with ` (1)` appended when the
+name collided. Delivering it would rename the entire corpus to our own upload garbage and
+then record that garbage in `written_name` as authoritative, so every later pass would defend
+it. The pass refuses before it asks who owns the field: the verdict is `skipped` — not a human
+edit, so it protects nothing, and not a write, so it records nothing — and a synthetic name
+found in *Papra* is likewise never treated as ours to overwrite. The pinned container on the
+test stack is exactly this keyless configuration, which is why the guard is covered against
+the live service rather than only against a double.
+
+The order, which is its own because the flags are separate and each reversible until the code
+comes out:
+
+1. Deploy with both delivery flags off and let the corpus index, as for content. Nothing about
+   Papra's records changes.
+2. Decide whether you want the bridge's titles at all, and look at what it would do first.
+   Delivery is refused while the flag is off, so read the verdicts from the legacy side by
+   checking the index directly, or turn the flag on in a test deployment and run
+   `papra-suite metadata --dry-run`. The dry run prints one line per reference with
+   `name=`/`date=`/`notes=` verdicts and writes nothing — not even a protection flag.
+3. Set `PAPRA_INDEX_METADATA_DELIVERY=true` and restart, leaving `PAPRA_LEGACY_WORKERS` as it
+   is. `check` prints `metadata writer: two writers (title queue draining)`, and that is the
+   arrangement you want for a minute: the flag has to be on before the queue can stop being
+   fed, because while it is off every OCR completion enqueues another title job. Draining
+   before the flip is the mistake this step exists to prevent — the count reads zero, the flip
+   refills it, and the proof proved nothing.
+
+   What you accept by flipping first, stated because waiting does not undo it: title jobs that
+   were already queued or running still run, and each one writes Papra's `name`. The ledger
+   reads back a title it never wrote and protects that field, so those documents keep the legacy
+   worker's title until an operator says otherwise. `papra-suite metadata --dry-run` names them
+   — `name=protected` on documents you had no reason to think were protected — and the order to
+   put them right is in "A human renamed it, and now the bridge will not".
+
+4. Prove the second writer is out of work, counting only the rows that are still work:
+
+   ```bash
+   sqlite3 "$DATA_DIR/state.db" \
+     "SELECT count(*) FROM jobs WHERE kind='title' AND status IN ('pending','running');"
+   ```
+
+   Two zeroes a minute apart. Counting every status proves nothing, because `completed` rows
+   accumulate forever and that total never reaches zero. With the flag on,
+   `on_job_done` refuses the ocr-done-to-title transition, so nothing this pipeline owns
+   refills the queue; a count that keeps *growing* means something else is still enqueueing
+   title jobs, and the thing to look at is a legacy loop running for other reasons.
+
+   `check` still prints `two writers` after this, and that is not a contradiction: the line is
+   computed from the two flags, not from the queue, and while the legacy loops run they could
+   still claim title work. It reads `index bridge` when `PAPRA_LEGACY_WORKERS` goes off, which
+   is content's step and not this one.
+
+5. Run the pass over what the index already holds, which the index worker only does for
+   documents it indexes from then on:
+
+   ```bash
+   papra-suite metadata --dry-run    # read it
+   papra-suite metadata              # write it
+   ```
+
+   Expect a lot of `protected` on `date`, and some on `name`. That is the rule working rather
+   than a misconfiguration: Papra's own date detection fills `documentDate` on upload, and a
+   date we cannot attribute is not ours to overwrite; a title Papra's enrichment rewrote after
+   we first saw the document is likewise indistinguishable from the user's. `notes` is usually
+   the one field that writes freely, because nothing but the user puts anything there.
+
+### A human renamed it, and now the bridge will not
+
+That is the intended behaviour, and it is permanent by design: the alternative is a nightly
+job that quietly puts `papra-doc-1-a1b2c3d4` back over the user's filename. The way back is a
+command rather than a SQLite incantation:
+
+```bash
+papra-suite metadata --restore-auto --dry-run     # what would change, per field
+papra-suite metadata --restore-auto --field name  # do it, for one field
+papra-suite metadata --restore-auto --document-id doc_1 --org-id org_1
+```
+
+`--restore-auto` calls the ledger's only un-protect and prints how many references it changed.
+It reads no Papra and no Kreuzakt, so it works while either is down and while the delivery
+flag is off — it is the command for the middle of the incident, and an escape hatch with a
+network dependency in it is not an escape hatch.
+
+Neither command alone returns a genuinely edited field to automatic delivery, and the order
+matters:
+
+```bash
+papra-suite metadata --force --yes-i-mean-it --field name --document-id doc_1
+papra-suite metadata --restore-auto --field name --document-id doc_1
+papra-suite metadata --dry-run --field name --document-id doc_1    # name=unchanged
+```
+
+`--force` puts the index's value back over the human's and leaves the protection flag set;
+`--restore-auto` then drops the flag; and the third command is what "automatic" means here —
+`unchanged`, because Papra now holds what we sent, with the flag off. The opposite order
+achieves nothing, and that is deliberate rather than a bug: clearing protection re-admits the
+field to the ownership question, whose answer is still "Papra holds something we never wrote",
+so the next pass protects it again. The flag was the symptom; the diverged value is the reason.
+The CLI prints this order after a `--restore-auto` for exactly that reason.
+
+`--force` is a different thing and the two are mutually exclusive on purpose. It delivers once
+regardless of protection and **leaves the flags set**, which makes it safe to reach for when
+the question is "is the index's value right after all?" rather than "stop protecting this
+field forever". Because it overwrites text only the user can restore, it prints its plan and
+exits `1` unless you add `--yes-i-mean-it`. `--org-id`, `--document-id` and `--field` narrow
+either command; `--field` takes `name`, `date` or `notes` and nothing else — `content` is not
+a metadata field and has its own flag, its own gate and its own handover section.
+
+Two limits worth stating plainly, because both look like bugs on the day they happen:
+
+- **Papra's own enrichment keeps running.** No flag here stops it, and it can rewrite a title
+  after our delivery. The next pass then reads a value that is not ours and protects the field:
+  the enrichment has not lost to us, it has simply taken the field out of play. There is no
+  convergence pass for titles — the verification pass converges `content` only — so the fix
+  for "I want the index's title there" is `--force`, not a wait.
+- **A document Papra says it has deleted is refused outright**, with a permanent failure rather
+  than a retry. Changing a column resurrects a trashed document, so "helpfully" delivering
+  metadata into one would un-delete something the user threw away. The delete propagation pass
+  owns those references, not this one.

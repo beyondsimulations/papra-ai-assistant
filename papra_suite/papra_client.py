@@ -69,10 +69,34 @@ class PapraClient:
         )
         return response.json()["document"]
 
+    #: The client's keyword to Papra's field name. One place, because the two disagree on
+    #: exactly one column and a caller that guessed would send a key Papra ignores — which
+    #: answers 200 and changes nothing, the worst possible failure for a delivery flag.
+    _WIRE_FIELD = {"name": "name", "content": "content", "document_date": "documentDate",
+                   "notes": "notes"}
+
     async def update_document(self, org_id: str, document_id: str, *,
-                              name: str | None = None, content: str | None = None) -> dict:
-        body = {key: value for key, value in {"name": name, "content": content}.items()
-                if value is not None}
+                              name: str | None = None, content: str | None = None,
+                              document_date: str | None = None,
+                              notes: str | None = None) -> dict:
+        """Patch the fields this call names, and only those.
+
+        Three facts about the body come from the pinned container rather than from taste,
+        and all three are the kind that answer 200 for the request and lose the field:
+        `documentDate` is the column, not `document_date`; a bare ISO date is accepted and
+        stored as `2025-10-01T00:00:00.000Z`; and `notes` stops accepting at 2048
+        characters, above which Papra answers 400 and the whole PATCH — title included —
+        fails. An empty `name` is a 400 too, so nothing here should ever pass one.
+
+        Omitted means untouched, which is what makes a partial patch safe: a delivery that
+        sends `{"notes": ...}` cannot rename a document a human titled. `None` is filtered
+        rather than sent, because Papra has no "clear this field" in this endpoint and an
+        explicit null would be a guess at one.
+        """
+        supplied = {"name": name, "content": content, "document_date": document_date,
+                    "notes": notes}
+        body = {self._WIRE_FIELD[key]: value
+                for key, value in supplied.items() if value is not None}
         response = await self._request(
             "PATCH", f"/api/organizations/{org_id}/documents/{document_id}", json=body
         )

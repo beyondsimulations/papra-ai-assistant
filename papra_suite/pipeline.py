@@ -44,6 +44,16 @@ CONTENT_WRITER_BRIDGE = "index bridge"
 CONTENT_WRITER_NONE = "none (handover window)"
 CONTENT_WRITER_BOTH = "two writers (refused at startup)"
 
+#: Who owns Papra's `name`, `documentDate` and `notes`, as `check` prints them. The fourth
+#: state is the reason this is a separate line from the content writer's: unlike two writers
+#: of `content`, two writers of `name` are not refused at startup, because the state is
+#: transient by construction and refusing would make the documented handover order
+#: impossible — see `metadata_writer_state`.
+METADATA_WRITER_LEGACY = "suite title worker (legacy)"
+METADATA_WRITER_BRIDGE = "index bridge"
+METADATA_WRITER_NONE = "none (handover window)"
+METADATA_WRITER_BOTH = "two writers (title queue draining)"
+
 
 class ContentWriterConflict(ConfigError):
     """This suite's legacy OCR worker and this bridge were both told to write `content`.
@@ -88,6 +98,44 @@ def content_writer_conflict(delivery: bool, legacy: bool) -> ContentWriterConfli
         "only then turn on "
         "the delivery flag PAPRA_INDEX_CONTENT_DELIVERY=true. While an ocr row remains, the "
         "convergence pass is fighting a running job for the same document.")
+
+
+def metadata_writer_state(delivery: bool, legacy: bool) -> str:
+    """Who owns Papra's `name`/`documentDate`/`notes`, given the two switches.
+
+    Same shape as `content_writer_state`, and deliberately NOT the same policy: two writers
+    of `content` is refused at startup, two writers of `name` is only reported.
+
+    The difference is what each state does to the other writer. The legacy title chain is
+    switched off at its own transition — `on_job_done` stops enqueueing `title` jobs while
+    metadata delivery is on, for documents from every intake path, sweep and mail alike — so
+    what remains in the `two writers` state is the title work already in flight. It drains,
+    and it cannot be refilled by the path this flag governs. Refusing the combination would
+    forbid the only order of operations that works: `legacy_workers` has to stay on while the
+    queues drain, and the flag that drains them is the flag being set.
+
+    It is still printed, because in-flight title jobs really do write Papra's `name`, and the
+    ledger reads the worker's write as a human edit and protects the field. So the state is
+    not merely cosmetic: the documents it touches end up with titles the bridge will not touch
+    again until an operator says so. The proof that it has passed is the actionable queue,
+    read twice a minute apart while the loops are still running:
+
+        sqlite3 "$DATA_DIR/state.db" "SELECT count(*) FROM jobs WHERE kind='title'
+                                      AND status IN ('pending','running');"
+
+    Two zeroes proves the second writer has no work left. It does NOT change this string,
+    which is computed from the two flags and not from the queue: while `legacy_workers` is on
+    the line keeps saying `two writers`, and that is the honest reading — the loops are still
+    running and would claim title work if any existed. The string becomes `index bridge` when
+    the legacy loops are switched off, which is content's handover step, not this one.
+    """
+    if delivery and legacy:
+        return METADATA_WRITER_BOTH
+    if delivery:
+        return METADATA_WRITER_BRIDGE
+    if legacy:
+        return METADATA_WRITER_LEGACY
+    return METADATA_WRITER_NONE
 
 
 def legacy_writers_enabled(store: Store) -> bool:
@@ -168,8 +216,25 @@ async def run_ocr_job(papra: PapraClient, ocr_llm: LLMClient, job: Job, *,
 
 
 def on_job_done(store: Store, job: Job, *, ocr_result: str) -> None:
-    """Central transition handler (decisions §2): ocr done -> enqueue title."""
+    """Central transition handler (decisions §2): ocr done -> enqueue title.
+
+    The one transition that is conditional, and the condition is the metadata gate. This is
+    where the legacy title chain is switched off, and it is the only place that switch is
+    correct: the OCR job above has already written Papra's `content` under its own flag, while
+    a `title` job exists only to write the title — so the flag that takes the title away
+    should stop the title job, and nothing else.
+
+    Stopping the `ocr` enqueue instead was the alternative, and it is wrong: with metadata
+    delivery on, content delivery off and the legacy loops on, that would starve the one
+    writer Papra's `content` still has while `check` went on crediting it. Handing the two
+    columns over separately is the point of having two flags.
+    """
     if job.kind != "ocr":
+        return
+    if store.settings_flag("index_metadata_delivery"):
+        # Once each time is enough: this is the transition, not a retry loop.
+        logger.info("title job skipped: papra=%s — Papra's title belongs to the index "
+                    "bridge while index_metadata_delivery is on", job.document_id)
         return
     content_hash = hashlib.sha256(ocr_result.encode()).hexdigest()
     store.enqueue_job(
@@ -378,10 +443,11 @@ def _sync_settings_from_config(store: Store, config) -> None:
     actually started the process with, so it is written on startup and the readers
     cannot disagree about which build is running.
 
-    `index_metadata_delivery` is seeded as given although nothing reads it yet:
-    writing one flag and not its sibling would make the settings table a half-truth
-    about the process that owns it. `index_content_delivery` is the exception, and it
-    is a fact about the build rather than about the operator: see the warning below.
+    `index_metadata_delivery` is seeded under the same rule as its sibling, and it is read
+    now: `deliver_metadata` owns that gate, so a build with no metadata path must not seed
+    `true`. That is the `OCR_LANGUAGES` shape — a flag that looks configurable and changes
+    nothing, with the documentation as the only thing that lied. Same warning, same refusal,
+    same module attribute as the seam.
 
     `legacy_workers` is seeded too, because it is not only a knob about this process's
     loops: the intake path and `enqueue_index_job` read it to decide whether a new
@@ -402,8 +468,14 @@ def _sync_settings_from_config(store: Store, config) -> None:
     store.set_setting("index_content_delivery",
                       "true" if (config.index_content_delivery
                                  and indexing.CONTENT_DELIVERY_IMPLEMENTED) else "false")
+    if config.index_metadata_delivery and not indexing.METADATA_DELIVERY_IMPLEMENTED:
+        logger.warning(
+            "PAPRA_INDEX_METADATA_DELIVERY is set but this build has no metadata delivery "
+            "path: leaving the legacy title worker in charge of Papra's name, date and "
+            "notes. The flag is honoured only by a build that implements delivery.")
     store.set_setting("index_metadata_delivery",
-                      "true" if config.index_metadata_delivery else "false")
+                      "true" if (config.index_metadata_delivery
+                                  and indexing.METADATA_DELIVERY_IMPLEMENTED) else "false")
     store.set_setting(LEGACY_WORKERS_SETTING,
                       "true" if config.legacy_workers else "false")
 
@@ -782,9 +854,14 @@ def enqueue_index_job(store: Store, *, papra_org_id: str, document_id: str,
 
     The legacy `ocr` enqueue is what keeps today's behaviour intact: Papra keeps the
     text and the titles it has now, and the index job costs nothing but Kreuzakt
-    work. Task 7 retires it when content delivery is on, Task 8 when metadata is — and
-    `legacy_workers` retires it earlier, because a queue the drained workers are no longer
-    claiming still has to stop being filled for a drain to be provable.
+    work. Content delivery retires it, because the bridge then writes the very column this
+    worker writes; the metadata flag deliberately does NOT, because with content still the
+    legacy worker's, suppressing the `ocr` row would leave Papra's `content` with no writer
+    while `check` went on crediting one. The title chain is switched off one step later, in
+    `on_job_done`, where stopping it stops a writer of `name` and nothing else — which is
+    what makes the two handovers genuinely independent. `legacy_workers` retires the `ocr`
+    enqueue earlier still, because a queue the drained workers are no longer claiming still
+    has to stop being filled for a drain to be provable.
     """
     if mime != "application/pdf":
         return ""
