@@ -629,6 +629,7 @@ behaviour).
 
 ### 10.3 Still not established
 
+- **Settings are startup-only, and one decision rests on it.** Task 7 let `DeliveryDisabled` escape the verification walk instead of stopping the walk, because no flag can change mid-pass. If anything ever makes these flags runtime-writable, revisit that deliberately: the right answer is then to stop the walk and return the partial result, with a test — not to discover it as a crash.
 - The quality of Kreuzakt's `description` and `document_date` **against omlx**, which
   the keyless probe could not exercise. Date and note write-back are specified in
   §4.3 on the assumption those fields are good; the write-nothing phase falsifies

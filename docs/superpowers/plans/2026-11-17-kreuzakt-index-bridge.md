@@ -1295,6 +1295,10 @@ Commit as `feat(index): metadata delivery on Papra-side baselines with explicit 
   document Papra has forgotten stops occupying a Kreuzakt id, and add a ledger test that reproduces the stuck
   state (bound + `delivered_generation == current` + a permanently failed job) and shows the unbind making the
   document eligible again.
+- **Also owns (found by Task 7's round-2 work): a direct table test over `papra_document_is_deleted()`.** That
+  predicate is shared by four call sites and has no test of its own, so a mistake in it surfaces today as four
+  unrelated failures. Pin `isDeleted` true, `deletedAt` set, both, and neither — cheaper to diagnose, and this
+  task is the one that starts depending on it hardest.
 - Produces:
   - `async def reconcile_deletions(store, papra, kz) -> DeletionResult(refs_marked: int, upstream_deleted: int, upstream_pending: int, restored: int, aborted: bool, capped: int)`
   - `async def run_cleanup(store, kz) -> CleanupResult(attempted: int, deleted: int, deferred: int, failed: int)`
@@ -1536,6 +1540,18 @@ v1 proposed matching stale ids to fresh documents via `file_hash` prefixes and o
 
 **Files:** Create `papra_suite/ledger_cli.py`, `tests/test_ledger_rebuild.py`; Modify `papra_suite/indexing.py`, `README.md`.
 
+- **Also owns (replaces behaviour Task 7's round 2 deliberately introduced): a bounded, visible state for
+  documents Papra persistently refuses.** Round 2 moved `repairs(24h)` to count repairs that *landed*, which was
+  required — a refused PATCH must not consume a budget meant for two-writer fights. The cost it accepted, and
+  stated, is that a document whose write Papra refuses for good (an oversized text layer returning 413 is the
+  plausible one; 403 another) is now never suppressed: it is re-read, re-PATCHed and ERROR-logged every pass
+  forever, and nothing in `check` says so. Replace it inside the same migration round as the jobs index:
+  `delivery_failures INTEGER NOT NULL DEFAULT 0` plus `last_delivery_error_at TEXT`, incremented on a refused
+  or failed delivery only (never on a read error), retrying stopped after 5 consecutive ones. Two honesty
+  requirements: pin the *current* retry-forever behaviour in a test first, so this lands as a deliberate
+  replacement that breaks a test rather than a silent swap; and rewrite, in the same commit, the README sentence
+  that documents what `repairs(24h)` counts, because it answers a different question than it did pre-Task 7.
+
 - **Also owns (found by Task 7's review):** after a rebuild, `unledgered` must be zero — or the runbook must
   state exactly which documents remain outside the index and why. A rebuild that re-indexes every **ledger
   reference** still cannot see a document that never got a reference, and pre-handover mailed PDFs are exactly
@@ -1622,7 +1638,7 @@ structural count of **Papra documents that have no ledger row at all** (`unledge
 bucket filter applies). Today that population is invisible: the sweep skips anything `document_seen` already
 knows, and every pre-handover emailed PDF was marked seen by the legacy intake without ever getting a
 reference, so `refs` and `current` can both look healthy while a chunk of the corpus is permanently outside the
-index. A warning in the README is not a control; a number that must reach zero is.
+index. A warning in the README is not a control; a number that must reach zero is. Print `delivery-blocked=N` from Task 11's counter on the same line: a document Papra has refused five times running is invisible today except in a log line every six hours, and an operator should not have to read logs to learn that a document will never be searchable.
 
 Auth and transport come from `docs/superpowers/specs/2026-11-16-mcp-search-server-design.md` **verbatim**: `mcp` 2.x Streamable HTTP, `token_verifier` under `auth` settings, the Host/Origin allow-list answering **421** to a bare host, 401 for query-string tokens, no Funnel, pydantic returns, the error model. What changes is the token store: per-token rows carrying bucket lists, replacing that spec's single `mcp_allowed_org_ids` key.
 
