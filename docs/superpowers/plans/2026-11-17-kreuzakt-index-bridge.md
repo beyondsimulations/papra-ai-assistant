@@ -1165,6 +1165,11 @@ Commit as `feat(index): content delivery and divergence-visible convergence`.
 **Interfaces:**
 - Consumes: `ledger_get/ledger_protect/ledger_clear_protection/ledger_record_metadata`, `PapraClient.get_document/update_document`, `truncate_notes`.
 - Produces:
+- **Also owns (found by Task 7):** `PAPRA_INDEX_METADATA_DELIVERY` must be read by code once this task lands.
+  Today nothing reads it and `check` cannot tell an operator that; Task 7 documented it as inert rather than
+  inventing a refusal, which was the right call for a flag with no behaviour behind it. An inert flag that
+  looks configurable is how the `OCR_LANGUAGES` incident happened, so: honour it here, and make `check` report
+  the metadata writer's state next to the content writer's rather than silently accepting the setting.
   - `normalize_date(value: str | None) -> str | None` — ISO `YYYY-MM-DD` or `None`; empty and unparseable model output become `None` and are skipped
   - `OwnershipVerdict(owned: bool, reason: str)` and `def ownership(ref, *, field, current) -> OwnershipVerdict`
   - `async def deliver_metadata(papra, store, ref, kz_doc) -> MetadataResult(name_action, date_action, notes_action)`, each `"written" | "protected" | "unchanged" | "skipped"`
@@ -1937,6 +1942,13 @@ git commit -m "feat(mcp): document tools with Papra-only identities and untruste
 ### Task 15: `backfill` and `jobs` CLIs
 
 **Files:** Create `papra_suite/jobs_cli.py`, `papra_suite/backfill_cli.py`, `tests/test_jobs_cli.py`, `tests/test_backfill_cli.py`; Modify `papra_suite/__main__.py`, `papra_suite/store.py` (`count_jobs`).
+- **Also owns (found by Task 7):** when the `jobs` subcommand exists, the handover runbook must stop pointing
+  at raw SQL. Task 7 shipped the drain step as a query against `state.db` because this branch has no `jobs`
+  command yet, and pinned that choice with `test_serve_refuses_two_writers_of_the_same_column`, which asserts
+  `"papra-suite jobs" not in message` and `"FROM jobs" in message`. That assertion is a deliberate tripwire:
+  it fails the moment someone rewrites the message to name a command that exists, and the fix is to update the
+  test *and* the README sequence together, not to relax the assertion. Keep the required order in the message
+  either way (legacy off -> prove quiescence -> delivery on).
 - **Also owns (found by Task 6 while escaping an xfail): `Store.list_jobs(..., document_id=None)`** — there is
   no document filter today, which is exactly why a typo nearly hid the re-scheduling gap behind a passing
   `xfailed`. The `jobs` CLI needs it to answer "what is happening to this document?".
