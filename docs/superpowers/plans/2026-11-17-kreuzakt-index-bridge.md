@@ -1325,6 +1325,42 @@ Commit as `feat(index): metadata delivery on Papra-side baselines with explicit 
   failed and show the document becoming claimable again (reset today, and note Task 11's partial index as the
   durable fix).
 
+- **Requirements added by Task 9's review, all of them binding on the follow-up round:**
+  1. *Three live tests, one file, no new harness.* The design bets on three external facts nobody measured:
+     that Papra's detail 404 means "gone" rather than wrong-token-scope or API drift (a false 404 walks straight
+     to a Kreuzakt delete); that `documentsCount` exists and is truthful (the only thing the truncation arm
+     checks); that Kreuzakt's `DELETE` is idempotent-success on an already-gone id. Pin each against the live
+     stack: the listing total the walk trusts, a shared-bytes pair where one delete leaves the survivor
+     searchable through real `search()`/`get_document()`, and last-reference destruction only after both
+     references go. Dedup itself is already live-pinned, so these are three tests.
+  2. *The completeness arm must fail closed.* `papra_client` substitutes `len(page)` when `documentsCount` is
+     absent, so on any Papra shape change `rows_seen < reported` becomes permanently false and the strongest arm
+     vanishes silently. Abort when no page reported an integer total, and check the total is stable across pages.
+  3. *The empty-listing breaker is bucket-local.* It currently aborts the whole pass, so one purged bucket
+     stalls propagation — including restores — for every other bucket, permanently, while both prose copies claim
+     only that bucket stops. Quarantine the org (settings + ERROR), keep the global abort only for the arms that
+     indicate a possibly-global fault, and make the prose match the behaviour.
+  4. *A cumulative alarm, not a smaller cap.* The cap bounds a pass, so a consistently wrong listing drains
+     20 references every sweep — 240 an hour — each mark individually "confirmed" by the same broken endpoint.
+     Keep a rolling 24h marks count in `settings` and abort above a fraction (10% of `ledger_stats()["references"]`)
+     until an operator clears it. Note in the comment that this unwinds: when the listing becomes trustworthy,
+     those rows become restore candidates and are unbound and re-admitted at 50 per sweep.
+  5. *Pin the same-pass case and the race the post-delete unbind can create.* Two references to one Kreuzakt id
+     vanishing in a single pass has no test, and the classic off-by-one mutant (count taken above the `UPDATE`)
+     survives the current set. And an unscoped post-delete unbind can clear a **live** row bound during the
+     await window, leaving it eligible in a sense nobody can act on — resolve the affected rows and re-admit any
+     live one, as the probe path already does.
+  6. *Cadence honesty.* The probe's anti-stall rule (a partial outage must not stamp the corpus as re-checked)
+     is unpinned, and when it fires it re-walks every distinct id **every sweep**; meanwhile the listing walk has
+     no cadence gate at all and re-lists the corpus every 300s. Fix the stamp rule to "walk completed" rather
+     than "every read succeeded", pin it, and give the listing walk the same stamp treatment.
+  7. *Never cite a command this build does not have.* `papra-suite ledger --cleanup` is named as the operator's
+     escape from `cleanup_state='failed'` in two code sites and in this plan, and it is Task 11's deliverable.
+     Until it exists, name the state and the manual route; a log line pointing at a missing subcommand is how an
+     operator loses an hour. Same rule already applied to `jobs --drain` and `jobs --reset`.
+  8. *One module, one definition.* The Task 9 header and 13 constants are defined twice in `indexing.py` and the
+     later block wins, so an edit to the first is silently ignored in the file that documents the trust predicate.
+
 - Produces:
   - `async def reconcile_deletions(store, papra, kz) -> DeletionResult(refs_marked: int, upstream_deleted: int, upstream_pending: int, restored: int, aborted: bool, capped: int)`
   - `async def run_cleanup(store, kz) -> CleanupResult(attempted: int, deleted: int, deferred: int, failed: int)`
