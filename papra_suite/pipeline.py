@@ -578,14 +578,15 @@ def _log_deletion_counts(result: SweepResult) -> None:
     the store: an alarm that lives only in a debug-level line is an alarm nobody hears. Ordinary
     activity is INFO, and a sweep in which nothing happened says nothing.
     """
-    if result.deletions_aborted:
+    if result.deletions_brake:
+        logger.error(
+            "sweep: deletion pass hit its marks brake, so it stopped marking mid-pass; walks, "
+            "restores, the probe and the queued deletes went on. `papra-suite check` names the "
+            "counter and how to clear it")
+    elif result.deletions_aborted:
         logger.error(
             "sweep: deletion pass aborted, nothing was marked or queued this pass; the reason "
             "is in `papra-suite check` (a listing that could not be trusted is the usual one)")
-    elif result.deletions_brake:
-        logger.error(
-            "sweep: deletion pass hit its marks brake, so it stopped marking mid-pass or "
-            "refused to run at all; `papra-suite check` names the counter and how to clear it")
     elif result.deletions_capped:
         logger.error(
             "sweep: deletion pass capped at %d references, more remain for the next pass",
@@ -906,7 +907,14 @@ async def sweep_once(store: Store, papra: PapraClient,
     result.deletions_aborted = deletions.aborted
     result.deletions_quarantined = deletions.quarantined
     result.deletions_brake = deletions.brake_tripped
-    cleanup = await indexing.run_cleanup(store, kreuzakt)
+    cleanup = await indexing.run_cleanup(store, papra, kreuzakt)
+    # The probe has its own clock, so it has its own call site — and it comes AFTER the deletes.
+    # Inside `reconcile_deletions` it sat behind that pass's early returns, which meant it never
+    # ran at all while Papra's listing was untrustworthy, and in front of `run_cleanup` it meant a
+    # slow-but-answering index pushed every queued delete a sweep later. Detecting a binding that
+    # answers 404 has nothing to do with Papra's listing, and nothing about it needs to happen
+    # before a delete: it only ever unbinds rows whose document is already gone.
+    await indexing.probe_index_liveness(store, kreuzakt, store.get_generation())
     result.cleanup_attempted = cleanup.attempted
     result.cleanup_deleted = cleanup.deleted
     result.cleanup_deferred = cleanup.deferred

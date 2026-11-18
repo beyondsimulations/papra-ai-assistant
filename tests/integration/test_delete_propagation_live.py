@@ -203,12 +203,12 @@ async def test_papra_answers_absence_in_the_form_the_pass_reads_it(buckets):
     assert isinstance(total, int) and not isinstance(total, bool)
     assert total == 3, f"the endpoint reported {total!r} for three documents"
 
-    listed = await indexing._walk_listing(buckets.papra, buckets.first, expected_refs=3)
+    listed = await indexing._walk_listing(buckets.papra, buckets.first)
     assert set(listed) == set(ids) and listed[ids[0]] is False
 
     _trash(buckets, buckets.first, ids[0])
 
-    listed = await indexing._walk_listing(buckets.papra, buckets.first, expected_refs=3)
+    listed = await indexing._walk_listing(buckets.papra, buckets.first)
     assert ids[0] not in listed and len(listed) == 2, "a trashed document leaves the listing"
     assert papra_document_is_deleted(await buckets.papra.get_document(buckets.first, ids[0]))
     assert await indexing._ask_papra(buckets.papra, buckets.first, ids[0]) == DELETED_THERE
@@ -273,13 +273,16 @@ async def test_one_reference_going_away_leaves_the_survivor_searchable(buckets, 
     _trash(buckets, buckets.first, gone)
 
     result = await reconcile_deletions(buckets.store, buckets.papra, buckets.kreuzakt)
-    cleanup = await run_cleanup(buckets.store, buckets.kreuzakt)
+    cleanup = await run_cleanup(buckets.store, buckets.papra, buckets.kreuzakt)
 
     assert (result.aborted, result.refs_marked, result.upstream_pending) == (False, 1, 0)
     assert cleanup.deleted == 0, "one reference of several is not a delete"
     ref = buckets.store.ledger_get(buckets.first, gone)
     assert ref.deleted_at is not None and ref.cleanup_state == "none"
-    assert buckets.store.ledger_get(buckets.second, kept).deleted_at is None
+    survivor = buckets.store.ledger_get(buckets.second, kept)
+    assert survivor.deleted_at is None
+    assert survivor.kreuzakt_id == first_id, \
+        "a delete aimed at one reference unbound the survivor's own row"
 
     # The survivor, asked of the index itself rather than of our bookkeeping.
     document = await buckets.kreuzakt.get_document(first_id)

@@ -654,10 +654,13 @@ class Store:
         generation = self._read_generation_or_none()
         if generation is None:
             raise ValueError(
-                f"{INDEX_GENERATION_KEY} is not a positive integer, so no generation "
-                "is current; refusing to resolve or bind index ids. Repair it with "
-                "`papra-suite ledger --invalidate`, which bumps the generation "
-                "above every epoch the ledger still carries."
+                f"{INDEX_GENERATION_KEY} is not a positive integer, so no generation is current; "
+                "refusing to resolve or bind index ids. The state is that one row of the settings "
+                "table. `papra-suite ledger --invalidate`, which bumps the generation above every "
+                "epoch the ledger still carries, is Task 11's and this build does not parse it; "
+                "until it lands the route is to set that row by hand to a positive integer: one "
+                "above the highest generation the ledger still carries, when the point is to "
+                "invalidate what is bound to epochs nobody can identify."
             )
         return generation
 

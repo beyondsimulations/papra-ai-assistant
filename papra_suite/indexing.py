@@ -1437,17 +1437,25 @@ async def _upload_and_correlate(kz, store: Store, job: Job, *, papra, generation
 #   3. The same document id is answered two different ways inside one walk. Pages shift
 #      under a live listing, so a duplicate is ordinary; a duplicate that contradicts
 #      itself means neither answer can be believed.
-#   4. The walk ends with fewer rows than the endpoint's own total. The walk is only
-#      exhaustive if the server agrees it was; a truncated page read as a finished walk is
-#      what "everything after row two was deleted" looks like from in here.
-#:   5. The listing answers empty for a bucket the ledger holds references for. This is a
-#:      circuit breaker, not a proof: the last document of a bucket genuinely can be purged.
-#:      Deliberate, because "empty" is also exactly what a broken listing looks like, and being
-#:      wrong in that direction costs every reference in that bucket. It is the one arm that
-#:      stops a BUCKET rather than the pass: the verdict is about this listing, and freezing the
-#:      corpus for it would let a legitimate end state (a bucket emptied and purged) stall
-#:      propagation, restores included, everywhere else. The bucket is quarantined — named in
-#:      `settings`, shouted about, and skipped — and everything else goes on.
+#   4. The walk ends with fewer rows than the largest total the endpoint volunteered. The walk
+#      is only exhaustive if the server agrees it was; a truncated page read as a finished walk
+#      is what "everything after row two was deleted" looks like from in here. The comparison is
+#      one-directional on purpose: `documentsCount` is a live count, so a total that MOVES is
+#      ordinary traffic — someone uploaded or trashed a document while the walk paged — and
+#      refusing on movement would throw away walks that saw everything the server ever claimed
+#      existed, then re-pay them because an aborted pass earns no cadence stamp.
+#:   5. The listing answers empty for a bucket that still has work here: a live reference, or
+#:      cleanup debt. This is a circuit breaker, not a proof: the last document of a bucket
+#:      genuinely can be purged. Deliberate, because "empty" is also exactly what a broken
+#:      listing looks like, and being wrong in that direction costs every reference in that
+#:      bucket. It is the one arm that stops a BUCKET rather than the pass: the verdict is about
+#:      this listing, and freezing the corpus for it would let a legitimate end state (a bucket
+#:      emptied and purged) stall propagation, restores included, everywhere else. The bucket is
+#:      quarantined — named in `settings`, shouted about, and skipped — and everything else goes
+#:      on. "Still has work" is part of the arm, not a refinement: ledger rows are never deleted,
+#:      so a predicate on the raw reference count quarantines a legitimately finished bucket for
+#:      ever, and a health surface that is red for a finished state is one nobody reads when a
+#:      brake has something real to report.
 #   6. The walk reaches `MAX_LISTING_PAGES_PER_ORG` without ever going short. An endpoint
 #      that ignores `pageIndex` must not be walked into a mass deletion.
 #
@@ -1483,9 +1491,16 @@ LIVENESS_PROBE_INTERVAL_S = 21600
 #: long interval either.
 LIVENESS_PROBE_RETRY_INTERVAL_S = 900
 LIVENESS_PROBE_RETRY_STAMP_SETTING = "index_liveness_probe_retry_at"
-#: Ids the last walk asked about and got no answer for. The next wake-up reads those and nothing
-#: else: one id the index will not answer for must not be a reason to re-read everything else.
+#: Ids the last walk asked about and got no answer for, as `<when they first failed>|<id>,<id>`.
+#: The next wake-up on the short clock reads those and nothing else: one id the index will not
+#: answer for must not be a reason to re-read everything else. The list is a schedule, not a
+#: record, and it is bounded twice for that reason — a permanently unreadable id would otherwise
+#: grow one settings row for as long as the process lives, and a total outage names every id in
+#: the corpus. Both bounds cost a delay and nothing else, because the long walk asks about every
+#: binding again on its own clock.
 LIVENESS_PROBE_UNANSWERED_SETTING = "index_liveness_probe_unanswered"
+LIVENESS_PROBE_UNANSWERED_LIMIT = 500
+LIVENESS_PROBE_UNANSWERED_MAX_AGE_S = 86400
 #: How often the listing may be walked. Cheaper per page than the probe and dearer in aggregate:
 #: every bucket, every 100 documents of it, on a sweep whose default interval is five minutes.
 #: Fifteen minutes is the compromise — a deleted document stays findable for at most one extra
@@ -1506,22 +1521,27 @@ CLEANUP_DUE_LIMIT = 50
 LIVENESS_PROBE_STAMP_SETTING = "index_liveness_probe_at"
 DELETION_CURSOR_SETTING = "index_deletion_cursor"
 LAST_DELETION_PASS_SETTING = "index_last_deletion_pass"
-#: Buckets the last pass could not read because they answered empty. A report, rewritten every
-#: pass from what the walk actually saw, so a bucket that starts listing again leaves it by
-#: itself: an operator lifting a lock that was never a lock is a second way to get this wrong.
+#: Buckets the last pass set aside because they answered empty while the ledger still had work
+#: for them. A report, rewritten by every pass that finished walking, so a bucket that starts
+#: listing again leaves it by itself: an operator lifting a lock that was never a lock is a second
+#: way to get this wrong. A pass that aborted rewrites nothing, so `check` labels the field when
+#: it did not come from the pass the reader is being shown.
 DELETION_QUARANTINE_SETTING = "index_deletion_quarantine"
 #: Marks are this pass's own output, so a run of them is the earliest signal available that the
 #: pipeline is wrong rather than somebody emptying a library. `MAX_DELETIONS_PER_PASS` bounds one
-#: pass and cannot see a day: twenty references every quarter-hour is nineteen hundred and twenty a
-#: day, every pass looking ordinary. This is the second brake — a day's marks, held to a tenth of
-#: the references the ledger holds, aborting loudly, with a counter an operator can clear by hand.
-#: The floor is one full pass, the least a cumulative bound can ask without contradicting the cap
-#: above it. That is also its disclosed cost: a corpus smaller than ten passes — two hundred
-#: references — can be marked out entirely in a day before anything refuses, because no cumulative
-#: rule can be stricter than the one pass that is already allowed.
+#: pass and cannot see a day: twenty references every quarter-hour is nineteen hundred and twenty
+#: a day, every pass looking ordinary. This is the second brake — a day's marks, held to a tenth
+#: of the references the ledger holds, refusing further marks loudly, with a counter an operator
+#: can clear by hand. It stops the marking loop and nothing else: restores, the walk and the
+#: probe cannot destroy anything, and `run_cleanup` — the half that can — is not this pass's
+#: business at all. The floor is one full pass, the least a cumulative bound can ask without
+#: contradicting the cap above it, and it is computed at call time (`_marks_rolling_floor`) rather
+#: than bound at import: an alias bound once is how a raised per-pass cap silently leaves a smaller
+#: daily floor behind. The floor is also its disclosed cost: a corpus smaller than ten passes — two
+#: hundred references — can be marked out entirely in a day before anything refuses, because no
+#: cumulative rule can be stricter than the one pass that is already allowed.
 MARKS_ROLLING_WINDOW_S = 86400
 MARKS_ROLLING_LIMIT_FRACTION = 0.1
-MARKS_ROLLING_FLOOR = MAX_DELETIONS_PER_PASS
 MARKS_ROLLING_SETTING = "index_marks_rolling"
 
 #: What Papra's detail read said about one candidate. `GONE` is a 404: Papra hard-deletes, so
@@ -1541,7 +1561,7 @@ class DeletionResult:
     them at ERROR and `check` prints the last pass's outcome, which is why this pass stamps
     its result into `settings` instead of only returning it.
 
-    Three fields carry meanings worth stating rather than assuming:
+    Four fields carry meanings worth stating rather than assuming:
 
     * `upstream_pending` is the durable queue — the intent written, nothing destroyed. The
       marking pass never deletes anything itself; `run_cleanup` does, after revalidating.
@@ -1553,6 +1573,16 @@ class DeletionResult:
       outcome. A reference bound to a superseded index is still marked deleted — the
       reference is gone whatever index it pointed at — but it queues nothing, and a corpus
       full of those has to be visible as itself rather than as a corpus with nothing to do.
+    * `quarantined` and `brake_tripped` are the two suppression mechanisms, and they are alarms
+      in the same class as `aborted`: while a bucket is set aside nothing about its contents is
+      propagated, and while the brake holds nothing new is marked. Both are bucket/pass-wide and
+      both can persist for days, so both are ERROR in the sweep line and printed by `check`
+      (`set aside: …`, `marks this window: …`). `brake_tripped` is NOT paired with `aborted` —
+      the brake stops marks, the pass still walks, restores and reports, and a brake trip that
+      arrives as an abort sends the operator looking at Papra for a fault in our own counter.
+      The count the brake held back is the `brake_held=N` token in the last-pass stamp, which is
+      the only place it survives the pass; it is a number of candidates that were confirmed by
+      Papra and deliberately not acted on.
     """
 
     refs_marked: int = 0
@@ -1604,7 +1634,7 @@ class _ListingUntrusted(Exception):
 
 
 class _ListingEmpty(_ListingUntrusted):
-    """One bucket answered empty while the ledger still holds references for it.
+    """One bucket's listing answered empty. What to do about that is the caller's judgement.
 
     A separate type because the right reaction is different in size, not in kind. The verdict
     ("do not read absence out of this bucket") is the same one the other arms reach, but only
@@ -1612,6 +1642,10 @@ class _ListingEmpty(_ListingUntrusted):
     purged — and it says nothing whatever about the other buckets. Discarding the whole pass
     for it would let one emptied bucket stop propagation, restores included, for every bucket
     in the corpus, permanently.
+
+    It carries no verdict about the ledger, deliberately: "empty" is only suspicious for a
+    bucket that still has work, and the walk has no business reading the ledger to find that
+    out. The caller has the bucket's references already.
     """
 
 
@@ -1645,28 +1679,42 @@ def _stamp_expired(stamp: str | None, *, interval_s: int, now: str) -> bool:
         return True
 
 
-async def _walk_listing(papra, org_id: str, *, expected_refs: int) -> dict[str, bool]:
+def listing_walk_gate(store: Store, *, now: str | None = None) -> str | None:
+    """When the listing walk may run again, or None if it may run on the next sweep.
+
+    This exists for `check`, which cannot run a pass to find out what one would do. A gated pass
+    writes nothing at all, so the line `check` prints can be a quarter-hour old and read as "this
+    pass found nothing" — beside a document somebody trashed five minutes ago, that is
+    indistinguishable from propagation being broken. The cadence knows the difference.
+    """
+    moment = _store_now() if now is None else now
+    stamp = store.get_setting(LISTING_WALK_STAMP_SETTING)
+    if not stamp or _stamp_expired(stamp, interval_s=LISTING_WALK_INTERVAL_S, now=moment):
+        return None
+    return _shift(stamp, seconds=LISTING_WALK_INTERVAL_S)
+
+
+async def _walk_listing(papra, org_id: str) -> dict[str, bool]:
     """Every document Papra lists for one bucket, as `{document_id: deleted_there}`.
 
-    Raises `_ListingUntrusted` for any of the six conditions named at the top of this
-    section, or `_ListingEmpty` for the fifth alone. The caller discards the pass on the first
-    and quarantines the bucket on the second. The return value is the only place the walk's
-    verdict exists, and it is deliberately a *complete* set of ids: a document missing from the
-    dict is what the caller reads as "Papra did not list this one", which is a candidate, and it
-    must not be confusable with "the walk never got this far" — that case does not return.
+    Raises `_ListingUntrusted` for the conditions named at the top of this section, or
+    `_ListingEmpty` when the bucket answered empty. The caller discards the pass on the first
+    and judges the second against the work this bucket still holds. The return value is the only
+    place the walk's verdict exists, and it is deliberately a *complete* set of ids: a document
+    missing from the dict is what the caller reads as "Papra did not list this one", which is a
+    candidate, and it must not be confusable with "the walk never got this far" — that case does
+    not return.
 
     The completeness check needs a number the endpoint volunteered, and it is picky about it on
-    purpose. A total the client invented from the page length would satisfy `rows_seen <
-    reported` by construction, so the guard would disappear exactly when the endpoint's shape
-    changed — the fault class it exists for — and it would disappear without a sound. So: a
-    walk in which no page reported an integer total is untrustworthy (there is nothing to
-    compare against), and a walk in which the total moved is untrustworthy (neither number
-    describes the walk that just happened). Both cost a pass and write nothing.
-
-    `expected_refs` is what the ledger holds for this bucket, and it is what makes an empty
-    answer suspicious rather than merely surprising. It counts every reference, deleted ones
-    included, because the question is not "is there work here" but "could this bucket really
-    be empty" — and the answer to that is no while the ledger still carries rows for it.
+    purpose. A total the client invented from the page length would satisfy the comparison by
+    construction, so the guard would disappear exactly when the endpoint's shape changed — the
+    fault class it exists for — and it would disappear without a sound. So: a walk in which no
+    page reported an integer total is untrustworthy, because there is nothing to compare against.
+    A total that MOVES is not, on its own: `documentsCount` counts what exists now, so one
+    upload or trash mid-walk moves it, and refusing on movement discarded walks that had seen
+    every document the server ever claimed existed. What is refused is the one direction that
+    cannot be explained by traffic — fewer rows served than the largest total ever claimed — and
+    it costs a pass and writes nothing.
     """
     listed: dict[str, bool] = {}
     rows_seen = 0
@@ -1715,20 +1763,15 @@ async def _walk_listing(papra, org_id: str, *, expected_refs: int) -> dict[str, 
             "no page of this listing carried an integer total, so nothing can say the walk "
             "saw every document in the bucket",
             org_id=org_id, page=page_index)
-    if len(set(totals)) > 1:
-        raise _ListingUntrusted(
-            f"the endpoint reported {totals[0]} documents and then {totals[-1]}, so neither "
-            "number describes the walk that just happened",
-            org_id=org_id, page=page_index)
-    reported = totals[0]
+    reported = max(totals)
     if rows_seen < reported:
         raise _ListingUntrusted(
-            f"the endpoint reported {reported} documents and served {rows_seen}",
+            f"the endpoint claimed up to {reported} documents across this walk and served "
+            f"{rows_seen}, so the walk is short by {reported - rows_seen}",
             org_id=org_id, page=page_index)
-    if not listed and expected_refs:
-        raise _ListingEmpty(
-            f"the listing answered empty while the ledger holds {expected_refs} "
-            "reference(s) for this bucket", org_id=org_id, page=0)
+    if not listed:
+        raise _ListingEmpty("the listing answered empty for this bucket",
+                            org_id=org_id, page=0)
     return listed
 
 
@@ -1758,6 +1801,17 @@ async def _ask_papra(papra, org_id: str, document_id: str) -> str | None:
     return DELETED_THERE if papra_document_is_deleted(document) else LIVE_THERE
 
 
+def _marks_rolling_floor() -> int:
+    """The least the cumulative bound can ask without contradicting the per-pass cap: one pass.
+
+    Read at call time rather than bound once at import. `MARKS_ROLLING_FLOOR =
+    MAX_DELETIONS_PER_PASS` looked harmless and was not: raising the per-pass cap to 40 would
+    have left the daily floor at 20, so the brake would refuse after a single allowed pass — a
+    limit nobody configured, in the mechanism whose whole job is to be believed.
+    """
+    return MAX_DELETIONS_PER_PASS
+
+
 def _marks_window(store: Store, now: str) -> tuple[str, int, int]:
     """Where the counted window started, how many marks it holds, and the allowance against it.
 
@@ -1768,8 +1822,10 @@ def _marks_window(store: Store, now: str) -> tuple[str, int, int]:
     exact rate limit, and the alternative on offer was no cumulative bound at all; a window that
     tumbles from the first mark it counted also cannot stall, since the next mark after expiry
     starts a fresh one.
-    fraction of what the ledger holds today, because the question the brake answers — is this
-    normal for this corpus — has no answer that is not about the size of the corpus.
+
+    The allowance is a fraction of what the ledger holds today, because the question the brake
+    answers — is this normal for this corpus — has no answer that is not about the size of the
+    corpus.
     """
     start = now
     count = 0
@@ -1779,8 +1835,18 @@ def _marks_window(store: Store, now: str) -> tuple[str, int, int]:
         if not _stamp_expired(recorded, interval_s=MARKS_ROLLING_WINDOW_S, now=now):
             start, count = recorded, int(text) if text.isdigit() else 0
     references = store.ledger_stats().get("references", 0)
-    allowance = max(MARKS_ROLLING_FLOOR, int(references * MARKS_ROLLING_LIMIT_FRACTION))
+    allowance = max(_marks_rolling_floor(), int(references * MARKS_ROLLING_LIMIT_FRACTION))
     return start, count, allowance
+
+
+def marks_window_state(store: Store) -> tuple[int, int]:
+    """`(marks counted, allowance)` for the window that is running now, for `check`.
+
+    The number an operator needs beside a pass that stopped marking is not the counter alone: 34
+    means nothing until it is next to the 30 it is being judged against.
+    """
+    _, counted, allowance = _marks_window(store, _store_now())
+    return counted, allowance
 
 
 def _rotate(candidates: list[tuple[str, str]], store) -> list[tuple[str, str]]:
@@ -1989,20 +2055,78 @@ def _apply_restore(store: Store, ref: LedgerRef) -> None:
     _readmit_index_job(store, after, reason="restored in papra")
 
 
-def _unanswered_ids(store: Store) -> list[int]:
-    """The ids the last walk asked about and got no answer for.
+def _unanswered_raw(store: Store) -> tuple[str | None, list[int]]:
+    """The retry list exactly as stored: `(when they first failed, ids)`, no age judgement.
 
-    Kept as data rather than as a reason to read everything again: the next wake-up reads these and
-    nothing else, so one id the index will not answer for costs one request instead of a GET per
-    distinct binding in the corpus.
+    The value is `<stamp>|<id>,<id>`. A value with no stamp — the format an earlier build wrote,
+    or a corrupt one — parses to nothing rather than raising: this is a schedule, and the next
+    full walk asks about every binding again anyway, so a dropped retry list costs a delay.
     """
     raw = store.get_setting(LIVENESS_PROBE_UNANSWERED_SETTING) or ""
+    start, sep, rest = raw.partition("|")
+    if not sep:
+        return None, []
     ids: list[int] = []
-    for chunk in raw.split(","):
+    for chunk in rest.split(","):
         chunk = chunk.strip()
         if chunk.isdigit():
             ids.append(int(chunk))
+    return (start or None), ids
+
+
+def _unanswered_ids(store: Store) -> list[int]:
+    """The ids the last walk asked about and got no answer for, while they are young enough.
+
+    Kept as data rather than as a reason to read everything again: the next wake-up on the short
+    clock reads these and nothing else, so one id the index will not answer for costs one request
+    instead of a GET per distinct binding in the corpus. Ageing is what keeps the list from lasting
+    for ever — the cap keeps it short — since an id unreadable for a whole day is the long walk's
+    business, and the long walk reads it within `LIVENESS_PROBE_INTERVAL_S` regardless.
+    """
+    start, ids = _unanswered_raw(store)
+    if not ids:
+        return []
+    if _stamp_expired(start, interval_s=LIVENESS_PROBE_UNANSWERED_MAX_AGE_S, now=_store_now()):
+        return []
     return ids
+
+
+def pending_probe_rereads(store: Store) -> int:
+    """How many ids are waiting on the short clock. Printed by `check`: it is a queue."""
+    return len(_unanswered_ids(store))
+
+
+def _remember_unanswered(store: Store, ids: list[int], *, now: str,
+                         since: str | None = None) -> None:
+    """Write the retry list, capped, keeping the age of the oldest failure.
+
+    The age is what makes the cap and the cut-off real: a list whose start were re-stamped every
+    pass would keep a permanently unreadable id young for ever, which is an unbounded settings row
+    wearing a cap. So the start is preserved whenever the failing set is unchanged or smaller — the
+    ordinary case, from a retry or from a full walk that re-reads the same ids and gets the same
+    silence — and a new window starts only when some id FAILED THAT WAS NOT ON THE LIST before.
+    That is deliberately coarse: one id newly failing re-ages the whole list, which buys an extra
+    day of short-clock retries for the old ones. Aging is a bound on hammering an index that is not
+    answering, not a per-id ledger, and the full walk re-reads everything regardless.
+
+    The cap is logged rather than silent because it is the sound of a total outage: ids dropping off
+    the short clock are not forgiven, they wait for the next full walk.
+    """
+    kept = ids[:LIVENESS_PROBE_UNANSWERED_LIMIT]
+    if len(ids) > len(kept):
+        logger.warning(
+            "the liveness probe's retry list holds %d id(s) at most, so %d unreadable id(s) wait "
+            "for the next full walk instead of the short clock", LIVENESS_PROBE_UNANSWERED_LIMIT,
+            len(ids) - len(kept))
+    if not kept:
+        store.set_setting(LIVENESS_PROBE_UNANSWERED_SETTING, "")
+        return
+    if since is None:
+        recorded_start, recorded = _unanswered_raw(store)
+        if recorded_start and set(kept) <= set(recorded):
+            since = recorded_start
+    store.set_setting(LIVENESS_PROBE_UNANSWERED_SETTING,
+                      f"{since or now}|{','.join(str(i) for i in kept)}")
 
 
 async def _probe_one(store: Store, kz, generation: int, kreuzakt_id: int) -> tuple[int, int]:
@@ -2030,22 +2154,32 @@ async def _probe_one(store: Store, kz, generation: int, kreuzakt_id: int) -> tup
 async def _retry_unanswered(store: Store, kz, generation: int, now: str) -> int:
     """Re-read the ids the last walk could not judge, and only those.
 
-    Two sentences have to hold at once: a read that failed must not be filed as a re-checked
-    corpus, and it must not put the whole corpus back under the knife on the next wake-up either.
-    Both hold because the failures are remembered individually: this pass asks about those ids,
-    charges them to the short clock, and leaves the long stamp alone.
+    Two sentences have to hold at once: a walk that could not judge an id may not be filed as
+    "the corpus is known clean", and it must not put the whole corpus back under the knife on the
+    next wake-up either. They hold because the two are carried by different state: the interval
+    stamp records that the walk ran to its end, and this list carries what is still unknown. So
+    this pass asks about those ids alone, charges them to the short clock, and leaves the long
+    stamp alone. That retry is the ONLY thing a total outage puts on the short clock; without the
+    stamp rule it was a full corpus read every `LIVENESS_PROBE_RETRY_INTERVAL_S`.
     """
+    since, recorded = _unanswered_raw(store)
+    ids = _unanswered_ids(store)
+    if recorded and not ids:
+        logger.warning(
+            "the liveness probe drops %d id(s) from its short clock after %ds without an answer; "
+            "they are not forgiven, only handed to the next full walk", len(recorded),
+            LIVENESS_PROBE_UNANSWERED_MAX_AGE_S)
     probed = 0
     unbound = 0
     still: list[int] = []
-    for kreuzakt_id in _unanswered_ids(store):
+    for kreuzakt_id in ids:
         judged, cleared = await _probe_one(store, kz, generation, kreuzakt_id)
         probed += judged
         unbound += cleared
         if not judged:
             still.append(kreuzakt_id)
     store.set_setting(LIVENESS_PROBE_RETRY_STAMP_SETTING, now)
-    store.set_setting(LIVENESS_PROBE_UNANSWERED_SETTING, ",".join(str(i) for i in still))
+    _remember_unanswered(store, still, now=now, since=since)
     if unbound:
         logger.warning(
             "unbound %d reference(s) whose kreuzakt document answers 404 on a retry and "
@@ -2071,11 +2205,13 @@ async def probe_index_liveness(store: Store, kz, generation: int) -> int:
     row is eligible again, and the reset job is what makes "eligible" mean a worker will claim
     it.
 
-    The verdict is a 404 and nothing else. `None` — the index not answering — leaves every
-    binding alone, and it also leaves the stamp unwritten, so the next pass tries again instead
-    of waiting out the interval on the strength of a walk that read nothing. Where a read
-    failed, the pass reports how many references it could not judge rather than reporting a
-    clean corpus.
+    The verdict is a 404 and nothing else. `None` — the index not answering — leaves every binding
+    alone, but it does not hold the cadence hostage: the interval bounds the *walk*, and a walk that
+    ran to its end earns its stamp whatever the reads said. Withholding it was the stall: with the
+    index down the read fails again every wake-up, so the withheld stamp put the corpus-wide read on
+    the retry interval while the constants advertise hours, and it left the narrow retry unreachable
+    in exactly that case. "The corpus is not known clean" is carried by the unanswered list instead:
+    capped, aged, retried alone, and counted in `check`.
     """
     now = _store_now()
     unanswered = _unanswered_ids(store)
@@ -2125,14 +2261,12 @@ async def probe_index_liveness(store: Store, kz, generation: int) -> int:
         after = (refs[-1].papra_org_id, refs[-1].papra_document_id)
         if len(refs) < VERIFY_PAGE_SIZE:
             break
-    if probed or not seen:
-        # The stamp records that the walk completed, not that every read succeeded: withholding it
-        # while any id stays unreadable makes the expensive read re-run every sweep, and with the
-        # index down it fails again every sweep, so the withholding is itself the stall. The other
-        # half of the old rule — that the corpus is not thereby known to be clean — is kept as the
-        # list below, which becomes a narrow retry and a warning an operator can read.
-        store.set_setting(LIVENESS_PROBE_STAMP_SETTING, now)
-    store.set_setting(LIVENESS_PROBE_UNANSWERED_SETTING, ",".join(str(i) for i in unreadable))
+    # The stamp records that the walk ran to its end, not that every read succeeded: that half is
+    # the list below. Withholding the stamp while an id stayed unreadable made the expensive read
+    # re-run every wake-up for as long as the index was down, which is the stall itself, and it
+    # starved the narrow retry written for exactly this case.
+    store.set_setting(LIVENESS_PROBE_STAMP_SETTING, now)
+    _remember_unanswered(store, unreadable, now=now)
     if unreadable:
         store.set_setting(LIVENESS_PROBE_RETRY_STAMP_SETTING, now)
     if unbound:
@@ -2163,10 +2297,11 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
        (bounded by `MAX_CANDIDATE_PROBES`, rotated so refusals cannot starve the tail). Only
        `deleted` or a 404 marks anything; a live answer vetoes the mark and, if the ledger was
        already marked, becomes a restore.
-    3. **Then write.** Marks, restores, the liveness probe, and one summary stamp.
-       The probe is inside that ordering, so an aborted pass does not run it either: a pass
-       that could not read the record does not spend the interval on repair work, and the
-       stamp it leaves says `aborted` instead of recording a probe that never happened.
+    3. **Then write.** Marks — bounded per pass, then by the day's brake — and restores, plus one
+       summary stamp. The liveness probe is NOT in this pass: it repairs Kreuzakt-side damage, it
+       has its own clock, and sitting in here behind two early returns it never ran while Papra's
+       listing was untrustworthy, which is precisely when a wrong Kreuzakt verdict needs undoing.
+       `sweep_once` calls it, between this pass and `run_cleanup`.
 
     Candidates are the ledger compared against the listing in both directions: a live row whose
     document Papra says is in the trash, a live row whose document Papra no longer lists at all
@@ -2181,21 +2316,12 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
     generation = store.get_generation()
     moment = _store_now()
     window_start, counted, allowance = _marks_window(store, moment)
-    if counted >= allowance:
-        # The brake refuses the pass before anything is read, so nothing is written either: marks,
-        # restores and the probe all ride on the same pass, and a pass that will not mark cannot be
-        # trusted to judge the rest either. Blocking a genuine restore is the cost, and it is the
-        # smaller one — a restore waits, a wrong verdict does not.
-        store.set_setting(LAST_DELETION_PASS_SETTING,
-                          f"refused by the marks brake: {counted} marks in the window against an "
-                          f"allowance of {allowance}")
-        logger.error(
-            "deletion pass refuses to run: %d references were marked within %d seconds against an "
-            "allowance of %d. Nothing was read and nothing was marked. If the run is real, write "
-            "an empty value to the settings row %s to let the pass run again; if it is not, the "
-            "listing is the suspect.", counted, MARKS_ROLLING_WINDOW_S, allowance,
-            MARKS_ROLLING_SETTING)
-        return DeletionResult(aborted=True, brake_tripped=True)
+    # No pre-pass brake check. The brake gates the marking loop below, and nothing else: reading
+    # the corpus, restoring what came back and re-admitting index work cannot destroy anything
+    # (`_apply_restore` unbinds and re-admits, that is all), while `run_cleanup` — the half that
+    # does destroy — runs from `sweep_once` whatever this pass decided. Refusing the pass before
+    # reading therefore froze the safe work and left the dangerous work running, and at a real
+    # corpus size (an afternoon of decluttering) it did it for a day at a time.
     if not _stamp_expired(store.get_setting(LISTING_WALK_STAMP_SETTING),
                           interval_s=LISTING_WALK_INTERVAL_S, now=moment):
         # Nothing was read, so there is no outcome to stamp and nothing worth logging: the walk
@@ -2210,20 +2336,37 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
     brake_tripped = False
     brake_held = 0
     for org_id in store.ledger_org_ids():
-        expected_refs = store.ledger_stats(org_ids=[org_id])["references"]
+        # The pass needs this bucket's references anyway, and the empty-listing verdict below is
+        # judged against them: "empty" only means something next to the work it is standing in for.
+        refs = _walk_org_refs(store, org_id)
         try:
-            listed = await _walk_listing(papra, org_id, expected_refs=expected_refs)
+            listed = await _walk_listing(papra, org_id)
         except _ListingEmpty as error:
             # Bucket-local, and said twice because the first version of this got it wrong: the
             # references this bucket holds are unreadable right now, so nothing may be inferred
             # about them, and that is the whole extent of the damage. Every other bucket keeps
-            # its marks, its restores and its probe.
+            # its marks and its restores.
+            #
+            # But "empty" is only suspicious if there is work here. Ledger rows are never deleted,
+            # so judging the raw reference count quarantined a bucket that somebody emptied and
+            # the pipeline had finished cleaning: ERROR every walk, `set aside: <org>` in `check`
+            # for good, and nothing blocked — which is how a permanently red light stops being
+            # read at all, including by the two brakes whose only defence is being loud.
+            live = sum(1 for ref in refs if ref.deleted_at is None)
+            debt = sum(1 for ref in refs if ref.cleanup_state in ("pending", "failed"))
+            if not live and not debt:
+                logger.info(
+                    "deletion pass skips org=%s: its listing is empty and the ledger owes it "
+                    "nothing (no live reference, no cleanup debt), which is what finished looks "
+                    "like rather than what a broken listing looks like", org_id)
+                continue
             quarantined.append(org_id)
             logger.error(
-                "deletion pass quarantines org=%s: %s — its references keep their bindings and "
-                "their index entries, and propagation for every other bucket continues; the "
-                "bucket leaves quarantine by listing something again",
-                error.org_id, error.message)
+                "deletion pass quarantines org=%s: %s while %d live reference(s) and %d "
+                "cleanup debt(s) wait on it — its references keep their bindings and their index "
+                "entries, and propagation for every other bucket continues; the bucket leaves "
+                "quarantine by listing something again",
+                error.org_id, error.message, live, debt)
             continue
         except _ListingUntrusted as error:
             logger.error(
@@ -2232,7 +2375,7 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
             store.set_setting(LAST_DELETION_PASS_SETTING,
                               f"aborted: {error.org_id} page {error.page}: {error.message}")
             return DeletionResult(aborted=True)
-        for ref in _walk_org_refs(store, org_id):
+        for ref in refs:
             deleted_there = listed.get(ref.papra_document_id)
             if ref.deleted_at is None and deleted_there is True:
                 proposed.append((org_id, ref.papra_document_id))
@@ -2274,6 +2417,9 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
                 "the detail read says live, so nothing was marked", org_id, document_id)
     marks.sort(key=lambda ref: (ref.papra_org_id, ref.papra_document_id))
     if len(marks) > MAX_DELETIONS_PER_PASS:
+        # `capped` records the cap value, not the number held back: what an operator needs beside
+        # "this pass marked 20" is the ceiling that decided it, and the remainder is already in
+        # the log line below and in the ledger, where a leftover is simply an unmarked reference.
         counts["capped"] = MAX_DELETIONS_PER_PASS
         logger.error(
             "deletion pass capped at %d references this pass, %d left for the next: if this "
@@ -2286,8 +2432,9 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
             brake_held = len(marks) - position
             logger.error(
                 "marks brake holds %d of %d confirmed candidates: the allowance of %d for this "
-                "window is spent, so the rest wait and the next pass refuses outright", brake_held,
-                len(marks), allowance)
+                "window is spent, so they wait. Marks alone are held — the walk, the restores and "
+                "the queued deletes all go on — and the counter an operator clears is %s",
+                brake_held, len(marks), allowance, MARKS_ROLLING_SETTING)
             break
         outcome = await _apply_mark(store, kz, ref, generation=generation)
         counts["refs_marked"] += 1
@@ -2302,14 +2449,15 @@ async def reconcile_deletions(store: Store, papra, kz) -> DeletionResult:
     for ref in restores:
         _apply_restore(store, ref)
         counts["restored"] += 1
-    probed = await probe_index_liveness(store, kz, generation)
+    # The pass stamps its own outcome because `check` opens no client and cannot run a pass to
+    # find one out. `brake_held` is the count of Papra-confirmed candidates this pass chose not to
+    # mark, and it survives only here; the probe is not reported because it is no longer this
+    # pass's work — see `sweep_once`.
     store.set_setting(LAST_DELETION_PASS_SETTING,
                       "ok marked={refs_marked} queued={upstream_pending} closed="
                       "{upstream_deleted} restored={restored} stale={stale_bindings} "
-                      "capped={capped} quarantined={quarantined} brake_held={brake_held} "
-                      "probed={probed}".format(
-                          probed=probed, quarantined=len(quarantined), brake_held=brake_held,
-                          **counts))
+                      "capped={capped} quarantined={quarantined} brake_held={brake_held}".format(
+                          quarantined=len(quarantined), brake_held=brake_held, **counts))
     return DeletionResult(quarantined=len(quarantined), brake_tripped=brake_tripped, **counts)
 
 
@@ -2344,12 +2492,12 @@ def _walk_org_refs(store: Store, org_id: str) -> list[LedgerRef]:
     return refs
 
 
-async def run_cleanup(store: Store, kz, *, now: str | None = None) -> CleanupResult:
+async def run_cleanup(store: Store, papra, kz, *, now: str | None = None) -> CleanupResult:
     """Perform the upstream deletes the ledger says are owed. This is the only place anything
     in Task 9 destroys anything, and even here only what the record has already let go of.
 
     Every row taken off the due list is *judged* before it is acted on, because the queue is a
-    claim about a moment that has already passed. Four checks, each of which can veto the delete
+    claim about a moment that has already passed. Five checks, each of which can veto the delete
     on its own, in the order a wrong answer is cheapest to catch:
 
     1. the reference is still deleted in the ledger — if it is not, the user restored it and the
@@ -2359,11 +2507,25 @@ async def run_cleanup(store: Store, kz, *, now: str | None = None) -> CleanupRes
     3. `cleanup_generation` still equals the current generation — after a rebuild the same
        integer may name different content, and the queued id says nothing about what it points
        at now;
-    4. **no live reference of the current generation resolves to that id** — the count taken at
-       queue time, taken again. This is the one that holds when the queueing side was wrong: a
-       document restored between the mark and the delete, or a second bucket that arrived in
-       the meantime and was indexed onto the same id because Kreuzakt deduplicates identical
-       bytes. Deleting then removes content the survivor cannot rebuild from the index.
+    4. **Papra itself still says this document is gone** — one detail read of the row's own
+       document, and the only veto that asks the record rather than our bookkeeping about it. The
+       others read the ledger, and the ledger is exactly what can be stale: a document trashed,
+       queued, deferred by an outage and then restored in Papra is still `deleted_at IS NOT NULL`
+       here, and nothing else on the execution path ever noticed the restore — only
+       `reconcile_deletions` did, and that runs on a cadence and used to be stoppable by a brake.
+       A live answer skips the intent for good (the restore pass turns the row back into a live,
+       re-admitted reference); an answer that does not arrive skips nothing, leaving the row
+       pending with its attempts intact, because "Papra did not reply" is not evidence about a
+       document and must not be spent like evidence. One GET per queued delete, once per sweep at
+       most per row, is the whole cost of not destroying a document somebody kept.
+    5. **no live reference of the current generation resolves to that id** — the count taken at
+       queue time, taken again, and deliberately the LAST thing read before the request. This is
+       the one that holds when the queueing side was wrong: a document restored between the mark
+       and the delete, or a second bucket that arrived in the meantime and was indexed onto the
+       same id because Kreuzakt deduplicates identical bytes. Deleting then removes content the
+       survivor cannot rebuild from the index. The cheap-answer-first order is broken for it — the
+       GET above is dearer than this count and runs anyway — because every await between the count
+       and the delete is a window the sibling index worker can bind a live reference into.
 
     A transport failure stops the pass for the rows it has not reached. It is not an attempt:
     "there is no answer" spent like "the answer is no" would walk every queued delete in the
@@ -2402,6 +2564,26 @@ async def run_cleanup(store: Store, kz, *, now: str | None = None) -> CleanupRes
                        f"is now {current}, so the queued id may name other content")
             deferred += 1
             continue
+        verdict = await _ask_papra(papra, ref.papra_org_id, ref.papra_document_id)
+        if verdict is LIVE_THERE:
+            store.ledger_skip_cleanup(
+                **where,
+                reason="papra says this document is live: the ledger's delete flag predates a "
+                       "restore nobody has propagated, so nothing is owed upstream")
+            deferred += 1
+            continue
+        if verdict is None:
+            # The re-ask failing closed is the point: the row waits, unpaid and unspent, and
+            # `_ask_papra` has already logged why. Deliberately not a pass-wide stop either — one
+            # document whose detail will not load says nothing about the index's health.
+            deferred += 1
+            continue
+        # The reference count is deliberately the LAST thing read before the delete, after the
+        # re-ask above rather than before it: every await between the count and the request is a
+        # window the sibling index worker can bind a live reference into. That window exists
+        # anyway — the delete itself is an await, and the re-resolve below is what pays for it —
+        # and this pass is not going to widen it by putting a network read in between two ledger
+        # statements. Costs one GET for the rows the count vetoes; those are the rare ones.
         live = store.ledger_resolve([kreuzakt_id], generation=current)
         if live:
             store.ledger_skip_cleanup(

@@ -226,6 +226,16 @@ class FakeIndex(FakeKreuzakt):
         self.unreachable = True
         self.all_deletes_fail = None
 
+    def recover(self) -> None:
+        """Undo `make_unreachable`: the index answers reads and deletes again.
+
+        The outage tests need both halves. A deferred delete that is never retried proves
+        nothing about a veto that is supposed to fire *after* the outage ends, which is the
+        sequence the Papra re-ask exists for.
+        """
+        self.unreachable = False
+        self.all_deletes_fail = _MISSING
+
     def _document(self, document_id: int):
         if document_id in self.unreadable:
             # A partial outage: this id, and only this id, stops answering. `unreachable` is the
@@ -425,7 +435,7 @@ async def test_last_reference_deletion_is_queued_then_executed(store, papra, ind
     assert ref.cleanup_generation == store.get_generation()
     assert index.deleted == [], "the marking pass does not destroy anything itself"
 
-    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert cleanup == CleanupResult(attempted=1, deleted=1, deferred=0, failed=0)
     assert index.deleted == [7]
@@ -451,7 +461,7 @@ async def test_the_cleanup_counts_account_for_everything_drained(store, papra, i
     papra.documents[(ORG, "doc-3")]["deletedAt"] = None
     await indexing.reconcile_deletions(store, papra, index)   # the ledger learns about it
 
-    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert cleanup == CleanupResult(attempted=3, deleted=1, deferred=1, failed=1)
     assert cleanup.attempted == cleanup.deleted + cleanup.deferred + cleanup.failed
@@ -475,12 +485,67 @@ async def test_cleanup_refuses_a_queued_delete_once_a_reference_resolves_again(
     seed_ledger(store, org=OTHER_ORG, document_id="doc-2", kreuzakt_id=7)
     caplog.set_level(logging.INFO, logger="papra_suite.store")
 
-    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert cleanup == CleanupResult(attempted=1, deleted=0, deferred=1, failed=0)
     assert index.deleted == []
     assert store.ledger_get(ORG, DOC_ID).cleanup_state == "skipped"
     assert any("still resolves" in record.getMessage() for record in caplog.records)
+
+
+async def test_a_restore_during_the_outage_stops_the_queued_delete_from_firing(store, papra,
+                                                                              index):
+    """The queue's own vetoes read the ledger, and the ledger is the thing that was stale.
+
+    The sequence this exists for, with no brake or cadence involved: the document is trashed,
+    the reference is marked and the delete is queued; an index outage defers the delete; the
+    person restores the document in Papra; the index comes back. Every ledger-side veto still
+    says "deleted" — only Papra knows otherwise, and until this round nothing on the execution
+    path asked Papra. So the delete fires against a document the user kept, and its text leaves
+    search until a restore pass unwinds it, up to a day later.
+
+    One GET per queued delete closes it independently of any cadence or brake.
+    """
+    seed_reference(store, papra, kreuzakt_id=7, deleted=True)
+    await indexing.reconcile_deletions(store, papra, index)
+    assert store.ledger_get(ORG, DOC_ID).cleanup_state == "pending"
+
+    index.make_unreachable()                        # the delete is deferred, not attempted
+    deferred = await indexing.run_cleanup(store, papra, index, now=due(store))
+    assert (deferred.deleted, deferred.failed) == (0, 0)
+    assert store.ledger_get(ORG, DOC_ID).cleanup_state == "pending"
+
+    papra.documents[(ORG, DOC_ID)]["isDeleted"] = False
+    papra.documents[(ORG, DOC_ID)]["deletedAt"] = None   # restored in Papra, during the outage
+    index.recover()                                 # ...and now the index is back
+
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
+
+    assert cleanup.deleted == 0, "a delete fired against a document the user restored"
+    assert index.deleted == [], "the index entry of a live document was destroyed"
+    assert 7 in index.documents, "the survivor's index entry is gone"
+    assert store.ledger_get(ORG, DOC_ID).cleanup_state == "skipped"
+
+
+async def test_a_queued_delete_waits_when_papra_will_not_answer_about_the_document(store, papra,
+                                                                                  index):
+    """The re-ask fails closed, and a non-answer is not an attempt.
+
+    "Papra did not reply" is not evidence about a document, so the delete waits; and spending
+    the retry allowance on it would walk a corpus of queued deletes to `cleanup_state='failed'`
+    through a Papra outage — the mistake this file already refuses twice elsewhere.
+    """
+    seed_reference(store, papra, kreuzakt_id=7, deleted=True)
+    await indexing.reconcile_deletions(store, papra, index)
+    papra.raise_on_get[DOC_ID] = PapraError("GET document failed: 500 upstream", 500)
+
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
+
+    assert cleanup == CleanupResult(attempted=1, deleted=0, deferred=1, failed=0)
+    assert index.deleted == []
+    ref = store.ledger_get(ORG, DOC_ID)
+    assert ref.cleanup_state == "pending" and ref.cleanup_attempts == 0, \
+        "an outage on the read side was spent as an attempt on the delete"
 
 
 async def test_the_upstream_delete_waits_for_the_last_reference_across_passes(
@@ -491,13 +556,13 @@ async def test_the_upstream_delete_waits_for_the_last_reference_across_passes(
     papra.documents[(ORG, "doc-1")]["isDeleted"] = True
 
     await indexing.reconcile_deletions(store, papra, index)
-    await indexing.run_cleanup(store, index, now=due(store))
+    await indexing.run_cleanup(store, papra, index, now=due(store))
     assert index.deleted == []
     assert store.ledger_resolve([7], generation=store.get_generation())
 
     papra.documents[(OTHER_ORG, "doc-2")]["isDeleted"] = True
     await indexing.reconcile_deletions(store, papra, index)
-    await indexing.run_cleanup(store, index, now=due(store))
+    await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert index.deleted == [7]
     assert store.ledger_resolve([7], generation=store.get_generation()) == []
@@ -591,6 +656,10 @@ async def test_a_kreuzakt_side_deletion_never_touches_papra(store, papra, index)
     index.missing_document_ids = {7}
 
     await indexing.reconcile_deletions(store, papra, index)
+    # The probe is the detector for a Kreuzakt-side deletion, and it is its own pass now: the
+    # deletion pass has no business running it, and cannot — Papra being readable says nothing
+    # about our bindings, and vice versa.
+    await indexing.probe_index_liveness(store, index, store.get_generation())
 
     assert papra.patch_calls == 0 and papra.delete_calls == 0
     ref = store.ledger_get(ORG, DOC_ID)
@@ -611,14 +680,14 @@ async def test_failed_upstream_delete_retries_from_the_ledger_after_restart(stor
     index.fail_delete(7)
 
     await indexing.reconcile_deletions(store, papra, index)
-    await indexing.run_cleanup(store, index, now=due(store))
+    await indexing.run_cleanup(store, papra, index, now=due(store))
 
     ref = store.ledger_get(ORG, DOC_ID)
     assert ref.cleanup_state == "pending" and ref.cleanup_attempts == 1
     assert index.deleted == []
 
     index.fail_delete(None)                    # the outage ends; a new process starts
-    cleanup = await indexing.run_cleanup(store, index, now=due(store, n=8))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store, n=8))
 
     assert cleanup.deleted == 1
     assert index.deleted == [7]
@@ -632,7 +701,7 @@ async def test_cleanup_backs_off_by_the_attempt_number(store, papra, index):
     index.fail_delete(7)
     first = due(store)
 
-    await indexing.run_cleanup(store, index, now=first)
+    await indexing.run_cleanup(store, papra, index, now=first)
     next_at = store.ledger_get(ORG, DOC_ID).cleanup_next_at
 
     expected = (datetime.fromisoformat(first)
@@ -653,7 +722,7 @@ async def test_cleanup_stops_erroring_after_five_attempts(store, papra, index, c
     caplog.set_level(logging.WARNING, logger="papra_suite.store")
 
     for step in range(1, CLEANUP_MAX_ATTEMPTS + 2):
-        result = await indexing.run_cleanup(store, index, now=due(store, n=step * 8))
+        result = await indexing.run_cleanup(store, papra, index, now=due(store, n=step * 8))
         assert result.attempted == (1 if step <= CLEANUP_MAX_ATTEMPTS else 0)
 
     ref = store.ledger_get(ORG, DOC_ID)
@@ -677,7 +746,7 @@ async def test_an_already_deleted_upstream_document_is_a_finished_delete(store, 
     await indexing.reconcile_deletions(store, papra, index)
     index.fail_delete(7, 404)
 
-    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert cleanup == CleanupResult(attempted=1, deleted=1, deferred=0, failed=0)
     ref = store.ledger_get(ORG, DOC_ID)
@@ -700,7 +769,7 @@ async def test_an_unreachable_index_does_not_spend_the_allowance(store, papra, i
     index.make_unreachable()
     caplog.set_level(logging.ERROR, logger="papra_suite.indexing")
 
-    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert cleanup == CleanupResult(attempted=2, deleted=0, deferred=2, failed=0)
     for document_id in ("doc-1", "doc-2"):
@@ -740,7 +809,7 @@ async def test_cleanup_refuses_a_clock_that_is_not_the_stores_own_form(store, pa
     index.fail_delete(7)
 
     with pytest.raises(ValueError, match="now"):
-        await indexing.run_cleanup(store, index, now="2026-11-17 10:00:00")
+        await indexing.run_cleanup(store, papra, index, now="2026-11-17 10:00:00")
 
 
 # --- what makes a listing untrustworthy (Y5) --------------------------------------
@@ -979,7 +1048,7 @@ async def test_the_cap_bounds_the_upstream_deletes_it_queues(store, papra, index
     seed_deleted_in_papra(store, papra, count=MAX_DELETIONS_PER_PASS + 5)
 
     result = await indexing.reconcile_deletions(store, papra, index)
-    await indexing.run_cleanup(store, index, now=due(store))
+    await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert result.upstream_deleted + result.upstream_pending <= MAX_DELETIONS_PER_PASS
     assert len(index.deleted) <= MAX_DELETIONS_PER_PASS
@@ -992,7 +1061,7 @@ async def test_a_restore_clears_the_flag_and_cancels_the_queued_delete(store, pa
     """A durable intent must not outlive the reason for it."""
     seed_reference(store, papra, kreuzakt_id=7, deleted=True)
     await indexing.reconcile_deletions(store, papra, index)
-    await indexing.run_cleanup(store, index, now=due(store))
+    await indexing.run_cleanup(store, papra, index, now=due(store))
     assert index.deleted == [7]
 
     papra.documents[(ORG, DOC_ID)]["isDeleted"] = False
@@ -1015,7 +1084,7 @@ async def test_a_restore_cancels_a_pending_delete_without_deleting(store, papra,
     papra.documents[(ORG, DOC_ID)]["isDeleted"] = False
     papra.documents[(ORG, DOC_ID)]["deletedAt"] = None
     await indexing.reconcile_deletions(store, papra, index)
-    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert index.deleted == []
     assert cleanup.deleted == 0
@@ -1034,7 +1103,7 @@ async def test_a_restore_resets_a_permanently_failed_index_job(store, papra, ind
     """
     seed_reference(store, papra, kreuzakt_id=7, deleted=True)
     await indexing.reconcile_deletions(store, papra, index)
-    await indexing.run_cleanup(store, index, now=due(store))
+    await indexing.run_cleanup(store, papra, index, now=due(store))
     job_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id=DOC_ID,
                                content_hash=HASH, payload={"file_hash": HASH})
     store.mark_job_failed(job_id, "document deleted in papra", max_attempts=1)
@@ -1053,7 +1122,7 @@ async def test_a_restore_creates_the_index_job_when_none_exists(store, papra, in
     """The other half: a document restored after its job was long since reaped."""
     seed_reference(store, papra, kreuzakt_id=7, deleted=True)
     await indexing.reconcile_deletions(store, papra, index)
-    await indexing.run_cleanup(store, index, now=due(store))
+    await indexing.run_cleanup(store, papra, index, now=due(store))
 
     papra.documents[(ORG, DOC_ID)]["isDeleted"] = False
     papra.documents[(ORG, DOC_ID)]["deletedAt"] = None
@@ -1073,7 +1142,7 @@ async def test_a_restore_after_the_upstream_delete_unbinds_the_dead_binding(stor
     """
     seed_reference(store, papra, kreuzakt_id=7, deleted=True)
     await indexing.reconcile_deletions(store, papra, index)
-    await indexing.run_cleanup(store, index, now=due(store))
+    await indexing.run_cleanup(store, papra, index, now=due(store))
     assert store.ledger_get(ORG, DOC_ID).cleanup_state == "done"
 
     papra.documents[(ORG, DOC_ID)]["isDeleted"] = False
@@ -1147,7 +1216,7 @@ async def test_the_liveness_probe_unbinds_a_dead_binding_and_readmits_the_job(st
     index.missing_document_ids = {7}
     assert store.ledger_needs_index(generation=store.get_generation()) == []
 
-    await indexing.reconcile_deletions(store, papra, index)
+    await indexing.probe_index_liveness(store, index, store.get_generation())
 
     assert store.ledger_get(ORG, DOC_ID).kreuzakt_id is None
     assert [r.papra_document_id for r in
@@ -1174,17 +1243,20 @@ async def test_the_liveness_probe_does_not_run_twice_inside_the_interval(store, 
         return sum(1 for method, route in index.calls
                    if method == "GET" and route.startswith("/api/documents/"))
 
-    await indexing.reconcile_deletions(store, papra, index)
+    def probe():
+        return indexing.probe_index_liveness(store, index, store.get_generation())
+
+    await probe()
     first_reads = document_reads()
     assert first_reads >= 2                       # both ids were looked at
 
-    await indexing.reconcile_deletions(store, papra, index)
+    await probe()
     assert document_reads() == first_reads, "the interval gate did not hold"
 
     later = (datetime.now(UTC)
              + timedelta(seconds=indexing.LIVENESS_PROBE_INTERVAL_S + 1)).isoformat()
     monkeypatch.setattr(indexing, "_store_now", lambda: later)
-    await indexing.reconcile_deletions(store, papra, index)
+    await probe()
     assert document_reads() > first_reads
 
 
@@ -1193,7 +1265,7 @@ async def test_the_probe_does_not_unbind_on_an_answer_that_is_not_404(store, pap
     seed_reference(store, papra, kreuzakt_id=7)
     index.unreachable = True
 
-    await indexing.reconcile_deletions(store, papra, index)
+    await indexing.probe_index_liveness(store, index, store.get_generation())
 
     assert store.ledger_get(ORG, DOC_ID).kreuzakt_id == 7
     assert store.ledger_needs_index(generation=store.get_generation()) == []
@@ -1211,7 +1283,7 @@ async def test_the_probe_clears_every_reference_bound_to_a_destroyed_document(st
                    kreuzakt_id=7)
     index.missing_document_ids = {7}
 
-    await indexing.reconcile_deletions(store, papra, index)
+    await indexing.probe_index_liveness(store, index, store.get_generation())
 
     assert store.ledger_get(ORG, "doc-1").kreuzakt_id is None
     assert store.ledger_get(OTHER_ORG, "doc-2").kreuzakt_id is None
@@ -1319,7 +1391,7 @@ async def test_cleanup_never_deletes_a_reused_integer_after_a_rebuild(store, pap
     seed_ledger(store, org=OTHER_ORG, document_id="doc-new", kreuzakt_id=7)  # live, new index
     caplog.set_level(logging.INFO, logger="papra_suite.store")
 
-    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert cleanup == CleanupResult(attempted=1, deleted=0, deferred=1, failed=0)
     assert index.deleted == []
@@ -1385,14 +1457,15 @@ async def test_a_listing_that_never_reports_a_total_aborts_the_pass(store, papra
     assert any("total" in record.getMessage() for record in caplog.records)
 
 
-async def test_a_total_that_moves_between_pages_aborts_the_pass(store, papra, index,
-                                                                small_pages):
-    """Two totals from one walk is not a total; it is two different walks.
+async def test_a_total_that_sinks_below_the_rows_served_aborts_the_pass(store, papra, index,
+                                                                        small_pages):
+    """If the server ever claimed more documents than the walk served, it did not finish.
 
-    The number is what the completeness arm compares the walk against, so a listing that says
-    five and then two has not told us anything we can check. This one shrinks, which is the
-    direction that the old `rows_seen < reported` comparison could not see at all: three rows
-    served against a final total of two looks like a walk that finished with room to spare.
+    The completeness arm asks one question: did we see at least as many rows as the biggest
+    total the endpoint volunteered? This listing says five on page one and two on page two;
+    three rows were served, so the five-document claim was never satisfied and nothing may be
+    inferred from the gaps. The direction ordinary churn produces, a total that GROWS, is the
+    next test, and it does not abort.
     """
     seed_reference(store, papra, document_id="doc-1", kreuzakt_id=7)
     seed_reference(store, papra, document_id="doc-2", file_hash="ab" * 32, kreuzakt_id=8)
@@ -1404,6 +1477,35 @@ async def test_a_total_that_moves_between_pages_aborts_the_pass(store, papra, in
 
     assert result.aborted is True and result.refs_marked == 0
     for document_id in ("doc-1", "doc-2", "doc-3"):
+        assert store.ledger_get(ORG, document_id).deleted_at is None
+
+
+async def test_a_total_that_grows_midway_still_completes_the_walk(store, papra, index,
+                                                                 small_pages):
+    """`documentsCount` is a live count, so a total that moves is ordinary traffic.
+
+    Somebody uploading or trashing one document between page 1 and page 2 makes the total move
+    while the walk runs. Refusing on movement threw the whole pass away for a person touching
+    their library — and an aborted pass earns no cadence stamp, so the next sweep re-pays the
+    entire walk and marks nothing again. That is the amplification this round exists to remove,
+    mirrored: the walk is what propagates a deletion, and it was being cancelled by the very
+    traffic it is meant to notice.
+
+    Four rows served against totals of [2, 4] satisfies the property the arm is for — we saw at
+    least as many rows as the server ever claimed exist — so the walk completes and the trashed
+    document is marked.
+    """
+    for number, document_id in enumerate(("doc-1", "doc-2", "doc-3", "doc-4")):
+        seed_reference(store, papra, document_id=document_id, file_hash=f"h{number}" * 32,
+                       kreuzakt_id=number + 7, deleted=(document_id == "doc-3"))
+    papra.total_pages = [2, 4]                      # one document arrived mid-walk
+
+    result = await indexing.reconcile_deletions(store, papra, index)
+
+    assert result.aborted is False, "a total that grew discarded a walk that saw everything"
+    assert result.refs_marked == 1
+    assert store.ledger_get(ORG, "doc-3").deleted_at is not None
+    for document_id in ("doc-1", "doc-2", "doc-4"):
         assert store.ledger_get(ORG, document_id).deleted_at is None
 
 
@@ -1426,7 +1528,8 @@ async def test_an_empty_listing_stops_its_own_bucket_and_no_other(store, papra, 
     seed_reference(store, papra, org=ORG, document_id="doc-gone", file_hash="cd" * 32,
                    kreuzakt_id=7, deleted=True)
     seed_ledger(store, org=OTHER_ORG, document_id="doc-orphan", file_hash="ef" * 32,
-                kreuzakt_id=9)                       # and Papra lists nothing for that bucket
+                kreuzakt_id=9)                       # and Papra lists nothing for that bucket,
+    # while the ledger still holds a LIVE reference for it: that pairing is the whole suspicion.
     caplog.set_level(logging.ERROR, logger="papra_suite.indexing")
 
     result = await indexing.reconcile_deletions(store, papra, index)
@@ -1481,6 +1584,39 @@ async def test_a_bucket_leaves_quarantine_by_answering_again(store, papra, index
     assert OTHER_ORG not in (store.get_setting(indexing.DELETION_QUARANTINE_SETTING) or "")
 
 
+async def test_a_bucket_that_is_emptied_and_cleaned_is_not_quarantined_forever(store, papra,
+                                                                              index, caplog):
+    """A finished bucket is not an unreadable one, and the health surface must know which.
+
+    The breaker counts references, and ledger rows are never deleted, so the old predicate
+    (`COUNT(*)` with no `deleted_at` filter) stayed true for ever: once a person emptied a
+    bucket and its references were marked and cleaned, every subsequent walk quarantined that
+    bucket, logged ERROR, and printed `set aside: <org>` in `check` permanently. Nothing was
+    blocked — which is exactly the damage: the two mechanisms whose only defence is being loud
+    were shouting about a state that is *finished*, on a corpus of four buckets, until nobody
+    listens to either of them.
+
+    So the empty-listing verdict is judged against the work here: a live reference, or cleanup
+    debt still owed. Neither means nothing to read absence out of, and nothing to say.
+    """
+    seed_reference(store, papra, org=OTHER_ORG, document_id="doc-last", file_hash="ef" * 32,
+                   kreuzakt_id=9, deleted=True)
+    await indexing.reconcile_deletions(store, papra, index)
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
+    assert (cleanup.deleted, index.deleted) == (1, [9])
+    assert store.ledger_get(OTHER_ORG, "doc-last").cleanup_state == "done"
+
+    del papra.documents[(OTHER_ORG, "doc-last")]     # Papra purges it: the bucket is now empty
+    caplog.set_level(logging.ERROR, logger="papra_suite.indexing")
+
+    for _ in range(2):                               # "forever" is the thing under test
+        result = await indexing.reconcile_deletions(store, papra, index)
+        assert result.quarantined == 0, "a bucket the ledger finished with was set aside"
+        assert OTHER_ORG not in (store.get_setting(indexing.DELETION_QUARANTINE_SETTING) or "")
+    assert not any("quarantin" in record.getMessage() for record in caplog.records), \
+        "a finished bucket was shouting about itself at ERROR"
+
+
 # --- review round 2: the same-pass case, and the bucket nobody registered -----------
 
 async def test_two_references_to_one_document_vanishing_in_one_pass_queue_one_delete(
@@ -1519,7 +1655,7 @@ async def test_two_references_to_one_document_vanishing_in_one_pass_queue_one_de
         "the first reference gone still left a live one"
     assert store.ledger_get(OTHER_ORG, "doc-2").cleanup_state == "pending"
 
-    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert (cleanup.deleted, index.deleted) == (1, [7])
     assert store.ledger_resolve([7], generation=store.get_generation()) == []
@@ -1540,7 +1676,7 @@ async def test_an_orphan_buckets_index_entry_is_still_reclaimed(store, papra, in
                    kreuzakt_id=7, deleted=True)
 
     result = await indexing.reconcile_deletions(store, papra, index)
-    cleanup = await indexing.run_cleanup(store, index, now=due(store))
+    cleanup = await indexing.run_cleanup(store, papra, index, now=due(store))
 
     assert (result.refs_marked, result.upstream_pending) == (1, 1)
     assert cleanup.deleted == 1 and index.deleted == [7]
@@ -1582,7 +1718,7 @@ async def test_a_reference_bound_inside_the_delete_window_is_unbound_and_readmit
         await indexing.reconcile_deletions(store, papra, raced)
         assert store.ledger_get(ORG, DOC_ID).cleanup_state == "pending"
 
-        cleanup = await indexing.run_cleanup(store, raced, now=due(store))
+        cleanup = await indexing.run_cleanup(store, papra, raced, now=due(store))
     finally:
         await raced.aclose()
 
@@ -1640,22 +1776,25 @@ async def test_a_walk_that_did_not_finish_is_not_recorded_as_done(store, papra, 
     assert store.get_setting(indexing.LISTING_WALK_STAMP_SETTING) is not None
 
 
-async def test_a_probe_that_judged_nothing_leaves_the_interval_stamp_unwritten(store, papra,
-                                                                              index, monkeypatch):
-    """An outage is not a re-check, and it is not a licence to re-read everything either.
+async def test_a_total_outage_stamps_the_walk_and_retries_only_what_did_not_answer(
+        store, papra, index, monkeypatch):
+    """Cadence honesty: the interval bounds the *walk*, not whether every read succeeded.
 
-    The anti-stall rule is one sentence with two halves that pull against each other: a failed read
-    may not be filed as a completed re-check, and the next wake-up may not put the whole corpus back
-    under the knife. Both hold only if the failure is remembered as something narrow, which is why
-    the two clocks are asserted separately here.
+    Withholding the stamp while any id stayed unreadable made the corpus-wide read run again
+    every `LIVENESS_PROBE_RETRY_INTERVAL_S` — twenty-four times a day against a constant that
+    advertises six hours — and it left the narrow retry unreachable in exactly the case it was
+    written for. Two sentences have to hold at once, and they only do if they are carried by
+    two different pieces of state: the stamp says the walk ran to its end, and the unanswered
+    list says the corpus is not thereby known to be clean.
     """
     seed_reference(store, papra, kreuzakt_id=7)
     index.make_unreachable()
     generation = store.get_generation()
 
     assert await indexing.probe_index_liveness(store, index, generation) == 0
-    assert store.get_setting(indexing.LIVENESS_PROBE_STAMP_SETTING) is None
-    assert store.get_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING) == "7"
+    assert store.get_setting(indexing.LIVENESS_PROBE_STAMP_SETTING) is not None, \
+        "a walk that ran to its end earned no cadence stamp"
+    assert store.get_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING).endswith("|7")
 
     reads = document_reads(index)
     assert await indexing.probe_index_liveness(store, index, generation) == 0
@@ -1664,8 +1803,10 @@ async def test_a_probe_that_judged_nothing_leaves_the_interval_stamp_unwritten(s
 
     monkeypatch.setattr(indexing, "_store_now",
                         lambda: later(indexing.LIVENESS_PROBE_RETRY_INTERVAL_S + 10))
+    before = document_reads(index)
     await indexing.probe_index_liveness(store, index, generation)
-    assert document_reads(index) > reads, "a failed read was never tried again"
+    assert document_reads(index) - before == 1, \
+        "the narrow retry re-read the corpus instead of the one id that never answered"
 
 
 async def test_a_walk_that_finished_around_an_unreadable_id_retries_only_that_id(store, papra,
@@ -1684,7 +1825,7 @@ async def test_a_walk_that_finished_around_an_unreadable_id_retries_only_that_id
 
     assert await indexing.probe_index_liveness(store, index, generation) == 1
     assert store.get_setting(indexing.LIVENESS_PROBE_STAMP_SETTING) is not None
-    assert store.get_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING) == "9"
+    assert store.get_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING).endswith("|9")
     assert store.ledger_get(ORG, "doc-two").kreuzakt_id == 9, "an unanswered id is not a verdict"
 
     reads = document_reads(index)
@@ -1699,37 +1840,192 @@ async def test_a_walk_that_finished_around_an_unreadable_id_retries_only_that_id
         "the retry re-read the corpus instead of the failure"
 
 
-# --- review round 2: a run of marks is a signal, not a queue -------------------------
+# --- review round 2/3: a run of marks is a signal, and it gates marks only ----------
 
-async def test_a_day_of_marks_past_a_tenth_of_the_corpus_stops_the_pass(store, papra, index,
-                                                                        monkeypatch):
+async def test_the_marks_brake_gates_marks_and_not_the_pass(store, papra, index, monkeypatch):
     """Marks that keep coming are a bad signal about the pipeline, not work to grind through.
 
-    The per-pass cap bounds one pass and is silent about the day: twenty references every five
-    minutes is several thousand a day with every individual pass looking ordinary. So the second
-    brake is a fraction of the references the ledger holds — "is this normal" has no answer that is
-    not about the size of the corpus — and when it trips the pass stops reading instead of working
-    the queue down, because reading is how a wrong verdict gets confirmed. The floor is lowered here
-    because ten references is not a corpus the production floor is meant for.
+    The per-pass cap bounds one pass and is silent about the day: twenty references every
+    quarter-hour is nineteen hundred and twenty a day with every individual pass looking
+    ordinary. So the second brake is a fraction of the references the ledger holds — "is this
+    normal" has no answer that is not about the size of the corpus — and the floor is one full
+    pass, lowered here because ten references is not a corpus the production floor is meant for.
+
+    What the brake is allowed to stop is the marking loop, and that is all. Round 2 refused the
+    pass before reading, which froze the non-destructive half of the pass — the walk, the
+    restores, the probe — while `run_cleanup`, the only destructive half, kept running from
+    `sweep_once` regardless: the safe work stopped and the dangerous work continued. And the
+    stated rationale does not reach `_apply_restore`, which can unbind and re-admit and cannot
+    destroy anything.
     """
-    monkeypatch.setattr(indexing, "MARKS_ROLLING_FLOOR", 2)
-    for number in range(10):
-        seed_reference(store, papra, document_id=f"doc-{number}", file_hash=f"hash-{number}",
-                       kreuzakt_id=number + 1, deleted=True)
+    monkeypatch.setattr(indexing, "_marks_rolling_floor", lambda: 2)
+    for number in (1, 2, 3):
+        seed_reference(store, papra, document_id=f"doc-gone-{number}", file_hash=f"{number}" * 64,
+                       kreuzakt_id=number, deleted=True)
 
     first = await indexing.reconcile_deletions(store, papra, index)
     assert first.refs_marked == 2, "one reference in ten is the allowance for ten references"
-    assert first.brake_tripped is True
-    assert first.aborted is False
+    assert (first.brake_tripped, first.aborted) == (True, False)
 
+    # The window is spent. The corpus still holds the deletion the brake turned down, and now it
+    # holds a restore as well.
     listed = papra.list_calls
+    papra.documents[(ORG, "doc-gone-1")]["isDeleted"] = False
+    papra.documents[(ORG, "doc-gone-1")]["deletedAt"] = None
+
     second = await indexing.reconcile_deletions(store, papra, index)
-    assert second.aborted is True and second.brake_tripped is True
-    assert papra.list_calls == listed, "a braked pass still went and read the whole corpus"
-    stamp = store.get_setting(indexing.LAST_DELETION_PASS_SETTING)
-    assert "marks brake" in stamp, stamp
+
+    assert second.aborted is False, "the brake gates marks, not the pass"
+    assert (second.refs_marked, second.brake_tripped) == (0, True)
+    assert second.restored == 1, "a restore cannot destroy anything, so the brake may not hold it"
+    assert papra.list_calls > listed, "the braked pass stopped reading the corpus"
+    assert store.ledger_get(ORG, "doc-gone-3").deleted_at is None, "new marks are what it holds"
+    assert store.ledger_get(ORG, "doc-gone-1").deleted_at is None
+    assert "brake_held=1" in store.get_setting(indexing.LAST_DELETION_PASS_SETTING)
 
     # Not a ratchet: an operator who has established that the run was real clears one row.
     store.set_setting(indexing.MARKS_ROLLING_SETTING, "")
     third = await indexing.reconcile_deletions(store, papra, index)
-    assert third.aborted is False and third.refs_marked == 2
+    assert third.aborted is False and third.refs_marked == 1
+
+
+async def test_the_liveness_probe_runs_even_when_papra_cannot_be_read(store, papra, index):
+    """The probe repairs our side; Papra's listing being unreadable is not its business.
+
+    Inside the pass it sat behind two early returns, so while the listing was untrustworthy —
+    precisely when a delete would be wrong — the one mechanism that recovers a document the
+    index has forgotten did not run at all. It has its own clock, so it has its own call site.
+    """
+    seed_reference(store, papra, kreuzakt_id=7)
+    index.missing_document_ids = {7}
+    papra.raise_on_list = PapraError("GET documents failed: 503 upstream", 503)
+
+    result = await sweep_once(store, papra, kreuzakt=index)
+
+    assert result.deletions_aborted is True
+    assert store.ledger_get(ORG, DOC_ID).deleted_at is None, "an unreadable listing marked"
+    assert store.ledger_get(ORG, DOC_ID).kreuzakt_id is None, \
+        "the probe never ran while Papra's listing was untrustworthy"
+
+
+async def test_the_marks_brake_is_announced_as_a_brake_and_still_lets_the_probe_run(store,
+                                                                                   papra, index,
+                                                                                   monkeypatch,
+                                                                                   caplog):
+    """A brake trip must read as a brake trip, and it must not stop the Kreuzakt-side repair.
+
+    Two defects in one place. The sweep's line tested `aborted` before `brake`, and the pre-pass
+    refusal set `aborted=True`, so a marks-brake stop shouted about a listing that could not be
+    trusted — sending the operator to Papra for a fault the marks counter named. And the probe
+    sat inside the pass, so it froze with everything else while `run_cleanup` carried on.
+    """
+    monkeypatch.setattr(indexing, "_marks_rolling_floor", lambda: 1)
+    # Both rows carry the hash the fake actually serves: `ledger_upsert_reference` clears a binding
+    # whose bytes changed, and the sweep's own pass re-upserts every document it lists.
+    seed_reference(store, papra, document_id="doc-gone", kreuzakt_id=1, deleted=True)
+    first = await sweep_once(store, papra, kreuzakt=index)
+    assert (first.deletions_marked, first.cleanup_deleted) == (1, 1)
+
+    # The window is spent, and a second document goes the same way. Its index entry has already
+    # died on its own: the state the probe exists to notice and repair.
+    seed_reference(store, papra, document_id="doc-next", kreuzakt_id=2, deleted=True)
+    index.missing_document_ids = {2}
+    store.set_setting(indexing.LIVENESS_PROBE_STAMP_SETTING, "")   # the long clock rolls over
+    caplog.set_level(logging.ERROR, logger="papra_suite.pipeline")
+
+    second = await sweep_once(store, papra, kreuzakt=index)
+
+    assert (second.deletions_marked, second.deletions_brake, second.deletions_aborted) == \
+        (0, True, False)
+    assert store.ledger_get(ORG, "doc-next").kreuzakt_id is None, \
+        "a brake on marks froze the repair of a Kreuzakt-side fault"
+    lines = [record.getMessage() for record in caplog.records]
+    assert any("marks brake" in line for line in lines), lines
+    assert not any("could not be trusted" in line for line in lines), \
+        "a brake trip was announced as an untrustworthy listing"
+
+
+def test_the_probe_retry_list_is_capped_and_aged(store):
+    """An id the index will never answer for must not grow the settings row for ever.
+
+    The unanswered list is a schedule rather than a record. Two bounds follow from that: it
+    holds at most a fixed number of ids, and an id that has stayed unreadable for a whole day
+    leaves it — the full walk re-reads every binding on its own clock, so aging costs a delay
+    and nothing else, while an unbounded list is a settings row that grows with an outage.
+    """
+    many = list(range(indexing.LIVENESS_PROBE_UNANSWERED_LIMIT + 25))
+    indexing._remember_unanswered(store, many, now=indexing._store_now())
+    assert len(indexing._unanswered_ids(store)) == indexing.LIVENESS_PROBE_UNANSWERED_LIMIT
+    assert indexing.pending_probe_rereads(store) == indexing.LIVENESS_PROBE_UNANSWERED_LIMIT
+
+    aged = later(-indexing.LIVENESS_PROBE_UNANSWERED_MAX_AGE_S - 60)
+    store.set_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING, f"{aged}|7,9")
+    assert indexing._unanswered_ids(store) == [], "an aged-out id is the full walk's business"
+    assert indexing.pending_probe_rereads(store) == 0
+
+    # A value written by an earlier build (bare ids, no age) reads as nothing rather than
+    # crashing: the next full walk asks about every id again anyway.
+    store.set_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING, "7,9")
+    assert indexing._unanswered_ids(store) == []
+    assert indexing.pending_probe_rereads(store) == 0
+
+    # Re-writing the SAME failing set must not re-age it, or an id that never answers stays
+    # permanently young and the cut-off never arrives: the full walk re-reads it every six hours
+    # and each of those walks would otherwise hand it a fresh day of short-clock retries.
+    first_stamp = indexing._store_now()
+    indexing._remember_unanswered(store, [7, 9], now=first_stamp)
+    again = later(600)
+    indexing._remember_unanswered(store, [7], now=again)
+    assert store.get_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING) == f"{first_stamp}|7"
+    # A NEW failure is a new vintage, and re-ages the list: coarse on purpose.
+    indexing._remember_unanswered(store, [7, 11], now=again)
+    assert store.get_setting(indexing.LIVENESS_PROBE_UNANSWERED_SETTING) == f"{again}|7,11"
+
+
+async def test_a_gated_walk_says_when_it_comes_back(store, papra, index, monkeypatch):
+    """`check` must not present a pass that is being skipped as one that just ran.
+
+    A gated pass writes nothing at all, so the line the operator reads can be a quarter-hour
+    old and say `ok marked=0` — which, next to a document they trashed five minutes ago, reads
+    as propagation being broken. The cadence knows when the walk may run again, so it says so.
+    """
+    monkeypatch.setattr(indexing, "LISTING_WALK_INTERVAL_S", 900)
+    seed_reference(store, papra, kreuzakt_id=7)
+
+    await indexing.reconcile_deletions(store, papra, index)      # walks, and stamps
+    gate = indexing.listing_walk_gate(store)
+    assert gate is not None, "a pass inside its own interval reported nothing outstanding"
+    assert gate == indexing._shift(store.get_setting(indexing.LISTING_WALK_STAMP_SETTING),
+                                   seconds=900)
+
+    listed = papra.list_calls
+    await indexing.reconcile_deletions(store, papra, index)      # gated: reads nothing
+    assert papra.list_calls == listed
+    assert indexing.listing_walk_gate(store) == gate
+
+    monkeypatch.setattr(indexing, "LISTING_WALK_INTERVAL_S", 0)  # the gate has let go
+    assert indexing.listing_walk_gate(store) is None
+
+
+async def test_the_probe_no_longer_runs_ahead_of_the_queued_deletes(store, papra, index):
+    """One sweep: the delete goes first, then the probe's read of an unrelated id.
+
+    The probe's own clock is the argument for its own call site, and the same argument decides
+    where in the sweep it belongs. It used to run between the marks and `run_cleanup`, so a slow
+    but answering index pushed every queued delete to the next sweep: a delete aged by a repair
+    that gained nothing by going first, since all the probe does is unbind rows whose document is
+    already gone.
+    """
+    seed_reference(store, papra, document_id="doc-gone", kreuzakt_id=1, deleted=True)
+    seed_reference(store, papra, document_id="doc-live", kreuzakt_id=2)
+    index.missing_document_ids = {2}                 # our side forgot it; Papra did not
+
+    result = await sweep_once(store, papra, kreuzakt=index)
+
+    assert (result.cleanup_deleted, index.deleted) == (1, [1])
+    assert store.ledger_get(ORG, "doc-live").kreuzakt_id is None, "the probe did not run"
+    calls = list(index.calls)
+    delete_at = next(i for i, (method, _) in enumerate(calls) if method == "DELETE")
+    probe_at = next(i for i, (method, route) in enumerate(calls)
+                    if method == "GET" and route.endswith("/api/documents/2"))
+    assert delete_at < probe_at, "the probe ran ahead of the queued delete again"

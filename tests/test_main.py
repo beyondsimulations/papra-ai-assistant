@@ -746,3 +746,80 @@ def test_check_says_delete_propagation_never_ran(monkeypatch, tmp_path, capsys):
     assert main() == 0
 
     assert "deletions: never ran" in capsys.readouterr().out
+
+
+def _check_run(monkeypatch, tmp_path, capsys, **settings):
+    """Run `papra-suite check` over a store whose settings rows the caller scripted."""
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from papra_suite.store import Store
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    for key, value in settings.items():
+        store.set_setting(key, value)
+    store.close()
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+    return capsys.readouterr().out
+
+
+def test_check_prints_the_buckets_the_last_pass_set_aside(monkeypatch, tmp_path, capsys):
+    """A quarantine is exactly the thing `check` is asked about, so it has to be printed.
+
+    Nothing is blocked by a quarantine, which is precisely why it needs a loud surface: while a
+    bucket is set aside, nothing about its contents is propagated, and from the ledger that is
+    indistinguishable from a bucket that is empty.
+    """
+    from papra_suite import indexing
+
+    out = _check_run(monkeypatch, tmp_path, capsys, **{
+        indexing.LAST_DELETION_PASS_SETTING: "ok marked=0 queued=0 closed=0 restored=0 "
+                                             "stale=0 capped=0 quarantined=1 brake_held=0",
+        indexing.DELETION_QUARANTINE_SETTING: "org-b",
+    })
+
+    assert "set aside: org-b" in out
+    assert "not re-read" not in out, "a fresh set-aside list was labelled stale"
+
+
+def test_check_marks_a_set_aside_list_the_last_pass_could_not_reconfirm(monkeypatch, tmp_path,
+                                                                       capsys):
+    """The list is rewritten only by a walk that finished, so it can outlive its reason.
+
+    After an abort the row still holds the previous pass's buckets. Printed unqualified it reads
+    as a current verdict, which is the same class of staleness the row was rewritten to avoid.
+    """
+    from papra_suite import indexing
+
+    out = _check_run(monkeypatch, tmp_path, capsys, **{
+        indexing.LAST_DELETION_PASS_SETTING: "aborted: org-a page 0: listing failed",
+        indexing.DELETION_QUARANTINE_SETTING: "org-b",
+    })
+
+    assert "set aside: org-b" in out
+    assert "not re-read by the last pass" in out
+
+
+def test_check_prints_the_marks_counter_the_walk_gate_and_the_probe_queue(monkeypatch, tmp_path,
+                                                                         capsys):
+    """The two brakes and the two clocks, on the one line the README names for this question."""
+    from datetime import UTC, datetime
+
+    from papra_suite import indexing
+
+    now = datetime.now(UTC).isoformat()
+    out = _check_run(monkeypatch, tmp_path, capsys, **{
+        indexing.LAST_DELETION_PASS_SETTING: "ok marked=0 queued=0 closed=0 restored=0 "
+                                             "stale=0 capped=0 quarantined=0 brake_held=2",
+        indexing.MARKS_ROLLING_SETTING: f"{now}|34",
+        indexing.LISTING_WALK_STAMP_SETTING: now,
+        indexing.LIVENESS_PROBE_UNANSWERED_SETTING: f"{now}|11,12,13",
+    })
+
+    assert "marks this window: 34" in out, "the counter that can stop the pass is invisible"
+    assert indexing.MARKS_ROLLING_SETTING in out, "check must name the row to clear"
+    assert "gated until" in out, "a skipped pass read as a pass that just ran"
+    assert "probe re-reads: 3" in out

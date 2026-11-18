@@ -329,17 +329,40 @@ def _deletion_pass_line(store) -> str:
     from papra_suite import indexing
 
     stamp = store.get_setting(indexing.LAST_DELETION_PASS_SETTING)
-    # The two things a pass can be quietly wrong about, printed beside its own verdict: buckets it
-    # has set aside because they told it nothing, and the marks counter that can make it refuse to
-    # run at all. Both are stated by the pass in its log, but `check` is where an operator looks
-    # when something is not happening, and a quarantine is exactly that.
+    # Four things a pass can be quietly wrong about, printed beside its own verdict: buckets it set
+    # aside, the marks counter that can hold marking for a day, the walk cadence that can skip the
+    # pass entirely, and the ids the liveness probe still cannot read. All four are stated in the
+    # pass's own log, but `check` is where an operator looks when something is not happening, and a
+    # quarantine is exactly that.
     extra = ""
     quarantine = store.get_setting(indexing.DELETION_QUARANTINE_SETTING)
     if quarantine:
+        # The list is rewritten only by a pass that walked every bucket to its end, so after an
+        # abort it is the PREVIOUS pass's verdict. Printed unqualified it reads as current, which
+        # is the staleness the row was rewritten from a lock in order to avoid.
+        stale = not (stamp or "").startswith("ok ")
         extra += f" | set aside: {quarantine}"
+        if stale:
+            extra += " (not re-read by the last pass)"
     marks = store.get_setting(indexing.MARKS_ROLLING_SETTING)
     if marks and "|" in marks:
-        extra += f" | marks this window: {marks.split('|', 1)[1]}"
+        # The counter alone is not a fact: 34 means nothing until it is beside the 30 it is being
+        # judged against, and the row to clear has to be named or this becomes an sqlite lesson.
+        try:
+            counted, allowance = indexing.marks_window_state(store)
+            extra += (f" | marks this window: {counted} of {allowance} allowed "
+                      f"(clear {indexing.MARKS_ROLLING_SETTING} to resume)")
+        except ValueError:
+            counted = marks.split("|", 1)[1]
+            extra += f" | marks this window: {counted}"
+    gate = indexing.listing_walk_gate(store)
+    if gate:
+        # Without this, a pass that is sitting out its cadence prints the last walk's `ok` line and
+        # looks like a pass that found nothing, beside a document somebody trashed five minutes ago.
+        extra += f" | gated until {gate}"
+    rereads = indexing.pending_probe_rereads(store)
+    if rereads:
+        extra += f" | probe re-reads: {rereads}"
     if not stamp:
         return ("deletions: never ran (the sweep does this once per pass, with kreuzakt up)"
                 + extra)
