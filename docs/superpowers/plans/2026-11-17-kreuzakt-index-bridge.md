@@ -1536,6 +1536,13 @@ v1 proposed matching stale ids to fresh documents via `file_hash` prefixes and o
 
 **Files:** Create `papra_suite/ledger_cli.py`, `tests/test_ledger_rebuild.py`; Modify `papra_suite/indexing.py`, `README.md`.
 
+- **Also owns (found by Task 7's review):** after a rebuild, `unledgered` must be zero — or the runbook must
+  state exactly which documents remain outside the index and why. A rebuild that re-indexes every **ledger
+  reference** still cannot see a document that never got a reference, and pre-handover mailed PDFs are exactly
+  that population (marked seen by the legacy intake, never ledgered). Prove it with a test that plants a
+  `document_seen` row with no ledger reference and shows the rebuild path enrolling it, and keep that test
+  honest by asserting the document becomes searchable rather than merely counted.
+
 **Interfaces:**
 - **Also owns (added after Task 6, tracked by a strict xfail at
   `tests/integration/test_index_pipeline.py:345`): migration 004, which makes the jobs queue re-schedulable.**
@@ -1609,6 +1616,13 @@ git commit -m "feat(index): generation-based rebuild safety; drop unsafe id rema
 ---
 
 ### Task 12: Token CLI and MCP server skeleton, with `index_status` scoped
+
+**Found by Task 7's review, and it must be fixed here rather than in prose:** `check` and `index_status` gain a
+structural count of **Papra documents that have no ledger row at all** (`unledgered=N`, per bucket when a
+bucket filter applies). Today that population is invisible: the sweep skips anything `document_seen` already
+knows, and every pre-handover emailed PDF was marked seen by the legacy intake without ever getting a
+reference, so `refs` and `current` can both look healthy while a chunk of the corpus is permanently outside the
+index. A warning in the README is not a control; a number that must reach zero is.
 
 Auth and transport come from `docs/superpowers/specs/2026-11-16-mcp-search-server-design.md` **verbatim**: `mcp` 2.x Streamable HTTP, `token_verifier` under `auth` settings, the Host/Origin allow-list answering **421** to a bare host, 401 for query-string tokens, no Funnel, pydantic returns, the error model. What changes is the token store: per-token rows carrying bucket lists, replacing that spec's single `mcp_allowed_org_ids` key.
 
@@ -1956,7 +1970,11 @@ git commit -m "feat(mcp): document tools with Papra-only identities and untruste
 **Interfaces:**
 - Consumes: `Store.list_jobs/count_jobs/reset_job/enqueue_job`, `ledger_needs_index`, `PapraClient.list_documents`, `_is_pdf`.
 - Produces: `papra-suite jobs [--kind K] [--status S] [--limit 50]`, `papra-suite jobs --reset JOB_ID`, `papra-suite jobs --kind K --drain`, `papra-suite backfill [--org-id ID] [--limit N] [--dry-run] [--all-stale]`.
-- Eligibility: a document is enqueued when the ledger has **no current-generation reference** for it (`--all-stale` walks `ledger_needs_index`), **not** when `document_seen` says we have ingested it — that flag records ingestion, so after a rebuild every document would look already-done.
+- Eligibility: a document is enqueued when the ledger has **no current-generation reference** for it (`--all-stale` walks `ledger_needs_index`), **not** when `document_seen` says we have ingested it — that flag records ingestion, so after a rebuild every document would look already-done. **Say plainly in `--help` and in the README that this command is the enrolment path for documents the sweep
+  will never visit** (anything `document_seen` already knows but the ledger has never held: mailed PDFs from
+  before the handover, oversized skips). Enqueuing one of those must create the ledger reference **before** the
+  job becomes visible, the same crash ordering the intake path obeys, otherwise the document is queued once and
+  invisible forever after.
 
 - [ ] **Step 1: Write the failing tests**
 
