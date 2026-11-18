@@ -1268,7 +1268,13 @@ def ownership(ref, *, field: str, current) -> OwnershipVerdict:
 
 - [ ] **Step 4: Stop feeding title jobs, drained**
 
-When `index_metadata_delivery` is on, `enqueue_index_job` skips the `ocr` enqueue entirely (no OCR text means no title input, and the `title` chain is dead by construction), and `README.md` requires `papra-suite jobs --kind title --drain` before the flag is flipped. Handover of content and of metadata are separate, each reversible until Task 16 removes the code.
+When `index_metadata_delivery` is on, the suite stops feeding the legacy title chain. **Placement ratified after Task 8's review:** the gate sits in the `ocr` job's completion handler (`on_job_done`), not in `enqueue_index_job` — suppressing the `ocr` row instead would starve Papra's `content` of its only writer while `check` credited one, which is the exact failure shape this plan refuses elsewhere.
+
+**And the gate must cover the consumer as well as the producer (Critical from Task 8's review).** Stopping new `title` rows leaves the ones already `pending`/`running`, and `run_title_job` PATCHes Papra's `name` while recording nothing in the ledger. The next metadata pass then reads a value that is neither `written_name` nor `papra_original_name`, so ownership says *not ours* and sets `name_protected = 1` — permanently, and byte-identical to a genuine human rename, because protection is one bit with no provenance. So while the metadata gate is on, `run_title_job` skips and marks the job done, the same way it already skips on a stale hash. Without this, the documented handover locks `name` on every document still sitting in the legacy title queue, with no signal in `check` and no recovery short of `metadata --force --yes-i-mean-it`, which overwrites every genuine human rename in scope.
+
+Two follow-ups, both cheap because the data already exists: `check`'s index line gains `protected_name=N protected_date=N protected_notes=N` (`ledger_stats` already computes them; today only the metadata CLI reads them), so a corpus-wide lock is visible from the command an operator runs when something is wrong; and the README's metadata steps must state the already-handed-over case — after the content handover the loops are gone, so queued `title` rows are inert and are deleted rather than drained, and `check` prints `index bridge` rather than `two writers (title queue draining)`. As written, the content section and the metadata section each require something the other removes, and one `PAPRA_LEGACY_WORKERS` flag cannot satisfy both orders.
+
+Handover of content and of metadata stay separate, each reversible until Task 16 removes the code.
 
 - [ ] **Step 5: Mutation check (c), gates, commit**
 
@@ -1310,6 +1316,15 @@ Commit as `feat(index): metadata delivery on Papra-side baselines with explicit 
   predicate is shared by four call sites and has no test of its own, so a mistake in it surfaces today as four
   unrelated failures. Pin `isDeleted` true, `deletedAt` set, both, and neither — cheaper to diagnose, and this
   task is the one that starts depending on it hardest.
+- **Also owns (found by Task 8's review): a direct table test for `papra_document_is_deleted()`, and a restore
+  that demonstrably re-admits.** The predicate is now shared by several call sites across `run_index_job`, the
+  convergence pass and metadata delivery, and has no test of its own, so a mistake surfaces as scattered
+  unrelated failures; pin `isDeleted` true, `deletedAt` set, both, and neither. Separately, prove the restore
+  path actually re-enqueues: with the current unique idempotency index, a `failed` row makes
+  `enqueue_job` a silent no-op, so write a test where an `index` job for those bytes is already permanently
+  failed and show the document becoming claimable again (reset today, and note Task 11's partial index as the
+  durable fix).
+
 - Produces:
   - `async def reconcile_deletions(store, papra, kz) -> DeletionResult(refs_marked: int, upstream_deleted: int, upstream_pending: int, restored: int, aborted: bool, capped: int)`
   - `async def run_cleanup(store, kz) -> CleanupResult(attempted: int, deleted: int, deferred: int, failed: int)`
@@ -1587,6 +1602,13 @@ v1 proposed matching stale ids to fresh documents via `file_hash` prefixes and o
   `user_version == 3` assertion and its "bump me when a migration lands" comment both move to 4 in the same
   commit, and the migration must use per-statement `conn.execute` (see the Critical that Task 4's review
   found in `executescript`). Remove the xfail marker in the commit that fixes it.
+
+  **Read this together with Task 9's restore path (found by Task 8's review).** A permanently failed `index`
+  row currently blocks every later `INSERT OR IGNORE` for the same `(kind, org, document, content_hash)`, and
+  the re-admission moves all work by enqueuing exactly that tuple: Task 9's `ledger_unbind` + restore, and
+  Task 15's backfill. Until this migration lands, a restore can therefore look successful and enqueue nothing.
+  Task 9 must not paper over it with a silent `reset_job` on the restore path alone — the durable fix is this
+  partial index; a reset in the restore path is belt-and-braces on top of it, with a test.
 
 - Consumes: `Store.get_generation/bump_generation/ledger_needs_index`, `KreuzaktClient.health`, `enqueue_index_job`.
 - Produces: `async def reconcile_generation(store, kz) -> RebuildResult(generation: int, stale: int, requeued: int)`, CLI `papra-suite ledger (--status | --invalidate | --cleanup)`, where `--cleanup` forces one immediate pass over rows in `cleanup_state='failed'` **and passes `reset_attempts=True` to `ledger_queue_cleanup`** — that parameter exists precisely for this deliberate operator reset, and without it a forced pass gets one attempt before re-failing (Task 4 left the wiring here on purpose).
