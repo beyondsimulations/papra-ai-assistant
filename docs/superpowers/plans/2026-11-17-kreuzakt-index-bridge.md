@@ -1511,7 +1511,12 @@ v1 proposed matching stale ids to fresh documents via `file_hash` prefixes and o
   `tests/integration/test_index_pipeline.py:345`): migration 004, which makes the jobs queue re-schedulable.**
   Jobs are idempotent on `(kind, org, document, content_hash)` via a unique index, so enqueuing a backfill
   item whose index job already **finished** returns the finished row's id and nothing is claimable — this
-  blocks both this task's rebuild re-index and Task 15's `backfill --all-stale`. Replace that unique index
+  blocks both this task's rebuild re-index and Task 15's `backfill --all-stale`. Worse, and worth stating in the migration's own comment: because
+  `enqueue_job` is `INSERT OR IGNORE` against that index, a job that reaches `failed` blocks every later
+  enqueue for the same bytes too. Ingest mail while Kreuzakt is unreachable -- and the index worker runs
+  unconditionally against a `kreuzakt_base_url` that does not resolve off-stack -- and those documents
+  burn three attempts and are then **locked out of the index permanently**, recoverable only by a
+  per-document `jobs --reset`. This migration is the recovery path for that outage, not a convenience. Replace that unique index
   with a **partial** one, `WHERE status IN ('pending','running')`, so "no two live jobs for the same input"
   still holds while a completed or failed job no longer blocks a fresh request. Drop the old index and create
   the new one inside migration 004; remember the pattern Task 1 and Task 4 established — the literal
