@@ -718,7 +718,7 @@ async def _collect(fetch, resolve, *, want: int, scan_rows: int) -> Sweep:
 async def _guarded(what: str, body, *, deadline_s: float | None):
     """Await one tool call's work, and turn every "could not find out" into one stable code.
 
-    Three things happen here and each is a leak or a lie prevented:
+    Four things happen here and each is a leak or a lie prevented:
 
     **Upstream prose stops here.** `KreuzaktError` interpolates the response body into its message,
     and the SDK hands `str(exc)` straight to the agent. So the client gets the exception's class and
@@ -734,6 +734,12 @@ async def _guarded(what: str, body, *, deadline_s: float | None):
     per call, so without this a sick index answers nothing at 30 s instead of refusing at 15 s. The
     worker thread a cancelled `to_thread` left behind finishes in the background and is dropped —
     the same trade `index_status_for` documents.
+
+    **And the unexpected is still a refusal.** Anything else that escapes — a Papra record that is
+    not a mapping, a view whose method set moved — becomes `index_unavailable` too, with the type
+    name in the log. Without that last branch the client gets the SDK's generic "Error executing
+    tool", which is a fourth undocumented shape to code against, and this module's own rule is that
+    a call which could not find out says so with the one code it already has.
     """
     try:
         return await asyncio.wait_for(body, timeout=deadline_s)
@@ -756,6 +762,16 @@ async def _guarded(what: str, body, *, deadline_s: float | None):
         logger.warning("mcp: %s could not read the ledger (%s)", what, type(error).__name__)
         raise IndexUnavailable("the ledger would not answer this request, so no reference could "
                                "be resolved and nothing can be shown") from error
+    except Exception as error:
+        # The catch-all this function did not have. Measured: a Papra record that is not a mapping
+        # made `record.get("isDeleted")` raise `AttributeError`, which escaped `mcp_tools` whole —
+        # and while the SDK kept the text off the wire (the client read only `Error executing tool
+        # search_documents`), that is a fourth, undocumented error shape for a client that
+        # branches on codes, and "this call could not find out" already has a code for it. The
+        # answer is a refusal, exactly like every other failure to find out.
+        logger.warning("mcp: %s failed unexpectedly (%s)", what, type(error).__name__)
+        raise IndexUnavailable("this request could not be answered, so nothing is reported as an "
+                               "answer") from error
 
 
 async def search_documents(ctx, store, papra, kz, query: str, *, page: int = 1,
