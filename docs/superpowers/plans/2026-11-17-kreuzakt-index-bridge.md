@@ -2023,7 +2023,10 @@ Commit as `feat(mcp): search and list filtered by the ledger, fail-closed and bo
 Create `papra_suite/untrusted_text.py`, `tests/test_mcp_documents.py`.
 
 **Interfaces:**
-- Consumes: `Store.ledger_get/get_generation`, `KreuzaktClient.get_document`, `Config.papra_base_url`, the sanitiser rule from `ingest_events` (isprintable + category filter).
+- Consumes: `Store.get_generation` and a **new** unfiltered `Store.ledger_refs_for_document(document_id)`
+  (`ledger_get` needs the bucket, and these tools are given none), `PapraClient.get_document` for
+  liveness, `KreuzaktClient.get_document` for the indexed body, `Config.papra_base_url`, and the
+  unsafe-character rule from `ingest_events` (category filter; see "As shipped" on where it lives).
 - Produces:
   - `async def get_document(ctx, store, papra, kz, document_id: str) -> DocumentView(document_id, org_id, title, description, document_date, original_filename, mime_type, page_count, opened_from: str)`
   - `async def get_document_content(ctx, store, papra, kz, document_id, *, max_chars=20000) -> ContentResult(text, truncated, chars_total, sanitized: bool)`

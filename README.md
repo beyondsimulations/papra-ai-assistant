@@ -706,13 +706,14 @@ from the index only: Papra's delivered copy is not a fallback, because a copy th
 blank, returned during an outage with nothing saying so, is a worse answer than a refusal.
 
 `open_document` builds both URLs out of `PAPRA_BASE_URL` and the reference's own bucket and id,
-percent-encoded, and speaks to nothing else — no index request, no index host or path in the answer or
-in the refusal. It does ask Papra the one question its two siblings ask, because a URL is a claim:
-*this document is in the archive, at this place*. So a document the archive reports deleted is
+percent-encoded, and **makes no Kreuzakt request** — no index host, path or id in the answer or in the
+refusal. It does read Papra once, the same liveness read its two siblings make, because a URL is a
+claim: *this document is in the archive, at this place*. So a document the archive reports deleted is
 `not-found` rather than a link, and a Papra that will not answer is `index_unavailable` rather than a
-URL that may lead nowhere — one Papra read per call, zero index calls. A dead index still leaves the
-viewer working, which is when an operator wants the link most; a link into a service that is not
-answering is not a fallback, it is a dead end that looks like one.
+URL that may lead nowhere. Counted honestly: **one Papra read on the path that answers, zero on every
+refusal path, zero index reads anywhere**. A dead index still leaves the viewer working, which is when
+an operator wants the link most; a link into a service that is not answering is not a fallback, it is a
+dead end that looks like one.
 
 **There is no `not-in-scope` code, and the reason is a fact about who could hear it.** This
 milestone's plan asked for a refusal that says *that document exists, in a bucket you were not
