@@ -2018,15 +2018,20 @@ Commit as `feat(mcp): search and list filtered by the ledger, fail-closed and bo
 
 ### Task 14: `get_document`, `get_document_content`, `open_document`
 
-**Files:** Modify `papra_suite/mcp_tools.py`; Create `tests/test_mcp_documents.py`.
+**Files:** Modify `papra_suite/mcp_tools.py`, `papra_suite/mcp_server.py`, `papra_suite/store.py`,
+`papra_suite/readers.py`, `papra_suite/kreuzakt_client.py`, `papra_suite/__main__.py`, `README.md`;
+Create `papra_suite/untrusted_text.py`, `tests/test_mcp_documents.py`.
 
 **Interfaces:**
 - Consumes: `Store.ledger_get/get_generation`, `KreuzaktClient.get_document`, `Config.papra_base_url`, the sanitiser rule from `ingest_events` (isprintable + category filter).
 - Produces:
   - `async def get_document(ctx, store, papra, kz, document_id: str) -> DocumentView(document_id, org_id, title, description, document_date, original_filename, mime_type, page_count, opened_from: str)`
   - `async def get_document_content(ctx, store, papra, kz, document_id, *, max_chars=20000) -> ContentResult(text, truncated, chars_total, sanitized: bool)`
-  - `async def open_document(ctx, store, document_id) -> OpenResult(viewer_url, download_url)`
-  - `ToolError(code)` with codes `not-found`, `not-in-scope`, `index-unavailable`, `invalid-request`.
+  - `async def open_document(ctx, store, papra, document_id, *, papra_base_url)
+    -> OpenResult(viewer_url, download_url)` — it takes the liveness dependency, see below
+  - `ToolError(code)` with the three codes that ship: `not-found`, `index_unavailable`,
+    `invalid-request`. `not-in-scope` is deliberately absent and `multiple_matches` is folded into
+    `invalid-request`; both are argued under "As shipped" below.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2034,9 +2039,9 @@ Commit as `feat(mcp): search and list filtered by the ledger, fail-closed and bo
 async def test_client_ids_are_papra_ids_and_kreuzakt_ids_are_rejected(store):
     with pytest.raises(ToolError, match="not-found"):
         await get_document(ctx, store, fake_papra, fake_kz, "7")     # a Kreuzakt integer
-async def test_reference_outside_the_token_is_not_in_scope(store, fake_papra, fake_kz):
+async def test_reference_outside_the_token_is_refused_indistinguishably(store, fake_papra, fake_kz):
     seed_ledger(store, org_id="org-b", document_id="doc-b", kreuzakt_id=9)
-    with pytest.raises(ToolError, match="not-in-scope"):
+    with pytest.raises(ToolError, match="not-found"):
         await get_document(ctx_scoped_to("org-a"), store, fake_papra, fake_kz, "doc-b")
     assert fake_kz.calls == []                 # refused before reaching the index
 
@@ -2055,8 +2060,8 @@ async def test_deleted_in_papra_is_not_found_even_though_the_index_still_has_it(
 async def test_content_is_capped_and_says_so(store):
     result = await get_document_content(ctx, store, fake_papra, fake_kz, "doc-1", max_chars=100)
     assert result.truncated and result.chars_total > 100
-async def test_open_document_urls_are_papra_only_and_require_no_kreuzakt_call(store, fake_kz):
-    result = await open_document(ctx, store, "doc-1")
+async def test_open_document_urls_are_papra_only_and_require_no_kreuzakt_call(store, fake_papra, fake_kz):
+    result = await open_document(ctx, store, fake_papra, "doc-1", papra_base_url=PAPRA_BASE)
     assert result.viewer_url.startswith("http://papra:1221/organizations/org-a/documents/doc-1")
     assert fake_kz.calls == []
 async def test_extracted_text_is_wrapped_as_untrusted_content(store):
@@ -2066,13 +2071,20 @@ async def test_control_and_format_characters_are_stripped(store):
 async def test_kreuzakt_unreachable_raises_index_unavailable(store, fake_papra, fake_kz):
     """No Papra-backed fallback: an outage says so instead of returning the worse copy."""
     fake_kz.error = KreuzaktError("connection refused")
-    with pytest.raises(ToolError, match="index-unavailable"):
+    with pytest.raises(ToolError, match="index_unavailable"):
         await get_document_content(ctx, store, fake_papra, fake_kz, "doc-1")
 ```
 
 - [ ] **Step 2: Implement, resolving Papra → Kreuzakt → Papra**
 
-Accept a **Papra** id, load the reference with `ledger_get`, require `not deleted_at`, `delivered_generation == store.get_generation()`, and `ctx.scope_all or org_id in ctx.org_ids`, then check Papra's live state, then fetch Kreuzakt content by `ref.kreuzakt_id`. Never accept a Kreuzakt id: making its integers client-visible is the identity model this design refuses. `open_document` builds `{papra_base_url}/organizations/{org}/documents/{id}` and `…/file` and touches no other service.
+Accept a **Papra** id, load every reference carrying it (`ledger_get` needs the bucket already, and
+these tools have none, so the read is a new unfiltered `Store.ledger_refs_for_document(document_id)`
+returning a list), require `not deleted_at`, `delivered_generation == store.get_generation()`, and
+`ctx.scope_all or org_id in ctx.org_ids`, then check Papra's live state, then fetch Kreuzakt content by
+`ref.kreuzakt_id`. Never accept a Kreuzakt id: making its integers client-visible is the identity model
+this design refuses. `open_document` builds `{papra_base_url}/organizations/{org}/documents/{id}` and
+`…/file` after the same one-GET Papra liveness check the other two perform, and speaks to no other
+service.
 
 - [ ] **Step 3: Commit**
 
@@ -2080,6 +2092,61 @@ Accept a **Papra** id, load the reference with `ledger_get`, require `not delete
 git add papra_suite/mcp_tools.py tests/test_mcp_documents.py
 git commit -m "feat(mcp): document tools with Papra-only identities and untrusted-text wrapping"
 ```
+
+**As shipped (landed 2026-11-19, amended 2026-11-20 after the controller round).** Six things in the
+code are not things the sketch above says, and each is recorded here rather than left for the next
+reader to re-litigate:
+
+- **The outage code is `index_unavailable`, with an underscore.** That spelling shipped in Task 12 and
+  rides on every `index_status` and search payload already, so a document tool answering
+  `index-unavailable` would give a client two spellings of one condition and two branches to write.
+  The table cell hyphenated it; the prose, the code and the pinned tests all agree on one. Pinned by
+  `test_the_index_outage_code_is_one_spelling_for_one_condition`.
+- **`sanitized` means "the character rule removed at least one character", and `chars_total` counts the
+  sanitised body.** The sketch named both fields and defined neither. `chars_total` is the length of
+  the text the caller could have been given, so `chars_total - len(body)` is exactly what was withheld
+  and no character is counted that was never offered; `sanitized` is not "the text was wrapped", which
+  is always true and therefore worth nothing. A clean document is reported as clean.
+- **There is no `not-in-scope`, and that is a security decision, not a simplification.** The 2026-11-16
+  spec's `not_found_or_not_accessible` collapses "absent" with "outside the allow-list" because
+  *"distinguishing them leaks existence across the allow-list boundary"*, and the plan's separate code
+  contradicted it. The audience decides: `ctx.scope_all` short-circuits the scope filter, so an
+  all-buckets credential — the operator's own — can never receive the disclosure, and the only tokens
+  that can are scoped ones, for whom "it exists, elsewhere" is one bit to walk across a corpus with no
+  bucket boundary in it. So a foreign live reference answers `not-found`, and the test asserts the two
+  refusals are **equal strings** rather than two messages that each match a pattern, because a
+  difference of one word re-opens the oracle. The diagnosis the code stops giving the caller it gives
+  the operator: the holding bucket and the token's label are logged at `info`.
+- **`multiple_matches` is folded into `invalid-request`.** Papra ids are per organisation and global
+  uniqueness is unverified, so one id can be two live documents; the tools take no bucket argument,
+  which makes the request under-specified rather than ambiguous. `invalid-request` naming both buckets
+  is safe to print — the caller is granted every bucket the message lists — and picking one by row
+  order would be a document whose identity depends on SQL. A dedicated code is one class and one line
+  if a client ever branches on it.
+- **`papra_suite/untrusted_text.py` is a new module, and it is the point of the "reuse the existing
+  rule" requirement.** Sharing `__main__.py`'s private `_UNSAFE_CATEGORIES` from `mcp_tools` would mean
+  the library importing the CLI, which is a cycle (`__main__` imports `mcp_server`). The rule lives in
+  a third module that both import, so the terminal renderer and the content tool cannot drift apart;
+  `test_the_sanitiser_is_one_rule_shared_with_the_event_renderer` asserts the two names are the *same
+  object*, not two sets that agree today. It is not `store.sanitize_event_text`, which collapses
+  whitespace and would flatten an invoice's transcript: what is shared is the character judgement, not
+  the medium's rule about newlines.
+- **There is no Papra content fallback, because `content_status` does not exist on Papra's API.** The
+  sketch's `content_status="missing"` was never a field the index or Papra serves (measured in Task 3's
+  capture). Papra's detail payload does carry the delivered `content`, and falling back to it during an
+  index outage would answer with a copy that may be older or blank where the index has text, with
+  nothing in the result saying which. So an outage is `index_unavailable` and the worse copy stays
+  unread; `open_document` is where the rest of a long document lives.
+
+Two rulings from the controller round also changed the shape above. `open_document` takes `papra` and
+performs the same one-GET liveness check as its siblings: a URL is a claim about the archive, so a
+document Papra reports deleted is `not-found` rather than a viewer link, and a Papra that will not
+answer is `index_unavailable` rather than a dead end that looks like a link. It still makes **zero
+Kreuzakt calls**, which is what keeps the viewer working while the index is down and keeps an index
+path, id or host out of both the answer and the refusal. `Store.ledger_refs_for_document` (unfiltered,
+returning a list) and the view/`REQUIRED_READS` entries that go with it are the reads these three tools
+were missing, and `KzDocument.page_count` is nullable because Papra's detail payload has no page count
+and a permanently-`None` field would be a lie by omission.
 
 ---
 
