@@ -60,6 +60,18 @@ from papra_suite.config import _safe_echo
 from papra_suite.kreuzakt_client import KreuzaktError
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.mcp_tokens import TokenContext, resolve_token, stamp_token_use, token_counts
+from papra_suite.mcp_tools import (
+    DEFAULT_LIMITS,
+    IndexUnavailable,
+    SearchLimits,
+    SearchPage,
+)
+from papra_suite.mcp_tools import (
+    list_recent_documents as list_recent_documents_tool,
+)
+from papra_suite.mcp_tools import (
+    search_documents as search_documents_tool,
+)
 from papra_suite.oversized import oversized_seen
 from papra_suite.readers import (
     BORROWED_FROM,
@@ -145,23 +157,20 @@ class McpListenerDied(RuntimeError):
     """
 
 
-class IndexUnavailable(ToolError):
-    """The index is not answering, so there is no honest number to return.
+# `IndexUnavailable` is imported from `papra_suite.mcp_tools` rather than defined here: the search
+# tools raise the same condition, the registration import runs `mcp_server` → `mcp_tools`, so a
+# shared error has to live downstream. `from papra_suite.mcp_server import IndexUnavailable` still
+# resolves, which is what keeps Task 12's pins working unchanged.
 
-    A tool error rather than a crash: the client reads the sentence, and the log gets one INFO line
-    instead of a traceback for an outage. The message starts with the code `index_unavailable` so a
-    client can branch on it, and it carries nothing else from upstream.
 
-    The alternative — answering from Papra — is refused on purpose. This suite is a bridge; a
-    Papra-backed answer behind an "index" tool is a second, worse index that does not say it fell
-    back, which is the exact shape of a confident wrong answer.
+class Unauthenticated(ToolError):
+    """A request that reached a tool with no principal attached. `unauthenticated: …`.
+
+    Unreachable behind the bearer gate, and it stays because the alternative is a default scope.
     """
 
     def __init__(self, reason: str):
-        # Bounded here rather than at every call site: this sentence goes to whoever called the
-        # tool, and the only way this program makes a long one is repeating upstream's words.
-        bounded = sanitize_event_text(reason, limit=CLIENT_MESSAGE_LIMIT) or "unknown"
-        super().__init__(f"index_unavailable: {bounded}")
+        super().__init__(f"unauthenticated: {reason}")
 
 
 @dataclass(frozen=True)
@@ -395,6 +404,28 @@ def token_context_of(request: object) -> TokenContext | None:
                         scope_all=scope_all)
 
 
+def require_principal(request: object) -> TokenContext:
+    """The principal this request authenticated as, or a refusal. There is no default scope.
+
+    `token_context_of` is the only source of a principal in this listener, and every tool takes its
+    scope from it and from nothing else: the SDK builds a tool's arguments from whatever the client
+    sent, so an `org_ids` or `scope` parameter on a tool would be a way to widen a grant by naming
+    buckets nobody minted. There is no such parameter, and the tests assert that against the
+    published schema rather than against this paragraph.
+
+    The default matters more than the check. A principal-less request answered with an empty context
+    is fail-closed only while some later filter happens to read an empty bucket list as nothing;
+    answered with `scope_all=True` it is the breach. Neither is allowed: the call is refused where
+    the principal should have been, before any index read happens.
+    """
+    principal = token_context_of(request)
+    if principal is None:
+        raise Unauthenticated(
+            "this request carried no authenticated principal, so there is no bucket list to answer "
+            "from; nothing was read")
+    return principal
+
+
 # --- the tool's return values (pydantic, per the project's standing rule) ----------------
 
 
@@ -545,9 +576,8 @@ CORRUPT_GENERATION_HINT = ("the ledger's index_generation names no current gener
                            "count would be a guess — `papra-suite ledger --status` names the row "
                            "and `ledger --invalidate` is the repair")
 
-#: How long one tool message may be on its way to an agent. The codes above are short; the bound is
-#: for anything mapped in a hurry later.
-CLIENT_MESSAGE_LIMIT = 240
+#: How long one tool message may be on its way to an agent lives in `mcp_tools.CLIENT_MESSAGE_LIMIT`
+#: from Task 13 on: it is the bound of the shared `IndexUnavailable`, which now lives there too.
 
 
 def _generation_is_corrupt(store: Store) -> bool:
@@ -736,7 +766,8 @@ async def index_status_for(store: Store, kz, context: TokenContext, *,
 
 def build_mcp_app(store: LedgerReader, papra: PapraReader, kz: KreuzaktReader, *,
                   url: str, host: str = DEFAULT_MCP_HOST,
-                  port: int = DEFAULT_MCP_PORT) -> Starlette:
+                  port: int = DEFAULT_MCP_PORT,
+                  limits: SearchLimits | None = None) -> Starlette:
     """The ASGI app: auth, transport checks, and the tools. Refuses to build on a bad config.
 
     **The dependencies are capabilities, and they are checked here.** All three are refused if they
@@ -759,6 +790,10 @@ def build_mcp_app(store: LedgerReader, papra: PapraReader, kz: KreuzaktReader, *
     require_read_only(store, role="store")
     require_read_only(papra, role="papra")
     require_read_only(kz, role="kreuzakt")
+    # The two search tools' bounds come from `load_config` in production (`run_mcp_listener` passes
+    # them) and from these defaults elsewhere, so the environment variables mean the same thing on
+    # the MCP path as they do on the CLI's.
+    limits = limits or DEFAULT_LIMITS
     security = transport_security_for(url, host=host, port=port)
     scheme, public_host, _ = _public_url(url)
     server = MCPServer(
@@ -785,13 +820,44 @@ def build_mcp_app(store: LedgerReader, papra: PapraReader, kz: KreuzaktReader, *
         is
         scoped to buckets, not that the queue is empty.
         """
-        principal = token_context_of(ctx.request_context.request)
-        if principal is None:
-            # Unreachable behind the bearer gate; kept because "no principal" must never fall
-            # through
-            # to the corpus-wide reading.
-            raise IndexUnavailable("this request carried no authenticated principal")
+        principal = require_principal(ctx.request_context.request)
         return await index_status_for(store, kz, principal)
+
+    @server.tool()
+    async def search_documents(ctx: Context, query: str, page: int = 1,
+                               page_size: int = DEFAULT_LIMITS.page_size_default) -> SearchPage:
+        """Search the index for these buckets: metadata only, never document text.
+
+        `page` starts at 1, `page_size` is 1-50, the query is at most 512 characters, and a value
+        outside a bound is refused rather than clamped. A result carries a Papra `document_id`, its
+        `org_id`, and the index's ranking — no snippet, no path, no Kreuzakt id. Call `get_document`
+        for text once you have an id.
+
+        Two filters run on whatever the index returned. The ledger's: a document in a bucket this
+        token was not granted is not shown, and its absence is counted in `stats`, not mentioned.
+        Papra's: a document in the trash, or one Papra will not confirm, is not shown either.
+        `partial: true` means the answer could be missing results — the scan budget ran out, or a
+        bucket in scope was beyond the per-call fan-out bound — and `partial_reason` says which.
+        """
+        return await search_documents_tool(
+            require_principal(ctx.request_context.request), store, papra, kz, query,
+            page=page, page_size=page_size, limits=limits)
+
+    @server.tool()
+    async def list_recent_documents(ctx: Context, limit: int = 20,
+                                    since: str | None = None) -> SearchPage:
+        """The newest documents in these buckets, in the index's own `added_at` order.
+
+        `limit` is 1-50. Nothing re-ranks the index's order across buckets: this is recency, not
+        relevance. Same filters, same `partial` rule, same `stats` as `search_documents`.
+
+        `since` is `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`, and anything else is refused: the value
+        this index silently ignores is an ISO `…Z` timestamp, which answers 200 with no rows and
+        would read as a quiet, permanent "nothing is new".
+        """
+        return await list_recent_documents_tool(
+            require_principal(ctx.request_context.request), store, papra, kz, limit=limit,
+            since=since, limits=limits)
 
     app = server.streamable_http_app(transport_security=security, host=host)
     # Outermost, so a request with a Host nobody named is answered before it is authenticated.
@@ -985,7 +1051,8 @@ async def run_mcp_listener(config, store: Store, *, papra=None, kreuzakt=None,
 
     try:
         app = build_mcp_app(ledger, papra_view, kreuzakt_view, url=config.mcp_url,
-                            host=bind.host, port=bind.port)
+                            host=bind.host, port=bind.port,
+                            limits=SearchLimits.from_config(config))
     except BaseException:
         _close_ledger()
         await _close_clients()

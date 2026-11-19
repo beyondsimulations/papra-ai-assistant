@@ -490,8 +490,12 @@ Two things the listener does behind that proxy, both asserted in
   `Host: localhost` and clear the transport check.
 
 **What a token can see.** A token carries a list of buckets, or `--all-buckets`. The scoping is a
-security boundary rather than a filter: `index_status` takes no `org_id` argument, so an agent can
-narrow within its grant and has no surface for widening it. A scoped token gets per-bucket counts
+security boundary rather than a filter: no tool takes an `org_id`, a bucket list or a scope argument —
+the schema the server publishes has none — so an agent can
+narrow within its grant and has no surface for widening it. The principal comes from the bearer gate
+and nowhere else, and a request that reaches a tool without one is refused with `unauthenticated`
+before the index is read: there is no default scope in either direction, because an empty grant is
+only safe while some later filter happens to mean it that way, and a wide one is the breach. A scoped token gets per-bucket counts
 for its own buckets — references, indexed, stale, `unledgered`, delivery-blocked, empty extractions,
 owed deletes, set-aside state — plus the scheduling gate, and gets `null` for the corpus-wide
 numbers: queue depth, the deletion-marks counter, and the size of the liveness-probe list. `null`
@@ -517,7 +521,7 @@ design, so joining on them would let a freshly rotated token inherit the old dev
 in the direction that stops you revoking something that matters. The listing prints no plaintext and
 no digest; the label is the only identifier it offers.
 
-**`index_status` answers within 15 s or not at all** — the spec's per-call deadline. An index that is
+**Any tool call answers within 15 s or not at all** — the spec's per-call deadline. An index that is
 thinking too slowly is refused with `index_unavailable` rather than answered late, and a store that
 cannot be read (a corrupt `index_generation`, a locked database, a bug of ours) returns a short stable
 code and never a SQL fragment or a traceback. The traceback belongs to this process's log. The reads
@@ -573,16 +577,65 @@ Two behaviours worth knowing before you debug one:
   in a URL, an access log, or a log line — and that last one is now asserted twice, once
   with a token minted in another process, because uvicorn's access log writes full query
   strings to stdout and `TestClient` never runs uvicorn.
-- **Kreuzakt down is an error, not an answer.** `index_status` reports `index_unavailable` rather
-  than answering out of Papra. This suite is a bridge; a Papra-backed result behind an "index" tool
-  would be a second, worse index that does not say it fell back.
+- **Kreuzakt down is an error, not an answer.** `index_status` and both search tools report
+  `index_unavailable` rather than answering out of Papra or returning an empty list. This suite is a
+  bridge; a Papra-backed result behind an "index" tool would be a second, worse index that does not
+  say it fell back, and "no documents match" under a dead index is a claim about your archive that
+  the call is not entitled to make. Upstream prose stops at the boundary too: the client sees the
+  exception class and the HTTP status, never Kreuzakt's body.
 
 `check` ends with the state of all this in one line — `mcp: disabled (…), tokens: 1 active,
 1 revoked` — with counts only: labels name a device and an agent, and `check` output is what gets
 pasted into an issue. `mcp-token --list` is the command for the names.
 
-This task ships the transport, the credentials and `index_status`. Search over the wire is the next
-task; until it lands, a client that connects sees one tool.
+**`search_documents` and `list_recent_documents` are the authorization boundary.** Kreuzakt answers a
+query from a corpus-wide index with no notion of a token in it, so the index's answer is not the
+agent's answer. One `ledger_resolve` per page of hits — never one per row, which would put five
+hundred reads in front of the single-writer database the delivery workers share — turns "these 400
+rows matched" into "these 3 of yours matched", and what it cannot account for is invisible: no ledger
+row, a row bound under a generation that no longer means what it said, a row in a bucket this token
+was not given. Then Papra is asked about the survivors only — a document in the trash is not a result
+you can open — and a document Papra will not confirm is dropped and counted, because "could not check"
+is not "safe to show". A page of 5 out of 500 scanned rows costs 5 liveness reads, not 500.
+
+**`partial` is the field that decides whether an empty answer means anything.** It is true when the
+scan budget (`PAPRA_INDEX_SEARCH_SCAN_ROWS`) was spent, when the index answered a short page while its
+own `total` claimed more rows, when a Papra read failed, or when a bucket in scope was never consulted
+(see the fan-out bound below) — and `partial_reason` names which in one line. It is false for a short
+page that exhausted the corpus, and false when rows were dropped for being another bucket's,
+unresolvable, or deleted: those were checked, and the archive's answer was no. `scanned` is index rows
+examined, and `stats` counts each reason separately, because "your token does not cover that" and "we
+never held that in the ledger" are different questions for whoever reads an empty list.
+
+**The fan-out bound is enforced on the read, not at mint time.** One tool call consults at most
+**8 buckets** with at most **4 lookups in flight**, because `--all-buckets` is exempt from
+`mcp-token --create`'s 8-bucket ceiling by design and is how an operator's own credential is minted:
+a limit that only bites at mint time bounds the tokens that could never exceed it. A call that reaches
+past the bound answers `partial=True` and names what it never consulted in `buckets_skipped` instead
+of returning a silently-short list.
+
+**Bounds are refusals, never clamps.** `1 <= page_size <= 50`, `page >= 1`, a query of at most
+`PAPRA_INDEX_QUERY_MAX_CHARS` (512), `1 <= limit <= 50` on the recent listing; a violation is
+`invalid-request`, and a clamp would turn "give me 51" into an answer that looks like 51. Paging is by
+`page` — `/api/search` and `/api/documents` honour it and ignore `offset` — with one page size per
+scan, because rows are addressed as `(page - 1) * limit` and shrinking the last request to fit a
+ragged budget would re-read some rows while never reading others.
+
+`list_recent_documents` keeps the index's own `added_at` order and re-sorts nothing, and its `since`
+must be `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`: an ISO `…Z` value is refused rather than rewritten,
+because measured against the pinned container it answers 200 with **no** rows, and the column it would
+be compared against has no documented timezone — rewriting it would pick a meaning for the instant and
+hide that choice from whoever asked for yesterday.
+
+**Nothing upstream leaves here.** An item is a Papra `document_id`, its bucket, and four display
+strings: no Kreuzakt path (`/api/documents/…`, `/thumbnail`, `/original`), no Kreuzakt integer id, no
+`content`, no `snippet`, no `score`. Those are absent from the models rather than emptied, and a test
+asserts every one of those needles against Task 3's byte-exact captured search response, which carries
+all of them.
+
+This task ships the transport, the credentials and `index_status`; `search_documents` and
+`list_recent_documents` arrived with Task 13, and `get_document`, `get_document_content` and
+`open_document` are the next task: until they land, a client that connects sees three tools.
 
 ### Handing the `content` column over
 

@@ -462,7 +462,8 @@ def listener_config(tmp_path, port=8765):
 
     return SimpleNamespace(mcp_host="127.0.0.1", mcp_port=port, mcp_url=PUBLIC_URL,
                            papra_base_url="http://papra.test", papra_api_key="ppapi_read_only",
-                           kreuzakt_base_url="http://kreuzakt.test", data_dir=tmp_path)
+                           kreuzakt_base_url="http://kreuzakt.test", data_dir=tmp_path,
+                           index_query_max_chars=64, index_search_scan_rows=250)
 
 
 async def test_the_listener_builds_the_app_on_views_and_closes_what_it_opened(monkeypatch,
@@ -482,8 +483,8 @@ async def test_the_listener_builds_the_app_on_views_and_closes_what_it_opened(mo
 
     captured = {}
 
-    def refusing_build(ledger, papra_view, kreuzakt_view, *, url, host, port):
-        captured.update(ledger=ledger, papra=papra_view, kreuzakt=kreuzakt_view)
+    def refusing_build(ledger, papra_view, kreuzakt_view, *, url, host, port, limits=None):
+        captured.update(ledger=ledger, papra=papra_view, kreuzakt=kreuzakt_view, limits=limits)
         raise RuntimeError("the app refused to build")
 
     monkeypatch.setattr("papra_suite.mcp_server.build_mcp_app", refusing_build)
@@ -495,6 +496,10 @@ async def test_the_listener_builds_the_app_on_views_and_closes_what_it_opened(mo
     assert captured["ledger"].db_path == store.db_path
     assert isinstance(captured["papra"], PapraReader)
     assert isinstance(captured["kreuzakt"], KreuzaktReader)
+    # Task 13: the search tools' bounds come from the deployment's config on the shipped path, not
+    # from the module defaults. Otherwise `PAPRA_INDEX_SEARCH_SCAN_ROWS` would be a knob with no
+    # the listener side, which is the `OCR_LANGUAGES` shape of failure.
+    assert (captured["limits"].query_max_chars, captured["limits"].scan_rows) == (64, 250)
     with pytest.raises(sqlite3.ProgrammingError):
         captured["ledger"].get_setting("anything")     # closed on the way out, not leaked
 
