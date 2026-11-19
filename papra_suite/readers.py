@@ -242,7 +242,7 @@ class LedgerReader:
     #: function's job, and the tools depend on the hiding.
     ledger_resolve = Store.ledger_resolve
     # `get_generation` reads through this pair, and they are reads too; they stay private so the
-    # public surface stays the reads named above, and `dir()` on the view is still a reviewable list.
+    # public surface stays the reads named above, so `dir()` on the view stays a reviewable list.
     _read_generation_or_none = Store._read_generation_or_none
     _read_generation = Store._read_generation
 
