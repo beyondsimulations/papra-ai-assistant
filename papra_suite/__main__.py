@@ -307,7 +307,9 @@ def _index_line(store) -> str:
     except sqlite3.Error as error:
         return f"index: unavailable ({type(error).__name__})"
     return (f"index: {stats['references']} refs, {stats['indexed_current']} current, "
+            f"{stats['stale']} stale, {stats['unledgered']} unledgered, "
             f"{stats['delivered']} delivered, {stats['extraction_empty']} extraction-empty, "
+            f"{stats['delivery_blocked']} delivery-blocked, "
             f"protected_name={stats['protected_name']} "
             f"protected_date={stats['protected_date']} "
             f"protected_notes={stats['protected_notes']}, "
@@ -370,6 +372,22 @@ def _deletion_pass_line(store) -> str:
         return ("deletions: never ran (the sweep does this once per pass, with kreuzakt up)"
                 + extra)
     return f"deletions: {stamp}" + extra
+
+
+def _mcp_line(store, config) -> str:
+    """`mcp: ...` — whether this build would answer the network, and with how many credentials.
+
+    The state a reader needs before they look for a token problem: a server that is disabled answers
+    "connection refused", which looks identical from a client to a server that is firewalled,
+    down, or
+    has no tokens. One line distinguishes all four, and prints no label (see `mcp_state_line`).
+    """
+    from papra_suite import mcp_server
+
+    try:
+        return mcp_server.mcp_state_line(store, config)
+    except sqlite3.Error as error:
+        return f"mcp: unavailable ({type(error).__name__})"
 
 
 def _content_writer_line(config) -> str:
@@ -452,6 +470,11 @@ def main() -> int:
     from papra_suite import ledger_cli
 
     ledger_cli.add_subparser(sub)
+    # And again for the MCP credentials: `mcp-token` mints, lists and revokes, and the rule that a
+    # plaintext is printed once lives in the module, not in this dispatch.
+    from papra_suite import mcp_tokens
+
+    mcp_tokens.add_subparser(sub)
 
     args = parser.parse_args()
 
@@ -487,6 +510,7 @@ def main() -> int:
             recent_events = _recent_event_counts(store)
             index_line = _index_line(store)
             deletion_line = _deletion_pass_line(store)
+            mcp_line = _mcp_line(store, config)
         finally:
             store.close()
         print(f"config ok; store migrated; data dir: {config.data_dir}")
@@ -498,6 +522,7 @@ def main() -> int:
         print(deletion_line)
         print(_content_writer_line(config))
         print(_metadata_writer_line(config))
+        print(mcp_line)
         return 0
 
     if args.command == "replay":
@@ -554,6 +579,15 @@ def main() -> int:
         from papra_suite import ledger_cli
 
         return ledger_cli.run_ledger(config, args)
+
+    if args.command == "mcp-token":
+        # Through the module, as with `metadata` and `ledger`: the dispatch is what makes the
+        # documented command reachable, and a `from ... import` here would make a test that swaps
+        # the
+        # module attribute assert about a name nothing calls.
+        from papra_suite import mcp_tokens
+
+        return mcp_tokens.run_mcp_token(config, args)
 
     if args.command == "serve":
         import asyncio

@@ -44,6 +44,8 @@ papra-suite serve
 | `PAPRA_INDEX_METADATA_DELIVERY` | default `false` — see "Handing the title, date and note over" |
 | `PAPRA_LEGACY_WORKERS` | default `true` — this suite's OCR and title workers keep writing; flipping it off is the handover |
 | `PAPRA_INDEX_MAX_ATTEMPTS`, `PAPRA_INDEX_POLL_INTERVAL_S`, `PAPRA_INDEX_WAIT_TIMEOUT_S`, `PAPRA_INDEX_QUERY_MAX_CHARS`, `PAPRA_INDEX_SEARCH_SCAN_ROWS` | optional tuning of the index pipeline |
+| `PAPRA_MCP_URL` | the public URL of the MCP listener, e.g. `https://papra-mcp.ts.net`; it is what the Host and Origin allow-lists are built from, so a listener that is enabled without it refuses to start |
+| `PAPRA_MCP_HOST`, `PAPRA_MCP_PORT` | the bind, defaulting to `127.0.0.1:8765`. Anything but loopback needs the `mcp_bind_nonloopback` setting as well — see "Publishing the index to an agent" |
 
 Mailboxes (IMAP host, credentials, poll interval, delete-after-download) are
 stored in the database, not in the environment.
@@ -81,6 +83,7 @@ trust boundary is verified for a specific provider.
 | `papra-suite events [--limit N] [--mailbox-id ID] [--kind K] [--since YYYY-MM-DD] [--json]` | why messages and attachments were **not** ingested |
 | `papra-suite metadata [--restore-auto \| --force] [--org-id ID] [--document-id ID] [--field name\|date\|notes] [--dry-run]` | deliver Kreuzakt's title, date and note into Papra, or hand a protected field back to automatic delivery |
 | `papra-suite ledger (--status \| --reindex-all \| --requeue \| --cleanup \| --clear-marks) [--dry-run] [--yes-i-mean-it]` | read the index ledger's counts; rebuild the index from Papra's bytes after Kreuzakt was wiped (`--invalidate` is the same command) or resume the queueing half of one (`--requeue`); settle upstream deletes the retries gave up on; release the deletion marks brake |
+| `papra-suite mcp-token (--create --label X [--org-id ID \| --all-buckets] \| --list \| --revoke --label X)` | mint, list and revoke the bearer tokens the MCP listener accepts. The plaintext is printed exactly once and only its sha256 is stored |
 
 `check` ends with one line — `events (last 24h): sender_denied=3, upload_failed=1`
 — because `check` is the command an operator already runs when something is wrong,
@@ -381,6 +384,53 @@ Three things this shape depends on, all of them cheap to get wrong:
   original and its own queue; the documents and the index ledger live in Papra and in
   `state.db`. Losing the volume costs VLM minutes to rebuild, nothing else.
 
+### Publishing the index to an agent
+
+`papra-suite serve` can also answer the Model Context Protocol over Streamable HTTP, so an
+MCP-capable agent can ask what the index holds. It is **off until you say so**, because it is the
+one part of this build that answers the network:
+
+```bash
+papra-suite mcp-token --create --label hermes --org-id org-1   # prints the token once
+papra-suite mcp-token --list
+papra-suite mcp-token --revoke --label hermes
+```
+
+| | |
+|---|---|
+| `mcp_server_enabled` (settings) | start the listener with `serve`. Unset means no listener, and `check` says `mcp: disabled` |
+| `mcp_bind_nonloopback` (settings) | required in addition to `PAPRA_MCP_HOST` before the listener will bind anything but loopback |
+| `PAPRA_MCP_URL` | the public URL, e.g. `https://papra-mcp.ts.net`. Host and Origin are checked against it: a `Host` it does not name is a **421**, an `Origin` it does not name a **403** |
+
+Publishing it is `tailscale serve` in front of `127.0.0.1:8765`, which is why the default bind is
+loopback and why a non-loopback bind needs a settings row and not only an environment variable: a
+bearer token on a reachable interface is a different security story, and the refusal names the
+address it refused.
+
+**What a token can see.** A token carries a list of buckets, or `--all-buckets`. The scoping is a
+security boundary rather than a filter: `index_status` takes no `org_id` argument, so an agent can
+narrow within its grant and has no surface for widening it. A scoped token gets per-bucket counts
+for its own buckets — references, indexed, stale, `unledgered`, delivery-blocked, empty extractions,
+owed deletes, set-aside state — plus the scheduling gate, and gets `null` for the corpus-wide
+numbers: queue depth, the deletion-marks counter, and the size of the liveness-probe list. `null`
+rather than `0`, because `pending: 0` reads as "your documents are indexed".
+
+Two behaviours worth knowing before you debug one:
+
+- **Wrong and missing tokens are the same 401**, byte for byte, and a token in a query string is a
+  missing token. Nothing about the store is revealed by a wrong guess, and no credential ever appears
+  in a URL, an access log, or a log line.
+- **Kreuzakt down is an error, not an answer.** `index_status` reports `index_unavailable` rather
+  than answering out of Papra. This suite is a bridge; a Papra-backed result behind an "index" tool
+  would be a second, worse index that does not say it fell back.
+
+`check` ends with the state of all this in one line — `mcp: disabled (…), tokens: 1 active,
+1 revoked` — with counts only: labels name a device and an agent, and `check` output is what gets
+pasted into an issue. `mcp-token --list` is the command for the names.
+
+This task ships the transport, the credentials and `index_status`. Search over the wire is the next
+task; until it lands, a client that connects sees one tool.
+
 ### Handing the `content` column over
 
 Until this section applies, it is this suite's own OCR worker that writes a document's
@@ -437,7 +487,8 @@ ordered operation:
    make is "everything this suite has ever listed". A Papra document that was never listed — a
    bucket added while the sweep was off, a period before the suite knew the organization existed
    — is outside both tables and outside the number, and no count of these two tables can find it.
-   `check` does not print `unledgered` on its own line yet; read it from `ledger --status`.
+   `check` prints the same number on its index line (`N unledgered`), so the two commands cannot
+   disagree, and the MCP status tool reports it per bucket for whatever a token may read.
 
    ```bash
    sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs GROUP BY 1, 2;"

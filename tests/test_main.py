@@ -217,7 +217,14 @@ def test_check_prints_the_index_counts(monkeypatch, tmp_path, capsys):
     assert main() == 0
 
     out = capsys.readouterr().out
-    assert ("index: 3 refs, 2 current, 1 delivered, 1 extraction-empty, "
+    # `stale` and `delivery-blocked` joined this line with the MCP status tool, so that the number
+    # an
+    # agent reads over the wire cannot disagree with the number an operator reads here. `unledgered`
+    # is the count the README used to say was missing: documents this suite saw that the ledger
+    # never
+    # held, which no pass will ever find again on its own.
+    assert ("index: 3 refs, 2 current, 1 stale, 0 unledgered, 1 delivered, 1 extraction-empty, "
+            "0 delivery-blocked, "
             "protected_name=2 protected_date=1 protected_notes=1, "
             "2 repairs(24h), 2 cleanup-pending (failed 1)") in out
 
@@ -231,7 +238,8 @@ def test_check_counts_an_empty_corpus_without_hiding_it(monkeypatch, tmp_path, c
 
     assert main() == 0
 
-    assert ("index: 0 refs, 0 current, 0 delivered, 0 extraction-empty, "
+    assert ("index: 0 refs, 0 current, 0 stale, 0 unledgered, 0 delivered, 0 extraction-empty, "
+            "0 delivery-blocked, "
             "protected_name=0 protected_date=0 protected_notes=0, "
             "0 repairs(24h), 0 cleanup-pending (failed 0)") in capsys.readouterr().out
 
