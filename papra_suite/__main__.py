@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from papra_suite import __version__
 from papra_suite.config import ConfigError, load_config
 from papra_suite.store import INGEST_EVENT_KINDS
+from papra_suite.untrusted_text import UNSAFE_CATEGORIES as _UNSAFE_CATEGORIES
 
 # Signals that must stop the service cleanly. SIGTERM is what `docker stop`
 # sends; SIGINT is Ctrl-C.
@@ -143,7 +144,11 @@ EVENT_COLUMNS = (
 # (zero-width space, which splices two values into one visually), surrogates and
 # unassigned code points, and the Unicode line separators U+2028 / U+2029, which
 # some renderers treat as a line break and so can still forge a row.
-_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+#
+# The set lives in `papra_suite.untrusted_text` since Task 14, because the MCP document tools apply
+# the same judgement to extracted text before handing it to an agent. Two copies would drift, and
+# the drift would look like the same bytes being safe in `papra-suite events` and unsafe in a tool
+# result — or the other way round, which is the direction that matters.
 
 # Short escapes for the controls an operator actually meets, so a quoted value
 # reads as "line\nbreak" rather than as a wall of \u000a.
