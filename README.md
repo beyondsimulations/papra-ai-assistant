@@ -164,7 +164,7 @@ the documents; everything about *how* they got there lives in that one file.
 | Poll cursors and `UIDVALIDITY` | every mailbox is read from the beginning again |
 | Content dedup hashes and the seen-document table | everything still in an inbox is attempted again |
 | Job queue (OCR and title work) | pending and in-flight work is gone |
-| Settings | today that is only the sweep's resume offsets (`sweep_offset:<org>`), so the sweep re-scans from page one |
+| Settings | the sweep's resume offsets (`sweep_offset:<org>`), the index generation, the delivery flags that `serve` re-seeds from the environment, and the deletion brakes (`index_marks_rolling`, `index_deletion_quarantine`, the listing-walk and liveness-probe stamps). So the sweep re-scans from page one, every bound index id stops being current — the corpus reads as backlog until a rebuild re-derives it — and the brakes come back **permissive**, because an absent row means "nothing is being held" |
 | `log_lines` ring buffer | the in-app log history |
 | `ingest_events` | the 90-day "why was this skipped" window |
 
@@ -258,7 +258,7 @@ caveat above is the whole story.
 ```bash
 make install-uv       # deps into .venv (uv); `make install` is the pip variant
 make lint             # ruff over the tree (measurement probes are excluded)
-make test-unit        # 447 tests, no Docker, ~18 s
+make test-unit        # the offline suite: no Docker, ~30 s
 make stack-up         # scratch Papra + GreenMail + Kreuzakt, images pinned by digest
 make ci               # lint + unit + integration against the running stack
 make test-ci          # CI shape: up -> run everything -> down -v   (DESTRUCTIVE)
