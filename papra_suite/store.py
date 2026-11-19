@@ -679,6 +679,11 @@ class JobAlreadyQueuedError(ValueError):
 class Store:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Where this database is. The MCP listener needs it to open its own read-only connection to
+        # the same file (`readers.LedgerReader`) rather than sharing this instance's write surface,
+        # and a path read off the connection would be a `PRAGMA` for something this class already
+        # knows. Read-only by convention: nothing here writes to it.
+        self.db_path = db_path
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row

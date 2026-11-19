@@ -40,7 +40,7 @@ ACCEPTED_RAW_WRITES = ("DELETE FROM jobs",)
 #: The CLI named beside its database file, options and a backslash continuation allowed between
 #: them: that pair is what "run this" looks like when it is written down.
 _RAW_INSTRUCTION = re.compile(
-    r"""\bsqlite3\b(?:\s+-{1,2}\S+)*\s*["'`]?[^\s"'`]*\.(?:db|sqlite\d*)""", re.IGNORECASE)
+    r"""\bsqlite3\b(?!\.)(?:\s+-{1,2}\S+)*\s*["'`]?[^\s"'`]*\.(?:db|sqlite\d*)""", re.IGNORECASE)
 
 #: A markdown code fence, which is the runbook's way of saying "this is what you type".
 _FENCE = re.compile(r"^\s*```")
@@ -187,6 +187,10 @@ def test_the_only_raw_statement_left_is_the_one_with_no_command():
         ("```bash\nsqlite3 \\\n  \"$DATA_DIR/state.db\" \\\n  \"DELETE FROM jobs\"\n```", 1),
         ("The only way in is `sqlite3`, which is not a thing to hand an operator at 2am.", 0),
         ("import sqlite3\n\nexcept sqlite3.Error as error:\n    pass\n", 0),
+        # The same shape a shipped module legitimately contains: `sqlite3.connect(store.db_path)` is
+        # Python opening a file, not a CLI named beside its database. Without the `(?!\.)` the `.db`
+        # inside an attribute name reads as the handover, and the guard fires on ordinary code.
+        ("self._conn = sqlite3.connect(self.db_path, check_same_thread=False)\n", 0),
     ):
         assert len(raw_invocations(sample, name="<control>")) == expected, sample
 
@@ -211,7 +215,8 @@ def test_the_only_raw_statement_left_is_the_one_with_no_command():
     shipped = []
     for path in sources:
         shipped += raw_invocations(path.read_text(encoding="utf-8"), name=path.name)
-    assert not shipped, "raw SQL handed to an operator from a module:\n" + "\n".join(shipped)
+    assert not shipped, "raw SQL handed to an operator from a module:\n" + "\n".join(
+        line for _number, line in shipped)
     module = (PACKAGE_DIR / "mcp_cli.py").read_text(encoding="utf-8")
     injected = raw_invocations(module + '\n# sqlite3 "$DATA_DIR/state.db" "DELETE FROM settings"\n',
                                name="mcp_cli.py")

@@ -48,7 +48,9 @@ from papra_suite.mcp_server import (
     token_context_of,
 )
 from papra_suite.mcp_tokens import mint_token, resolve_token
+from papra_suite.readers import LedgerReader
 from papra_suite.store import EMPTY_EXTRACTION_SHA, Store
+from tests.fakes.ledger import close_views, remember, view_for
 
 PUBLIC_URL = "https://papra-mcp.ts.net"
 HOST = "papra-mcp.ts.net"
@@ -80,10 +82,31 @@ class FakeKreuzakt:
 
 
 class NoPapra:
-    """Task 12 has no tool that reads Papra, so a call to it is a failure, not a stub."""
+    """Task 12 has no tool that reads Papra, so a call to it is a failure, not a stub.
 
-    async def __getattr__(self, name):
-        raise AssertionError(f"index_status must not read papra, called {name!r}")
+    The five names are written out rather than fabricated by `__getattr__`, because containment
+    option C refuses to build an app on an object whose capability surface cannot be enumerated: a
+    proxy fake answers `update_document` as readily as `list_tags`, which is precisely what
+    `readers.require_read_only` must not wave through. Same promise, one that can be checked.
+    """
+
+    async def get_document(self, org_id, document_id):
+        raise AssertionError("index_status must not read papra")
+
+    async def list_documents(self, org_id, **kwargs):
+        raise AssertionError("index_status must not read papra")
+
+    async def download_file(self, org_id, document_id):
+        raise AssertionError("index_status must not read papra")
+
+    async def list_tags(self, org_id):
+        raise AssertionError("index_status must not read papra")
+
+    async def whoami(self):
+        raise AssertionError("index_status must not read papra")
+
+    async def aclose(self):
+        raise AssertionError("the listener owns the views it opened, not this one")
 
 
 @pytest.fixture
@@ -92,6 +115,13 @@ def store(tmp_path):
     store.migrate()
     yield store
     store.close()
+
+
+@pytest.fixture(autouse=True)
+def _close_ledger_views():
+    """The wire tests open a read-only connection each; this is where they are closed."""
+    yield
+    close_views()
 
 
 def seed_bucket(store, org, *, refs=0, indexed=0, empty=0, blocked=0,
@@ -438,8 +468,13 @@ async def test_the_outage_message_carries_no_counts_and_no_upstream_body(store, 
 # --- the tool, over the wire ---------------------------------------------------------------
 
 def wire_call(store, token, name="index_status", arguments=None):
-    """Drive the real MCP handshake against the in-process app and return the tool result."""
-    app = build_mcp_app(store, NoPapra(), FakeKreuzakt(), url=PUBLIC_URL)
+    """Drive the real MCP handshake against the in-process app and return the tool result.
+
+    `store` is the fixture's store, or a read-only view of it when the test wants a view that
+    misbehaves (`BlockingStore`): either way the app is built on a `LedgerReader`, never on `Store`.
+    """
+    view = store if isinstance(store, LedgerReader) else view_for(store)
+    app = build_mcp_app(view, NoPapra(), FakeKreuzakt(), url=PUBLIC_URL)
     payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                "params": {"name": name, "arguments": arguments or {}}}
     with TestClient(app) as client:
@@ -497,7 +532,7 @@ def test_the_tool_reports_the_outage_as_a_tool_error(store, monkeypatch):
     token = mint_token(store, label="pi", org_ids=[SCOPED])
     seed_bucket(store, SCOPED, refs=1, indexed=1)
     broken = FakeKreuzakt(error=KreuzaktError("connection refused"))
-    app = mcp_server.build_mcp_app(store, NoPapra(), broken, url=PUBLIC_URL)
+    app = mcp_server.build_mcp_app(view_for(store), NoPapra(), broken, url=PUBLIC_URL)
     with TestClient(app) as client:
         headers = {"host": HOST, "content-type": "application/json",
                    "accept": "application/json, text/event-stream",
@@ -544,24 +579,27 @@ def test_token_context_of_refuses_a_request_with_no_principal():
 # --- what an unreadable store says, and where the reads run (review I5, I6) -----------------
 
 
-class BlockingStore:
-    """A store whose ledger reads block the **thread** they run in.
+class BlockingStore(LedgerReader):
+    """A read-only ledger view whose counts scan blocks the **thread** they run in.
 
     `ledger_stats` is a correlated `NOT EXISTS` scan, and this listener shares `serve`'s event loop
     with the pollers, the OCR workers and the sweep, against one single-writer connection. Run on
     the loop, one `index_status` call stalls the whole pipeline behind a delivery write; the house
     answer is `asyncio.to_thread` (`mail.py`, `pipeline.py`). If the reads go back onto the loop,
     the heartbeat below stops ticking and this class is what notices.
+
+    It is a `LedgerReader` and not a wrapper around `Store`, for the same reason the shipped code
+    is: the handler's dependency must not be able to write, and a wrapper with a catch-all
+    `__getattr__` cannot be shown not to.
     """
 
     def __init__(self, store, *, delay_s=0.2, error=None):
+        super().__init__(store.db_path)
+        remember(self)
         self._store = store
         self.delay_s = delay_s
         self.error = error
         self.blocking_calls = 0
-
-    def __getattr__(self, name):
-        return getattr(self._store, name)
 
     def ledger_stats(self, *, org_ids=None):
         self.blocking_calls += 1

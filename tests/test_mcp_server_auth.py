@@ -40,6 +40,7 @@ from papra_suite.mcp_server import (
 )
 from papra_suite.mcp_tokens import mint_token, revoke_token
 from papra_suite.store import Store
+from tests.fakes.ledger import close_views, view_for
 from tests.test_config import BASE_ENV
 
 PUBLIC_URL = "https://papra-mcp.ts.net"
@@ -86,8 +87,21 @@ def token(store):
     return mint_token(store, label="pi", org_ids=[ORG])
 
 
+@pytest.fixture(autouse=True)
+def _close_ledger_views():
+    """Every `app_for` opens a read-only connection; this is where they all get closed."""
+    yield
+    close_views()
+
+
 def app_for(store, url=PUBLIC_URL, kz=None, papra=None):
-    return build_mcp_app(store, papra or OkPapra(), kz or OkKreuzakt(), url=url)
+    """The app, on the objects the shipped listener gets: a `LedgerReader`, not the `Store`.
+
+    `build_mcp_app` refuses a migration-capable store on purpose (containment option C), so the app
+    under test reads the same file through its own `PRAGMA query_only` connection — which is what it
+    does in production, beside `serve`'s write connection.
+    """
+    return build_mcp_app(view_for(store), papra or OkPapra(), kz or OkKreuzakt(), url=url)
 
 
 def client_for(app):
@@ -315,13 +329,13 @@ def test_a_public_url_refusal_does_not_echo_its_credentials():
 
 def test_mcp_url_must_be_configured_or_startup_fails(store):
     with pytest.raises(ValueError, match="PAPRA_MCP_URL"):
-        build_mcp_app(store, OkPapra(), OkKreuzakt(), url="")
+        build_mcp_app(view_for(store), OkPapra(), OkKreuzakt(), url="")
 
 
 def test_a_malformed_public_url_refuses_startup(store):
     for bad in ("not a url", "ftp://papra-mcp.ts.net", "https://"):
         with pytest.raises(ValueError, match="PAPRA_MCP_URL"):
-            build_mcp_app(store, OkPapra(), OkKreuzakt(), url=bad)
+            build_mcp_app(view_for(store), OkPapra(), OkKreuzakt(), url=bad)
 
 
 def test_a_nonloopback_bind_is_refused_and_names_what_was_refused(tmp_path):
@@ -478,7 +492,8 @@ def test_a_logger_that_echoes_the_credential_is_redacted_and_not_printed(store, 
 
 def test_the_public_url_host_is_the_one_the_allow_list_uses(store):
     """A URL with a port and an uppercase host still accepts the host `fetch` sends."""
-    app = build_mcp_app(store, OkPapra(), OkKreuzakt(), url="https://Papra-MCP.ts.net:8443/prefix")
+    app = build_mcp_app(view_for(store), OkPapra(), OkKreuzakt(),
+                        url="https://Papra-MCP.ts.net:8443/prefix")
     token = mint_token(store, label="case", org_ids=[ORG])
     with client_for(app) as client:
         response, _ = initialize(client, token, host=f"{HOST}:8443")

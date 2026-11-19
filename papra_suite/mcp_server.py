@@ -36,6 +36,7 @@ Tasks 13 and 14 on top of the same context.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ from papra_suite.config import _safe_echo
 from papra_suite.kreuzakt_client import KreuzaktError
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.mcp_tokens import TokenContext, token_counts
+from papra_suite.readers import KreuzaktReader, LedgerReader, PapraReader, require_read_only
 from papra_suite.store import Store, sanitize_event_text
 
 logger = logging.getLogger("papra_suite.mcp_server")
@@ -655,9 +657,17 @@ async def index_status_for(store: Store, kz, context: TokenContext, *,
             from error
 
 
-def build_mcp_app(store: Store, papra, kz, *, url: str,
-                  host: str = DEFAULT_MCP_HOST, port: int = DEFAULT_MCP_PORT) -> Starlette:
+def build_mcp_app(store: LedgerReader, papra: PapraReader, kz: KreuzaktReader, *,
+                  url: str, host: str = DEFAULT_MCP_HOST,
+                  port: int = DEFAULT_MCP_PORT) -> Starlette:
     """The ASGI app: auth, transport checks, and the tools. Refuses to build on a bad config.
+
+    **The dependencies are capabilities, and they are checked here.** All three are refused if they
+    can write: `require_read_only` rejects the migration-capable `Store` and the full API clients by
+    type, and anything else that answers to one of the write names. A listener whose tool bodies
+    merely *happen* not to write therefore cannot be built — which is the difference between a
+    guarantee and a review habit. The annotations state the intent; the check is structural, so a
+    test double that exposes the same reads still builds.
 
     `papra` is a Task 13/14 argument, kept in the signature now so the wiring does not change shape
 later. No tool registered here reads Papra — the read-only-ness of this task is asserted
@@ -666,8 +676,12 @@ later. No tool registered here reads Papra — the read-only-ness of this task i
 
     The server never migrates. Schema ownership stays with `serve` and the CLI, so a fresh
 `DATA_DIR` cannot become a silently empty archive; whatever opened this store did the
-    migrations.
+    migrations. `LedgerReader` refuses to open a database with no schema, which is the same refusal
+    `check` names.
     """
+    require_read_only(store, role="store")
+    require_read_only(papra, role="papra")
+    require_read_only(kz, role="kreuzakt")
     security = transport_security_for(url, host=host, port=port)
     scheme, public_host, _ = _public_url(url)
     server = MCPServer(
@@ -804,13 +818,45 @@ def _propagate_listener_death(serving: asyncio.Task, bind: McpBind) -> NoReturn:
         f"{sanitize_event_text(str(error), limit=200)}") from error
 
 
-async def run_mcp_listener(config, store: Store, *, papra, kreuzakt,
+def _open_read_views(config, store: Store, papra, kreuzakt):
+    """The three capabilities the app is built on, derived from what `serve` already owns.
+
+    This is the composition root and the only place a write-capable handle is in scope. It returns
+    the views plus the ones this call opened, so the caller can close exactly those and nothing that
+    was injected by a test or by a caller that owns them.
+
+    The order is deliberate: `LedgerReader` first, because it is the one that can refuse (a
+    `DATA_DIR` with no schema), and the HTTP clients after it, because opening them cannot fail on
+    configuration and an unclosed `httpx` client is a warning while an unclosed store connection is
+    a held file.
+    """
+    ledger = LedgerReader(store.db_path)
+    try:
+        papra_view = papra or PapraReader(config.papra_base_url, config.papra_api_key)
+        kreuzakt_view = kreuzakt or KreuzaktReader(config.kreuzakt_base_url)
+    except BaseException:
+        ledger.close()
+        raise
+    owned = [view for view, injected in ((papra_view, papra), (kreuzakt_view, kreuzakt))
+             if not injected]
+    return ledger, papra_view, kreuzakt_view, owned
+
+
+async def run_mcp_listener(config, store: Store, *, papra=None, kreuzakt=None,
                            stop: asyncio.Event | None = None) -> None:
     """Serve the MCP app until `stop` is set — or until the listener dies, which ends this task.
 
     The config refusals are raised before anything binds, so a bad `PAPRA_MCP_HOST` reaches the
     operator as the sentence `check` already prints rather than as a traceback from a task, and
     never as a listener on an interface nobody agreed to.
+
+    `store` is `serve`'s migration-capable store, and it stops here. What reaches the app is a
+    `LedgerReader` opened on the same file under `PRAGMA query_only=ON`, plus read-only views of the
+    two API clients: `serve`'s own `PapraClient` can patch a document and its `KreuzaktClient` can
+    delete one, and neither capability may exist anywhere a tool call can reach. When a caller does
+    not inject `papra`/`kreuzakt` they are built here from the same configuration and closed here —
+    the `owns_*` rule `serve` itself uses. An injected dependency is not trusted for it: it goes
+    through `build_mcp_app`'s refusal like any other.
 
     The wait is on `{serving, stop}` with FIRST_COMPLETED, and that is the whole of the availability
     fix. Awaiting only `stop` — which `serve` always passes — meant a uvicorn that died left this
@@ -821,7 +867,30 @@ async def run_mcp_listener(config, store: Store, *, papra, kreuzakt,
     import uvicorn
 
     bind = resolve_bind(config, store=store)
-    app = build_mcp_app(store, papra, kreuzakt, url=config.mcp_url, host=bind.host, port=bind.port)
+    ledger, papra_view, kreuzakt_view, owned = _open_read_views(config, store, papra, kreuzakt)
+    ledger_open = True
+
+    def _close_ledger() -> None:
+        """Release the read-only connection. Synchronous, so no cancellation path can skip it."""
+        nonlocal ledger_open
+        if ledger_open:
+            ledger_open = False
+            ledger.close()
+
+    async def _close_clients() -> None:
+        for view in owned:
+            try:
+                await view.aclose()
+            except Exception:  # noqa: BLE001 - leaving must not skip the rest of the cleanup
+                logger.exception("mcp: a read-only view would not close cleanly")
+
+    try:
+        app = build_mcp_app(ledger, papra_view, kreuzakt_view, url=config.mcp_url,
+                            host=bind.host, port=bind.port)
+    except BaseException:
+        _close_ledger()
+        await _close_clients()
+        raise
     server = uvicorn.Server(uvicorn.Config(app, **uvicorn_config_kwargs(bind)))
     serving = asyncio.create_task(_serve_guarded(server, bind), name="mcp-uvicorn")
     # `starting`, not `listening`: nothing is bound yet at this line, and the everyday death is a
@@ -857,3 +926,10 @@ async def run_mcp_listener(config, store: Store, *, papra, kreuzakt,
                 serving.cancel()
             except Exception:  # noqa: BLE001 - the process is leaving; a stuck listener says so loudly
                 logger.exception("mcp: the listener did not shut down cleanly")
+        # The views live and die with the listener: `serve`'s own store and clients are untouched,
+        # which is the point — this task borrowed a read-only window onto them and closes it here.
+        # The ledger first and synchronously: a task cancelled on its way out must not leave a held
+        # file behind, and an `await` here can be the very thing the cancellation interrupts.
+        _close_ledger()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _close_clients()
