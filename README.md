@@ -688,10 +688,10 @@ is still there (one GET), and only then is **Kreuzakt** asked for what only it k
 outside the token's buckets is refused with zero requests to either service, which is what makes "a
 disallowed document is never fetched" true of these tools rather than merely intended. Fail-closed
 means the same thing here as in a search: no live ledger row at the current generation is
-`not-found`, a document Papra reports deleted is `not-found` even though the index still serves it, and
-a Papra read that **errors** is `index_unavailable` and is logged — "could not find out" is not
-evidence of absence, and here the single document *is* the whole answer, so there is no `partial` flag
-to hide it under.
+`not-found`, a document Papra reports deleted is `not-found` in all three tools even though the index
+still serves it, and a Papra read that **errors** is `index_unavailable` and is logged — "could not
+find out" is not evidence of absence, and here the single document *is* the whole answer, so there is
+no `partial` flag to hide it under.
 
 `get_document_content` returns at most **20 000 characters** (`max_chars` is 1–20 000 and is refused
 outside that range, never clamped), reports `truncated` and `chars_total`, and says with `sanitized`
@@ -707,24 +707,30 @@ blank, returned during an outage with nothing saying so, is a worse answer than 
 
 `open_document` builds both URLs out of `PAPRA_BASE_URL` and the reference's own bucket and id,
 percent-encoded, and speaks to nothing else — no index request, no index host or path in the answer or
-in the refusal. It is the one document tool that does not check Papra's live state: it discloses no
-content, only a place a human can open, and the archive's own UI is the authority behind that address.
+in the refusal. It does ask Papra the one question its two siblings ask, because a URL is a claim:
+*this document is in the archive, at this place*. So a document the archive reports deleted is
+`not-found` rather than a link, and a Papra that will not answer is `index_unavailable` rather than a
+URL that may lead nowhere — one Papra read per call, zero index calls. A dead index still leaves the
+viewer working, which is when an operator wants the link most; a link into a service that is not
+answering is not a fallback, it is a dead end that looks like one.
 
-**`not-in-scope` is a disclosure, and it is written down here for the same reason the banded counters
-are.** It is the one code on this surface that tells a scoped token that something exists which it
-cannot have. It is as narrow as the code can make it: it fires only for a reference that is live and
-bound to the current generation (a foreign row that is deleted or stale answers `not-found`, like
-everything else), and it never names the bucket, the title, or anything else about the document. What
-it cannot be made not to say is the fact itself: to a leaked single-bucket token that holds a real
-document id, `not-in-scope` and `not-found` are two answers where collapsing them would be one, and
-Papra's ids are the only thing standing between that and an enumeration. So the part the caller is not
-told goes where the operator reads it: refusing a document logs the holding bucket and the token's
-label at `info`, and only the code reaches the client — the same rule that puts the exact withheld
-counts in the log and the bands in the JSON. The 2026-11-16 spec's own error model collapsed the two
-codes on exactly that argument; this milestone's plan separated them so that an operator debugging an
-empty result can tell "wrong token" from "no such document", and with that log line the diagnosis no
-longer depends on the wire answer. Both documents are in the tree and they disagree, so the decision is
-recorded as an acceptance item in the Task 14 report rather than settled here.
+**There is no `not-in-scope` code, and the reason is a fact about who could hear it.** This
+milestone's plan asked for a refusal that says *that document exists, in a bucket you were not
+granted*; the 2026-11-16 spec's error model has no such code, and collapses the two on the ground that
+*"distinguishing them leaks existence across the allow-list boundary"*. The spec won, and the decisive
+detail is the audience: `ctx.scope_all` short-circuits the scope filter, so an all-buckets token — the
+operator's own credential — can never receive the disclosure, and the only tokens that can are scoped
+ones. To a leaked single-bucket token holding one real document id, "exists elsewhere" and "does not
+exist" are two answers where one is safe, and two answers are a bit that can be walked across a corpus
+with no bucket boundary in it. So all five causes — never indexed, deleted, stale generation, a
+Kreuzakt rowid presented as a document id, out of scope — answer `not-found`, and the test asserts the
+two refusals are **equal strings** rather than two messages that each match a pattern, because a
+difference of one word would re-open the whole oracle. What the wire does not carry, the log does:
+refusing an out-of-scope reference logs the holding bucket and the token's label at `info`, which is
+where somebody debugging "the assistant cannot see a document I can see in papra" looks, while the
+client gets one line naming nothing — the same rule that puts the exact withheld counts in the log and
+the bands in the JSON. A surface that really needed the distinction would need a mint-time credential
+attribute behind it, not a code with no caller that could ever hear it.
 
 ### Handing the `content` column over
 

@@ -955,63 +955,48 @@ MAX_CONTENT_CHARS = 20_000
 OPENED_FROM = "papra"
 
 #: The refusal for "this id is not a document the caller may read, and here is what that does and
-#: does not mean". The negative half is not decoration: `not-found` is what a stale generation, a
-# : soft-deleted row and a never-indexed document all answer, and a caller who reads it as "the
-# archive
-#: has no such document" will tell a user their invoice was never uploaded.
+#: does not mean". One code, five causes. The negative half is not decoration: `not-found` is what
+#: a stale generation, a soft-deleted row and a never-indexed document all answer, and a caller who
+#: reads it as "the archive has no such document" will tell a user their invoice was never uploaded.
+#: The fifth cause — a live reference in a bucket this token was not granted — is named here rather
+#: than given a code of its own, and the reason to retire that code is a fact about who could hear
+#: it: `ctx.scope_all` short-circuits the scope filter, so an all-buckets credential (the operator's
+#: own) can never be told, and the only audience left is a scoped token — the one population for
+#: which "it exists, elsewhere" is a bit worth walking across a corpus. The bit goes to the log
+#: instead, which is the operator's medium and not the caller's.
 _NOT_FOUND_MESSAGE = (
     "no live reference to that document id exists in the part of this archive this token may read. "
-    "That covers a document that was never indexed, one that is deleted, and one whose index entry "
-    "belongs to a generation that has since been rebuilt; it is not a claim that the archive does "
-    "not hold the document")
+    "That covers a document that was never indexed, one that is deleted, one whose index entry "
+    "belongs to a generation that has since been rebuilt, and one held by a bucket this token was "
+    "not granted; it is not a claim that the archive does not hold the document")
 
-#: …and the refusal for "it exists, elsewhere". `not-in-scope` is the plan's code, and it is an
-#: existence oracle about buckets this caller was not given: with a guessable id, `not-in-scope` and
-#: `not-found` are two answers where the safe deployment would give one. Two things narrow it as far
-#: as the code allows — it fires only for a reference that is live and bound to the current
-# : generation (a foreign row that is deleted or stale answers `not-found`, like everything else),
-# and
-# : it never names the bucket or the document's title — and the argument for retiring it is written
-# up
-#: in the task report rather than settled here.
-_NOT_IN_SCOPE_MESSAGE = (
-    "a live reference to that document id exists in a bucket this token was not given, so nothing "
-    "about it is readable here. The bucket is not named, and no other detail is returned")
-
-# : The shape a Kreuzakt rowid has: digits, and nothing else. Papra's ids are prefixed, entropy-
-# bearing
-# : strings (`doc_bm1plswq9gnov2u9jvvc9s6r` in the 2026-11-17 webhook capture), so this never
-# shadows a
-#: real id — it matches the thing that must not be a lookup.
+#: The shape a Kreuzakt rowid has: digits, and nothing else. Papra's ids are prefixed, entropy-
+#: bearing strings (`doc_bm1plswq9gnov2u9jvvc9s6r` in the 2026-11-17 webhook capture), so this never
+#: shadows a real id — it matches the thing that must not be a lookup.
 _KREUZAKT_ROWID_FORM = re.compile(r"\d+")
 
 
 class DocumentNotFound(ToolError):
     """`not-found: …` — this caller may not read anything about that id.
 
-    One code for four causes (absent, deleted, stale generation, and a Kreuzakt rowid presented as a
-    document id) because the four are indistinguishable from the outside and one of them is not an
-    answer the caller should be able to distinguish at all: if `"7"` said anything different from
-    `"doc_zzz"`, the first probe would tell a caller whether the index has seven rows.
+    One code for five causes (absent, deleted, stale generation, a Kreuzakt rowid presented as a
+    document id, and a live reference outside this token's buckets) because the four that are not
+    about scope are indistinguishable from the outside, and the fifth is not an answer any caller
+    should be able to tell apart: if `"7"` said anything different from `"doc_zzz"`, the first probe
+    would tell a caller whether the index has seven rows; and if a foreign bucket's live reference
+    said anything different from a never-indexed id, a leaked single-bucket token could ask that
+    same question of every id in a corpus that has no bucket boundary in it. The second is the
+    2026-11-16 spec's own rule for `not_found_or_not_accessible` — *"distinguishing them leaks
+    existence across the allow-list boundary"* — and it is why there is no `not-in-scope` class here
+    even though this
+    milestone's plan asked for one: the diagnosis is worth more in the log, where the holding bucket
+    and the token are both named, than in an answer a script can walk. A surface that really needed
+    the distinction would need a mint-time credential attribute behind it — a `mcp_tokens` change,
+    not a code left lying around with no caller that could hear it.
     """
 
     def __init__(self, reason: str = _NOT_FOUND_MESSAGE):
         super().__init__(f"not-found: {reason}")
-
-
-class NotInScope(ToolError):
-    """`not-in-scope: …` — a live reference exists outside this token's buckets.
-
-    See `_NOT_IN_SCOPE_MESSAGE`: this is the one place on the MCP surface where a scoped token is
-    told that something exists that it cannot have. The alternative — answering `not-found` — was
-    the spec's own rule (`not_found_or_not_accessible`: "distinguishing them leaks existence across
-    the allow-list boundary"), and the plan for this milestone overrode it so that an operator
-    debugging an empty result can tell "wrong token" from "no document". Both are true, which is
-    why the code says as little as it can and the report argues the rest.
-    """
-
-    def __init__(self, reason: str = _NOT_IN_SCOPE_MESSAGE):
-        super().__init__(f"not-in-scope: {reason}")
 
 
 class DocumentView(BaseModel):
@@ -1106,11 +1091,13 @@ def _resolve_reference(ctx, store, document_id: str, *, what: str):
     1. `get_generation` first. A reference bound under an epoch that has been rebuilt points at an
        id that may now be some other document's bytes, so it is not a reference at all.
     2. `ledger_refs_for_document` — every row carrying the id, deleted and stale ones included,
-       because the distinction between "nowhere", "not yours" and "not any more" is what the three
-       refusals are made of.
+       because the distinction between "nowhere", "not yours" and "not any more" is what this
+       function decides, even though only two answers reach the caller.
     3. The scope test, against the **token**, on the **reference**: nothing here asks either API
        whether the document may be shown, so a scope answer costs one query and no network — which
        is what keeps "is this mine?" from becoming a latency and enumeration question at the index.
+       A reference that is live and not mine is refused **exactly like a reference that does not
+       exist**, and that identity is the point: see `DocumentNotFound`.
     4. More than one live in-scope row is `invalid-request`, not a pick. Papra ids are per
        organisation and global uniqueness is unverified; the 2026-11-16 spec's answer to one id in
        two allowed orgs is `multiple_matches` naming both, and since this tool takes no bucket
@@ -1131,16 +1118,19 @@ def _resolve_reference(ctx, store, document_id: str, *, what: str):
     if mine:
         return mine[0]
     if live:
-        # The client's answer says as little as it can, so the reason has to be recorded where it
-        # cannot read. Task 13's banded counts work the same way: the withheld fact is worth having
-        # when somebody debugs "the assistant cannot see a document I can see in papra", and it is
-        # not worth handing to the token that asked. The holding bucket and the token's label go to
-        # the log, which is the operator's; the answer stays one line that names nothing.
+        # Out of scope, and answered `not-found` like everything else — one line for both cases, so
+        # no caller can tell them apart. The reason still has to be recorded somewhere, and the
+        # place it is recorded is where the caller cannot read: Task 13's banded counts work the
+        # same way. The withheld fact is worth having when somebody debugs "the assistant cannot
+        # see a
+        # document I can see in papra", and it is not worth handing to the token that asked, so the
+        # holding bucket and that token's label go to the log and the answer stays one line that
+        # names nothing. Delete this line and the collapse costs the operator the diagnosis; that is
+        # what `test_the_reason_goes_to_the_log_that_the_answer_may_not_give` is for.
         holders = ", ".join(sorted(ref.papra_org_id for ref in live))
         logger.info("mcp: %s refused %s: the id is a live reference in %s, which token %r is not "
                     "granted (%d row(s) for that id at generation %s)", what, document_id, holders,
                     ctx.label, len(live), generation)
-        raise NotInScope()
     raise DocumentNotFound()
 
 
@@ -1331,32 +1321,42 @@ async def get_document_content(ctx, store, papra, kz, document_id: str, *,
     return await _guarded("get_document_content", body(), deadline_s=deadline_s)
 
 
-async def open_document(ctx, store, document_id: str, *, papra_base_url: str | None,
+async def open_document(ctx, store, papra, document_id: str, *, papra_base_url: str | None,
                         deadline_s: float | None = TOOL_DEADLINE_S) -> OpenResult:
-    """Where this document lives in Papra: two URLs, no other service, and no network call at all.
+    """Where this document lives in Papra: two URLs, one liveness read, and no index call at all.
 
-    The scope rule is the same as the other two tools — same ledger read, same three refusals — and
-    then this stops. That is deliberate, and it is worth stating what it buys and what it costs:
+    The scope rule is the same as the other two tools — same ledger read, same refusals — and then
+    this asks Papra the one question its siblings ask (`_live_record`) and stops. What that order
+    buys, and what it costs, is worth stating because it changed on 2026-11-20:
 
-    * It buys a tool that still works while the index is down (which is when an operator most wants
-      the link), and one whose answer cannot name a Kreuzakt path, id or host, because it never
-      speaks to Kreuzakt.
-    * It costs the live Papra check. A document deleted in Papra a moment ago, whose ledger row the
-      delete pass has not marked yet, still gets a URL. No content is disclosed by that — the caller
-      already holds the id, and the link goes to the archive's own UI, which is the authority on
-      whether the document is there and says so itself. The two tools that return text do check, and
-      they are where the disclosure would be.
+    * It still buys a tool that answers while the **index** is down, which is when an operator most
+      wants the link, and one whose answer cannot name a Kreuzakt path, id or host, because it never
+      speaks to Kreuzakt. `get_document` needs the index for `page_count` and the description; this
+      needs neither, so a dead index leaves the viewer working.
+    * It no longer skips the **archive**. A URL is not content, but it is a claim: *this document is
+      in the archive, at this place*. Answering that from the ledger alone means a document Papra
+      calls deleted — whose row the delete pass has not marked yet — gets a viewer and a download
+      link, and "the two tools that return text are where the disclosure would be" was never a good
+      reason for one tool to answer a question about the archive without asking the archive. So the
+      deleted case is `not-found` and a Papra that will not answer is `index_unavailable`, exactly
+      as in its siblings: one code per condition across the three tools, and one Papra GET per call.
+    * The cost of that is honest and small: a Papra outage now takes the links down too. A link into
+      a service that is not answering is not a fallback, it is a dead end that looks like one — the
+      same argument that keeps Papra's copy of the text from being served during an index outage.
 
     Path segments are percent-encoded with `safe=""`, so an id that reads `../../admin?x=1#y` cannot
     walk out of the route it belongs in: the encoding belongs to the URL, and the id is reported
     verbatim everywhere else.
     """
     asked = _require_document_id(document_id, what="open_document")
+    # Configuration is judged before anything is read: an unusable base is a refusal that should not
+    # cost a request to the archive, and it must not become one by way of the liveness check.
     origin = _papra_origin(papra_base_url)
 
     async def body() -> OpenResult:
         ref = await asyncio.to_thread(_resolve_reference, ctx, store, asked,
                                       what="open_document")
+        await _live_record(papra, ref, what="open_document")
         path = (f"/organizations/{quote(ref.papra_org_id, safe='')}"
                 f"/documents/{quote(ref.papra_document_id, safe='')}")
         return OpenResult(viewer_url=f"{origin}{path}", download_url=f"{origin}{path}/file")

@@ -896,12 +896,14 @@ def build_mcp_app(store: LedgerReader, papra: PapraReader, kz: KreuzaktReader, *
         Three checks run in that order, and the order is the cost model and the security model at
         once: the ledger decides whether this token may read it at all, Papra decides whether it is
         still there, and only then is the index asked for the fields it alone knows. A document
-        outside your buckets is refused with no request to either service.  `not-found` covers a
-        document that was never indexed, a deleted one, and one whose index entry belongs to a
-        generation that has since been rebuilt: it is not a claim that the archive does not hold it.
-        `not-in-scope` means the opposite — a live reference exists in a bucket this token was not
-        given, and nothing else about it is returned. A digits-only id is always `not-found`: the
-        index's own row numbers are not document ids here.
+        outside your buckets is refused with no request to either service. `not-found` is the one
+        answer for a document that was never indexed, a deleted one, one whose index entry belongs
+        to a generation that has since been rebuilt, and one that lives in a bucket this token was
+        not given: those four are deliberately indistinguishable here, because telling "it exists
+        and is not yours" from "nothing here has that id" would hand any holder of a read token an
+        enumeration of buckets they were not granted. It is not a claim that the archive does not
+        hold the document. A digits-only id is always `not-found`: the index's own row numbers are
+        not document ids here.
         """
         return await get_document_tool(
             require_principal(ctx.request_context.request), store, papra, kz, document_id)
@@ -929,14 +931,14 @@ def build_mcp_app(store: LedgerReader, papra: PapraReader, kz: KreuzaktReader, *
         """Where this document lives in Papra: a viewer URL and a download URL, both built here.
         Nothing else: no index request, no path into the index's storage, and no address of it in
         the refusal either. The two URLs are the configured Papra base plus your document's own
-        bucket and id, percent-encoded, so this is the tool that still answers while the index is
-        down — which is when an operator wants the link most.  It applies the same ledger scope as
-        the other two, and it is the one document tool that does not ask Papra whether the document
-        is still there: it discloses no content, only a place a human can open, and Papra's UI is
-        the authority on whether a document is behind that address.
+        bucket and id, percent-encoded, so this is the document tool that keeps answering while the
+        index is down — which is when an operator wants the link most. It applies the same ledger
+        scope as the other two, and it asks Papra the same question they ask: a document the archive
+        reports deleted is `not-found` rather than a link, and a Papra that will not answer is
+        `index_unavailable` rather than a URL that may lead nowhere. One Papra read, no index read.
         """
         return await open_document_tool(
-            require_principal(ctx.request_context.request), store, document_id,
+            require_principal(ctx.request_context.request), store, papra, document_id,
             papra_base_url=papra_base_url)
 
     app = server.streamable_http_app(transport_security=security, host=host)

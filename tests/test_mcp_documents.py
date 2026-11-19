@@ -12,15 +12,20 @@ the same place:
 * **Scope is decided before the index is touched.** The ledger answers "whose is this?" in one read;
   Kreuzakt is only asked once the answer is "yours". The assertion that proves it is
   `fake_kz.calls == []` on the refusal paths — a lookup that reached the index first would turn a
-  scope question into a latency question and an existence question at once.
+  scope question into a latency question and an existence question at once. And the refusal is
+  **the same refusal as "no such document"**, asserted as an equality of strings: "it exists, in a
+  bucket you were not given" is an existence oracle whose whole audience is scoped tokens, because
+  `scope_all` short-circuits the filter and an operator's own credential can never be told.
 * **Fail closed.** No ledger row at the current generation, a row under a generation that no longer
-  means what it said, a soft-deleted row, a document Papra reports deleted: all `not-found`. A Papra
-  read that *errors* is `index-unavailable` and is logged, because here — unlike in a search page —
-  the document nobody could check **is** the whole answer, and "I could not find out" must not be
-  reported as "it is not there".
+  means what it said, a soft-deleted row, a document Papra reports deleted: all `not-found`, in all
+  three tools. A Papra read that *errors* is `index_unavailable` and is logged, because here —
+  unlike
+  in a search page — the document nobody could check **is** the whole answer, and "I could not find
+  out" must not be reported as "it is not there".
 * **Nothing upstream leaves here.** A view carries Papra's id and bucket and no Kreuzakt integer, no
   `/api/documents/…`, no `stored_filename`, no index host. `open_document` builds both URLs out of
-  the configured Papra base and touches no other service, so a refusal cannot name the index either.
+  the configured Papra base, asks the archive the one question its siblings ask, and speaks to no
+  other service, so a refusal cannot name the index either.
 
 Content gets the two treatments the 2026-11-16 spec asks for: `max_chars` bounds it (a bound refused
 rather than clamped, `truncated` and `chars_total` honest about what was withheld), and it is
@@ -291,7 +296,7 @@ async def test_a_kreuzakt_integer_id_is_not_a_document_id_and_costs_no_lookup(st
         with pytest.raises(ToolError, match="not-found"):
             await get_document_content(ctx(ORG_A), ledger, papra, index.reader(), candidate)
         with pytest.raises(ToolError, match="not-found"):
-            await open_document(ctx(ORG_A), ledger, candidate, papra_base_url=PAPRA_BASE)
+            await open_document(ctx(ORG_A), ledger, papra, candidate, papra_base_url=PAPRA_BASE)
     assert index.calls == []
     assert papra.get_calls == 0
     assert ledger.queries == []
@@ -329,7 +334,7 @@ async def test_a_view_and_its_urls_carry_no_kreuzakt_identifier_or_path(store):
     view = await get_document(ctx(scope_all=True), LedgerSpy(store), papra, reader, "doc-1")
     content = await get_document_content(ctx(scope_all=True), LedgerSpy(store), papra, reader,
                                          "doc-1")
-    urls = await open_document(ctx(scope_all=True), LedgerSpy(store), "doc-1",
+    urls = await open_document(ctx(scope_all=True), LedgerSpy(store), papra, "doc-1",
                                papra_base_url=PAPRA_BASE)
     assert isinstance(view, DocumentView) and isinstance(content, ContentResult)
     assert isinstance(urls, OpenResult)
@@ -345,63 +350,112 @@ async def test_a_view_and_its_urls_carry_no_kreuzakt_identifier_or_path(store):
 # --- the scope rule, decided before the index is asked -----------------------------------------
 
 
-async def test_a_reference_in_another_bucket_is_not_in_scope_and_the_index_never_heard_of_it(
-        store):
+async def test_a_reference_in_another_bucket_answers_not_found_and_costs_no_read(store):
     """Mutation check (f): drop the scope check and this dies first.
 
-    `not-in-scope` is the plan's code and the plan's oracle: it says *this document exists and is
-    not yours*. Two things are pinned alongside it, because the code alone is the leak and nothing
-    else: no Kreuzakt request and no Papra read (the answer is in the ledger), and no name of the
-    bucket that holds it — the caller is told the reference is outside their grant, not where it
-    lives. The tension the code creates anyway is argued in the task report rather than hidden here.
+    A live reference in a bucket this token was not granted is refused `not-found`, which is what
+    the 2026-11-16 spec asked for and what the controller ruled on 2026-11-20: a distinct
+    "exists, elsewhere" answer is an existence oracle, and its only audience is scoped tokens —
+    `ctx.scope_all` short-circuits the filter, so an all-buckets credential can never be told. Three
+    things are pinned here, because the code alone is only half of it: no Kreuzakt request and no
+    Papra read (the ledger already knows), and no name of the bucket that holds the reference.
+    `test_a_foreign_id_and_a_never_seen_id_are_the_same_refusal` is the other half: the equality.
     """
     bind(store, ORG_B, "doc-b", kreuzakt_id=7)
     papra = FakePapra({"doc-b": papra_doc("doc-b", org=ORG_B)})
     index = ScriptedIndex()
-    with pytest.raises(ToolError, match="not-in-scope") as caught:
+    with pytest.raises(ToolError, match="not-found") as caught:
         await get_document(ctx(ORG_A), store, papra, index.reader(), "doc-b")
-    assert str(caught.value).startswith("not-in-scope")
+    assert str(caught.value).startswith("not-found")
     assert ORG_B not in str(caught.value)
     assert index.calls == []
     assert papra.get_calls == 0
 
-    with pytest.raises(ToolError, match="not-in-scope"):
+    with pytest.raises(ToolError, match="not-found"):
         await get_document_content(ctx(ORG_A), store, papra, index.reader(), "doc-b")
-    with pytest.raises(ToolError, match="not-in-scope"):
-        await open_document(ctx(ORG_A), store, "doc-b", papra_base_url=PAPRA_BASE)
+    with pytest.raises(ToolError, match="not-found"):
+        await open_document(ctx(ORG_A), store, papra, "doc-b", papra_base_url=PAPRA_BASE)
     assert index.calls == []
     assert papra.get_calls == 0
+
+
+async def test_a_foreign_id_and_a_never_seen_id_are_the_same_refusal(store):
+    """The oracle is closed iff the two refusals are **equal strings** — so equality is asserted.
+
+    This is the differential, and it is deliberately stronger than two `pytest.raises(match=…)`
+    calls. Two codes would be the obvious leak and a pattern match would catch it; two messages
+    that share the `not-found` prefix would not, and would disclose exactly as much: *this id exists
+    and is not yours* versus *nothing here has this id*. So each tool is asked for the foreign id
+    and for an id no ledger row has ever carried, and the two client-visible strings must be
+    identical — same code, same wording, same everything. Mutant (e) changes one word in one branch
+    and dies only
+    here. A refusal must not even echo the id it refused, which is the third assertion.
+    """
+    bind(store, ORG_B, "doc-b", kreuzakt_id=7)
+    papra = FakePapra({"doc-b": papra_doc("doc-b", org=ORG_B)})
+    index = ScriptedIndex()
+    tools = (
+        ("get_document", lambda document_id: get_document(
+            ctx(ORG_A), store, papra, index.reader(), document_id)),
+        ("get_document_content", lambda document_id: get_document_content(
+            ctx(ORG_A), store, papra, index.reader(), document_id)),
+        ("open_document", lambda document_id: open_document(
+            ctx(ORG_A), store, papra, document_id, papra_base_url=PAPRA_BASE)),
+    )
+
+    async def refusal(tool, document_id):
+        with pytest.raises(ToolError) as caught:
+            await tool(document_id)
+        return str(caught.value)
+
+    for name, tool in tools:
+        foreign = await refusal(tool, "doc-b")
+        never_seen = await refusal(tool, "doc-never-indexed")
+        assert foreign == never_seen, f"{name} tells the two cases apart: {foreign!r} / " \
+                                      f"{never_seen!r}"
+        assert never_seen.startswith("not-found:"), name
+        assert ORG_B not in foreign and "doc-b" not in foreign, name
+    assert index.calls == []
+    assert papra.get_calls == 0            # the ledger answers, so the refusal still costs no read
 
 
 async def test_the_reason_goes_to_the_log_that_the_answer_may_not_give(store, caplog):
     """The bucket the caller is not told about is still a fact the operator is owed.
 
-    This is Task 13's rule for the banded counters applied to the one code on this surface that
-    withholds a fact: the client's answer is deliberately uninformative, and an uninformative answer
-    is cheap to give only if somebody can still find out afterwards. So the holding bucket and the
-    token's label are logged, and the assertion pair is the whole point — the same string must be
-    absent from the refusal and present in the log. Whether `not-in-scope` should be answerable at
-    all is the controller's open decision (report §"The `not-in-scope` oracle"); this line is what
-    makes collapsing it on the wire affordable, because the diagnosis survives either way.
+    This is Task 13's rule for the banded counters applied to the refusal that withholds a fact, and
+    with the collapse it is the *only* place the reason exists at all: the client gets one code for
+    both cases, so an operator debugging "the assistant cannot see a document I can see in papra"
+    would have nothing but a `not-found` if the holding bucket were not logged. Hence the pair — the
+    bucket and the token's label appear in the log and neither appears on the wire, asserted against
+    a label chosen to be distinctive rather than to a word that could occur in prose. The collapse
+    is affordable because of this line, which is why it is pinned as a property and not a
+    preference.
     """
     bind(store, ORG_B, "doc-b", kreuzakt_id=7)
     papra = FakePapra({"doc-b": papra_doc("doc-b", org=ORG_B)})
     index = ScriptedIndex()
+    token = TokenContext(label="support-token", org_ids=frozenset({ORG_A}), scope_all=False)
     caplog.set_level(logging.INFO, logger="papra_suite.mcp_tools")
-    with pytest.raises(ToolError, match="not-in-scope") as caught:
-        await get_document(ctx(ORG_A), store, papra, index.reader(), "doc-b")
+    with pytest.raises(ToolError, match="not-found") as caught:
+        await get_document(token, store, papra, index.reader(), "doc-b")
 
-    assert ORG_B not in str(caught.value)            # the wire stays silent about where it lives
-    assert ORG_B in caplog.text                      # and the operator is not left guessing
+    assert ORG_B not in str(caught.value)          # the wire stays silent about where it lives
+    assert "support-token" not in str(caught.value)   # and not about who asked, either
+    assert ORG_B in caplog.text                    # the operator is not left guessing
+    assert "support-token" in caplog.text
     assert "doc-b" in caplog.text and "not granted" in caplog.text
-    assert "Traceback" not in caplog.text            # a refusal is not an exception worth a stack
+    assert "Traceback" not in caplog.text          # a refusal is not an exception worth a stack
 
 
 async def test_an_all_buckets_token_reads_the_other_buckets_document(store):
-    """`--all-buckets` is not refused by the same code: the check is the grant, not a surprise.
+    """`--all-buckets` reads another bucket's document, so the scope test is a grant, not a reflex.
 
-    Without this half, a mutant that always raised `not-in-scope` would pass the test above, and the
-    operator's own credential could not read its own archive.
+    This is the half that keeps the collapse honest. The differential above proves the two refusals
+    agree; this proves the code still says *yes* when the token covers every bucket. Without it, a
+    mutant that refused every cross-bucket id unconditionally — or one that inverted the scope test
+    — would look identical to the shipped code from outside, and the operator's own credential could
+    not read its own archive. It is also the fact that made `not-in-scope` dead code for anybody who
+    could safely have been told: `scope_all` short-circuits the filter, so this path never refuses.
     """
     bind(store, ORG_B, "doc-b")
     papra = FakePapra({"doc-b": papra_doc("doc-b", org=ORG_B)})
@@ -430,7 +484,7 @@ async def test_two_buckets_holding_one_document_id_are_refused_not_guessed(store
             await tool(ctx(scope_all=True), store, papra, index.reader(), "doc-x")
         assert ORG_A in str(caught.value) and ORG_B in str(caught.value)
     with pytest.raises(ToolError, match="invalid-request"):
-        await open_document(ctx(scope_all=True), store, "doc-x", papra_base_url=PAPRA_BASE)
+        await open_document(ctx(scope_all=True), store, papra, "doc-x", papra_base_url=PAPRA_BASE)
     assert papra.get_calls == 0
     assert index.calls == []
 
@@ -454,7 +508,8 @@ async def test_a_document_with_no_ledger_row_fails_closed(store):
         with pytest.raises(ToolError, match="not-found"):
             await tool(ctx(scope_all=True), store, papra, index.reader(), "doc-unknown")
     with pytest.raises(ToolError, match="not-found"):
-        await open_document(ctx(scope_all=True), store, "doc-unknown", papra_base_url=PAPRA_BASE)
+        await open_document(ctx(scope_all=True), store, papra, "doc-unknown",
+                            papra_base_url=PAPRA_BASE)
     assert index.calls == []
     assert papra.get_calls == 0
 
@@ -493,7 +548,10 @@ async def test_deleted_in_papra_is_not_found_even_though_the_index_still_has_it(
     The delete pass marks the ledger on its own schedule, so there is a window where the reference
     is live, the index still serves the row, and Papra says `isDeleted`. Papra is the archive, so
     its answer wins, and it wins *before* the content is fetched: the index is never asked for text
-    that is about to be refused.
+    that
+    is about to be refused. All three tools are in the loop, because all three ask now — the link
+    tool was the exception until the controller's ruling of 2026-11-20, and a viewer URL for a
+    document the archive calls deleted is the same wrong answer in a smaller font.
     """
     papra = corpus(store)
     papra.documents["doc-1"]["isDeleted"] = True
@@ -504,6 +562,29 @@ async def test_deleted_in_papra_is_not_found_even_though_the_index_still_has_it(
             await tool(ctx(scope_all=True), store, papra, index.reader(), "doc-1")
         # Exactly one Papra read per call — the one that answered "deleted" — and no index request.
         assert papra.get_calls == before + 1
+    before = papra.get_calls
+    with pytest.raises(ToolError, match="not-found"):
+        await open_document(ctx(scope_all=True), store, papra, "doc-1", papra_base_url=PAPRA_BASE)
+    assert papra.get_calls == before + 1
+    assert index.calls == []
+
+
+async def test_open_document_refuses_a_papra_outage_rather_than_printing_a_link(store):
+    """A Papra that will not answer gets no link either: `index_unavailable`, like its siblings.
+
+    This is the half the deleted-document test cannot see. A URL is not content, and the archive's
+    own UI does have the last word about what sits behind it, which was the argument for skipping
+    the check — but the check is not only about disclosure, it is about a claim: handing back
+    `viewer_url`/`download_url` says "this document is in the archive, at this place", and this call
+    gets to make that claim only if Papra answered. So an unreadable Papra is the outage code and is
+    logged, never a link that may be a dead end or somebody else's bytes after a restore.
+    """
+    papra = corpus(store)
+    papra.raise_on_get = True
+    index = ScriptedIndex()
+    with pytest.raises(ToolError, match="index_unavailable") as caught:
+        await open_document(ctx(scope_all=True), store, papra, "doc-1", papra_base_url=PAPRA_BASE)
+    assert "SECRET-PAPRA-DETAIL" not in str(caught.value)
     assert index.calls == []
 
 
@@ -797,17 +878,18 @@ async def test_a_document_the_index_has_no_page_count_for_still_opens(store):
 async def test_open_document_urls_are_papra_only_and_require_no_kreuzakt_call(store):
     """Mutation check (f): let `open_document` consult or name the index and this dies.
 
-    The two URLs are built from the configured Papra base and the reference's own bucket and id.
-    Zero network calls of any kind: the ledger answers the scope question, and a link needs nothing
-    else — which is also what makes this tool still work while the index is down.
+    The two URLs are built from the configured Papra base and the reference's own bucket and id. One
+    Papra read (the liveness check) and **zero index calls**: the link itself needs nothing from
+    Kreuzakt, which is what keeps a dead index from taking the viewer down and keeps a Kreuzakt
+    id or host out of the answer.
     """
     papra = corpus(store)
     index = ScriptedIndex()
-    result = await open_document(ctx(ORG_A), store, "doc-1", papra_base_url=PAPRA_BASE)
+    result = await open_document(ctx(ORG_A), store, papra, "doc-1", papra_base_url=PAPRA_BASE)
     assert result.viewer_url == f"http://papra:1221/organizations/{ORG_A}/documents/doc-1"
     assert result.download_url == f"http://papra:1221/organizations/{ORG_A}/documents/doc-1/file"
     assert index.calls == []
-    assert papra.get_calls == 0
+    assert papra.get_calls == 1
     assert "kreuzakt" not in json.dumps(result.model_dump())
 
 
@@ -816,17 +898,21 @@ async def test_open_document_refuses_an_unusable_base_url_without_printing_it(st
 
     `PAPRA_BASE_URL` is operator configuration and can carry userinfo in other deployments; the
     client's message says the server cannot offer a link, and the log says the same without the
-    value. A URL built out of a garbage base would be a link to wherever that string pointed.
+    value. A URL built out of a garbage base would be a link to wherever that string pointed. The
+    base is judged before anything is read, including Papra: a refusal this cheap should not cost a
+    request, and the liveness check the tool now performs cannot turn a configuration mistake into a
+    read of the archive.
     """
-    corpus(store)
+    papra = corpus(store)
     index = ScriptedIndex()
     for bad in (None, "", "not a url", "ftp://papra:1221",
                 "http://user:sekret@papra.internal:1221"):
         with pytest.raises(ToolError, match="index_unavailable") as caught:
-            await open_document(ctx(scope_all=True), store, "doc-1", papra_base_url=bad)
+            await open_document(ctx(scope_all=True), store, papra, "doc-1", papra_base_url=bad)
         assert "sekret" not in str(caught.value)
         assert "papra.internal" not in str(caught.value)
     assert index.calls == []
+    assert papra.get_calls == 0
 
 
 async def test_the_path_segments_of_a_url_are_percent_encoded(store):
@@ -839,8 +925,9 @@ async def test_the_path_segments_of_a_url_are_percent_encoded(store):
     """
     odd = "../../admin?x=1#y"
     bind(store, ORG_A, odd)
+    papra = FakePapra({odd: papra_doc(odd)})
     index = ScriptedIndex()
-    result = await open_document(ctx(scope_all=True), store, odd, papra_base_url=PAPRA_BASE)
+    result = await open_document(ctx(scope_all=True), store, papra, odd, papra_base_url=PAPRA_BASE)
     assert result.viewer_url == (f"{PAPRA_BASE}/organizations/org-a/documents/"
                                  "..%2F..%2Fadmin%3Fx%3D1%23y")
     # The separator before `file` is a real one: every character that *belongs to the id* is
@@ -852,20 +939,21 @@ async def test_the_path_segments_of_a_url_are_percent_encoded(store):
 
 
 async def test_open_document_answers_a_document_the_index_never_had(store):
-    """The ledger is enough here, so a Kreuzakt outage cannot take the viewer links down.
+    """A Kreuzakt outage cannot take the viewer links down, and this pins why that is still true.
 
-    This is the one document tool that reads nothing but the ledger, and it is deliberate: the
-    answer is a location derived from an id the caller already holds, so there is no second system
-    whose cooperation the claim needs. What it therefore does *not* check is Papra's live state —
-    see the report for the argument, and for what that costs when a document was deleted in Papra a
-    moment ago.
+    The liveness check costs a Papra read and nothing else: the rowid that would have to reach the
+    index is never consulted, so the answer is still derived from the ledger and the archive alone.
+    `index.error_hits == 0` is the assertion that keeps the check from being implemented as "fetch
+    the document, then build the URL" — which would name nothing but would make every link in the
+    archive depend on a service that is not needed to make one.
     """
     papra = corpus(store)
     index = ScriptedIndex(error=True)
-    result = await open_document(ctx(scope_all=True), store, "doc-1", papra_base_url=PAPRA_BASE)
+    result = await open_document(ctx(scope_all=True), store, papra, "doc-1",
+                                papra_base_url=PAPRA_BASE)
     assert result.viewer_url.endswith("/documents/doc-1")
     assert index.error_hits == 0
-    assert papra.get_calls == 0
+    assert papra.get_calls == 1
 
 
 # --- the registered surface: six tools, and no way to widen one --------------------------------
@@ -968,26 +1056,37 @@ async def test_the_wire_answers_a_document_the_token_may_read(store):
 
 
 async def test_the_wire_refuses_a_foreign_document_with_no_index_request(store):
-    """The scope refusal survives the transport, and the index never heard of the id."""
+    """The scope refusal survives the transport as **one indistinguishable answer**, and the index
+    never heard of the id.
+
+    `not-found` here is the whole ruling: a foreign live reference and an id the ledger has never
+    seen produce the same text, so this asserts the code and the equality together — the wire
+    message for `doc-b` must equal the one for an id nothing holds. Nothing on the wire names the
+    bucket; the log does, and
+    `test_the_reason_goes_to_the_log_that_the_answer_may_not_give` is about that half.
+    """
     bind(store, ORG_B, "doc-b", kreuzakt_id=7)
     papra = FakePapra({"doc-b": papra_doc("doc-b", org=ORG_B)})
     index = ScriptedIndex()
     token = mint_token(store, label="wire", org_ids=[ORG_A])
-    _response, _message, text = wire_call(store, token, "get_document_content",
-                                         {"document_id": "doc-b"}, papra=papra,
-                                         kz=index.reader())
-    assert "not-in-scope" in text
-    assert ORG_B not in text
+    _response, _message, foreign = wire_call(store, token, "get_document_content",
+                                             {"document_id": "doc-b"}, papra=papra,
+                                             kz=index.reader())
+    _response, _message, never_seen = wire_call(store, token, "get_document_content",
+                                                {"document_id": "doc-never-indexed"}, papra=papra,
+                                                kz=index.reader())
+    assert "not-found" in foreign and ORG_B not in foreign
+    assert foreign == never_seen
     assert index.calls == []
     assert papra.get_calls == 0
 
 
 async def test_the_wire_gives_links_and_no_credential_and_no_index_host(store):
-    token = mint_token(store, label="wire", org_ids=[ORG_A])
-    corpus(store)
+    papra = corpus(store)
     index = ScriptedIndex()
+    token = mint_token(store, label="wire", org_ids=[ORG_A])
     _response, _message, text = wire_call(store, token, "open_document",
-                                         {"document_id": "doc-1"}, kz=index.reader())
+                                         {"document_id": "doc-1"}, papra=papra, kz=index.reader())
     assert f"{PAPRA_BASE}/organizations/{ORG_A}/documents/doc-1" in text
     assert KZ_HOST not in text and "90210" not in text and "/api/documents" not in text
     assert index.calls == []
