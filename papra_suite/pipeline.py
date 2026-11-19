@@ -489,6 +489,7 @@ async def serve(config, *, stop: asyncio.Event | None = None,
             _supervise(task, task.get_name())
 
     fatal: list[BaseException] = []
+    reaping = False
 
     def _watch_listener(task: asyncio.Task) -> None:
         """The listener's death ends the process; every other hosted task only logs.
@@ -502,7 +503,16 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         """
         def _on_done(done: asyncio.Task) -> None:
             if done.cancelled():
-                return                      # the parent asked: not a death
+                # Cancellation is only clean when THIS function started it. A listener that
+                # cancelled itself, or let a `CancelledError` escape, is the same dead port with a
+                # quieter traceback, so `reaping` — not the cancellation — says who asked.
+                if not reaping:
+                    fatal.append(mcp_server.McpListenerDied(
+                        f"task {done.get_name()} was cancelled although nothing had asked it to"
+                        " stop"))
+                    logger.error("%s", fatal[-1])
+                    stop.set()
+                return
             error = done.exception()
             # A raised exit is ALWAYS a death. `run_mcp_listener` sets `stop` itself on the way
             # out — that is how it brings the process down — so the flag cannot tell a requested
@@ -523,6 +533,9 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     try:
         await stop_waiter
     finally:
+        # Set before the first `cancel()`, and read by the done-callbacks that run during the
+        # gather below: everything cancelled from here on is the parent's own cleanup.
+        reaping = True
         stop_waiter.cancel()
         for task in tasks:
             task.cancel()

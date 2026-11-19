@@ -162,3 +162,23 @@ async def test_a_listener_whose_bind_fails_ends_serve_for_real(store, tmp_path, 
         await _serve_until_it_ends(store, tmp_path, monkeypatch, run_mcp_listener)
     assert "task mcp died" in str(caught.value)
 
+
+
+async def test_a_listener_that_cancels_itself_is_a_death_too(store, tmp_path, monkeypatch):
+    """`done.cancelled()` cannot mean "the parent asked" on its own — only the parent knows.
+
+    Anything that lets a `CancelledError` escape the listener — a self cancel, a stray inner
+    timeout —
+    would otherwise read as an orderly stop, and the process would sit beside a port nobody holds
+    until something else ended it. So the reap sets a flag, and cancellation is clean only when the
+    reap started it.
+    """
+    import asyncio
+
+    async def self_cancelling(config, store, *, papra=None, kreuzakt=None, stop=None):
+        asyncio.current_task().cancel()
+        await asyncio.sleep(30)
+
+    with pytest.raises(McpListenerDied) as caught:
+        await _serve_until_it_ends(store, tmp_path, monkeypatch, self_cancelling)
+    assert "cancelled" in str(caught.value)

@@ -361,6 +361,13 @@ class KreuzaktReader:
 #: asserts on, and nothing in it may be a way to build or widen a handle.
 BORROWED_FROM = {PapraReader: PapraClient, KreuzaktReader: KreuzaktClient}
 
+#: The state a borrowed view takes from the client, named, and nothing else. The reads are the
+#: client's own functions, so this is everything they touch — and the list is the point: copying the
+#: client's whole `__dict__` would let a future attribute, including another mutable handle, walk
+#: into the view on the day somebody adds it, and a name added here is a review decision rather than
+#: an accident of construction.
+BORROW_STATE = {PapraReader: ("_client", "_backoff_base_s"), KreuzaktReader: ("_client",)}
+
 
 def borrow_view(view_cls, client):
     """A GET-only view of a client somebody else opened, owns and will close.
@@ -374,6 +381,13 @@ def borrow_view(view_cls, client):
     answers `GET` and nothing else, while the owner's client stays exactly as mutable as it was.
     """
     view = view_cls.__new__(view_cls)
-    view.__dict__.update(client.__dict__)
+    for name in BORROW_STATE[view_cls]:
+        if name == "_client":
+            continue                      # gated below, never handed over raw
+        if not hasattr(client, name):
+            raise McpContainmentError(
+                f"{type(client).__name__} is not the client a {view_cls.__name__} borrows from:"
+                f" it has no {name}")
+        setattr(view, name, getattr(client, name))
     view._client = _GetOnlyClient(client._client)
     return view

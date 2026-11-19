@@ -485,3 +485,23 @@ def test_the_app_refuses_a_writable_store_even_when_its_verifier_would_not(store
     with pytest.raises(McpContainmentError) as caught:
         build(store)
     assert "store" in str(caught.value)
+
+
+def test_a_borrow_cannot_carry_state_the_view_did_not_ask_for():
+    """`borrow_view` names the state it copies, so a new client attribute is not automatically a
+    capability on the request path.
+
+    Copying `client.__dict__` wholesale moves any future handle — a second client, a store, a writer
+    callable — onto the view the day somebody adds it, and nothing at construction would notice.
+    """
+    from papra_suite.papra_client import PapraClient
+    from papra_suite.readers import PapraReader, borrow_view
+
+    class WithAnExtraHandle(PapraClient):
+        def __init__(self):
+            super().__init__("http://papra.test", "papra-key-1")
+            self.writer = self          # whatever a later client might grow
+
+    view = borrow_view(PapraReader, WithAnExtraHandle())
+    assert not hasattr(view, "writer")
+    assert view._backoff_base_s == 0.5, "the state the borrowed reads use has to come along"
