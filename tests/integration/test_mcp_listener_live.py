@@ -17,6 +17,9 @@ store. It is deliberately not the atlas/Tailscale deployment check — publishin
 serve` is a runbook item, and a test that passed here and failed there would be worse than none.
 """
 
+import asyncio
+import json
+import logging
 import socket
 import time
 
@@ -149,6 +152,77 @@ async def test_missing_wrong_and_query_string_credentials_are_the_same_401(liste
     assert missing.status_code == wrong.status_code == query.status_code == 401
     assert missing.content == wrong.content == query.content, "the 401s must be byte-identical"
     assert token not in query.text and token not in missing.headers.get("www-authenticate", "")
+
+
+async def test_a_revoked_token_is_the_same_401_as_a_missing_one(listener):
+    """Over the wire, too: revocation must not become an oracle for "this token existed".
+
+    The in-process pair is asserted in `test_mcp_server_auth.py`; this is the same claim about the
+    bytes a client actually receives from uvicorn, which is where a `WWW-Authenticate` difference
+    would appear.
+    """
+    token = mint_token(listener.store, label="revoked-401", org_ids=[ORG])
+    from papra_suite.mcp_tokens import revoke_token
+
+    revoke_token(listener.store, label="revoked-401")
+    async with raw_client(token) as client:
+        revoked = await client.post(listener.endpoint, json={})
+    async with raw_client() as client:
+        absent = await client.post(listener.endpoint, json={})
+
+    assert revoked.status_code == absent.status_code == 401
+    assert revoked.content == absent.content, "revoked and absent must be byte-identical"
+    assert revoked.headers.get("www-authenticate") == absent.headers.get("www-authenticate")
+
+
+async def test_nothing_the_listener_answers_lands_on_stdout(listener, capsys, caplog):
+    """The leak the 2026-11-16 spec measured, asserted where uvicorn actually runs.
+
+    uvicorn's access log writes full URLs **including query strings** to stdout, so a refused
+    `?access_token=` would be written down verbatim by the one component that never passes through
+    this suite's redaction filter. `access_log=False` is the whole defence, and every other log test
+    here drives `TestClient`, which never starts uvicorn — so without this, flipping that flag would
+    leave the suite green and the README's claim false.
+    """
+    token = mint_token(listener.store, label="stdout-check", org_ids=[ORG])
+
+    with caplog.at_level(logging.INFO):
+        async with raw_client() as client:
+            await client.get(f"{listener.endpoint}?access_token={token}")
+            await client.post(listener.endpoint, json={})
+
+    captured = capsys.readouterr()
+    assert captured.out == "", "something wrote to stdout from inside the listener"
+    assert token not in captured.out and token not in captured.err
+    assert not [record for record in caplog.records if record.name.startswith("uvicorn.access")], \
+        "uvicorn's access log is on, and it logs query strings"
+
+
+async def test_two_tokens_on_two_sessions_keep_their_own_buckets(listener):
+    """Two live scopes in one process, at the same instant.
+
+    This is the boundary Task 13 sits on. The store-level and sequential per-token isolation are
+    pinned elsewhere; what nothing covered was two SDK sessions open at once, because the mechanism
+    is per-request (`scope["user"]`, no contextvar) and therefore easy to break with a well-meant
+    "cache the principal on the session" later.
+    """
+    second_bucket = "org-second"  # not a prefix of ORG, so the substring assertions below cannot
+    listener.store.ledger_upsert_reference(papra_org_id=second_bucket, papra_document_id="d2",
+                                           file_hash="ef" * 32, papra_original_name="d2.pdf")
+    first_token = mint_token(listener.store, label="pair-a", org_ids=[ORG])
+    second_token = mint_token(listener.store, label="pair-b", org_ids=[second_bucket])
+
+    async with raw_client(first_token) as http_a, raw_client(second_token) as http_b:
+        async with Client(streamable_http_client(listener.endpoint, http_client=http_a)) as a:
+            async with Client(streamable_http_client(listener.endpoint, http_client=http_b)) as b:
+                first, second = await asyncio.gather(a.call_tool("index_status"),
+                                                     b.call_tool("index_status"))
+
+    mine, theirs = first.structured_content, second.structured_content
+    assert [bucket["org_id"] for bucket in mine["buckets"]] == [ORG]
+    assert [bucket["org_id"] for bucket in theirs["buckets"]] == [second_bucket]
+    assert second_bucket not in json.dumps(mine), "a concurrent call leaked the other grant"
+    assert ORG not in json.dumps(theirs), "a concurrent call leaked the other grant"
 
 
 async def test_an_unlisted_origin_is_refused_over_the_wire(listener):

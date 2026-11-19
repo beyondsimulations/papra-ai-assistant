@@ -433,3 +433,116 @@ def test_cli_create_writes_the_row_and_migrates(tmp_path, capsys):
         assert token_counts(store) == (1, 0)
     finally:
         store.close()
+
+
+# --- a grant that names no bucket (review I4) -----------------------------------------------
+
+
+def seen_bucket(store, org):
+    """A bucket this suite has recorded seeing a document in.
+
+    `documents_org_ids()` is the wider of the two local bucket listings, so it is the one that must
+    silence the warning: a bucket with only unledgered documents is still a real bucket.
+    """
+    store.record_document_seen(papra_org_id=org, papra_document_id=f"{org}-d1", name="d1.pdf",
+                               mime="application/pdf", ingested_via="mail")
+
+
+def test_create_warns_loudly_when_a_granted_id_names_no_bucket(store, capsys):
+    """`org-1` when the real id is `org-01` authenticates, prints `scope: buckets`, and reads as an
+    empty archive: a confident wrong answer behind a happy exit code, and the command that minted it
+    is the last cheap place to catch it.
+    """
+    code = run_mcp_token(config_for(store), parse(
+        ["--create", "--label", "hermes", "--org-id", "org-1"]), store=store)
+    captured = capsys.readouterr()
+
+    assert code == 0, "the token is still minted: a brand-new bucket legitimately has no rows yet"
+    err = captured.err
+    assert "org-1" in err
+    assert "no bucket" in err and "typo" in err
+    assert "org-1" in captured.out, "the grant is still printed on the token's own line"
+
+
+def test_create_is_quiet_about_a_bucket_the_archive_has_seen(store, capsys):
+    seen_bucket(store, ORG)
+    code = run_mcp_token(config_for(store), parse(
+        ["--create", "--label", "hermes", "--org-id", ORG]), store=store)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.err == "", captured.err
+
+
+def test_create_warns_about_only_the_ids_that_name_nothing(store, capsys):
+    seen_bucket(store, ORG)
+    run_mcp_token(config_for(store), parse(
+        ["--create", "--label", "hermes", "--org-id", ORG, "--org-id", "org-01"]), store=store)
+    err = capsys.readouterr().err
+
+    assert "org-01" in err
+    assert ORG not in err, "naming a bucket that exists alongside a typo would bury the typo"
+
+
+def test_create_says_nothing_about_an_all_buckets_grant(store, capsys):
+    """`--all-buckets` names no id, so there is nothing to have mistyped."""
+    run_mcp_token(config_for(store), parse(
+        ["--create", "--label", "op", "--all-buckets"]), store=store)
+
+    assert capsys.readouterr().err == ""
+
+
+def test_list_flags_a_grant_that_names_no_bucket(store, capsys):
+    """The same reading, later, for a token somebody else minted.
+
+    The note is a footer rather than a column: the table is tab-separated and its `buckets` field is
+    what an operator copies into a client, so a marker in it would read as part of an id.
+    """
+    mint_token(store, label="hermes", org_ids=["org-01"])
+    seen_bucket(store, ORG)
+    mint_token(store, label="pi", org_ids=[ORG])
+
+    code = run_mcp_token(config_for(store), parse(["--list"]), store=store)
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "org-01" in out and "hermes" in out
+    assert "no bucket" in out
+    rows = [line for line in out.splitlines() if line.startswith(("hermes", "pi"))]
+    assert len(rows) == 2 and all(len(line.split("\t")) == 4 for line in rows)
+
+
+def test_list_is_quiet_when_every_grant_names_a_real_bucket(store, capsys):
+    seen_bucket(store, ORG)
+    mint_token(store, label="hermes", org_ids=[ORG])
+    run_mcp_token(config_for(store), parse(["--list"]), store=store)
+
+    assert "no bucket" not in capsys.readouterr().out
+
+
+# --- a rejected row is a count, never a key -----------------------------------------------
+
+
+def test_a_rejected_row_is_reported_as_a_count_and_not_as_its_key(store, caplog):
+    """The settings key of a token row **is** the token's sha256.
+
+    A row that fails to parse is worth logging — otherwise a hand-edited or half-written row is a
+    credential that silently stopped working. What is not worth logging is the key: it goes to
+    stderr and into the `log_lines` ring buffer the dashboard serves, and "no credential material in
+    the logs" has to be one rule with no exceptions in it, not a rule with a 256-bit footnote.
+    """
+    digest = "ab" * 32
+    store.set_setting(f"{TOKEN_SETTING_PREFIX}{digest}", "{not json")
+    store.set_setting(f"{TOKEN_SETTING_PREFIX}{'cd' * 32}", json.dumps({"label": "half a row"}))
+
+    with caplog.at_level(logging.DEBUG):
+        assert list_tokens(store) == []
+
+    printed = "\n".join(record.getMessage() for record in caplog.records)
+    assert printed, "nothing was logged, so a row silently stopped working"
+    assert "2" in printed, "the count is what gets logged"
+    # The bare prefix is fine to name — it is a namespace, not a secret. What may not appear is the
+    # 64 hex characters that follow it, in any phrasing.
+    assert digest not in printed and "cd" * 32 not in printed
+    assert f"{TOKEN_SETTING_PREFIX}{digest}" not in printed
+

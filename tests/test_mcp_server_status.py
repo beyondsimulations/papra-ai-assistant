@@ -19,18 +19,25 @@ Two deliberate asymmetries:
   Papra while Kreuzakt is down would be a second index with worse search and no warning.
 """
 
+import asyncio
 import itertools
 import json
-from datetime import UTC, datetime
+import logging
+import sqlite3
+import threading
+import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from starlette.testclient import TestClient
 
 from papra_suite.indexing import (
     DELETION_QUARANTINE_SETTING,
+    LISTING_WALK_INTERVAL_S,
     LISTING_WALK_STAMP_SETTING,
     LIVENESS_PROBE_UNANSWERED_SETTING,
     MARKS_ROLLING_SETTING,
+    MARKS_ROLLING_WINDOW_S,
 )
 from papra_suite.kreuzakt_client import KreuzaktError
 from papra_suite.mcp_server import (
@@ -40,7 +47,7 @@ from papra_suite.mcp_server import (
     index_status_for,
     token_context_of,
 )
-from papra_suite.mcp_tokens import mint_token
+from papra_suite.mcp_tokens import mint_token, resolve_token
 from papra_suite.store import EMPTY_EXTRACTION_SHA, Store
 
 PUBLIC_URL = "https://papra-mcp.ts.net"
@@ -322,8 +329,14 @@ async def test_the_marks_brake_counts_are_privileged(seeded):
 
     Both are `None` for a scoped token: printing the allowance without the count would be a hint
     about what the hidden number is being judged against, and printing the count is the leak.
+
+    The window is stamped half a window ago, not with a literal: this counter is read against the
+    real clock (`MARKS_ROLLING_WINDOW_S`, a day), so a fixed stamp says “34” for one day and then
+    “0” for the rest of the project — the same trap the cadence test above fell into.
     """
-    seeded.set_setting(MARKS_ROLLING_SETTING, "2026-11-19T00:00:00+00:00|34")
+    half_window = MARKS_ROLLING_WINDOW_S / 2
+    stamp = (datetime.now(UTC) - timedelta(seconds=half_window)).isoformat()
+    seeded.set_setting(MARKS_ROLLING_SETTING, f"{stamp}|34")
     scoped = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
     everything = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
     assert scoped.marks is None
@@ -351,10 +364,33 @@ async def test_the_cadence_gate_is_shown_to_every_token(seeded):
     concluding propagation was broken. That reading is corrected by a "gated until" the scoped token
     can also see — and it names no other bucket.
     """
-    seeded.set_setting(LISTING_WALK_STAMP_SETTING, "2026-11-19T09:00:00+00:00")
+    # Relative to the real clock: half an interval ago, so the gate is genuinely open for another
+    # half-interval whenever the suite runs. This used a literal, so it
+    # passed only until that instant arrived — red from 09:00 UTC on and never green again. That
+    # is how a cadence regression ends up “fixed” by deleting an assertion nobody trusts.
+    half = LISTING_WALK_INTERVAL_S / 2
+    seeded.set_setting(LISTING_WALK_STAMP_SETTING,
+                       (datetime.now(UTC) - timedelta(seconds=half)).isoformat())
     scoped = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
-    assert scoped.gated_until
-    assert "T" in scoped.gated_until
+    assert scoped.gated_until, "a pass that ran half an interval ago is still gated"
+    gate = datetime.fromisoformat(scoped.gated_until)
+    assert gate > datetime.now(UTC), f"the gate is printed as already open: {scoped.gated_until}"
+
+
+async def test_an_expired_cadence_prints_nothing_rather_than_a_stale_date(seeded):
+    """The other arm, next to the first: a cadence that ran out has **no** date to show.
+
+    A `gated_until` in the past is the confident wrong answer this field exists to prevent — an
+    operator reads “until 09:00” at 14:00 as “the pass is late” when the truth is “it may run on the
+    next sweep”. And without this arm, a mutation that made stamps never expire would keep the test
+    above green: it only ever looks at the open case.
+    """
+    stale = datetime.now(UTC) - timedelta(seconds=LISTING_WALK_INTERVAL_S * 2)
+    seeded.set_setting(LISTING_WALK_STAMP_SETTING, stale.isoformat())
+
+    scoped = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+
+    assert scoped.gated_until is None, f"an expired cadence printed a date: {scoped.gated_until}"
 
 
 # --- Kreuzakt down is an error, not an answer --------------------------------------
@@ -503,3 +539,210 @@ def test_token_context_of_refuses_a_request_with_no_principal():
     """The tool's own guard: a context that did not authenticate gets nothing, not a wide scope."""
     assert token_context_of(None) is None
     assert token_context_of(object()) is None
+
+
+# --- what an unreadable store says, and where the reads run (review I5, I6) -----------------
+
+
+class BlockingStore:
+    """A store whose ledger reads block the **thread** they run in.
+
+    `ledger_stats` is a correlated `NOT EXISTS` scan, and this listener shares `serve`'s event loop
+    with the pollers, the OCR workers and the sweep, against one single-writer connection. Run on
+    the loop, one `index_status` call stalls the whole pipeline behind a delivery write; the house
+    answer is `asyncio.to_thread` (`mail.py`, `pipeline.py`). If the reads go back onto the loop,
+    the heartbeat below stops ticking and this class is what notices.
+    """
+
+    def __init__(self, store, *, delay_s=0.2, error=None):
+        self._store = store
+        self.delay_s = delay_s
+        self.error = error
+        self.blocking_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def ledger_stats(self, *, org_ids=None):
+        self.blocking_calls += 1
+        if self.error is not None:
+            raise self.error
+        time.sleep(self.delay_s)
+        return self._store.ledger_stats(org_ids=org_ids)
+
+
+class ThreadRecordingStore:
+    """A store that remembers which OS thread every read happened on.
+
+    `to_thread` is the whole of the fix for a blocking read, and a test that only checks the answer
+    is correct cannot tell whether it was used. This asks the mechanical question instead: did any
+    store call run on the thread that owns the event loop? The error path matters most, because an
+    error handler written after the fact is where a `store.get_generation()` sneaks back onto the
+    loop — one indexed read is enough to stall a poller behind a delivery write.
+    """
+
+    def __init__(self, store):
+        self._store = store
+        self.reads: list[tuple[str, int]] = []
+
+    def __getattr__(self, name):
+        attribute = getattr(self._store, name)
+        if not callable(attribute):
+            return attribute
+
+        def recorded(*args, **kwargs):
+            self.reads.append((name, threading.get_ident()))
+            return attribute(*args, **kwargs)
+
+        return recorded
+
+
+class SlowKreuzakt:
+    """An index that never answers, at longer than the tool's own budget."""
+
+    def __init__(self, delay_s=10.0):
+        self.delay_s = delay_s
+
+    async def health(self):
+        await asyncio.sleep(self.delay_s)
+        return {"status": "ok"}
+
+    async def queue_counts(self):
+        await asyncio.sleep(self.delay_s)
+        return {"pending": 0}
+
+
+async def test_the_store_reads_do_not_block_the_event_loop(seeded):
+    """The loop has to keep breathing while a bucket is counted (review I6).
+
+    Twenty milliseconds of sleep per bucket against a heartbeat that ticks every ten: off-loop, the
+    heartbeat runs about twenty times; on the loop, it runs once.
+    """
+    slow = BlockingStore(seeded, delay_s=0.2)
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        await status_for(slow, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    finally:
+        beat.cancel()
+
+    assert slow.blocking_calls > 0, "the ledger was never read, so this test proved nothing"
+    assert ticks > 3, f"the event loop ticked only {ticks} times during a blocking store read"
+
+
+async def test_the_call_is_bounded_by_its_own_deadline(store):
+    """The spec's per-call deadline, asserted on the call rather than trusted in prose (I6).
+
+    Two sequential Kreuzakt reads at the client's own 30 s timeout would otherwise blow the 15 s
+    budget for an all-buckets token, which is the one token an operator uses.
+    """
+    from papra_suite.mcp_tokens import resolve_token
+
+    context = resolve_token(store, all_token(store))
+    with pytest.raises(IndexUnavailable) as caught:
+        await index_status_for(store, SlowKreuzakt(), context, deadline_s=0.05)
+
+    message = str(caught.value)
+    assert message.startswith("index_unavailable")
+    assert "15" not in message or "0.05" in message   # names the budget it missed, not a bare retry
+    assert len(message) <= 300
+
+
+async def test_a_corrupt_generation_is_a_stable_code_and_not_an_internal_error(seeded, caplog):
+    """The state `_index_line` already treats as expected-and-repairable (review I5).
+
+    A corrupt `index_generation` makes every generation-scoped count a guess, and the store says so
+    with a `ValueError` whose text is store internals. The agent gets the code and the repair; the
+    internals stay in this process, and a *warning* — this is not a crash.
+    """
+    seeded.set_setting("index_generation", "rebuild-2026-11-17")
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(IndexUnavailable) as caught:
+            await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+
+    message = str(caught.value)
+    assert message.startswith("index_unavailable")
+    assert "ledger --invalidate" in message, "the repair has to be named, as `check` names it"
+    assert "SELECT" not in message.upper() and "index_ledger" not in message
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], \
+        "an expected, repairable state must not arrive as a traceback"
+
+
+async def test_even_the_error_path_reads_the_store_off_the_event_loop(seeded):
+    """The `to_thread` rule has to hold on the path that runs *after* the deadline expired.
+
+    `index_status_for` classifies a `ValueError` by asking the store whether the generation is
+    corrupt, and that question is itself a store read — made from the handler, outside
+    `wait_for`'s budget, on whatever thread the handler happens to run on, which is the event loop.
+    A tool that refuses for being slow and then blocks the loop to work out why has fixed the wrong
+    thing: the deadline protects the caller, the thread protects everyone else in the process.
+    """
+    loop_thread = threading.get_ident()
+    # Resolved before the spy is fitted: the credential read is the auth path's business, and it has
+    # its own test. This one is about the counts.
+    context = resolve_token(seeded, scoped_token(seeded, SCOPED))
+    assert context is not None
+    spy = ThreadRecordingStore(seeded)
+    seeded.set_setting("index_generation", "rebuild-2026-11-17")   # the expected, repairable state
+
+    with pytest.raises(IndexUnavailable):
+        await index_status_for(spy, FakeKreuzakt(), context)
+
+    assert spy.reads, "the spy saw no read at all, so it would pass for the wrong reason"
+    on_loop = sorted({name for name, ident in spy.reads if ident == loop_thread})
+    assert not on_loop, f"these store reads ran on the event loop: {on_loop}"
+
+
+async def test_a_store_error_names_the_type_and_no_query(seeded):
+    """`sqlite3` messages quote SQL and column names; the client gets neither."""
+    broken = BlockingStore(seeded, error=sqlite3.OperationalError(
+        "database is locked: SELECT count(*) FROM index_ledger WHERE secret_note = 1"))
+    with pytest.raises(IndexUnavailable) as caught:
+        await status_for(broken, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+
+    message = str(caught.value)
+    assert "OperationalError" in message
+    assert "database is locked" not in message and "index_ledger" not in message
+
+
+async def test_an_unexpected_error_never_reaches_the_agent_verbatim(seeded, caplog):
+    """The SDK returns `str(exc)` as tool content, so anything unhandled is a message to the agent.
+
+    The operator still gets the traceback — a swallowed programming error is a worse outage than a
+    leaky one — but the client gets a bounded, stable code.
+    """
+    broken = BlockingStore(seeded, error=RuntimeError(
+        "no such column: documents.secret_excerpt for org-9"))
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(IndexUnavailable) as caught:
+            await status_for(broken, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+
+    message = str(caught.value)
+    assert message.startswith("index_unavailable")
+    assert "secret_excerpt" not in message and "org-9" not in message
+    assert "RuntimeError" in message, "the class name is the bounded part an operator can grep"
+    assert len(message) <= 300
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR], \
+        "a bug nobody logs is a bug nobody fixes"
+
+
+def test_the_wire_carries_the_stable_code_and_not_the_store(seeded):
+    """The same promise, over the tool boundary: `isError`, one code, no internals."""
+    token = scoped_token(seeded, SCOPED)
+    broken = BlockingStore(seeded, error=sqlite3.OperationalError("database is locked"))
+    response, message = wire_call(broken, token)
+
+    result = message["result"]
+    text = result["content"][0]["text"]
+    assert response.status_code == 200
+    assert result["isError"] is True
+    assert "index_unavailable" in text
+    assert "database is locked" not in text and "SELECT" not in text.upper()
+

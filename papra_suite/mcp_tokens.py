@@ -145,14 +145,40 @@ def _token_key(raw: str) -> str:
     return TOKEN_SETTING_PREFIX + hashlib.sha256(raw.encode()).hexdigest()
 
 
+def unknown_buckets(store: Store, org_ids: object) -> list[str]:
+    """Granted ids that name no bucket this suite has ever seen, sorted.
+
+    The union of the two local listings — `ledger_org_ids()` and `documents_org_ids()` — is the
+    widest set of buckets this archive can prove: the ledger alone cannot name a bucket whose
+    documents are all unledgered.
+
+    This is a *screening* question, not an authority. Papra owns the list of organisations, and the
+    2026-11-16 spec asks for validation against it; asking Papra here was rejected because minting
+    and revoking have to work while Papra is down — rotating a lost credential during the outage
+    that made it lost is the case that matters — and because a network round trip does not belong
+    inside the one command that must succeed offline. So the check catches the failure it can see
+    cheaply (a mistyped id, a bucket that has never been ingested here) and says what it is: an
+    id that exists in Papra but is not yet indexed here is a warning, and an id that names a real
+    but unrelated bucket is out of reach. Both are stated in the README's MCP section.
+    """
+    known = set(store.ledger_org_ids()) | set(store.documents_org_ids())
+    return sorted({org for org in (org_ids or []) if org not in known})
+
+
 def _rows(store: Store) -> list[tuple[str, dict]]:
     """Every token row as (key, document), dropping the ones that are not token documents.
 
     A row under this prefix that does not parse is reported and skipped rather than served: the
     alternative is for a hand-edited or half-written row to become a credential, and for a row whose
     `org_ids` went missing to become a token that grants everything the JSON forgot to restrict.
+
+    What is logged is a **count**. The key is `mcp_token:<sha256hex>`, and log lines go to stderr
+    and into the `log_lines` ring buffer the dashboard serves; a digest is unrecoverable behind 256
+    bits, but "no credential material in the logs" is only a rule if no line is ever allowed to
+    carry a piece of one.
     """
     found: list[tuple[str, dict]] = []
+    rejected = 0
     for key in store.list_setting_keys(prefix=TOKEN_SETTING_PREFIX):
         raw = store.get_setting(key)
         if raw is None:
@@ -160,12 +186,15 @@ def _rows(store: Store) -> list[tuple[str, dict]]:
         try:
             document = json.loads(raw)
         except ValueError:
-            logger.warning("mcp: settings key %s is not a token row, ignored", key)
+            rejected += 1
             continue
         if _parse(document) is None:
-            logger.warning("mcp: settings key %s does not describe a token, ignored", key)
+            rejected += 1
             continue
         found.append((key, document))
+    if rejected:
+        logger.warning("mcp: %d settings row(s) under %s are not usable token rows and were "
+                       "ignored", rejected, TOKEN_SETTING_PREFIX)
     return found
 
 
@@ -386,10 +415,38 @@ def run_mcp_token(config, args, *, store: Store | None = None) -> int:
             opened.close()
 
 
+def _warn_unknown_buckets(store: Store, grants: dict[str, list[str]], *, stream) -> None:
+    """Say so, out loud, when a grant names a bucket this archive has never seen.
+
+    The failure this exists for: `--org-id org-1` when the real bucket is `org-01`. The token
+    authenticates, `index_status` answers `scope: buckets`, and every count is zero — which is
+    indistinguishable, to whoever holds the token, from a bucket that is genuinely empty. It is the
+    shape this project keeps calling a confident wrong answer, and a warning printed once at the
+    mint is the cheapest place left to catch it.
+
+    It warns rather than refuses, twice over: a bucket that exists in Papra but is not indexed
+    here yet is a legitimate grant, and a mint that fails on a guess would leave the operator unable
+    to hand out a credential during the very outage that made one necessary.
+    """
+    lines = []
+    for label, org_ids in grants.items():
+        unknown = unknown_buckets(store, org_ids)
+        if unknown:
+            lines.append(f"{label} grants {', '.join(unknown)}")
+    if not lines:
+        return
+    print(f"warning: {'; '.join(lines)} — no bucket this archive has ever indexed. A typo "
+          "authenticates and then reads as an empty archive, which is not something a token holder "
+          "can tell apart from a bucket that is genuinely empty. Check the id against Papra's "
+          "organisation list; if this bucket is simply new, nothing is wrong and this token works "
+          "as soon as it has documents.", file=stream)
+
+
 def _create(store: Store, args) -> int:
     if not args.label:
         raise TokenError("--create needs --label, the name of the device or agent this token is "
                          "for; without it `--revoke` has nothing to point at")
+    _warn_unknown_buckets(store, {args.label: list(args.org_id or [])}, stream=sys.stderr)
     token = mint_token(store, label=args.label, org_ids=args.org_id or [],
                        scope_all=bool(args.all_buckets))
     scope = "every bucket" if args.all_buckets else (
@@ -413,6 +470,10 @@ def _print_tokens(store: Store) -> int:
     for info in tokens:
         scope = "ALL" if info.scope_all else (",".join(info.org_ids) or "none")
         print(f"{info.label}\t{scope}\t{info.created_at}\t{info.revoked_at or 'active'}")
+    # A footer, never a column: this table is tab-separated and its `buckets` field is what an
+    # operator copies into a client, so a marker in it would read as part of an id.
+    _warn_unknown_buckets(store, {info.label: list(info.org_ids) for info in tokens},
+                          stream=sys.stdout)
     return EXIT_OK
 
 

@@ -198,8 +198,13 @@ def test_a_revoked_token_stops_working_on_the_next_request(store):
         headers = initialize_headers(token)
         headers["mcp-session-id"] = session
         after = client.post("/mcp", headers=headers, json=envelope("tools/list", {}, 2))
+        absent = client.get("/mcp", headers=initialize_headers())
 
     assert after.status_code == 401
+    # Byte-identical to "no credential at all": otherwise "this token used to be real" is a
+    # distinguishable answer, and the whole point of the digest lookup is that it is not.
+    assert after.text == absent.text
+    assert after.headers.get("www-authenticate") == absent.headers.get("www-authenticate")
 
 
 # --- 421 / 403: the Host and Origin allow-list -------------------------------------------
@@ -270,6 +275,40 @@ def test_the_loopback_listener_stays_reachable_for_a_local_health_check(store):
     assert "127.0.0.1:8765" in settings.allowed_hosts
     assert "localhost:8765" in settings.allowed_hosts
     assert "http://127.0.0.1:8765" in settings.allowed_origins
+
+
+def test_a_nonloopback_bind_does_not_keep_the_loopback_host_forms():
+    """Once the listener is on a routable interface, `Host: localhost` must not pass.
+
+    The loopback forms are here because `tailscale serve` connects over 127.0.0.1 and because a
+    local health check is the first thing an operator tries when a proxy is in the middle. Neither
+    is true of a bind the operator put on a reachable interface with `mcp_bind_nonloopback`; there,
+    a peer that can route to the port could send `Host: localhost` and clear the transport check.
+    Defence-in-depth rather than a bypass (a valid token is still required) — and the reason this
+    function takes `host` at all.
+    """
+    routable = transport_security_for(PUBLIC_URL, host="100.64.1.20", port=8765)
+
+    for form in ("127.0.0.1", "127.0.0.1:8765", "localhost", "localhost:8765",
+                 "[::1]", "[::1]:8765"):
+        assert form not in routable.allowed_hosts, form
+        assert f"http://{form}" not in routable.allowed_origins, form
+    assert routable.allowed_hosts == sorted([HOST, f"{HOST}:443"])
+    assert routable.enable_dns_rebinding_protection is True
+
+
+def test_a_public_url_refusal_does_not_echo_its_credentials():
+    """The refusal reaches stderr from `check` unredacted, so the echo is the leak.
+
+    `PAPRA_MCP_URL` normally arrives through `_require_base_url`, which already refuses userinfo;
+    this is the layer underneath it, which a hand-built app or a future caller can still reach.
+    """
+    from papra_suite.mcp_server import McpConfigError, _public_url
+
+    with pytest.raises(McpConfigError) as caught:
+        _public_url("https://user:sekret@:8765")
+    message = str(caught.value)
+    assert "sekret" not in message and "user" not in message
 
 
 # --- configuration refusals ---------------------------------------------------------------
@@ -562,3 +601,41 @@ def test_check_names_the_bind_address_when_the_server_is_enabled(monkeypatch, tm
     assert main() == 0
     out = capsys.readouterr().out
     assert "mcp: enabled" in out and "127.0.0.1:8765" in out
+    # And the line has to say what it reports. `check` reads settings and opens no socket, so it
+    # cannot know whether a running `serve` still has its listener — which is exactly the claim that
+    # used to be made silently and then stayed true forever after a listener died on a taken port.
+    assert "no socket" in out
+    assert "exits serve" in out
+
+
+# --- the read every request makes -----------------------------------------------------------
+
+
+async def test_the_per_request_credential_read_does_not_run_on_the_event_loop(store, token,
+                                                                             monkeypatch):
+    """`verify_token` is a lookup that happens on every request, so it may not block the loop.
+
+    `resolve_token` is `Store.get_setting`: blocking SQLite on the single-writer connection the
+    pollers, the OCR workers and the sweep share. One primary-key read is nothing on its own; what
+    matters is the read that queues behind a delivery write holding the lock, which turns a status
+    call into a stalled pipeline. `index_status` already reads off the loop for that reason (review
+    I6) — this is the other half of the same request path, and a test that only checks the 401
+    cannot see it.
+    """
+    import threading
+
+    from papra_suite.mcp_server import StoreTokenVerifier
+
+    loop_thread = threading.get_ident()
+    seen = []
+    real = Store.get_setting
+
+    def spy(self, *args, **kwargs):
+        seen.append(threading.get_ident())
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "get_setting", spy)
+
+    assert await StoreTokenVerifier(store).verify_token(token) is not None
+    assert seen, "the verifier read nothing at all, so the assertion below would prove nothing"
+    assert loop_thread not in seen, "the credential read ran on the thread that must not block"

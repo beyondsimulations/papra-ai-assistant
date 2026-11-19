@@ -4,3 +4,8 @@ pytest-asyncio==0.25.2
 ruff==0.8.6
 pymupdf==1.25.1
 pytest-timeout==2.4.0
+
+# Declared because tests/integration/test_mcp_listener_live.py imports it directly: the SDK's own
+# client speaks httpx2, not the httpx our Papra and Kreuzakt clients use. Two HTTP stacks in one venv
+# is worth naming rather than arriving as a transitive surprise the suite happens to depend on.
+httpx2==2.16.2

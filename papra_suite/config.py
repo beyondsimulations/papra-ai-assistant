@@ -263,27 +263,54 @@ def _host_env(env: Mapping[str, str], name: str, default: str) -> str:
     port), userinfo carries a credential that a bind cannot use and that stderr would echo, and a
     scheme means somebody wrote a URL into an interface field. The screening is the one
     `_parse_bind` already applies to `DASHBOARD_BIND`, minus the part about the port.
+
+    The one spelling that is rewritten rather than refused is a bracketed IPv6 literal: `[::1]` is
+    what a URL and `curl` use, `::1` is what `bind()` accepts, and they name the same interface.
+
+    The refusal echoes through `_safe_echo` like every sibling here, because this is the one
+    field an operator fills in by pasting from a browser bar, and that paste can carry
+    `user:password@`. `__main__` prints `ConfigError` to stderr with no filter in front.
     """
     raw = env.get(name, "").strip()
     if not raw:
         return default
     if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in raw):
         raise ConfigError(f"{name} must not contain whitespace or control characters")
-    if "://" in raw or "/" in raw or "@" in raw or raw.count(":") > 1 or raw.startswith("["):
-        # `[::1]` is the one bracketed form that is legitimate, and it is accepted below by
-        # `ipaddress`; what is refused here is a URL or an `host:port` pair landing in this field.
-        if not raw.startswith("[") or not _is_literal_bind(raw):
-            raise ConfigError(f"{name} must be a bare host, got: {raw!r}")
+    raw = _unwrap_ipv6_literal(raw)
+    # One screen, not two: `_is_literal_bind` refuses a scheme, a path, userinfo, a bracketed
+    # non-address and a `host:port` pair, because it accepts a colon only inside a real IPv6
+    # literal. That is also why the bare `::1` gets through — it is a legal bind address, and
+    # `LOOPBACK_HOSTS` and the Host allow-list both name it.
     if not _is_literal_bind(raw):
-        raise ConfigError(f"{name} must be a bare host, got: {raw!r}")
+        raise ConfigError(f"{name} must be a bare host, got: {_safe_echo(raw)!r}")
     return raw.lower()
+
+
+def _unwrap_ipv6_literal(raw: str) -> str:
+    """`[::1]` and `::1` are the same literal; the socket wants the bare one.
+
+    Unwraps **only** when the brackets hold a real IPv6 address. A bracketed hostname, or
+    `[::1:8765`, or `[::1]:8765` with a port that belongs to `PAPRA_MCP_PORT`, is returned
+    untouched so the check below can refuse it: silently repairing a paste error in a bind address
+    is how a container ends up listening on something nobody named.
+    """
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1]
+        try:
+            ipaddress.IPv6Address(inner)
+        except ValueError:
+            return raw
+        return inner
+    return raw
 
 
 def _is_literal_bind(raw: str) -> bool:
     """An IP literal or a hostname — and nothing that could be read as something else.
 
-    `127.0.0.1:8765` fails the single-colon rule above; `http://x` and `x/y` fail here; `::1` is the
-    IPv6 literal the loopback default needs and is legal as a bind address.
+    `127.0.0.1:8765` fails the single-colon rule in `_host_env`; `http://x` and `x/y` fail here;
+    `::1` is the IPv6 loopback literal and is legal as a bind address, in bare form only — the
+    bracketed spelling is turned into that form by `_unwrap_ipv6_literal` before this runs, so a
+    bracket that survives to here belongs to something that is not an address.
     """
     if ":" in raw:
         try:

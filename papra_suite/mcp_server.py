@@ -37,8 +37,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, NoReturn
 from urllib.parse import urlparse
 
 from mcp.server.auth.provider import AccessToken
@@ -53,6 +54,7 @@ from starlette.requests import Request
 from starlette.types import Receive, Scope, Send
 
 from papra_suite import indexing
+from papra_suite.config import _safe_echo
 from papra_suite.kreuzakt_client import KreuzaktError
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.mcp_tokens import TokenContext, token_counts
@@ -85,6 +87,21 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 #: "stable, sanitised codes"; a Kreuzakt body is neither, and it is not ours to relay.
 UPSTREAM_MESSAGE_LIMIT = 180
 
+#: The peers whose `X-Forwarded-*` headers this listener believes, and the only reason
+#: `proxy_headers` is switched on: the deployment is `tailscale serve` in front of 127.0.0.1, so a
+#: same-host proxy is the one caller allowed to say "the client actually spoke https". Without it a
+#: slash redirect (`/mcp/` → `/mcp`) is built from the inbound scheme and answered as `http://`, and
+#: the client refuses the downgrade — a server that passes every localhost test and rejects every
+#: proxied request. Naming the list explicitly is also what stops `FORWARDED_ALLOW_IPS=*` in a
+#: container environment making every peer's `X-Forwarded-For` authoritative, which is uvicorn's
+#: behaviour when the code leaves it unset.
+FORWARDED_ALLOW_IPS = "127.0.0.1,::1"
+
+#: The 2026-11-16 spec's per-call deadline for one tool call. Two sequential Kreuzakt reads at the
+#: client's own 30 s timeout would otherwise blow it for an all-buckets token — the one token an
+#: operator actually uses — and a tool that has overrun is a tool that answers nothing.
+INDEX_STATUS_DEADLINE_S = 15.0
+
 #: Told once, at handshake, rather than stamped on every result and paid for per call. The spec is
 #: explicit that this is guidance and not a boundary: document text is data, and a label cannot make
 #: an agent obey.
@@ -100,6 +117,22 @@ class McpConfigError(ValueError):
     """A configuration this listener will not start under. Names the variable, always."""
 
 
+class McpListenerDied(RuntimeError):
+    """The listener stopped serving while `serve` was running it. Fatal, on purpose.
+
+    `serve` is the unit the container supervisor restarts, and the unit that owns the store, both
+    API clients and the signal handlers. The alternative — restarting uvicorn inside the process —
+    would keep a misconfiguration (a port somebody else holds) alive behind a stream of retry lines,
+    would re-enter uvicorn's SIGTERM handler installation on every attempt, and above all would let
+    the process go on advertising a network service that is not listening. Exiting is the honest
+    answer, and the restart policy is the backoff.
+
+    It replaced a silence: the listener task used to be created and then ignored, because `serve`
+    always passes `stop`, so a uvicorn that died left the `mcp` task running, `_supervise` logging
+    nothing, and `check` still printing `mcp: enabled`.
+    """
+
+
 class IndexUnavailable(ToolError):
     """The index is not answering, so there is no honest number to return.
 
@@ -113,7 +146,10 @@ class IndexUnavailable(ToolError):
     """
 
     def __init__(self, reason: str):
-        super().__init__(f"index_unavailable: {reason}")
+        # Bounded here rather than at every call site: this sentence goes to whoever called the
+        # tool, and the only way this program makes a long one is repeating upstream's words.
+        bounded = sanitize_event_text(reason, limit=CLIENT_MESSAGE_LIMIT) or "unknown"
+        super().__init__(f"index_unavailable: {bounded}")
 
 
 @dataclass(frozen=True)
@@ -131,7 +167,11 @@ class McpBind:
 def _clean_host(value: str, *, name: str) -> str:
     host = value.strip().lower().rstrip(".")
     if not host or any(char.isspace() or ord(char) < 32 for char in host):
-        raise McpConfigError(f"{name} must be a bare host without whitespace, got {value!r}")
+        # `_safe_echo`, and not because a host can carry a password on its own: this function is
+        # also handed the raw `PAPRA_MCP_URL` value from `resolve_bind`'s error path, and refusals
+        # here go to stderr from `check`, where no redacting filter is in front of them.
+        raise McpConfigError(f"{name} must be a bare host without whitespace, got "
+                             f"{_safe_echo(value)!r}")
     return host
 
 
@@ -175,7 +215,12 @@ def _public_url(url: str) -> tuple[str, str, int | None]:
         port = None
         parsed = None
     if parsed is None or parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise McpConfigError(f"PAPRA_MCP_URL must be an http(s) URL of this server, got {url!r}")
+        # The house rule from `config.py`: echo only what urlparse can structurally identify, never
+        # userinfo, port text, path or query. `PAPRA_MCP_URL` normally arrives through
+        # `_require_base_url`, which already rejects those, but `check` and a hand-built app can
+        # hand this function anything, and the refusal is printed unredacted.
+        raise McpConfigError(f"PAPRA_MCP_URL must be an http(s) URL of this server, got "
+                             f"{_safe_echo(url)!r}")
     return parsed.scheme, _clean_host(parsed.hostname, name="PAPRA_MCP_URL"), port
 
 
@@ -191,8 +236,13 @@ def transport_security_for(url: str, *, host: str = DEFAULT_MCP_HOST,
       accepts `host:9000.evil`. There are no `:*` entries; the ports that occur in this
       deployment are written out.
 
-    The loopback forms stay on the list because `tailscale serve` talks to us over 127.0.0.1 and a
-    health check from the host is the first thing an operator tries when a proxy is in the middle.
+    The loopback forms are on the list **only for a loopback bind**: `tailscale serve` talks to us
+    over 127.0.0.1, and a health check from the host is the first thing an operator tries when a
+    proxy is in the middle. Once `mcp_bind_nonloopback` has put the listener on a routable
+    interface, neither excuse holds and the entry becomes a hole in the guard — a peer that can
+    route to the port could send `Host: localhost` and clear the transport check. This is
+    defence-in-depth, not a bypass: a valid token is still required, and a browser rebinding
+    attack still fails, since a browser sends the rebinding domain as `Host`.
     """
     scheme, public_host, public_port = _public_url(url)
     default_port = 443 if scheme == "https" else 80
@@ -203,10 +253,11 @@ def transport_security_for(url: str, *, host: str = DEFAULT_MCP_HOST,
                f"{scheme}://{public_host}:{public_port or default_port}"}
     if public_port is not None:
         origins.add(f"{scheme}://{public_host}:{public_port}")
-    for loopback in ("127.0.0.1", "localhost", "[::1]"):
-        hosts.add(loopback)
-        hosts.add(f"{loopback}:{port}")
-        origins.add(f"http://{loopback}:{port}")
+    if host in LOOPBACK_HOSTS:
+        for loopback in ("127.0.0.1", "localhost", "[::1]"):
+            hosts.add(loopback)
+            hosts.add(f"{loopback}:{port}")
+            origins.add(f"http://{loopback}:{port}")
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=sorted(hosts),
@@ -258,7 +309,11 @@ class StoreTokenVerifier:
     async def verify_token(self, token: str) -> AccessToken | None:
         from papra_suite.mcp_tokens import resolve_token
 
-        context = resolve_token(self._store, token)
+        # Off the loop, like the counts: this runs once per request, and `get_setting` is blocking
+        # SQLite on the same single-writer connection the pollers, the OCR workers and the sweep
+        # use. One primary-key read is cheap; a loop that stops for it while a delivery write
+        # holds the lock is not.
+        context = await asyncio.to_thread(resolve_token, self._store, token)
         if context is None:
             return None
         # A token minted in another process reaches this suite for the first time here, so this is
@@ -417,8 +472,94 @@ def _upstream_reason(error: Exception) -> str:
     return bounded.strip() or type(error).__name__
 
 
-async def index_status_for(store: Store, kz, context: TokenContext) -> IndexStatus:
-    """Build the status for one token's scope. The scoping rule lives here, in one place.
+#: The repair `_index_line` names for the same state, so `check` and `index_status` cannot send an
+#: operator to two different fixes for one corrupt row. Bounded and stable: this string is what a
+#: client sees, and the store's own message is a paragraph about its settings table.
+CORRUPT_GENERATION_HINT = ("the ledger's index_generation names no current generation, so every "
+                           "count would be a guess — `papra-suite ledger --status` names the row "
+                           "and `ledger --invalidate` is the repair")
+
+#: How long one tool message may be on its way to an agent. The codes above are short; the bound is
+#: for anything mapped in a hurry later.
+CLIENT_MESSAGE_LIMIT = 240
+
+
+def _generation_is_corrupt(store: Store) -> bool:
+    """Whether this store is in the one `ValueError` state this tool knows how to repair.
+
+    Worth asking rather than assuming: a `ValueError` from anywhere else mapped to a repair
+    instruction is a wrong diagnosis printed as a confident one, which is the failure this whole
+    task keeps designing against.
+    """
+    try:
+        store.get_generation()
+    except ValueError:
+        return True
+    except Exception:  # noqa: BLE001 - a store that cannot answer is not a corrupt generation
+        return False
+    return False
+
+
+class _CorruptGeneration(Exception):
+    """Raised **inside the worker thread** when the ledger's `index_generation` names nothing.
+
+    The classification needs a store read (`get_generation()`), and a store read is exactly what
+    this tool keeps off the event loop, so it happens where the reads already happen. Doing it from
+    `index_status_for` was the first version, and it put a `get_setting` and a `get_generation` on
+    the loop *after* the deadline had already expired: the deadline protects the caller, the thread
+    protects the pollers and OCR workers that share this process. Private, and it never leaves this
+    module — the client-facing half is `CORRUPT_GENERATION_HINT`.
+    """
+
+
+def _store_state(store: Store, context: TokenContext) -> tuple[list, MarksBrake | None,
+                                                               int | None, str | None]:
+    """Every store read this tool performs, in one blocking function, off the event loop.
+
+    These are correlated `NOT EXISTS` scans over `documents`/`index_ledger` against a single-writer
+    connection with a 5 s busy timeout, and this listener shares `serve`'s loop with the pollers,
+    the OCR workers and the sweep. Run inline, one `index_status` call stalls the entire pipeline
+    behind
+    a delivery write; `asyncio.to_thread` is what `mail.py` and `pipeline.py` already do about
+    blocking work on this loop.
+    """
+    try:
+        return _store_state_body(store, context)
+    except ValueError as error:
+        # The one `ValueError` this program knows how to repair, decided here rather than in the
+        # handler — see `_CorruptGeneration`. Anything else stays a ValueError, and stays a bug.
+        if _generation_is_corrupt(store):
+            raise _CorruptGeneration from error
+        raise
+
+
+def _store_state_body(store: Store, context: TokenContext) -> tuple[list, MarksBrake | None,
+                                                                   int | None, str | None]:
+    """The blocking reads themselves, already on the worker thread."""
+    quarantined = _quarantined_buckets(store)
+    buckets = [
+        _bucket_status(store, org_id, quarantined)
+        for org_id in buckets_in_scope(store, context)
+    ]
+    marks: MarksBrake | None = None
+    probe_rereads: int | None = None
+    if context.scope_all:
+        # Privileged because each is a corpus-wide aggregate: the number of deletion marks in the
+        # rolling window, and the size of the pending liveness-probe list.
+        try:
+            counted, allowance = indexing.marks_window_state(store)
+            marks = MarksBrake(counted=counted, allowance=allowance)
+        except ValueError:
+            # A counter this program cannot parse is a brake nobody can read the state of; saying so
+            # is the tool's business, and the row is named by `ledger --status`.
+            marks = None
+        probe_rereads = indexing.pending_probe_rereads(store)
+    return buckets, marks, probe_rereads, indexing.listing_walk_gate(store)
+
+
+async def _index_status_body(store: Store, kz, context: TokenContext) -> IndexStatus:
+    """The scoping rule itself, in one place; `index_status_for` adds the budget and the
+    error model.
 
     The order matters. The index is asked whether it is alive first, for every token: a scoped token
     never reads the queue, so if the liveness probe were skipped for it, a degraded index would
@@ -440,30 +581,17 @@ async def index_status_for(store: Store, kz, context: TokenContext) -> IndexStat
         raise IndexUnavailable(f"kreuzakt reports status {reported}, so these counts would "
                                "describe an index that is not answering")
 
-    quarantined = _quarantined_buckets(store)
-    buckets = [
-        _bucket_status(store, org_id, quarantined)
-        for org_id in buckets_in_scope(store, context)
-    ]
     queue: dict[str, int] | None = None
-    marks: MarksBrake | None = None
-    probe_rereads: int | None = None
     if context.scope_all:
-        # Privileged because each is a corpus-wide aggregate: queue depth, the number of deletion
-        # marks in the rolling window, and the size of the pending liveness-probe list.
+        # Queue depth is the third privileged aggregate (with marks and the probe list below).
         try:
             queue = await kz.queue_counts()
         except KreuzaktError as error:
             raise IndexUnavailable(
                 f"kreuzakt refused the queue read ({_upstream_reason(error)})") from error
-        try:
-            counted, allowance = indexing.marks_window_state(store)
-            marks = MarksBrake(counted=counted, allowance=allowance)
-        except ValueError:
-            # A counter this program cannot parse is a brake nobody can read the state of; saying so
-            # is the tool's business, and the row is named by `ledger --status`.
-            marks = None
-        probe_rereads = indexing.pending_probe_rereads(store)
+
+    buckets, marks, probe_rereads, gated_until = await asyncio.to_thread(
+        _store_state, store, context)
 
     return IndexStatus(
         scope="all" if context.scope_all else ("buckets" if buckets else "none"),
@@ -473,11 +601,58 @@ async def index_status_for(store: Store, kz, context: TokenContext) -> IndexStat
         unledgered=sum(bucket.unledgered for bucket in buckets),
         delivery_blocked=sum(bucket.delivery_blocked for bucket in buckets),
         set_aside=[bucket.org_id for bucket in buckets if bucket.set_aside],
-        gated_until=indexing.listing_walk_gate(store),
+        gated_until=gated_until,
         queue=queue,
         marks=marks,
         probe_rereads=probe_rereads,
     )
+
+
+async def index_status_for(store: Store, kz, context: TokenContext, *,
+                           deadline_s: float = INDEX_STATUS_DEADLINE_S) -> IndexStatus:
+    """Build the status for one token's scope, within a budget, and never with our internals in it.
+
+    Two things the tool boundary owes the caller:
+
+    **A deadline.** The SDK hands `str(exc)` to the client and has no timeout of its own, and the
+    Kreuzakt client waits 30 s per call — so an all-buckets token, which makes two of them, could
+    sit twice over the spec's 15 s per-call budget. Overrunning answers nothing, so it is refused
+    here as `index_unavailable` rather than delivered late.
+
+    **A stable code, not a traceback.** The same two handlers `_index_line` has since Task 7: a
+    corrupt `index_generation` is expected-and-repairable, and a `sqlite3` message quotes SQL and
+    column names. Anything else is a bug, and a bug is worth a traceback to the operator — which is
+    why the unexpected branch logs one while the client still only gets the class name.
+    """
+    try:
+        return await asyncio.wait_for(_index_status_body(store, kz, context), timeout=deadline_s)
+    except IndexUnavailable:
+        raise
+    except TimeoutError:
+        # The builtin `TimeoutError` is what `asyncio.wait_for` raises from 3.11 on. The worker
+        # thread cannot be killed, so a cancelled `to_thread` finishes in the background and is
+        # dropped; that is the same trade the graceful-shutdown path makes, and it is why the counts
+        # are refused rather than answered late.
+        raise IndexUnavailable(
+            f"the index state did not answer within its {deadline_s:g} s budget, so no counts are "
+            "returned rather than guessed") from None
+    except _CorruptGeneration as error:
+        # Expected and repairable, so a warning and not a crash: the same reading `check`'s
+        # `_index_line` gives, naming the same repair, so the two commands cannot disagree.
+        logger.warning("mcp: index_status refused, the ledger has no current generation")
+        raise IndexUnavailable(CORRUPT_GENERATION_HINT) from error.__cause__ or error
+    except ValueError as error:
+        logger.exception("mcp: index_status hit an unexpected ValueError")
+        raise IndexUnavailable(f"the index state could not be read ({type(error).__name__})") \
+            from error
+    except sqlite3.Error as error:
+        # The message would quote the SQL and the column names; the class name is the whole story.
+        logger.warning("mcp: index_status could not read the store (%s)", type(error).__name__)
+        raise IndexUnavailable(f"the store would not answer ({type(error).__name__})") from error
+    except Exception as error:  # noqa: BLE001 - the SDK would otherwise print this one to the agent
+        logger.exception("mcp: index_status hit an unexpected %s", type(error).__name__)
+        raise IndexUnavailable(f"the index state could not be read ({type(error).__name__})") \
+            from error
 
 
 def build_mcp_app(store: Store, papra, kz, *, url: str,
@@ -545,6 +720,13 @@ def mcp_state_line(store: Store, config) -> str:
     issue; `papra-suite mcp-token --list` is the command for the names, and it is the operator's own
     terminal. The refused-bind case prints the refusal rather than pretending the bind is fine,
     because `check` is where an operator learns a container will not come up.
+
+    What this line reports is **configuration, not liveness**, and it says so. It reads settings; it
+    opens no socket, and it cannot know whether a running `serve` still has its listener. The
+    alternative — probing the port from `check` — would make the diagnostic command depend on the
+    service it diagnoses, and a listener on another host would read as dead. What closes the gap is
+    not this line but the death path in `run_mcp_listener`: a listener that goes away exits `serve`,
+    so "enabled" and "not listening" cannot coexist for long.
     """
     active, revoked = token_counts(store)
     counts = f"{active} active, {revoked} revoked"
@@ -556,38 +738,115 @@ def mcp_state_line(store: Store, config) -> str:
         _public_url(config.mcp_url if getattr(config, "mcp_url", None) else "")
     except McpConfigError as error:
         return f"mcp: enabled but refused: {error} | tokens: {counts}"
-    return (f"mcp: enabled on {bind}, tokens: {counts}; names: "
+    return (f"mcp: enabled on {bind} — configuration only: this command opens no socket, and a "
+            f"listener that dies exits serve. Tokens: {counts}; names: "
             "`papra-suite mcp-token --list`")
+
+
+def uvicorn_config_kwargs(bind: McpBind) -> dict:
+    """The uvicorn configuration, in one function, because two of these flags are the deployment.
+
+    Asserted as a unit test rather than trusted, for the reason the review gave: `TestClient` never
+    runs uvicorn, so nothing in the suite would notice any of them being flipped.
+
+    * `access_log=False` — uvicorn's access log goes to **stdout** and writes full URLs *including
+      query strings*, which is the one place the refused `?access_token=` form could be written down
+      verbatim. It is also the reason a token never travels in a URL in the first place.
+    * `proxy_headers=True` with `forwarded_allow_ips` named — see `FORWARDED_ALLOW_IPS`. Without it,
+      a redirect behind `tailscale serve` is issued as `http://` and the client refuses the
+      downgrade: a listener that passes every localhost test and answers no proxied request. It
+      cannot weaken the 421 gate: uvicorn's `ProxyHeadersMiddleware` rewrites `scope["scheme"]`
+      and `scope["client"]`, never the `host` header the guard reads.
+    * `log_config=None` — uvicorn does not reconfigure logging under the suite: one root logger, one
+      redacting filter, one ring buffer, and no second handler writing request lines past them.
+    * `lifespan="on"` — the session manager's task group starts and stops with the server.
+    """
+    return {
+        "host": bind.host,
+        "port": bind.port,
+        "log_config": None,
+        "access_log": False,
+        "proxy_headers": True,
+        "forwarded_allow_ips": FORWARDED_ALLOW_IPS,
+        "lifespan": "on",
+    }
+
+
+async def _serve_guarded(server, bind: McpBind) -> None:
+    """`server.serve()`, with uvicorn's process-exit turned into an error this process can report.
+
+    `Server.startup` calls `sys.exit(1)` when the bind fails, and `address already in use` is the
+    everyday case. Left alone, that `SystemExit` punches through the event loop: the process goes
+    without a log line and without `serve`'s cleanup of its API clients and the store, and no
+    `Exception` handler anywhere — including the one that watches this task — is allowed to catch
+    it. Converting it here is what makes the death an ordinary, reported, cleanup-running one.
+    """
+    try:
+        await server.serve()
+    except SystemExit as exit_error:
+        raise McpListenerDied(
+            f"uvicorn refused to serve on {bind} (its own exit code {exit_error.code}); the usual "
+            "cause is a port already in use, so check PAPRA_MCP_PORT") from exit_error
+
+
+def _propagate_listener_death(serving: asyncio.Task, bind: McpBind) -> NoReturn:
+    """Turn a finished listener task into the error that brings `serve` down."""
+    if serving.cancelled():
+        raise McpListenerDied(
+            f"the listener on {bind} was cancelled although nothing had asked it to stop")
+    error = serving.exception()
+    if error is None:
+        raise McpListenerDied(f"the listener on {bind} stopped serving without being asked")
+    if isinstance(error, McpListenerDied):
+        raise error
+    raise McpListenerDied(
+        f"the listener on {bind} died: {type(error).__name__}: "
+        f"{sanitize_event_text(str(error), limit=200)}") from error
 
 
 async def run_mcp_listener(config, store: Store, *, papra, kreuzakt,
                            stop: asyncio.Event | None = None) -> None:
-    """Serve the MCP app until `stop` is set (or this task is cancelled).
+    """Serve the MCP app until `stop` is set — or until the listener dies, which ends this task.
 
     The config refusals are raised before anything binds, so a bad `PAPRA_MCP_HOST` reaches the
     operator as the sentence `check` already prints rather than as a traceback from a task, and
     never as a listener on an interface nobody agreed to.
 
-    `access_log=False` is not a style choice: uvicorn's access log goes to stdout and writes full
-    URLs **including query strings**, and the refused query-string token then appears verbatim in
-    it. Access logging is off, the SDK's own logging goes to stderr, and the token is never in a
-    URL.
+    The wait is on `{serving, stop}` with FIRST_COMPLETED, and that is the whole of the availability
+    fix. Awaiting only `stop` — which `serve` always passes — meant a uvicorn that died left this
+    coroutine blocked forever: the `mcp` task never completed, `_supervise` logged nothing, and
+    `check` went on printing `mcp: enabled` beside a port nobody held. Death is fatal to `serve`
+    rather than restarted here, with the reasoning in `McpListenerDied`.
     """
     import uvicorn
 
     bind = resolve_bind(config, store=store)
     app = build_mcp_app(store, papra, kreuzakt, url=config.mcp_url, host=bind.host, port=bind.port)
-    server = uvicorn.Server(uvicorn.Config(
-        app, host=bind.host, port=bind.port, log_config=None, access_log=False, lifespan="on"))
-    serving = asyncio.create_task(server.serve(), name="mcp-uvicorn")
-    logger.info("mcp: listening on %s (read-only, %s)", bind,
+    server = uvicorn.Server(uvicorn.Config(app, **uvicorn_config_kwargs(bind)))
+    serving = asyncio.create_task(_serve_guarded(server, bind), name="mcp-uvicorn")
+    # `starting`, not `listening`: nothing is bound yet at this line, and the everyday death is a
+    # port somebody else holds. uvicorn's own logger writes "Uvicorn running on …" once the socket
+    # exists — that is the confirmation, and `log_config=None` still lets that line through.
+    logger.info("mcp: starting on %s (read-only, %s)", bind,
                 "loopback" if bind.host in LOOPBACK_HOSTS else "NOT loopback")
+    stop_task = None
     try:
-        if stop is None:
-            await serving
-        else:
-            await stop.wait()
+        watched = {serving}
+        if stop is not None:
+            stop_task = asyncio.create_task(stop.wait(), name="mcp-stop")
+            watched.add(stop_task)
+        done, _pending = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+        if serving in done and not (stop is not None and stop.is_set()):
+            if stop is not None:
+                stop.set()   # the process comes down with the service it was supposed to be running
+            _propagate_listener_death(serving, bind)
+        elif serving in done:
+            # Already coming down: worth one line, not a crash alarm beside a shutdown that was
+            # asked for. The goodbye below still reaps whatever uvicorn left behind.
+            logger.info("mcp: the listener on %s had already exited during shutdown", bind)
     finally:
+        if stop_task is not None:
+            stop_task.cancel()
         server.should_exit = True
         if not serving.done():
             # A bounded goodbye: uvicorn's own shutdown waits for its connections, and a listener

@@ -24,10 +24,26 @@ Everything else follows from that choice:
 ## Setup
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
+python -m venv .venv
+uv pip install -r requirements-prod.lock.txt --python .venv/bin/python   # pinned + hashed
 papra-suite check        # validates config, creates/migrates the SQLite store
 papra-suite serve
 ```
+
+Install from `requirements-prod.lock.txt`, not from `requirements.txt`, on anything that will run the
+MCP listener. `requirements.txt` pins `mcp==2.3.0` and nothing else, and that one pin drags in the
+distributions holding the authentication and transport code the listener runs on (`bearer_auth.py`,
+`transport_security.py`, `streamable_http_manager.py`) plus `starlette`, `uvicorn`, `pydantic` and
+`cryptography`. Reinstalling from the unpinned file after a lost disk — or after a bad month — gets
+you different auth code than the tests proved. Regenerate the lock after any change to
+`requirements.txt`:
+
+```bash
+uv pip compile requirements.txt --generate-hashes -o requirements-prod.lock.txt
+```
+
+Development needs `requirements-dev.txt` on top (`pytest`, `ruff`, and `httpx2`, which the live
+listener test imports directly because the SDK's client speaks it, not `httpx`).
 
 | Variable | Notes |
 |---|---|
@@ -411,11 +427,40 @@ papra-suite mcp-token --revoke --label hermes
 | `mcp_server_enabled` (settings) | start the listener with `serve`. Unset means no listener, and `check` says `mcp: disabled` |
 | `mcp_bind_nonloopback` (settings) | required in addition to `PAPRA_MCP_HOST` before the listener will bind anything but loopback |
 | `PAPRA_MCP_URL` | the public URL, e.g. `https://papra-mcp.ts.net`. Host and Origin are checked against it: a `Host` it does not name is a **421**, an `Origin` it does not name a **403** |
+| `PAPRA_MCP_HOST` | the interface to bind: `127.0.0.1` by default; `::1` and `[::1]` both work, and anything routable needs the setting above |
+| `PAPRA_MCP_PORT` | `8765` by default |
+
+There is no `papra-suite` command that sets the two settings rows yet (Task 16 writes one). Until
+there is, they are SQLite, and that is the literal command — `PAPRA_MCP_HOST` alone will not open the
+listener, and setting it to a routable address without `mcp_bind_nonloopback` is a refusal, not a bind:
+
+```bash
+sqlite3 "$DATA_DIR/state.db" "INSERT OR REPLACE INTO settings(key, value) VALUES ('mcp_server_enabled', '1');"
+sqlite3 "$DATA_DIR/state.db" "INSERT OR REPLACE INTO settings(key, value) VALUES ('mcp_bind_nonloopback', '1');"  # only if you mean it
+```
 
 Publishing it is `tailscale serve` in front of `127.0.0.1:8765`, which is why the default bind is
 loopback and why a non-loopback bind needs a settings row and not only an environment variable: a
 bearer token on a reachable interface is a different security story, and the refusal names the
 address it refused.
+
+Two things the listener does behind that proxy, both asserted in
+`tests/test_mcp_listener_lifecycle.py` because nothing in-process could see them:
+
+- **Proxy headers are trusted, from loopback only.** `proxy_headers=True` with
+  `forwarded_allow_ips = "127.0.0.1,::1"`. Without it, a slash redirect (`/mcp/` → `/mcp`) behind
+  `tailscale serve` is issued as `http://` and the client refuses the downgrade: a server that passes
+  every localhost test and rejects every proxied request. The trust list is written out rather than
+  left to uvicorn's default, because uvicorn reads `FORWARDED_ALLOW_IPS` from the environment when the
+  code passes no value, and one `*` in a container environment would make any peer's
+  `X-Forwarded-For` authoritative. It cannot weaken the 421 gate: uvicorn rewrites `scope["scheme"]`
+  and `scope["client"]`, never the `Host` header the guard reads. **The one thing no test can
+  settle** — and Task 16 must measure it before turning the listener on — is which
+  `Host`/`Origin`/`X-Forwarded-*` values `tailscale serve` actually forwards to `127.0.0.1:8765`.
+- **The loopback `Host` forms are allow-listed only for a loopback bind.** They exist because the
+  proxy connects over 127.0.0.1 and because a host-local health check is the first thing an operator
+  tries. Once you set `mcp_bind_nonloopback`, a peer that can route to the port could otherwise send
+  `Host: localhost` and clear the transport check.
 
 **What a token can see.** A token carries a list of buckets, or `--all-buckets`. The scoping is a
 security boundary rather than a filter: `index_status` takes no `org_id` argument, so an agent can
@@ -425,11 +470,62 @@ owed deletes, set-aside state — plus the scheduling gate, and gets `null` for 
 numbers: queue depth, the deletion-marks counter, and the size of the liveness-probe list. `null`
 rather than `0`, because `pending: 0` reads as "your documents are indexed".
 
+**A granted bucket id is not checked against Papra.** `mcp-token --create --org-id X` screens the
+shape of `X` (length, no control characters, at most 8 of them) and then **warns** — on stderr at the
+mint, and again as a footer under `--list` — when `X` names no bucket this archive has ever indexed.
+The failure that warning exists for: `--org-id org-1` when the real bucket is `org-01` authenticates,
+reports `scope: buckets`, and returns zeros, which a token holder cannot tell apart from a bucket that
+is genuinely empty. It warns rather than refuses, twice over: a bucket that exists in Papra and has
+not been ingested here yet is a legitimate grant, and minting and revoking have to work while Papra is
+down, which is the case that matters during an incident. So an id that is mistyped *and* happens to
+name a bucket this suite has already seen is still accepted — check the id against Papra's own
+organisation list when you mint.
+
+**`index_status` answers within 15 s or not at all** — the spec's per-call deadline. An index that is
+thinking too slowly is refused with `index_unavailable` rather than answered late, and a store that
+cannot be read (a corrupt `index_generation`, a locked database, a bug of ours) returns a short stable
+code and never a SQL fragment or a traceback. The traceback belongs to this process's log. The reads
+happen off `serve`'s event loop, because they are correlated scans over the same single-writer SQLite
+file the pollers and OCR workers are using, and a status call that stalled them would be a worse
+outage than a slow one.
+
+**A dead listener takes `serve` down with it.** If uvicorn dies — `address already in use` is the
+everyday case — the `mcp` task exits, the supervisor logs it as the crash it is, and the process stops
+instead of running on with no listener. `check`'s `mcp: enabled on …` line reports *configuration*: it
+reads settings and opens no socket, so it cannot tell you whether a running `serve` is still listening.
+That is what the exit is for — a crash-looping container is visible in `docker ps` where a
+silently-restarting listener would not be. One catch, and it belongs to the whole process rather
+than to this listener: a supervised task that dies sets `serve`'s stop event, `serve` returns
+normally, and `main` exits **0**. So the restart policy has to be one that restarts a clean exit too
+(`unless-stopped` or `always`); `on-failure` would watch the listener die quietly and leave it dead.
+Making a crashed task exit nonzero is process-topology work that Task 16 owns, not a line to slip in
+here.
+
+**Runbook items for Task 16, in the order they matter:**
+
+1. Measure what `tailscale serve` forwards to `127.0.0.1:8765` (`Host`, `Origin`, `X-Forwarded-*`)
+   **before** setting `mcp_server_enabled`. Nothing in this repo can settle it, and the failure mode is
+   every localhost test green and every proxied client refused.
+2. **Do not restart the listener after an unpinned re-install.** Install from
+   `requirements-prod.lock.txt`. If anything was installed from `requirements.txt` or by hand, run
+   `pytest tests/test_mcp_server_auth.py tests/test_mcp_listener_lifecycle.py -m "not integration"`
+   against the new environment first: the authentication and transport code the listener runs on lives
+   in that dependency closure, not in this repository.
+3. Write the command that sets `mcp_server_enabled` and `mcp_bind_nonloopback`. Until it exists the
+   only way is `sqlite3`, which is not a thing to hand an operator at 2am.
+4. Turn the listener on, then confirm the `check` counts, one scoped token and one `--all-buckets`
+   token, and that a token can be revoked without a restart.
+5. Set a restart policy on the suite container and say which one in this README. No policy is
+   documented today, and per the note above `on-failure` is the one that would not do it: a dead
+   listener leaves the container **exited with status 0**.
+
 Two behaviours worth knowing before you debug one:
 
 - **Wrong and missing tokens are the same 401**, byte for byte, and a token in a query string is a
   missing token. Nothing about the store is revealed by a wrong guess, and no credential ever appears
-  in a URL, an access log, or a log line.
+  in a URL, an access log, or a log line — and that last one is now asserted twice, once
+  with a token minted in another process, because uvicorn's access log writes full query
+  strings to stdout and `TestClient` never runs uvicorn.
 - **Kreuzakt down is an error, not an answer.** `index_status` reports `index_unavailable` rather
   than answering out of Papra. This suite is a bridge; a Papra-backed result behind an "index" tool
   would be a second, worse index that does not say it fell back.
