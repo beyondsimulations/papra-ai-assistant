@@ -1081,3 +1081,33 @@ def test_detail_budget_is_its_own_and_not_the_filename_one(store):
     assert len(event.detail) == EVENT_TEXT_LIMITS["detail"]
     assert len(event.filename) == EVENT_TEXT_LIMITS["filename"]
     assert event.detail.endswith("…")
+
+
+def test_list_setting_keys_returns_keys_in_a_stable_order(store):
+    """Keys only, sorted: the listing an operator may paste must not carry values."""
+    store.set_setting("index_marks_rolling", "2026-11-19T00:00:00+00:00|3")
+    store.set_setting("sweep_offset:org-2", "40")
+    store.set_setting("sweep_offset:org-1", "7")
+
+    assert store.list_setting_keys() == ["index_marks_rolling", "sweep_offset:org-1",
+                                          "sweep_offset:org-2"]
+
+
+def test_list_setting_keys_prefix_matches_literally(store):
+    """`_` and `%` in a prefix are characters, not wildcards."""
+    store.set_setting("mcp_token:aaa", "{}")
+    store.set_setting("mcpXtoken:bbb", "{}")
+    store.set_setting("index_generation", "1")
+
+    assert store.list_setting_keys(prefix="mcp_token:") == ["mcp_token:aaa"]
+    assert store.list_setting_keys(prefix="nothing:") == []
+
+
+def test_list_setting_keys_on_an_unmigrated_store_is_an_error(tmp_path):
+    """A missing table raises rather than answering "no keys"."""
+    fresh = Store(tmp_path / "fresh.db")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            fresh.list_setting_keys()
+    finally:
+        fresh.close()

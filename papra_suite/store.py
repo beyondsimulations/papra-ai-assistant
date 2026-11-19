@@ -713,6 +713,35 @@ class Store:
                 (key, value),
             )
 
+    def list_setting_keys(self, *, prefix: str | None = None) -> list[str]:
+        """Every key in `settings`, optionally only those starting with `prefix`.
+
+        The settings table is keyed by purpose, and several purposes keep one row per thing: the
+        sweep's resume offsets, and one row per MCP bearer token. Those families are only enumerable
+        as a family, and a caller that had to guess the keys would be a caller that could miss one.
+
+        Keys only, never values: the rows worth enumerating are the ones whose *values* are
+        sensitive,
+and a listing helper that returned both would be the thing that leaks a token into a log
+        or a
+        support paste. A missing `settings` table is `sqlite3.OperationalError`, which the callers
+        that read without migrating report as "this store has not been migrated" rather than as an
+        empty set of keys.
+        """
+        sql = "SELECT key FROM settings"
+        params: tuple[object, ...] = ()
+        if prefix is not None:
+            # ESCAPE so a prefix containing `_` or `%` matches itself: settings keys use `:` as the
+            # family separator, but a caller that passed `mcp_token` would otherwise also match a
+            # hypothetical `mcpXtoken...` key, and a security listing has no business being
+            # approximate.
+            escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql += " WHERE key LIKE ? ESCAPE '\\'"
+            params = (escaped + "%",)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return sorted(row["key"] for row in rows)
+
     def settings_flag(self, name: str) -> bool:
         """A settings row read as a boolean, missing key meaning off.
 
@@ -1462,6 +1491,22 @@ class Store:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT DISTINCT papra_org_id FROM index_ledger ORDER BY papra_org_id"
+            ).fetchall()
+        return [row["papra_org_id"] for row in rows]
+
+    def documents_org_ids(self) -> list[str]:
+        """Every bucket this suite has recorded seeing a document in, ledger row or not.
+
+        The pair to `ledger_org_ids`, and the reason both are needed: the population between them is
+        the one Task 7's review found invisible — seen, never enrolled. A listing that came only
+        from
+        the ledger cannot name a bucket whose documents are *all* in that population, so a corpus
+        count would report orphans with no bucket to attribute them to, and `index_status` would
+        answer a scoped token about a bucket it had silently dropped.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT papra_org_id FROM documents ORDER BY papra_org_id"
             ).fetchall()
         return [row["papra_org_id"] for row in rows]
 
