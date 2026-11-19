@@ -480,16 +480,60 @@ async def test_the_outage_message_carries_no_counts_and_no_upstream_body(store, 
     assert len(message) <= 300, "an upstream message is echoed bounded"
 
 
+async def test_a_plain_text_upstream_body_is_not_echoed_either(store, seeded):
+    """The body that gets past a sanitizer which only knows about JSON.
+
+    An earlier version of `_upstream_reason` cut the upstream message at the first brace or bracket,
+    which stops `{"documents":9000}` and nothing else: a proxy's own error line names its software,
+    its config path and its row counts in plain text, and every word of it reached the client. The
+    status is the only upstream fact a caller is given now, and this is the case the old split let
+    through whole.
+    """
+    token = scoped_token(seeded, SCOPED)
+    kz = FakeKreuzakt(error=KreuzaktError(
+        "502 Bad Gateway from nginx/1.27.4: upstream /var/lib/kreuzakt/index.db is locked "
+        "with 9000 rows pending", status=502))
+    with pytest.raises(IndexUnavailable) as caught:
+        await status_for(seeded, kz, token)
+    message = str(caught.value)
+    for needle in ("Bad Gateway", "nginx", "/var/lib/kreuzakt", "locked", "9000", "pending"):
+        assert needle not in message, needle
+    assert "http 502" in message          # the actionable part, and the only part
+
+
+async def test_a_refused_health_read_reaches_the_wire_with_no_upstream_prose(store, seeded):
+    """The same claim through `tools/call`, because the SDK is what composes the client's text.
+
+    A refusal asserted on a raised exception can still be relayed differently once the tool wrapper
+    serialises it, and this is the path an agent actually reads.
+    """
+    token = scoped_token(seeded, SCOPED)
+    kz = FakeKreuzakt(error=KreuzaktError(
+        "500 Internal Server Error: /var/lib/kreuzakt/index.db, 9000 documents", status=500))
+    _response, message = wire_call(seeded, token, kz=kz)
+    assert message["result"]["isError"] is True
+    serialised = json.dumps(message, ensure_ascii=False).lower()
+    # The needles are the ones the plan actually bars: upstream prose, internal paths, counts that
+    # are not the caller's, and our own class names. Not the word "kreuzakt" — naming the component
+    # is how `index_status` has always described the outage, and the containment rule is about
+    # identifiers and bodies, not vocabulary.
+    for needle in ("internal server error", "/var/lib/kreuzakt", "9000", "documents\":",
+                   "kreuzakterror", "operationalerror"):
+        assert needle not in serialised, needle
+    assert "index_unavailable" in serialised and "http 500" in serialised
+
+
 # --- the tool, over the wire ---------------------------------------------------------------
 
-def wire_call(store, token, name="index_status", arguments=None):
+def wire_call(store, token, name="index_status", arguments=None, kz=None):
     """Drive the real MCP handshake against the in-process app and return the tool result.
 
     `store` is the fixture's store, or a read-only view of it when the test wants a view that
     misbehaves (`BlockingStore`): either way the app is built on a `LedgerReader`, never on `Store`.
+    `kz` lets an outage test hand the app an index that fails in a specific, scripted way.
     """
     view = store if isinstance(store, LedgerReader) else view_for(store)
-    app = build_mcp_app(view, NoPapra(), FakeKreuzakt(), url=PUBLIC_URL)
+    app = build_mcp_app(view, NoPapra(), kz or FakeKreuzakt(), url=PUBLIC_URL)
     payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                "params": {"name": name, "arguments": arguments or {}}}
     with TestClient(app) as client:

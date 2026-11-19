@@ -556,17 +556,18 @@ def _bucket_status(store: Store, org_id: str, quarantined: frozenset[str]) -> Bu
 
 
 def _upstream_reason(error: Exception) -> str:
-    """An upstream failure reduced to one bounded line, with no body in it.
+    """An upstream failure reduced to the one fact a client is allowed to have: did it answer.
 
-    `KreuzaktError` interpolates the response body into its message, and that body is the one text
-    here that neither this program nor the token holder wrote. It is truncated at the first bracket
-    on purpose: `HTTP 500 ... : {"documents": 9000, ...}` is exactly the shape of an internal count
-    that must not travel to a client through an error string. The status and the path stay, because
-    those are what an operator needs to act on.
+    `KreuzaktError` interpolates the response body into its message. Splitting that message at the
+    first brace or bracket — an earlier version of this function — stops a JSON body and nothing
+    else: a plain-text error page, a proxy's own line, or an internal filesystem path arrives
+    and none of that text was written by this program or by the person holding the token. There is
+    also nothing in it an operator needs: the status is the actionable part, and the traceback the
+    log keeps carries the rest. So nothing from `str(error)` is relayed, and the class name stays
+    out of the client's text for the same reason it stays out of the search tools'.
     """
-    text = str(error).split("{", 1)[0].split("[", 1)[0]
-    bounded = sanitize_event_text(text, limit=UPSTREAM_MESSAGE_LIMIT)
-    return bounded.strip() or type(error).__name__
+    status = getattr(error, "status", None)
+    return f"http {status}" if isinstance(status, int) else "it did not answer at all"
 
 
 #: The repair `_index_line` names for the same state, so `check` and `index_status` cannot send an

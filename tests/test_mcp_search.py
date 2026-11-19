@@ -1308,6 +1308,7 @@ def test_the_scan_never_mixes_page_sizes_in_one_sweep():
     assert page_rows_for(120) == 60
     assert page_rows_for(250) == 50
     assert page_rows_for(37) == 37                       # a budget under a page is one page
+    assert page_rows_for(997) == KREUZAKT_PAGE_ROWS      # 97 rows stranded: see the test below
     for scan_rows in (37, 99, 100, 101, 120, 250, 500, 997, 1024):
         rows = page_rows_for(scan_rows)
         assert rows <= KREUZAKT_PAGE_ROWS
@@ -1315,18 +1316,27 @@ def test_the_scan_never_mixes_page_sizes_in_one_sweep():
         assert scan_rows % rows == 0 or rows == KREUZAKT_PAGE_ROWS
 
 
-async def test_a_prime_allowance_names_the_rows_it_could_not_spend(store):
-    """The one case where the budget is not fully used says so, in the reason, not in `scanned`."""
+async def test_an_allowance_with_no_usable_divisor_names_the_rows_it_cannot_spend(store):
+    """The fallback is not about primes: 997 leaves 97 rows stranded after nine full pages.
+
+    What matters is that the report says *which* rows it did not look at, rather than describing the
+    budget as spent. `page_rows_for` stops before exceeding the ceiling; the remainder is a fact the
+    caller is owed, because `scanned: 900` beside `budget: 997` otherwise reads as arithmetic that
+    has not finished yet.
+    """
     from papra_suite.mcp_tools import SearchLimits
 
     bind(store, ORG_A, "doc-far", 105)
     papra = FakePapra({"doc-far": papra_doc("doc-far")})
-    index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 251)])
+    index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 1201)])
     page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung",
-                                  page_size=5, limits=SearchLimits(scan_rows=101))
-    assert index.search_calls == [(1, KREUZAKT_PAGE_ROWS)]
-    assert page.items == [] and page.scanned == 100
-    assert page.partial is True and "whole page" in (page.partial_reason or "")
+                                  page_size=5, limits=SearchLimits(scan_rows=997))
+    assert len(index.search_calls) == 9 and {n for n, _ in index.search_calls} == set(range(1, 10))
+    assert {limit for _, limit in index.search_calls} == {KREUZAKT_PAGE_ROWS}
+    assert [i.document_id for i in page.items] == ["doc-far"]
+    assert page.scanned == 900
+    assert page.partial is True and "less than one page's worth" in (page.partial_reason or "")
+    assert "97 rows of allowance remain" in (page.partial_reason or "")
 
 
 async def test_the_page_size_is_asked_for_the_same_way_every_time(store):

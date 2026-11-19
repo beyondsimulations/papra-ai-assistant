@@ -524,8 +524,9 @@ class Sweep:
         if self.budget_spent:
             spare = scan_rows - self.scanned
             if spare > 0:
-                reasons.append(f"the scan budget of {scan_rows} rows allowed no further whole page "
-                               f"(scanned {self.scanned}, {spare} row(s) short of one)")
+                reasons.append(f"the scan budget of {scan_rows} rows allowed no further whole "
+                               f"page ({self.scanned} rows scanned; {spare} rows of allowance "
+                               f"remain, less than one page's worth)")
             else:
                 reasons.append(f"the scan budget of {scan_rows} rows was spent after "
                                f"{self.scanned} rows")
@@ -551,9 +552,12 @@ def page_rows_for(scan_rows: int) -> int:
     right to call out as a budget not actually spent. A page size that divides the allowance
     satisfies both: a budget of 120 scans 60+60 and reaches every row it paid for.
 
-    A prime allowance (101) has no divisor at all, so the floor of 25 keeps one pathological config
-    from turning a scan into a hundred-and-one one-row requests: it falls back to a full page, stops
-    with a row unusable, and `Sweep.reasons` says so rather than claiming the budget ran out.
+    An allowance with no divisor at or above the floor does not divide: 101 is prime, and 997 after
+    nine 100-row pages still leaves 97 rows that no further page can spend. Both take a full page
+    and
+    stop before exceeding the ceiling, and `Sweep.reasons` names the remainder rather than claiming
+    the budget ran out. The floor of 25 is what keeps a pathological config from turning a scan into
+    a hundred-and-one one-row requests.
     """
     if scan_rows <= KREUZAKT_PAGE_ROWS:
         return scan_rows                    # one page, and the ceiling is the whole allowance

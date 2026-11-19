@@ -622,8 +622,9 @@ of returning a silently-short list.
 scan, because rows are addressed as `(page - 1) * limit` and shrinking the last request to fit a
 ragged budget would re-read some rows while never reading others. The page size is chosen per scan to
 divide the allowance where a divisor exists (a 120-row budget scans 60+60 and reaches row 105), and
-where the budget is prime it stops a row short and `partial_reason` says that, rather than reporting
-an exhausted budget that was not spent.
+an allowance with no usable divisor — 997 buys nine 100-row pages — stops before exceeding the ceiling
+and `partial_reason` names the rows left unread, rather than reporting an exhausted budget that was
+not spent.
 
 `list_recent_documents` keeps the index's own `added_at` order and re-sorts nothing, and its `since`
 must be `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`: an ISO `…Z` value is refused rather than rewritten,
