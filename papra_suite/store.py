@@ -1657,6 +1657,31 @@ and a listing helper that returned both would be the thing that leaks a token in
             ).fetchone()
         return _row_to_ledger_ref(row) if row else None
 
+    def ledger_refs_for_document(self, papra_document_id: str) -> list[LedgerRef]:
+        """Every row that carries this Papra document id, one per bucket that holds it.
+
+        The document tools take a Papra id and no bucket, so this is the read that answers
+        "whose is this?" — and it is deliberately unfiltered, exactly like `ledger_get`. The caller
+        has to be able to tell "no row anywhere" from "a row you were not granted" from "a row you
+        may see that is soft-deleted, or bound to an epoch that no longer means what it said". A
+        query that hid the last two would answer the first two identically, and one that hid the
+        middle one would move the scope decision into SQL, where it stops being one rule with one
+        owner. So everything comes back, `deleted_at` and `delivered_generation` included, and the
+        caller decides.
+
+        A list rather than one row, because Papra document ids are per organisation and nothing here
+        has verified that they are globally unique. Two buckets, one id, is a fact this table can
+        hold; a method that returned `.fetchone()` would pick one silently, and a document whose
+        identity depends on SQLite's row order is a document nobody can reason about.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM index_ledger WHERE papra_document_id = ?"
+                " ORDER BY papra_org_id",
+                (papra_document_id,),
+            ).fetchall()
+        return [_row_to_ledger_ref(row) for row in rows]
+
     def ledger_org_ids(self) -> list[str]:
         """Every bucket the ledger holds references for, whatever the `orgs` table says.
 

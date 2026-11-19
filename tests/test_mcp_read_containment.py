@@ -111,7 +111,7 @@ def test_the_ledger_view_exposes_exactly_the_reads_and_no_write(tmp_path, store)
         public = {name for name in dir(reader) if not name.startswith("_")}
         assert public == {"db_path", "close", "get_setting", "settings_flag", "table_columns",
                           "get_generation", "ledger_org_ids", "documents_org_ids", "ledger_stats",
-                          "ledger_resolve"}
+                          "ledger_resolve", "ledger_refs_for_document"}
         for name in sorted(FORBIDDEN_WRITE_NAMES):
             assert not hasattr(reader, name), f"the ledger view can {name}"
         assert not hasattr(reader, "migrate"), "the listener would migrate on first read"
@@ -142,6 +142,10 @@ def test_the_ledger_view_answers_what_the_handlers_ask(tmp_path, store):
         stats = reader.ledger_stats(org_ids=[ORG])
         assert stats["references"] == 1 and stats["unledgered"] == 1
         assert reader.ledger_stats(org_ids=[])["references"] == 0
+        # Task 14's scope question, on the same view: the tools that take a Papra id and no bucket
+        # get the store's own query rather than a second one written beside it.
+        assert [ref.papra_org_id for ref in reader.ledger_refs_for_document("d1")] == [ORG]
+        assert reader.ledger_refs_for_document("absent") == []
     finally:
         reader.close()
 
@@ -165,6 +169,9 @@ def test_the_ledger_view_resolves_the_authorization_query(tmp_path, store):
     store.ledger_set_kreuzakt_id(papra_org_id=ORG, papra_document_id="doc-1", kreuzakt_id=7,
                                 generation=1)
     assert "ledger_resolve" not in FORBIDDEN_WRITE_NAMES
+    # …and so is Task 14's read, for the same reason: it is a `SELECT` over `index_ledger`, and a
+    # tool that could not ask it would write its own scope query instead.
+    assert "ledger_refs_for_document" not in FORBIDDEN_WRITE_NAMES
     reader = LedgerReader(store.db_path)
     try:
         require_read_only(reader, role="store")
@@ -331,10 +338,12 @@ PUBLIC_URL = "https://papra-mcp.test"
 class OkKreuzakt:
     """The reads the shipped handlers are allowed to ask the index for, and nothing else.
 
-    `search`/`list_documents` exist so that the containment check has something to find: since
-    Task 13 they are on `REQUIRED_READS["kreuzakt"]`, so a double that cannot answer them is
-    refused at construction — which is the assertion, not an inconvenience. No test in this file
-    calls them.
+    `search`/`list_documents` exist so that the containment check has something to find: since Task
+    13 they are on `REQUIRED_READS["kreuzakt"]`, so a double that cannot answer them is refused at
+    construction — which is the assertion, not an inconvenience. `get_document` joins the list for
+    Task 14's document tools, for the same reason: a listener whose index handle cannot read one
+    document would answer a document question with an `AttributeError` inside a tool call. No test
+    in this file calls any of them.
     """
 
     async def health(self):
@@ -348,6 +357,9 @@ class OkKreuzakt:
 
     async def list_documents(self, *, page=1, limit=100, since=None):
         raise AssertionError("no test here reads the index's contents")
+
+    async def get_document(self, document_id):
+        raise AssertionError("no test here reads one document from the index")
 
 
 def views(tmp_path, store):
@@ -483,8 +495,10 @@ async def test_the_listener_builds_the_app_on_views_and_closes_what_it_opened(mo
 
     captured = {}
 
-    def refusing_build(ledger, papra_view, kreuzakt_view, *, url, host, port, limits=None):
-        captured.update(ledger=ledger, papra=papra_view, kreuzakt=kreuzakt_view, limits=limits)
+    def refusing_build(ledger, papra_view, kreuzakt_view, *, url, host, port, limits=None,
+                       papra_base_url=None):
+        captured.update(ledger=ledger, papra=papra_view, kreuzakt=kreuzakt_view, limits=limits,
+                        papra_base_url=papra_base_url)
         raise RuntimeError("the app refused to build")
 
     monkeypatch.setattr("papra_suite.mcp_server.build_mcp_app", refusing_build)
@@ -500,6 +514,9 @@ async def test_the_listener_builds_the_app_on_views_and_closes_what_it_opened(mo
     # from the module defaults. Otherwise `PAPRA_INDEX_SEARCH_SCAN_ROWS` would be a knob with no
     # the listener side, which is the `OCR_LANGUAGES` shape of failure.
     assert (captured["limits"].query_max_chars, captured["limits"].scan_rows) == (64, 250)
+    # Task 14: `open_document` builds its links from this, and from no argument a caller sends — so
+    # the shipped path has to carry the configured Papra base into the app or the tool refuses.
+    assert captured["papra_base_url"] == "http://papra.test"
     with pytest.raises(sqlite3.ProgrammingError):
         captured["ledger"].get_setting("anything")     # closed on the way out, not leaked
 

@@ -120,11 +120,19 @@ FORBIDDEN_WRITE_NAMES = frozenset({
 #: by naming its reads rather than being waved through.
 REQUIRED_READS = {
     "store": frozenset({"get_setting", "settings_flag", "get_generation", "ledger_org_ids",
-                        "documents_org_ids", "ledger_stats", "ledger_resolve"}),
+                        "documents_org_ids", "ledger_stats", "ledger_resolve",
+                        # Task 14's three document tools take a Papra id and no bucket, so the read
+                        # that answers "whose is this?" is theirs. Unfiltered on purpose — see
+                        # `Store.ledger_refs_for_document` — which is what keeps the scope decision
+                        # in the tools, where the token is, rather than in SQL.
+                        "ledger_refs_for_document"}),
     # The liveness check: the ledger decides what a token may see, Papra whether the document is
     # still there. Every returned item needs both answers.
     "papra": frozenset({"get_document"}),
-    "kreuzakt": frozenset({"health", "queue_counts", "search", "list_documents"}),
+    # `get_document` since Task 14: the metadata and the text of one document are read from the
+    # index by its rowid, which the caller never sees — the rowid travels from the ledger, never
+    # from an argument.
+    "kreuzakt": frozenset({"health", "queue_counts", "search", "list_documents", "get_document"}),
 }
 
 
@@ -248,6 +256,10 @@ class LedgerReader:
     #: disagree with it about what "soft-deleted" or "stale generation" means. Hiding rows is this
     #: function's job, and the tools depend on the hiding.
     ledger_resolve = Store.ledger_resolve
+    #: Task 14's scope question: every reference that carries one Papra document id, in any bucket,
+    #: deleted and stale ones included. A `SELECT` over `index_ledger` and nothing else, so it is on
+    #: the view rather than on `FORBIDDEN_WRITE_NAMES` for the same reason `ledger_resolve` is.
+    ledger_refs_for_document = Store.ledger_refs_for_document
     # `get_generation` reads through this pair, and they are reads too; they stay private so the
     # public surface stays the reads named above, so `dir()` on the view stays a reviewable list.
     _read_generation_or_none = Store._read_generation_or_none

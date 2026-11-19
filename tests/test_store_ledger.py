@@ -380,6 +380,36 @@ def test_ledger_get_unknown_returns_none(store):
     assert store.ledger_get("org-a", "doc-1") is None
 
 
+def test_refs_for_document_finds_every_bucket_and_hides_nothing(store):
+    """The document tools' read: by Papra id, one row per bucket, states included.
+
+    The mirror of `ledger_resolve`, and deliberately *not* another copy of its filters. `resolve`
+    answers "which of these index ids are live references", and the MCP tools that use it want the
+    hiding. This one answers "who holds this Papra document id", and the caller has to be able to
+    see a soft-deleted row (so that "not yours" is distinguishable from "not any more") and a row
+    under an old generation (so that a rebuild is not silently renamed into "no such document").
+    Hiding either here would move the scope decision into SQL, where the token is not.
+
+    Ordered by bucket, and a list rather than one row: Papra ids are per organisation, so the same
+    id in two buckets is a fact this table can hold and a `fetchone()` would settle arbitrarily.
+    """
+    store = two_refs(store)
+    store.ledger_upsert_reference(papra_org_id="org-c", papra_document_id="doc-1",
+                                  file_hash=H, papra_original_name="doc-1.pdf")
+    store.ledger_mark_deleted(papra_org_id="org-c", papra_document_id="doc-1")
+    store.bump_generation()
+
+    by_doc = {(r.papra_org_id, r.papra_document_id) for r in
+              store.ledger_refs_for_document("doc-1")}
+    assert by_doc == {("org-a", "doc-1"), ("org-c", "doc-1")}
+    assert [r.papra_org_id for r in store.ledger_refs_for_document("doc-1")] == ["org-a", "org-c"]
+    # The states are carried, not filtered: the caller decides what each one means.
+    stale = store.ledger_refs_for_document("doc-1")[0]
+    assert stale.delivered_generation == 1 and stale.deleted_at is None
+    assert store.ledger_refs_for_document("doc-1")[1].deleted_at is not None
+    assert store.ledger_refs_for_document("doc-nothing") == []
+
+
 def test_record_delivery_refuses_a_row_it_cannot_vouch_for(store, caplog):
     """Recording a delivery also stamps `delivered_generation`, which is what makes
     a binding resolve — so it is an authorization write, not a receipt.
