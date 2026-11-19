@@ -754,10 +754,12 @@ def test_the_entry_point_walks_a_real_store_end_to_end(tmp_path, monkeypatch, ca
 
 
 def test_the_summary_names_the_buckets_it_queued_across(store, capsys):
-    """The plan's line: `enqueued N of M candidates across K buckets; L remaining`.
+    """The headline's shape: `enqueued N new row(s) across K bucket(s); asked for N+A of C
+    candidate(s); L remaining`.
 
     Bucket count is in it because an operator deciding whether to run again wants to know whether
-    the run covered one organisation or four.
+    the run covered one organisation or four — and it hangs off the new rows, because a run that
+    absorbed everything touched no bucket at all.
     """
     papra = FakeListing()
     papra.add("doc-a", org=ORG)
@@ -767,7 +769,8 @@ def test_the_summary_names_the_buckets_it_queued_across(store, capsys):
     assert run(store, papra) == 0
 
     out = capsys.readouterr().out
-    assert "enqueued 2 of 2" in out and "across 2 bucket(s)" in out and "0 remaining" in out
+    assert "enqueued 2 new row(s) across 2 bucket(s)" in out
+    assert "asked for 2 of 2 candidate(s)" in out and "0 remaining" in out
 
 
 def test_the_parses_surface_is_what_the_readme_prints():
@@ -799,29 +802,38 @@ async def test_a_stuck_head_does_not_eat_the_next_slice(store, capsys):
     """`--limit 2` twice has to reach documents 3 and 4 while 1 and 2 are still queued.
 
     An absorbed request changes nothing — a live row already carries that work — so it must not
-    so it must not spend the cap. If it did, a stalled worker would make every limited run re-report
-    the same two documents, the rest of the corpus would never be reached, and the line would still
-    read `enqueued 2`.
+    spend the cap. If it did, a stalled worker would make every limited run re-report the same two
+    documents and the rest of the corpus would never be reached, while the line still read
+    `enqueued 2 new row(s)`.
+
+    All three of `enqueued`, `new_rows` and `already_queued` are pinned here because the second run
+    is the shape that separates them: the absorbed documents were still asked for, so they count in
+    `enqueued` and in `already_queued` while `new_rows` — the number `--limit` caps — stays at 2.
+    Pinning two of the three is how `enqueued` was able to sit equal to `new_rows` through a unit
+    suite of over a thousand tests.
     """
     papra = FakeListing()
     for index in range(1, 5):
         papra.add(f"doc-{index}", content_hash=f"{index:02}" * 32)
 
     first = await backfill_corpus(store, papra, orgs=[ORG], limit=2)
-    assert (first.new_rows, first.already_queued, first.remaining) == (2, 0, 2)
+    assert (first.enqueued, first.new_rows, first.already_queued) == (2, 2, 0)
+    assert first.remaining == 2
 
     second = await backfill_corpus(store, papra, orgs=[ORG], limit=2)
 
-    assert (second.new_rows, second.already_queued, second.remaining) == (2, 2, 0)
+    assert (second.enqueued, second.new_rows, second.already_queued) == (4, 2, 2)
+    assert second.remaining == 0
     assert store.count_jobs("index") == 4
 
 
 def test_the_report_names_the_rows_it_only_found_already_queued(store, capsys):
-    """A run that queued nothing new says so, instead of claiming four documents.
+    """The second run over one corpus prints 0 new rows, 4 asked for, 4 already queued separately.
 
-    The second run over the same corpus is the one an operator reads after a stalled worker, and
-    "enqueued 4" there would be a number for work that was already in the queue before the command
-    ran.
+    The leading number is what changed, because that is what an operator can act on: a corpus whose
+    workers are stalled produces a run that asked for everything and changed nothing, and a headline
+    that led with the asked-for count would read as progress. The asked-for count is printed too,
+    since it is what `enqueued` means, and the parenthesis is what makes the totals add up.
     """
     papra = FakeListing()
     for index in range(1, 5):
@@ -832,5 +844,35 @@ def test_the_report_names_the_rows_it_only_found_already_queued(store, capsys):
     assert run(store, papra) == EXIT_OK
 
     out = capsys.readouterr().out
-    assert "enqueued 0 new of 4 candidate(s)" in out
-    assert "(4 already queued, unchanged)" in out
+    assert "enqueued 0 new row(s) across 0 bucket(s)" in out
+    assert "asked for 4 of 4 candidate(s) (4 already queued, unchanged)" in out
+
+
+async def test_the_machine_payload_carries_two_different_counts(store):
+    """The serialized result has to keep `enqueued` and `new_rows` apart, not clone them.
+
+    `backfill` prints prose and has no `--json` flag, so the assertion runs the result through the
+    project's own machine serializer (`_dump_json`, the one `jobs --json` uses) over
+    `dataclasses.asdict` — the payload any machine output of this command would be built from, and
+    the surface where two fields that can never differ get read as two populations. The whole run is
+    done with the cap off so the second pass absorbs every document.
+    """
+    import dataclasses
+    import json
+
+    from papra_suite.__main__ import _dump_json
+
+    papra = FakeListing()
+    for index in range(1, 5):
+        papra.add(f"doc-{index}", content_hash=f"{index:02}" * 32)
+    await backfill_corpus(store, papra, orgs=[ORG])
+
+    again = await backfill_corpus(store, papra, orgs=[ORG])
+
+    payload = dataclasses.asdict(again)
+    payload["orgs_queued"] = sorted(payload["orgs_queued"])
+    machine = json.loads(_dump_json(payload))
+
+    assert (machine["enqueued"], machine["new_rows"], machine["already_queued"]) == (4, 0, 4)
+    assert machine["enqueued"] != machine["new_rows"]
+    assert machine["enqueued"] == machine["new_rows"] + machine["already_queued"]

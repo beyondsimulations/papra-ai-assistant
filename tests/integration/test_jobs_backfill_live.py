@@ -129,6 +129,12 @@ async def test_backfill_is_idempotent_against_a_live_bucket(live):
     """
     await upload(live, "rechnung-1.pdf", "c3")
 
+    # The first run is what puts the live row there at all: `upload` only creates the Papra
+    # document, and a fresh store holds no job until something enqueues one. Missing this call is
+    # what made this test die with IndexError on `list_jobs(...)[0]` the first time it ran.
+    once = await backfill_corpus(live.store, live.papra, orgs=[live.org_id])
+    assert (once.enqueued, once.new_rows, once.already_queued) == (1, 1, 0)
+
     first_id = live.store.list_jobs(kind="index")[0].id
     again = await backfill_corpus(live.store, live.papra, orgs=[live.org_id])
 

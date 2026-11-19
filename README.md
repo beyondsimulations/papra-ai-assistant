@@ -1064,19 +1064,23 @@ never contacted, so a backfill runs through an index outage — but Papra itself
 listing, because Papra's listing is the only catalogue of the corpus. A bucket Papra will not list
 is reported as unreadable and the run exits `1`; it is never reported as empty.
 
-**The remainder is printed, never implied.** `--limit` caps the *new rows* one run takes, and the
-walk keeps listing after the cap so the rest can be counted rather than guessed:
+**The remainder is printed, never implied.** `--limit` caps the *new rows* one run takes — a document
+a live row already carries is absorbed and does not spend the cap — and the walk keeps listing after
+the cap so the rest can be counted rather than guessed:
 
 ```
-backfill: enqueued 5 of 12 candidate(s) across 1 bucket(s); 7 remaining
+backfill: enqueued 5 new row(s) across 1 bucket(s); asked for 5 of 12 candidate(s); 7 remaining
 ```
 
 A run that stopped at the cap could not tell "the rest is eligible" from "the rest is already
-indexed", and that difference decides whether you run it again. Documents whose work a live row
-already carries are counted apart (`(4 already queued, unchanged)`) and do not spend the cap, so a
-stalled queue cannot make every later run re-report the same head of the corpus. Documents
-deliberately left out get their own buckets (not a PDF, in Papra's trash or queued for deletion,
-over the size limit) and are not remaining work.
+indexed", and that difference decides whether you run it again. Two counts are printed because they
+answer two questions: the leading one is what the run *changed* (new queue rows), the `asked for` one
+is the population it vouched for — `enqueued = new rows + already queued`, so a run over a corpus
+whose workers are stalled reads `enqueued 0 new row(s) … asked for 4 of 4 candidate(s) (4 already
+queued, unchanged)`. Documents whose work a live row already carries are counted apart and do not
+spend the cap, so a stalled queue cannot make every later run re-report the same head of the corpus.
+Documents deliberately left out get their own buckets (not a PDF, in Papra's trash or queued for
+deletion, over the size limit) and are not remaining work.
 
 **It costs a VLM extraction per document, and says so first.** While `PAPRA_INDEX_CONTENT_DELIVERY`
 is off, intake also fills the legacy `ocr` queue, so a backfill re-extracts Papra's text — one paid
