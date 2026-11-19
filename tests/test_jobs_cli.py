@@ -30,7 +30,9 @@ the failure that hid a re-scheduling gap behind a passing `xfailed` in Task 6.
 import argparse
 import json
 import sqlite3
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -576,7 +578,10 @@ def test_a_locked_store_is_a_sentence_and_not_a_traceback(store, capsys, monkeyp
     def locked(*args, **kwargs):
         raise sqlite3.OperationalError("database is locked")
 
+    # Both counting reads: the listing takes its total from `count_jobs`, the handover gate from
+    # `count_jobs_by_status`, and neither may answer "quiet" when the table would not answer.
     monkeypatch.setattr(Store, "count_jobs", locked)
+    monkeypatch.setattr(Store, "count_jobs_by_status", locked)
 
     assert run_jobs(None, cli_args(kind="ocr", drain=True), store=store) == EXIT_REFUSED
     assert "refused" in capsys.readouterr().err
@@ -699,9 +704,12 @@ def test_every_papra_suite_command_the_shipped_code_names_is_one_that_parses():
     `papra-suite jobs` command this branch had not shipped, which reads to an operator at 23:00 as a
     broken installation rather than as a stale message, so the test asserted the raw-SQL reading
     instead. Any log line or docstring in any module can reintroduce it, and the standing rule is
-    "never cite a subcommand you did not implement" — so the shipped package is scanned for
-    `papra-suite <command> --flag` and every command named has to be registered by a module of this
-    package on the real entry point's shape.
+    "never cite a subcommand you did not implement".
+
+    Scope, stated plainly: a *name* check against the `add_subparser` helpers `main()` calls,
+    so it catches a command that no module registers. It says nothing about the flags printed beside
+    a name — that is `test_the_shipped_entry_point_accepts_every_invocation_the_runbook_prints`,
+    which runs the real binary.
     """
     import argparse
     import importlib
@@ -747,3 +755,165 @@ def test_drain_counts_a_queue_bigger_than_any_listing_cap(store, capsys):
     out = capsys.readouterr().out
     assert "120 pending" in out and "cannot drain" in out
     assert store.count_jobs("ocr", "pending") == 120
+
+
+def test_reset_job_refuses_a_running_row_at_the_write(store):
+    """The guard that protects a worker has to be the one next to the UPDATE.
+
+    `reset_job` refuses a reset that would collide with a live sibling; it says nothing about the
+    named row itself being `running`, so a caller that checks first and writes second can still put
+    a row back mid-flight. The command's refusal is for the operator; this is the one that holds
+    when the two happen in the other order.
+    """
+    job_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id="doc-1",
+                               content_hash=H, payload={})
+    store.claim_next_job("index")
+
+    with pytest.raises(ValueError, match="running"):
+        store.reset_job(job_id)
+
+    unchanged = store.get_job(job_id)
+    assert unchanged.status == "running" and unchanged.error is None
+
+
+def test_reset_refuses_a_row_a_second_connection_claimed_after_the_listing(tmp_path, capsys):
+    """The race the CLI's own check cannot see, run on purpose with two connections to one file.
+
+    One `Store` is the operator's command, the other a worker in another process: the listing said
+    `pending`, the worker claimed the row, enter was already pressed. A reset landing here gives the
+    document a second claimer while the first is still uploading, and the first worker's
+    `mark_job_done` then settles work it no longer owns — so the refusal is the answer, and the row
+    stays `running`.
+    """
+    path = tmp_path / "state.db"
+    operator = Store(path)
+    operator.migrate()
+    operator.create_org(papra_org_id=ORG, name="Org A")
+    worker = Store(path)
+    try:
+        job_id = operator.enqueue_job(kind="index", papra_org_id=ORG, document_id="doc-race",
+                                      content_hash=H, payload={})
+        assert operator.get_job(job_id).status == "pending"
+        assert worker.claim_next_job("index").id == job_id
+
+        assert run_jobs(None, cli_args(reset=job_id), store=operator) == EXIT_REFUSED
+
+        assert "running" in capsys.readouterr().err
+        assert operator.get_job(job_id).status == "running"
+    finally:
+        worker.close()
+        operator.close()
+
+
+def test_a_row_claimed_between_the_read_and_the_write_is_refused_in_words(store, capsys):
+    """The window between "it is pending" and the UPDATE, opened on purpose.
+
+    The proxy is a worker that claims the row after the command has read it: the check in the
+    command passes on a stale read, so only a guard next to the write can stop it — and when that
+    guard raises, the operator gets a sentence and exit 2, not a traceback about `ValueError`.
+    """
+    job_id = store.enqueue_job(kind="index", papra_org_id=ORG, document_id="doc-window",
+                               content_hash=H, payload={})
+
+    class ClaimedUnderneath:
+        def __init__(self, inner):
+            self._inner = inner
+            self._claimed = False
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def get_job(self, job_id):
+            job = self._inner.get_job(job_id)
+            if job is not None and not self._claimed:
+                self._claimed = True
+                self._inner.claim_next_job(job.kind)      # a worker wins the race
+            return job
+
+    assert run_jobs(None, cli_args(reset=job_id), store=ClaimedUnderneath(store)) == EXIT_REFUSED
+
+    err = capsys.readouterr().err
+    assert "running" in err and "Traceback" not in err
+    assert store.get_job(job_id).status == "running"
+
+
+def test_count_jobs_by_status_answers_every_status_in_one_read(store):
+    """One GROUP BY over the scope, so a caller can compare statuses without reading twice.
+
+    `--drain` needs `pending` and `running` together; asked for them separately, SQLite can answer
+    from two different instants and a row that moves between them (a worker restart puts `running`
+    back to `pending`) can make both come back 0 above a queue that has work.
+    """
+    for index in range(2):
+        store.enqueue_job(kind="index", papra_org_id=ORG, document_id=f"doc-p{index}",
+                          content_hash=H, payload={})
+    store.enqueue_job(kind="index", papra_org_id=ORG, document_id="doc-f",
+                      content_hash=H, payload={})
+    store.enqueue_job(kind="ocr", papra_org_id=ORG, document_id="doc-o",
+                      content_hash=H, payload={})
+    store.claim_next_job("index")
+    store.mark_job_failed(store.list_jobs(kind="ocr")[0].id, "gone", max_attempts=1)
+
+    assert store.count_jobs_by_status() == {"pending": 2, "running": 1, "failed": 1}
+    assert store.count_jobs_by_status("index") == {"pending": 2, "running": 1}
+    assert store.count_jobs_by_status("ocr") == {"failed": 1}
+    assert store.count_jobs_by_status("title") == {}
+    # `claim_next_job` takes the oldest claimable row, which is `doc-p0`, so the untouched
+    # document is the one that still answers `pending`.
+    assert store.count_jobs_by_status(document_id="doc-p0") == {"running": 1}
+    assert store.count_jobs_by_status(document_id="doc-f") == {"pending": 1}
+
+
+def test_drain_reads_its_two_numbers_from_one_snapshot(store, capsys):
+    """The proxy forbids per-status counting, which makes one read the contract, not a habit.
+
+    `--drain` is the step whose wrong answer is two writers on Papra's `content` column, so it may
+    not assemble its verdict out of two readings of the queue.
+    """
+    store.enqueue_job(kind="index", papra_org_id=ORG, document_id="doc-live",
+                      content_hash=H, payload={})
+    store.enqueue_job(kind="index", papra_org_id=ORG, document_id="doc-run",
+                      content_hash=H, payload={})
+    store.claim_next_job("index")
+
+    class OneRead:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def count_jobs(self, *args, **kwargs):
+            raise AssertionError("drain counted the queue status by status")
+
+    assert run_jobs(None, cli_args(drain=True), store=OneRead(store)) == EXIT_INCOMPLETE
+
+    out = capsys.readouterr().out
+    assert "1 pending, 1 running" in out
+
+
+#: Every invocation the README prints or a log line names for the two commands in this task.
+CITED_INVOCATIONS = [
+    ["jobs"], ["jobs", "--reset", "JOB_ID"], ["jobs", "--drain"],
+    ["jobs", "--kind", "ocr", "--drain"], ["jobs", "--kind", "index", "--status", "failed"],
+    ["jobs", "--document-id", "DOC", "--json"],
+    ["backfill"], ["backfill", "--dry-run"], ["backfill", "--limit", "20"],
+    ["backfill", "--org-id", "ORG", "--limit", "5"], ["backfill", "--all-stale"],
+]
+
+
+@pytest.mark.parametrize("argv", CITED_INVOCATIONS, ids=" ".join)
+def test_the_shipped_entry_point_accepts_every_invocation_the_runbook_prints(argv):
+    """The README's code blocks are what an operator types, so parse them with the real binary.
+
+    The scan test above proves a cited command name is registered by some module of this package;
+    only `main()` proves the flags printed beside it exist. What that catches is a runbook line that
+    stops with `unrecognized arguments` in front of somebody in the middle of an incident, which is
+    the same class of stale message Task 7 pinned from the plan.
+    """
+    root = Path(store_module.__file__).resolve().parents[1]
+    proc = subprocess.run([sys.executable, "-m", "papra_suite", *argv, "--help"],
+                          cwd=root, capture_output=True, text=True, timeout=120)
+
+    assert proc.returncode == 0, f"{' '.join(argv)}: {proc.stderr}"
+

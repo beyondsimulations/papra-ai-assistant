@@ -1084,11 +1084,19 @@ class Store:
                 raise ValueError(
                     f"job {job_id}: the same work is already queued as {live['id']}"
                 )
-            self._conn.execute(
+            if row["status"] == "running":
+                raise ValueError(f"job {job_id}: it is running, a worker is holding it")
+            # Guarded again in the write itself: a worker can claim the row between the read above
+            # and this statement, and a reset that lands then puts a second claimer on a document
+            # somebody is uploading. The condition is evaluated where SQLite holds the write lock,
+            # so the rowcount is the only answer that can be trusted.
+            moved = self._conn.execute(
                 "UPDATE jobs SET status = 'pending', attempts = 0, error = NULL, "
-                "next_attempt_at = ?, updated_at = ? WHERE id = ?",
+                "next_attempt_at = ?, updated_at = ? WHERE id = ? AND status != 'running'",
                 (_now(), _now(), job_id),
             )
+            if moved.rowcount != 1:
+                raise ValueError(f"job {job_id}: it is running, a worker is holding it")
 
     def list_jobs(self, *, kind: str | None = None, status: str | None = None,
                   document_id: str | None = None, limit: int = 100) -> list[Job]:
@@ -1157,6 +1165,33 @@ class Store:
         with self._lock:
             row = self._conn.execute(query, params).fetchone()
         return int(row[0])
+
+    def count_jobs_by_status(self, kind: str | None = None, *,
+                             document_id: str | None = None) -> dict[str, int]:
+        """Every status count for a scope, from one statement.
+
+        `jobs --drain` is the middle step of the `content` handover and its wrong answer is two
+        writers on one column. Asked for `pending` and `running` as two queries, SQLite may answer
+        from two instants: a worker restart runs `recover_running_jobs`, which moves a `running`
+        row back to `pending`, so a first count of `pending` and a second of `running` can both
+        come home 0 above a queue that holds work. One GROUP BY cannot be split that way, and a
+        status missing from the result means zero rather than an unknown.
+        """
+        query = "SELECT status, COUNT(*) FROM jobs"
+        params: list[object] = []
+        clauses: list[str] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if document_id:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " GROUP BY status"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
 
     # -- orgs ---------------------------------------------------------------
 

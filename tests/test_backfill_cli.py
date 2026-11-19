@@ -36,6 +36,7 @@ import pytest
 
 from papra_suite.backfill_cli import (
     EXIT_INCOMPLETE,
+    EXIT_OK,
     EXIT_REFUSED,
     LISTING_PAGE_SIZE,
     add_subparser,
@@ -792,3 +793,44 @@ def test_a_limit_of_zero_is_refused_rather_than_run_as_nothing(store, capsys):
     assert run(store, FakeListing(), limit=0) == EXIT_REFUSED
     assert "--limit" in capsys.readouterr().err
     assert store.list_jobs() == []
+
+
+async def test_a_stuck_head_does_not_eat_the_next_slice(store, capsys):
+    """`--limit 2` twice has to reach documents 3 and 4 while 1 and 2 are still queued.
+
+    An absorbed request changes nothing — a live row already carries that work — so it must not
+    so it must not spend the cap. If it did, a stalled worker would make every limited run re-report
+    the same two documents, the rest of the corpus would never be reached, and the line would still
+    read `enqueued 2`.
+    """
+    papra = FakeListing()
+    for index in range(1, 5):
+        papra.add(f"doc-{index}", content_hash=f"{index:02}" * 32)
+
+    first = await backfill_corpus(store, papra, orgs=[ORG], limit=2)
+    assert (first.new_rows, first.already_queued, first.remaining) == (2, 0, 2)
+
+    second = await backfill_corpus(store, papra, orgs=[ORG], limit=2)
+
+    assert (second.new_rows, second.already_queued, second.remaining) == (2, 2, 0)
+    assert store.count_jobs("index") == 4
+
+
+def test_the_report_names_the_rows_it_only_found_already_queued(store, capsys):
+    """A run that queued nothing new says so, instead of claiming four documents.
+
+    The second run over the same corpus is the one an operator reads after a stalled worker, and
+    "enqueued 4" there would be a number for work that was already in the queue before the command
+    ran.
+    """
+    papra = FakeListing()
+    for index in range(1, 5):
+        papra.add(f"doc-{index}", content_hash=f"{index:02}" * 32)
+    assert run(store, papra) == EXIT_OK        # the first pass queues all four
+    capsys.readouterr()
+
+    assert run(store, papra) == EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "enqueued 0 new of 4 candidate(s)" in out
+    assert "(4 already queued, unchanged)" in out

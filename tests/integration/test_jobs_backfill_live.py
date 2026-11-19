@@ -129,17 +129,23 @@ async def test_backfill_is_idempotent_against_a_live_bucket(live):
     """
     await upload(live, "rechnung-1.pdf", "c3")
 
+    first_id = live.store.list_jobs(kind="index")[0].id
     again = await backfill_corpus(live.store, live.papra, orgs=[live.org_id])
 
-    assert again.enqueued == 1
+    # The second run asks for the document and the live row absorbs it: nothing new, same id.
+    assert (again.enqueued, again.new_rows, again.already_queued) == (1, 0, 1)
+    assert [job.id for job in live.store.list_jobs(kind="index")] == [first_id]
     assert live.store.count_jobs("index") == 1
-    # A terminal row does not block a retry — that is the point of migration 004 — but it does not
-    # make the second run queue a document that is already queued either.
-    job = live.store.list_jobs(kind="index")[0]
+    # A terminal row does not block a retry — migration 004's whole point — and the retry takes a
+    # NEW row instead of reviving the spent one, which is the pairing `jobs --reset` relies on.
     live.store.claim_next_job("index")
-    live.store.mark_job_failed(job.id, "kreuzakt refused", max_attempts=1)
+    live.store.mark_job_failed(first_id, "kreuzakt refused", max_attempts=1)
     third = await backfill_corpus(live.store, live.papra, orgs=[live.org_id])
-    assert third.enqueued == 1 and live.store.count_jobs("index") == 2
+
+    assert (third.new_rows, third.already_queued) == (1, 0)
+    rows = live.store.list_jobs(kind="index")
+    assert len(rows) == 2 and {row.status for row in rows} == {"failed", "pending"}
+    assert first_id in {row.id for row in rows}
 
 
 async def test_backfill_limit_leaves_a_counted_remainder_against_live_data(live):

@@ -44,6 +44,7 @@ import sys
 from dataclasses import dataclass, field
 
 from papra_suite.indexing import papra_document_is_deleted
+from papra_suite.jobs_cli import LIVE_STATUSES
 from papra_suite.papra_client import PapraClient
 from papra_suite.pipeline import (
     OCR_MAX_DOCUMENT_BYTES,
@@ -64,6 +65,9 @@ EXIT_REFUSED = 2
 #: Rows per listing page. The sweep's cadence, so a backfill and a sweep ask Papra the same
 #: question the same way.
 LISTING_PAGE_SIZE = 100
+# Queue rows one document can hold in one kind since migration 004. Read as a yes/no, not a
+# page: a document with more live rows than this is a queue nobody is backfilling anyway.
+DOC_ROW_LIMIT = 100
 
 PDF_MIME = "application/pdf"
 
@@ -90,7 +94,12 @@ class BackfillResult:
 
     * `listed` — documents Papra returned, of any type: the walk's reach.
     * `candidates` — the PDFs among them that are neither trashed nor non-PDF: what "of M" counts.
-    * `enqueued` — documents queued (in a dry run, documents the run would have queued).
+    * `enqueued` — documents this run asked for (new rows plus the ones already queued).
+    * `new_rows` — of those, the ones that took a fresh queue row: the only number `--limit` caps.
+    * `already_queued` — of those, the ones a live row already carried, so nothing changed. Counted
+      apart because an absorbed request is not progress: were it to spend the cap, a stalled worker
+      would make every limited run re-report the same head of the queue, and the rest would never be
+      reached.
     * `enrolled` — of those, the ones that had no ledger reference at all before this run.
     * `stale_queued` — of those, the ones the ledger held under a generation that is not current.
     * `remaining` — eligible documents this run did not queue because of `--limit`. The number that
@@ -103,6 +112,8 @@ class BackfillResult:
     listed: int = 0
     candidates: int = 0
     enqueued: int = 0
+    new_rows: int = 0
+    already_queued: int = 0
     enrolled: int = 0
     stale_queued: int = 0
     already_current: int = 0
@@ -200,8 +211,19 @@ def _moved(store: Store, generation: int) -> str | None:
             "re-run this command to queue what is left under the new generation")
 
 
+def _already_queued(store: Store, document_id: str, content_hash: str) -> bool:
+    """Is this exact work sitting in the queue right now?
+
+    Read before the enqueue, because afterwards it is always true: `enqueue_job` names the live row
+    that already carries the key instead of taking a second one. The answer decides whether this
+    document is progress or a repeat, which decides whether it spends the `--limit` cap.
+    """
+    rows = store.list_jobs(kind="index", document_id=document_id, limit=DOC_ROW_LIMIT)
+    return any(row.status in LIVE_STATUSES and row.content_hash == content_hash for row in rows)
+
+
 def _queue(store: Store, org: str, document_id: str, *, file_hash: str, name: str,
-           standing: str, budget: _Budget, result: BackfillResult) -> None:
+           standing: str, budget: _Budget, result: BackfillResult, dry_run: bool) -> None:
     """Queue one document through the intake path — the only enqueue this command has.
 
     `enqueue_index_job` is the whole point of calling it: reference first, then the index job (and
@@ -209,6 +231,20 @@ def _queue(store: Store, org: str, document_id: str, *, file_hash: str, name: st
     record. A backfill with its own enqueue would be a second intake path, and the ordering rule it
     skipped is the one that keeps an enrolled document visible afterwards.
     """
+    if _already_queued(store, document_id, file_hash):
+        result.already_queued += 1
+        logger.debug("backfill: %s/%s is already queued, nothing changed", org, document_id)
+        return
+    if dry_run:
+        result.enqueued += 1
+        result.new_rows += 1
+        result.orgs_queued.add(org)
+        budget.spend()        # the rehearsal caps itself the way the run does
+        if standing == UNLEDGERED:
+            result.enrolled += 1
+        else:
+            result.stale_queued += 1
+        return
     job_id = enqueue_index_job(store, papra_org_id=org, document_id=document_id,
                                file_hash=file_hash, name=name, mime=PDF_MIME,
                                ingested_via=BACKFILL_INGESTED_VIA)
@@ -222,6 +258,7 @@ def _queue(store: Store, org: str, document_id: str, *, file_hash: str, name: st
         return
     budget.spend()
     result.enqueued += 1
+    result.new_rows += 1
     result.orgs_queued.add(org)
     if standing == UNLEDGERED:
         result.enrolled += 1
@@ -297,18 +334,9 @@ async def _consider(store: Store, papra, org: str, document: dict, generation: i
     if not budget.allows():
         result.remaining += 1
         return
-    if dry_run:
-        result.enqueued += 1
-        result.orgs_queued.add(org)
-        budget.spend()        # the rehearsal consumes the same cap the run does
-        if standing == UNLEDGERED:
-            result.enrolled += 1
-        else:
-            result.stale_queued += 1
-        return
     _queue(store, org, document_id, file_hash=file_hash or "",
            name=document.get("name") or document_id, standing=standing, budget=budget,
-           result=result)
+           result=result, dry_run=dry_run)
 
 
 async def _walk_listing(store: Store, papra, org: str, generation: int, budget: _Budget,
@@ -376,15 +404,9 @@ def _queue_stale_references(store: Store, org: str, generation: int, budget: _Bu
             if not budget.allows():
                 result.remaining += 1
                 continue
-            if dry_run:
-                result.enqueued += 1
-                result.orgs_queued.add(org)
-                budget.spend()
-                result.stale_queued += 1
-                continue
             _queue(store, ref.papra_org_id, ref.papra_document_id, file_hash=ref.file_hash,
                    name=ref.papra_original_name or ref.papra_document_id, standing=STALE,
-                   budget=budget, result=result)
+                   budget=budget, result=result, dry_run=dry_run)
         cursor = (refs[-1].papra_org_id, refs[-1].papra_document_id)
 
 
@@ -462,8 +484,16 @@ def _report(store: Store, args, result: BackfillResult) -> int:
     next, and a summary that ends with its own successes reads as finished.
     """
     verb = "would enqueue" if args.dry_run else "enqueued"
-    print(f"backfill: {verb} {result.enqueued} of {result.candidates} candidate(s) across "
-          f"{len(result.orgs_queued)} bucket(s); {result.remaining} remaining")
+    if result.already_queued:
+        # The honest headline: work that was already in the queue was not queued by this run, and a
+        # number for it would read as progress on a corpus whose workers are stalled.
+        head = (f"backfill: {verb} {result.new_rows} new of {result.candidates} candidate(s) "
+                f"({result.already_queued} already queued, unchanged) across "
+                f"{len(result.orgs_queued)} bucket(s); {result.remaining} remaining")
+    else:
+        head = (f"backfill: {verb} {result.enqueued} of {result.candidates} candidate(s) across "
+                f"{len(result.orgs_queued)} bucket(s); {result.remaining} remaining")
+    print(head)
     print(f"  {result.listed} document(s) listed; {result.already_current} already current in the "
           f"ledger, {result.skipped_non_pdf} not a pdf, {result.skipped_deleted} in papra's trash "
           "or queued for deletion, "
@@ -480,6 +510,10 @@ def _report(store: Store, args, result: BackfillResult) -> int:
     if args.dry_run:
         print("  dry run: nothing was queued, no ledger row was written and no document was marked "
               "seen")
+    if result.already_queued:
+        print(f"  {result.already_queued} candidate(s) were already queued under a live row and "
+              "were left alone — the cap counts new rows, so this run went on to the next "
+              "documents instead of spending itself on work already in the queue")
     if result.remaining:
         capped = (f"this run stopped at --limit {args.limit}" if args.limit is not None
                   else "this run stopped early")

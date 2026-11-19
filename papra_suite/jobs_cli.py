@@ -308,6 +308,15 @@ def _reset(store: Store, args) -> int:
     try:
         store.reset_job(job.id)
     except ValueError as error:
+        if "running" in str(error):
+            # The row was claimed after the read above said `pending`. The guard next to the write
+            # is the one that holds, and the operator gets the same refusal either way — a
+            # traceback here would bury the one fact that matters, which row is now a worker's.
+            print(f"refusing to reset {job.id}: it is running, a worker claimed it just now",
+                  file=sys.stderr)
+            print("let it settle, then read the document: "
+                  f"`papra-suite jobs --document-id {job.document_id}`", file=sys.stderr)
+            return EXIT_REFUSED
         if "already queued" in str(error):
             # Nothing to fix and nothing changed: the work IS queued, under another row. Exit 1
             # rather than 0 because the row that was named is still settled, and 0 would read as
@@ -344,8 +353,12 @@ def _drain(store: Store, args) -> int:
     empty reading is what a loop that claims the next row one second later looks like.
     """
     scope = f"kind {args.kind}" if args.kind else "every kind"
-    pending = store.count_jobs(args.kind, "pending")
-    running = store.count_jobs(args.kind, "running")
+    # One statement for both live counts: two queries could be answered from two instants, and a
+    # worker restart moves `running` back to `pending` in between, which is how both numbers come
+    # home 0 above a queue that has work.
+    counts = store.count_jobs_by_status(args.kind)
+    pending = counts.get("pending", 0)
+    running = counts.get("running", 0)
     if pending or running:
         print(f"cannot drain {scope}: {pending} pending, {running} running")
         holders = _kinds_holding_work(store, args.kind)
@@ -356,7 +369,7 @@ def _drain(store: Store, args) -> int:
         print("read it again a minute from now; the handover wants 0 pending and 0 running twice "
               "in a row")
         return EXIT_INCOMPLETE
-    settled = store.count_jobs(args.kind, "done") + store.count_jobs(args.kind, "failed")
+    settled = counts.get("done", 0) + counts.get("failed", 0)
     print(f"{scope}: 0 pending, 0 running — quiet ({settled} settled row(s) are history, not "
           "work)")
     print("safe to switch the writer over once a second reading a minute from now is also 0: run "

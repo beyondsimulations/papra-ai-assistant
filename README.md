@@ -944,10 +944,9 @@ purpose` bucket, so the next rebuild has something to compare against.
 
 ### Reading the queue, and repairing one row
 
-`papra-suite jobs` is the queue read on its own. It never migrates, refuses a missing database
-before it opens one (constructing the store would create the file and replace "wrong `DATA_DIR`"
-with "empty queue"), and reads neither service — so it keeps working during the outage it is being
-run during.
+`papra-suite jobs` is the queue read on its own: it never migrates, refuses a missing database
+before it opens one (constructing the store would create the file and turn "wrong `DATA_DIR`" into
+"empty queue"), and reads neither Papra nor Kreuzakt.
 
 ```bash
 papra-suite jobs --kind index --status failed        # what stopped, with the stored error
@@ -974,12 +973,12 @@ run the same bytes twice and rewrite a history nobody asked to revisit — and i
 A `pending` row waiting out a backoff is fair game — it is in nobody's hands, and this is how
 "retry now, do not wait eight minutes" is said.
 
-`--drain` is the handover gate, not a summary. It counts `pending` and `running` in scope, refuses
-with exit `1` and both counts while either is non-zero, and refuses to be narrowed:
-`--drain --status pending` would answer "no pending rows" above a `running` job, so the combination
-is rejected rather than reinterpreted. Read it twice a minute apart and only flip the delivery flag
-when both readings are 0 — one empty reading is what a loop that claims the next row a second later
-looks like. The count comes from SQL, so no listing cap can make a busy queue look quiet.
+`--drain` is the handover gate, not a summary. It counts `pending` and `running` in scope from one
+SQL statement — so no listing cap can make a busy queue look quiet, and the two numbers cannot come
+from two different instants — refuses with exit `1` and both counts while either is non-zero, and
+refuses to be narrowed: `--drain --status pending` would answer "no pending rows" above a `running`
+job. Read it twice a minute apart and flip the delivery flag only when both readings are 0; one
+empty reading is what a loop that claims the next row a second later looks like.
 
 
 ### Backfilling a corpus, and enrolling the documents the sweep will never visit
@@ -1009,31 +1008,31 @@ hand this command.
 **Enrolling goes through the intake path, so the ordering rule holds.** Reference first, then the
 index job, then the seen record last. A queued job with no ledger row behind it is work no later
 pass can see — the document would be enqueued once and be invisible forever after — so this command
-does not implement its own enqueue. Nothing is written to Papra and Kreuzakt is never contacted:
-enqueuing is the whole extent of it, which is what makes it safe to run while either service is
-down.
+does not implement its own enqueue. Nothing is written to Papra and Kreuzakt is
+never contacted, so a backfill runs through an index outage — but Papra itself has to answer the
+listing, because Papra's listing is the only catalogue of the corpus. A bucket Papra will not list
+is reported as unreadable and the run exits `1`; it is never reported as empty.
 
-**The remainder is printed, never implied.** `--limit` caps one run, and the walk keeps listing after
-the cap so the rest can be counted rather than guessed:
+**The remainder is printed, never implied.** `--limit` caps the *new rows* one run takes, and the
+walk keeps listing after the cap so the rest can be counted rather than guessed:
 
 ```
 backfill: enqueued 5 of 12 candidate(s) across 1 bucket(s); 7 remaining
 ```
 
 A run that stopped at the cap could not tell "the rest is eligible" from "the rest is already
-indexed", and that difference decides whether you run it again — so exiting `0` here is honest while
-the count is on the screen, and repeating the command cannot duplicate the work: the live row absorbs
-the request. Documents deliberately left out are counted in their own buckets (not a PDF, in Papra's
-trash or queued for deletion, over the size limit) and are not remaining work.
+indexed", and that difference decides whether you run it again. Documents whose work a live row
+already carries are counted apart (`(4 already queued, unchanged)`) and do not spend the cap, so a
+stalled queue cannot make every later run re-report the same head of the corpus. Documents
+deliberately left out get their own buckets (not a PDF, in Papra's trash or queued for deletion,
+over the size limit) and are not remaining work.
 
 **It costs a VLM extraction per document, and says so first.** While `PAPRA_INDEX_CONTENT_DELIVERY`
 is off, intake also fills the legacy `ocr` queue, so a backfill re-extracts Papra's text — one paid
-extraction per document. That is the point when the corpus holds text extracted with the wrong
-`OCR_LANGUAGES`, and it is not the point when it does not. `--dry-run` prints the cost before it
-queues anything. `papra-suite ledger --requeue` is the command that queues the same index work
-*without* the extraction, and that is the difference between the two: `--requeue` finishes a rebuild,
+extraction each, which is the point only when that text came out with the wrong `OCR_LANGUAGES`.
+`--dry-run` prints the cost before anything is queued, and `papra-suite ledger --requeue` is the
+command that queues the same index work *without* the extraction: `--requeue` finishes a rebuild,
 `backfill` brings a corpus in.
 
-Both commands refuse a missing database with exit `2` before the store is opened. Backfill walks the
-buckets this store knows — `orgs` plus whatever the ledger holds — so a bucket it has never heard of
-has to be named with `--org-id`.
+Backfill walks the buckets this store knows — `orgs` plus whatever the ledger holds — so a bucket it
+has never heard of has to be named with `--org-id`.
