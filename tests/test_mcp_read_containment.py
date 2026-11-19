@@ -471,3 +471,17 @@ def test_the_composition_root_borrows_the_clients_serve_hands_it(store):
         assert callable(papra.update_content)  # the owner keeps its writes
     finally:
         ledger.close()
+
+
+def test_the_app_refuses_a_writable_store_even_when_its_verifier_would_not(store, monkeypatch):
+    """Two boundaries refuse a `Store` today, so a test that passes with either one deleted pins
+    neither. This one stubs the verifier away and leaves the app's own argument check standing: a
+    later build that registers tools without an auth gate must still be refused.
+    """
+    import papra_suite.mcp_server as mcp_server
+    from papra_suite.readers import McpContainmentError
+
+    monkeypatch.setattr(mcp_server, "StoreTokenVerifier", lambda store: object())
+    with pytest.raises(McpContainmentError) as caught:
+        build(store)
+    assert "store" in str(caught.value)
