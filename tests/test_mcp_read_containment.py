@@ -438,3 +438,36 @@ def test_the_auth_gate_refuses_a_write_capable_store_too(store):
     with pytest.raises(McpContainmentError) as caught:
         StoreTokenVerifier(store)
     assert "store" in str(caught.value)
+
+
+def test_the_composition_root_borrows_the_clients_serve_hands_it(store):
+    """`serve` injects its own mutable clients, so injection must yield views, not a refusal.
+
+    A refusal reads as containment and is really a listener that cannot start in production: the
+    unit tests inject read-only fakes, while the process injects the one Papra client and the one
+    Kreuzakt client that the pollers, the title worker and the indexer share. Borrowing keeps that
+    sharing honest — the views stay out of `owned`, so the listener cannot close a transport the
+    pipeline is still using — and the owner's client keeps its writes, because containment is about
+    what a tool call can reach, not about crippling the process that owns the credential.
+    """
+    from types import SimpleNamespace
+
+    from papra_suite.kreuzakt_client import KreuzaktClient
+    from papra_suite.mcp_server import _open_read_views
+    from papra_suite.papra_client import PapraClient
+    from papra_suite.readers import KreuzaktReader, PapraReader, require_read_only
+
+    papra, kz = PapraClient("http://papra.test", "papra-key-1"), KreuzaktClient("http://kz.test")
+    config = SimpleNamespace(papra_base_url="http://elsewhere.test", papra_api_key="elsewhere-key",
+                             kreuzakt_base_url="http://elsewhere.test")
+
+    ledger, papra_view, kz_view, owned = _open_read_views(config, store, papra, kz)
+    try:
+        assert isinstance(papra_view, PapraReader) and isinstance(kz_view, KreuzaktReader)
+        require_read_only(papra_view, role="papra")
+        require_read_only(kz_view, role="kreuzakt")
+        assert owned == [], "a borrowed transport must not be closed by the listener"
+        assert papra_view._client._client is papra._client, "a second transport was opened"
+        assert callable(papra.update_content)  # the owner keeps its writes
+    finally:
+        ledger.close()

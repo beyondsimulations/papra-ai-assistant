@@ -32,7 +32,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from papra_suite.mcp_server import MCP_ENABLED_SETTING
+from papra_suite.mcp_server import MCP_ENABLED_SETTING, McpListenerDied
 from papra_suite.store import Store
 from tests.test_config import BASE_ENV
 from tests.test_mcp_server_auth import OkKreuzakt, OkPapra, app_for, client_for, initialize
@@ -147,8 +147,11 @@ async def test_a_dead_listener_is_a_crash_the_supervisor_reports(monkeypatch, tm
                                                                  capsys):
     """The other half: `serve` must not run on with no listener and a quiet log.
 
-    Same shape as a crashed poller, so it goes through the real `serve`: the task raises,
-    `_supervise` logs it as a crash, and the stop that `serve` waits on is set.
+    Goes through the real `serve`: the task raises, the listener's watcher logs one sentence
+    naming the task and the cause, and the error reaches the caller so the process can exit
+    non-zero. The stub sets `stop` first — exactly as the real listener does, because that is how
+    it brings the process down — which is why the watcher may not read that flag as proof that a
+    shutdown was requested.
     """
     import asyncio
 
@@ -171,7 +174,8 @@ async def test_a_dead_listener_is_a_crash_the_supervisor_reports(monkeypatch, tm
     root = logging.getLogger()
     saved_handlers, saved_level = list(root.handlers), root.level
     try:
-        await serve(config, stop=stop, store=store, papra=FakePapra(), kreuzakt=FakeKreuzakt())
+        with pytest.raises(McpListenerDied):
+            await serve(config, stop=stop, store=store, papra=FakePapra(), kreuzakt=FakeKreuzakt())
     finally:
         root.handlers[:] = saved_handlers
         root.setLevel(saved_level)
@@ -179,7 +183,7 @@ async def test_a_dead_listener_is_a_crash_the_supervisor_reports(monkeypatch, tm
     # Read from the process's own sink, not `caplog`: `serve` calls `setup_logging`, which
     # root handlers, and the handler `caplog` had installed is cleared with them.
     printed = capsys.readouterr().out
-    assert "exited unexpectedly" in printed
+    assert "task mcp died" in printed
     assert "address already in use" in printed
 
 

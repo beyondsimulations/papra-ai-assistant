@@ -73,14 +73,17 @@ async def _serve_until_it_ends(store, tmp_path, monkeypatch, listener):
 
     from papra_suite.config import load_config
     from papra_suite.pipeline import serve
-    from tests.test_index_job import FakeKreuzakt, FakePapra
+    from tests.test_mcp_server_auth import OkKreuzakt, OkPapra
 
+    # Read-only doubles, not `FakePapra`: the listener's composition root refuses a handle it cannot
+    # contain, and a test that reached `serve` with a writable double would stop there — loudly, and
+    # for a reason that has nothing to do with the exit path under test.
     monkeypatch.setattr("papra_suite.mcp_server.run_mcp_listener", listener)
     store.set_setting(MCP_ENABLED_SETTING, "1")
     config = load_config({**SERVE_ENV, "DATA_DIR": str(tmp_path)})
     stop = asyncio.Event()
     with _restored_logging():
-        await serve(config, stop=stop, store=store, papra=FakePapra(), kreuzakt=FakeKreuzakt())
+        await serve(config, stop=stop, store=store, papra=OkPapra(), kreuzakt=OkKreuzakt())
     return stop
 
 
@@ -138,3 +141,24 @@ def test_the_process_exits_one_when_the_listener_dies(tmp_path, monkeypatch, cap
     assert main() == 1, "a dead listener must not look like a clean shutdown"
     assert capsys.readouterr().err.strip() == (
         "fatal: task mcp died: OSError: cannot assign requested address")
+
+
+async def test_a_listener_whose_bind_fails_ends_serve_for_real(store, tmp_path, monkeypatch):
+    """Through `run_mcp_listener`, not around it — the flag cannot say who asked for the shutdown.
+
+    The listener sets `stop` on its way out, because that is how it brings the process down, so a
+    supervisor that read `stop.is_set()` as "a shutdown was requested" saw a taken port as an
+    orderly stop and let `serve` return 0. This is the deployment's own shape: uvicorn's
+    `Server.startup` calls `sys.exit(1)`, and the task ends with `SystemExit`, which is not an
+    `Exception` and is missed by every `except Exception` on the way.
+    """
+    import uvicorn
+
+    from papra_suite.mcp_server import McpListenerDied, run_mcp_listener
+    from tests.test_mcp_listener_lifecycle import DyingUvicorn
+
+    monkeypatch.setattr(uvicorn, "Server", DyingUvicorn)
+    with pytest.raises(McpListenerDied) as caught, _restored_logging():
+        await _serve_until_it_ends(store, tmp_path, monkeypatch, run_mcp_listener)
+    assert "task mcp died" in str(caught.value)
+

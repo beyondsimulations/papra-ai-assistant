@@ -352,3 +352,28 @@ class KreuzaktReader:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+# --- borrowing a client that another subsystem owns ------------------------------------------
+
+#: The mutable client each view is a gate on. Deliberately a module mapping rather than a class
+#: attribute or a classmethod: the surface an instance offers is exactly what containment
+#: asserts on, and nothing in it may be a way to build or widen a handle.
+BORROWED_FROM = {PapraReader: PapraClient, KreuzaktReader: KreuzaktClient}
+
+
+def borrow_view(view_cls, client):
+    """A GET-only view of a client somebody else opened, owns and will close.
+
+    `serve` shares one Papra client and one Kreuzakt client between the pollers, the title worker,
+    the indexer and the delivery writes, so the request path borrows those transports instead of
+    opening a second set of credentials behind their back — and stays off the listener's close
+    list,
+    because closing a borrowed transport would pull it out from under the pipeline that still needs
+    it. Borrowing loosens nothing: the verb gate lives on the view class, so this handle
+    answers `GET` and nothing else, while the owner's client stays exactly as mutable as it was.
+    """
+    view = view_cls.__new__(view_cls)
+    view.__dict__.update(client.__dict__)
+    view._client = _GetOnlyClient(client._client)
+    return view

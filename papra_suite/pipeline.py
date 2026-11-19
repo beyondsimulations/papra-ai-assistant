@@ -497,18 +497,19 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         `mcp: enabled`, the app's own health endpoint still answers, and a container that eventually
         stops with exit 0 cannot be restarted by a `restart: on-failure` policy. So the listener's
         exit — raised OR returned — becomes `McpListenerDied`, reaped below and raised after the
-        other tasks have been cancelled. A shutdown that was already asked for is not a death.
+        other tasks have been cancelled. The one exit that is not a death is a clean return after a
+        shutdown somebody else asked for.
         """
         def _on_done(done: asyncio.Task) -> None:
             if done.cancelled():
-                return                      # the shutdown path: nobody is surprised
+                return                      # the parent asked: not a death
             error = done.exception()
-            if stop.is_set():
-                # Coming down anyway: the exit is a side effect of the shutdown, not its cause.
-                if error is None:
-                    logger.info("task %s exited", done.get_name())
-                else:
-                    logger.error("task %s exited unexpectedly: %s", done.get_name(), error)
+            # A raised exit is ALWAYS a death. `run_mcp_listener` sets `stop` itself on the way
+            # out — that is how it brings the process down — so the flag cannot tell a requested
+            # shutdown from the listener's own failure; only the exception can. One clean return is
+            # not fatal: the listener saw a shutdown that somebody else asked for.
+            if error is None and stop.is_set():
+                logger.info("task %s exited", done.get_name())
                 return
             fatal.append(_listener_death(done.get_name(), error))
             logger.error("%s", fatal[-1])

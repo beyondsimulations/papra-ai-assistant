@@ -61,10 +61,12 @@ from papra_suite.kreuzakt_client import KreuzaktError
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.mcp_tokens import TokenContext, resolve_token, stamp_token_use, token_counts
 from papra_suite.readers import (
+    BORROWED_FROM,
     KreuzaktReader,
     LedgerReader,
     McpContainmentError,
     PapraReader,
+    borrow_view,
     require_read_only,
 )
 from papra_suite.store import Store, sanitize_event_text
@@ -852,6 +854,24 @@ def _propagate_listener_death(serving: asyncio.Task, bind: McpBind) -> NoReturn:
         f"{sanitize_event_text(str(error), limit=200)}") from error
 
 
+def _view_for(injected, view_cls, build):
+    """The read-only handle for one capability, whoever supplied it, plus whether we own it.
+
+    The middle branch is the production path and the one no unit test reached on its own: `serve`
+    injects the mutable clients the pipeline shares, and they are borrowed into a view rather than
+    refused. Refusing them reads as containment and is a listener that cannot start in production
+    while every test passes — the tests inject read-only fakes, the process injects the real client.
+    A view that arrived ready is passed through and stays its owner's; anything else, a test double,
+    is handed on and `require_read_only` is what decides about it.
+    """
+    if injected is None:
+        return build(), True
+    borrowed = BORROWED_FROM.get(view_cls)
+    if borrowed is not None and isinstance(injected, borrowed):
+        return borrow_view(view_cls, injected), False
+    return injected, False
+
+
 def _open_read_views(config, store: Store, papra, kreuzakt):
     """The three capabilities the app is built on, derived from what `serve` already owns.
 
@@ -866,13 +886,16 @@ def _open_read_views(config, store: Store, papra, kreuzakt):
     """
     ledger = LedgerReader(store.db_path)
     try:
-        papra_view = papra or PapraReader(config.papra_base_url, config.papra_api_key)
-        kreuzakt_view = kreuzakt or KreuzaktReader(config.kreuzakt_base_url)
+        papra_view, papra_owned = _view_for(
+            papra, PapraReader,
+            lambda: PapraReader(config.papra_base_url, config.papra_api_key))
+        kreuzakt_view, kz_owned = _view_for(
+            kreuzakt, KreuzaktReader, lambda: KreuzaktReader(config.kreuzakt_base_url))
     except BaseException:
         ledger.close()
         raise
-    owned = [view for view, injected in ((papra_view, papra), (kreuzakt_view, kreuzakt))
-             if not injected]
+    owned = [view for view, opened in ((papra_view, papra_owned), (kreuzakt_view, kz_owned))
+             if opened]
     return ledger, papra_view, kreuzakt_view, owned
 
 
@@ -889,8 +912,9 @@ async def run_mcp_listener(config, store: Store, *, papra=None, kreuzakt=None,
     two API clients: `serve`'s own `PapraClient` can patch a document and its `KreuzaktClient` can
     delete one, and neither capability may exist anywhere a tool call can reach. When a caller does
     not inject `papra`/`kreuzakt` they are built here from the same configuration and closed here —
-    the `owns_*` rule `serve` itself uses. An injected dependency is not trusted for it: it goes
-    through `build_mcp_app`'s refusal like any other.
+    the `owns_*` rule `serve` itself uses. An injected client is `serve`'s own and is borrowed
+    into a view rather than passed on raw: what reaches the app is the GET-only gate, never the
+    client the pipeline writes with, and the borrowed transport is not ours to close.
 
     The wait is on `{serving, stop}` with FIRST_COMPLETED, and that is the whole of the availability
     fix. Awaiting only `stop` — which `serve` always passes — meant a uvicorn that died left this
