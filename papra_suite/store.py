@@ -1170,13 +1170,15 @@ class Store:
         several rows — the live one plus the superseded history — so a caller must not read a row
         count as a document count.
 
-        Newest first is the table's own order, `rowid DESC`, and not `created_at DESC`. They are
-        the same answer — `enqueue_job` stamps `created_at` as it inserts, so the highest rowid is
-        the newest row — but only the rowid ordering is the order the rows are physically in, which
-        lets SQLite read the tail and stop at the limit instead of putting the whole queue, every
-        settled row it ever wrote included, into a temporary B-tree in order to print fifty lines.
-        It is also the stable one: a row's rowid never changes, so two reads of an unchanged table
-        cannot disagree about the order of one document's history.
+        Newest first here means most recently *inserted* first: `rowid DESC`, the table's own order,
+        not `created_at DESC`. `enqueue_job` stamps `created_at` as it inserts, so while the clock
+        runs forward the two orders coincide; the rowid ordering is the order the rows are
+        physically in, which lets SQLite read the tail and stop at the limit instead of putting the
+        whole queue, every settled row it ever wrote included, into a temporary B-tree in order to
+        print fifty lines. It is also the order that does not lean on a wall clock: a row's rowid
+        never changes, so two reads of an unchanged table cannot disagree, and a row written while a
+        corrected clock ran backwards is listed where it was written rather than where it was
+        stamped.
         """
         query = "SELECT * FROM jobs"
         clauses: list[str] = []

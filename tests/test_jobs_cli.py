@@ -564,17 +564,18 @@ def test_drain_refuses_filters_that_would_narrow_the_reading(store, capsys):
 def test_the_listing_prints_newest_first_after_the_rowid_ordering(store, capsys):
     """The queue view's contract, at the terminal rather than in the store.
 
-    `ORDER BY rowid DESC` replaced `ORDER BY created_at DESC, rowid DESC` to stop the bare listing
-    sorting the whole table, and the claim is that the operator sees the same page, in the same
-    order. `enqueue_job` stamps `created_at` as it inserts, so newest-last-inserted is both
-    orderings; this pins it where it is read, because that order is how an operator picks a row to
-    `--reset`.
+    `ORDER BY rowid DESC` replaced `ORDER BY created_at DESC, rowid DESC` to stop the bare listing —
+    no `--kind`, no `--status`, the first view an operator types — sorting the whole table. What it
+    owes the terminal is the same page newest-first, because that page is how a person picks the row
+    to name in `--reset`; the store-level pins cover the rows and the plan, this covers the column.
+    Deliberately the unfiltered listing: the ordering clause is shared by every shape of this read,
+    and the one that got cheaper is the one with no filters.
     """
-    first = seed_job(store, kind="index", document_id="doc-first")
-    second = seed_job(store, kind="index", document_id="doc-second")
+    first = seed_job(store, kind="ocr", document_id="doc-first")
+    second = seed_job(store, kind="title", document_id="doc-second")
     third = seed_job(store, kind="index", document_id="doc-third")
 
-    assert run_jobs(None, cli_args(kind="index"), store=store) == 0
+    assert run_jobs(None, cli_args(), store=store) == 0
 
     body = [line for line in capsys.readouterr().out.splitlines()
             if line.startswith(("yes\t", "no\t"))]

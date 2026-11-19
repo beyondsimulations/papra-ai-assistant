@@ -655,7 +655,8 @@ def test_the_bare_listing_read_does_not_sort_the_queue(store):
     The listing is the first thing an operator types in an incident, on a queue that also carries
     every settled row the system ever wrote. `ORDER BY created_at DESC` has no index behind it, so
     SQLite answers it by putting the whole table in a temporary B-tree before printing fifty rows;
-    the rowid ordering is the same newest-first answer taken straight from the table's own order.
+    the rowid ordering is newest-inserted-first, read straight from the table's own order, and
+    `enqueue_job` stamps `created_at` as it inserts, so it is that answer without the sort.
     """
     statements = _statements(store, lambda: store.list_jobs())
     plan = _plan(store, statements[-1])
