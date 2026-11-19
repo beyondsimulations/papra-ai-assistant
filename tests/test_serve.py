@@ -215,8 +215,10 @@ async def test_serve_spawns_sweep_loop(tmp_path, monkeypatch):
     import papra_suite.pipeline as pipeline_mod
     from papra_suite.pipeline import SweepResult
 
-    config = load_config({**BASE_ENV, "SWEEP_INTERVAL_S": "1",
-                          "DATA_DIR": str(tmp_path)})
+    config = load_config({**BASE_ENV, "SWEEP_INTERVAL_S": "1", "DATA_DIR": str(tmp_path),
+                          # Not the shipped default, so the assertion below cannot pass by both
+                          # sides reading the same constant: this is the operator's number.
+                          "PAPRA_MAX_DOCUMENT_BYTES": "1234"})
     store = Store(tmp_path / "state.db")
     store.migrate()
     store.create_org(papra_org_id="org_1", name="Org")  # no mailboxes
@@ -224,10 +226,12 @@ async def test_serve_spawns_sweep_loop(tmp_path, monkeypatch):
     stop = asyncio.Event()
     sweeps = []
 
-    async def sweep_once_and_stop(store_arg, papra, *, kreuzakt=None):
+    async def sweep_once_and_stop(store_arg, papra, *, kreuzakt=None, max_document_bytes=None):
         # `kreuzakt` is Task 9's: the sweep propagates deletions, so the double takes the
         # keyword the loop passes, and the assertion below pins serve handing it over.
-        sweeps.append((store_arg, kreuzakt))
+        # `max_document_bytes` is Task 17's for the same reason: a ceiling the daemon never
+        # forwards is a knob that does nothing while `serve` is what indexes the corpus.
+        sweeps.append((store_arg, kreuzakt, max_document_bytes))
         stop.set()  # end serve from within the FIRST sweep
         return SweepResult()
 
@@ -246,6 +250,8 @@ async def test_serve_spawns_sweep_loop(tmp_path, monkeypatch):
     assert len(sweeps) == 1  # the sweep ran once, then serve stopped
     assert sweeps[0][1] is not None, \
         "serve gave the sweep no kreuzakt client, so delete propagation would never run"
+    assert sweeps[0][2] == 1234, \
+        "serve did not forward PAPRA_MAX_DOCUMENT_BYTES, so the sweep refused at the default"
     assert not _dangling_serve_tasks()
     store.close()
 

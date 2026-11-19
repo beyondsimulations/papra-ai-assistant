@@ -411,6 +411,68 @@ async def test_reconcile_counts_what_it_cannot_enrol_when_papra_is_absent(
     assert "unledgered" in caplog.text and "papra" in caplog.text.lower()
 
 
+async def test_a_refused_enrolment_is_written_to_the_record(store):
+    """`--reindex-all` is one of the three places a document can be refused, so it writes the row.
+
+    Without this the record would be the sweep's and the backfill's report only, and `check` would
+    under-count for the one command an operator runs after raising `PAPRA_MAX_DOCUMENT_BYTES` and
+    finding the corpus still incomplete.
+    """
+    from papra_suite.oversized import oversized_seen
+
+    huge = seen_only(store, "doc-huge")
+    huge["originalSize"] = 400
+    papra = with_papra([huge])
+
+    result = await reconcile_generation(store, papra=papra, max_document_bytes=100)
+
+    assert result.skipped_oversized == 1
+    record = oversized_seen(store)
+    assert [(d.org_id, d.document_id, d.size) for d in record.documents] == [(ORG, "doc-huge", 400)]
+    assert record.limit == 100 and record.largest == 400
+
+
+async def test_a_refusal_discovered_in_the_body_is_recorded_too(store):
+    """A listing that declares no size is measured from the download, and that gate writes too."""
+    from papra_suite.oversized import oversized_seen
+    from tests.test_index_job import PDF_BYTES
+
+    row = seen_only(store, "doc-no-size", hash_=None)
+    row.pop("originalSize", None)
+    papra = with_papra([row])
+
+    result = await reconcile_generation(store, papra=papra, max_document_bytes=4)
+
+    assert result.skipped_oversized == 1 and papra.download_calls == 1
+    record = oversized_seen(store)
+    assert record.documents[0].size == len(PDF_BYTES) and record.limit == 4
+
+
+def test_the_rebuild_report_quotes_the_ceiling_that_ran(tmp_path, capsys):
+    """`over the N byte limit` has to be the operator's number, not this file's constant.
+
+    The line is what they act on — compress it, or raise the knob — and quoting 104857600 at someone
+    who set 524288000 sends them to fix the wrong thing.
+    """
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    store.create_org(papra_org_id=ORG, name="Org 1")
+    try:
+        huge = seen_only(store, "doc-huge")
+        huge["originalSize"] = 400
+        code = run_ledger(configuration(tmp_path, PAPRA_MAX_DOCUMENT_BYTES="100"),
+                          cli_args(reindex_all=True, yes_i_mean_it=True),
+                          store=store, papra=with_papra([huge]),
+                          kreuzakt=ScriptedHealth(status="ok"))
+    finally:
+        store.close()
+
+    out = capsys.readouterr().out
+    assert code == EXIT_INCOMPLETE or code == 0
+    assert "over the 100 byte limit" in out
+    assert "104857600" not in out
+
+
 async def test_enrolment_leaves_what_the_index_cannot_hold_out_and_names_it(store):
     """Z6's other half: zero is not the only acceptable remainder, but a remainder needs a name.
 

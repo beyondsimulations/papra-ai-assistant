@@ -12,11 +12,12 @@ from dataclasses import dataclass
 
 from papra_suite import indexing
 from papra_suite.allowlist import AllowList
-from papra_suite.config import ConfigError
+from papra_suite.config import OCR_MAX_DOCUMENT_BYTES, ConfigError
 from papra_suite.indexing import run_index_job, verify_once
 from papra_suite.kreuzakt_client import KreuzaktClient
 from papra_suite.llm_client import LLMClient
 from papra_suite.ocr import OCR_SYSTEM_PROMPT, assemble_markdown, page_count, render_page
+from papra_suite.oversized import clear_oversized_skip, record_oversized_skip
 from papra_suite.papra_client import PapraClient
 from papra_suite.store import TRUTHY_SETTING_VALUES, Job, Store
 from papra_suite.titles import generate_title
@@ -26,10 +27,15 @@ logger = logging.getLogger(__name__)
 SWEEP_PAGE_SIZE = 50
 MAX_SWEEP_PAGES = 100  # hard cap: a listing endpoint that ignores pageIndex must not loop forever
 DEFAULT_DOCUMENT_NAME = "document.pdf"
-# Upper bound on downloaded document bytes for OCR and the sweep's hash step:
-# a hostile/huge document must fail visibly (or be skipped via listing
-# metadata) instead of being pulled into memory unbounded.
-OCR_MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
+#: `OCR_MAX_DOCUMENT_BYTES` is imported above, from `config`, and is re-exported by this module:
+#: every consumer (`backfill_cli`, `ledger_cli`, the tests) already reads the name from here, and
+#: it is the DEFAULT behind the operator's `PAPRA_MAX_DOCUMENT_BYTES`, not the limit in force.
+#:
+#: One number for both of its consumers, deliberately: the OCR worker's memory guard below and the
+#: enrollment gate in the sweep, the backfill and `ledger` reconcile. A document over the limit is
+#: never enrolled, so it is never indexed either, and the operator's remedy is to compress it and
+#: re-upload to Papra — a separate index ceiling would only let the two surfaces disagree about a
+#: document this suite cannot read.
 #: The `settings` row that mirrors `PAPRA_LEGACY_WORKERS`. Like the delivery flags it is
 #: written from `Config` at every startup so the sweep, the intake path and the CLI ask
 #: the store rather than guessing about a process they cannot see.
@@ -202,8 +208,9 @@ async def run_ocr_job(papra: PapraClient, ocr_llm: LLMClient, job: Job, *,
     memory (~290MB for a crafted 50-page document).
     """
     pdf_bytes = await papra.download_file(job.papra_org_id, job.document_id)
-    if len(pdf_bytes) > OCR_MAX_DOCUMENT_BYTES:
-        raise ValueError(f"document too large for OCR: {len(pdf_bytes)} bytes")
+    if len(pdf_bytes) > config.max_document_bytes:
+        raise ValueError(f"document too large for OCR: {len(pdf_bytes)} bytes over "
+                         f"{config.max_document_bytes}")
     total = page_count(pdf_bytes)
     limit = min(total, config.ocr_max_pages)
     if total > config.ocr_max_pages:
@@ -436,7 +443,8 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     ), name="index-worker"))
     if config.sweep_interval_s > 0:
         tasks.append(asyncio.create_task(
-            _sweep_loop(store, papra, config.sweep_interval_s, kreuzakt=kreuzakt),
+            _sweep_loop(store, papra, config.sweep_interval_s, kreuzakt=kreuzakt,
+                        max_document_bytes=config.max_document_bytes),
             name="sweep"))
     # The convergence pass runs whether or not the gate is open, and says nothing while it
     # is shut: the gate is read per pass, so the loop being up is what makes a flag flip
@@ -688,10 +696,12 @@ def _log_deletion_counts(result: SweepResult) -> None:
 
 
 async def _sweep_loop(store: Store, papra: PapraClient, interval_s: int, *,
-                      kreuzakt: KreuzaktClient | None = None) -> None:
+                      kreuzakt: KreuzaktClient | None = None,
+                      max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> None:
     while True:
         try:
-            result = await sweep_once(store, papra, kreuzakt=kreuzakt)
+            result = await sweep_once(store, papra, kreuzakt=kreuzakt,
+                                      max_document_bytes=max_document_bytes)
             if result.documents_enqueued or result.non_pdf_skipped:
                 logger.info("sweep: %d checked, %d documents enqueued, %d non-pdf",
                             result.documents_checked, result.documents_enqueued,
@@ -844,7 +854,8 @@ def _is_pdf(document: dict) -> bool:
 
 
 async def sweep_once(store: Store, papra: PapraClient,
-                     *, kreuzakt: KreuzaktClient | None = None) -> SweepResult:
+                     *, kreuzakt: KreuzaktClient | None = None,
+                     max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> SweepResult:
     """Record and enqueue indexing for externally-ingested documents (decisions §4).
 
     Papra-native uploads — a PDF dropped into the web UI — are documents this process
@@ -911,7 +922,8 @@ async def sweep_once(store: Store, papra: PapraClient,
                 try:
                     if _is_pdf(document):
                         original_size = document.get("originalSize")
-                        if original_size is not None and original_size > OCR_MAX_DOCUMENT_BYTES:
+                        if (original_size is not None
+                                and original_size > max_document_bytes):
                             # Skip via listing metadata — never download the
                             # oversize body just to hash it. Recorded as seen:
                             # the skip is permanent, not retried every sweep.
@@ -921,11 +933,18 @@ async def sweep_once(store: Store, papra: PapraClient,
                                 mime=document.get("mimeType", "application/pdf"),
                                 ingested_via="sweep",
                             )
+                            # Written here, at the decision, because this is the only pass that will
+                            # ever look at this document again: `record_document_seen` above is what
+                            # makes the skip permanent, so the ledger never holds a row to hang the
+                            # reason on and the log line ages out of the ring buffer.
+                            record_oversized_skip(store, papra_org_id=org.papra_org_id,
+                                                  document_id=document_id, size=original_size,
+                                                  limit=max_document_bytes)
                             logger.warning(
                                 "sweep: skipping oversized document %s in org %s "
                                 "(%d bytes > %d)",
                                 document_id, org.papra_org_id,
-                                original_size, OCR_MAX_DOCUMENT_BYTES,
+                                original_size, max_document_bytes,
                             )
                             result.oversized_skipped += 1
                             continue
@@ -1095,6 +1114,11 @@ def enqueue_index_job(store: Store, *, papra_org_id: str, document_id: str,
     """
     if mime != "application/pdf":
         return ""
+    # First, because it is the enrollment that makes it true: this document now has a ledger row,
+    # so it is indexed and is no longer oversized. Leaving the entry behind would leave `check` and
+    # `index_status` naming a document the operator already fixed — a reason that outlives its
+    # problem, which is the failure mode of having a record at all.
+    clear_oversized_skip(store, papra_org_id=papra_org_id, document_id=document_id)
     store.ledger_upsert_reference(
         papra_org_id=papra_org_id, papra_document_id=document_id, file_hash=file_hash,
         papra_original_name=name or None,

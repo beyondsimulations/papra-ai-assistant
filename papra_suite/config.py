@@ -31,6 +31,9 @@ class AppConfig:
     ocr_dpi: int
     ocr_concurrency: int
     sweep_interval_s: int
+    #: The ceiling on one document's bytes, `PAPRA_MAX_DOCUMENT_BYTES`, default 100 MiB. One
+    #: number for both of its consumers — see `OCR_MAX_DOCUMENT_BYTES` for why they are not two.
+    max_document_bytes: int
     allowed_senders: "AllowList"
     # The index bridge. Both delivery flags default False: the bridge lands write-nothing,
     # and content/metadata write-back are switched on deliberately, per flag.
@@ -49,6 +52,20 @@ class AppConfig:
 
 
 DEFAULT_BIND = "127.0.0.1:8080"
+
+#: Upper bound on one document's bytes, and the default behind `PAPRA_MAX_DOCUMENT_BYTES`.
+#: Historical home: `papra_suite.pipeline`, which kept the name as a module attribute after the
+#: knob landed (it is still what the OCR worker's own memory guard reads), and this is where the
+#: number is now defined because `load_config` needs it and `pipeline` imports `config`, not the
+#: other way round.
+#:
+#: ONE number for two consumers, deliberately. It bounds (a) the bytes the OCR worker will pull
+#: into memory to render and (b) whether a document is enrolled in the ledger at all. They cannot
+#: sensibly disagree: a document over the limit is never enrolled, so it is never indexed either,
+#: and an index ceiling higher than the OCR ceiling would promise a population this suite has no
+#: way to read. The operator's remedy for a document over the ceiling is the one the README names:
+#: compress it and re-upload to Papra, after which the next pass enrols it.
+OCR_MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
 
 
 def _safe_echo(value: str) -> str:
@@ -384,6 +401,12 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
         ocr_dpi=_int_env(env, "OCR_DPI", 150),
         ocr_concurrency=min(_int_env(env, "OCR_CONCURRENCY", 3), 3),
         sweep_interval_s=_int_env(env, "SWEEP_INTERVAL_S", 300),
+        # `_positive_int_env`, the port's and the counters' parser: `10MB`, `1e8` and `-5` refuse
+        # with the bad value named rather than falling back to 100 MiB, which is the failure the
+        # operator would never see — they raise the ceiling to admit a big scan, the typo is
+        # swallowed, and the documents keep being refused at the default.
+        max_document_bytes=_positive_int_env(env, "PAPRA_MAX_DOCUMENT_BYTES",
+                                             OCR_MAX_DOCUMENT_BYTES),
         allowed_senders=allowed_senders,
         kreuzakt_base_url=_optional_base_url(env, "PAPRA_KREUZAKT_URL",
                                              "http://kreuzakt:3000"),

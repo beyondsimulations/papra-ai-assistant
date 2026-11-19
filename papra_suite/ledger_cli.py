@@ -48,6 +48,7 @@ from papra_suite.indexing import (
     run_cleanup,
 )
 from papra_suite.kreuzakt_client import KreuzaktClient, KreuzaktError
+from papra_suite.oversized import record_oversized_skip
 from papra_suite.papra_client import PapraClient, PapraError
 from papra_suite.pipeline import OCR_MAX_DOCUMENT_BYTES, _is_pdf, enqueue_index_job
 from papra_suite.store import DELIVERY_MAX_FAILURES, Store
@@ -107,6 +108,10 @@ class RebuildResult:
     skipped_deleted: int = 0
     skipped_non_pdf: int = 0
     skipped_oversized: int = 0
+    #: The ceiling this walk enforced, so the report line quotes the number that ran rather than the
+    #: one this file imported. `PAPRA_MAX_DOCUMENT_BYTES` is the operator's; the constant is its
+    #: default, and printing a default at somebody who changed the knob sends them to the wrong fix.
+    max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES
     read_errors: int = 0
     enrolment_attempted: bool = False
     aborted: str | None = None
@@ -143,8 +148,26 @@ def _enqueue_index(store: Store, *, org: str, document_id: str, file_hash: str, 
                              file_hash=file_hash, name=name, mime=mime,
                              ingested_via=ingested_via, legacy_ocr=False)
 
+def _refuse_oversized(store: Store, result: RebuildResult, *, where: str, org: str,
+                      document_id: str, size: int, limit: int) -> None:
+    """One document too big to enrol: counted, logged, and written down where `check` can read it.
+
+    The counting alone used to be the whole output, which meant the reason lived in a log line for a
+    pass that had already finished. A refused document has **no ledger row** — it is skipped before
+    enrollment — so without this write there is nothing in the database for `check` or the MCP
+    `index_status` tool to count, and the population stays as invisible as it was before this file
+    existed.
+    """
+    result.skipped_oversized += 1
+    record_oversized_skip(store, papra_org_id=org, document_id=document_id, size=size, limit=limit)
+    logger.warning("ledger reconcile: %s is %s bytes, over the %s byte limit, not enrolled and not "
+                   "indexed — compress it and re-upload to papra, or raise "
+                   "PAPRA_MAX_DOCUMENT_BYTES and run this command again", where, size, limit)
+
+
 async def reconcile_generation(store: Store, *, papra=None,
-                               page: int = RECONCILE_PAGE_SIZE) -> RebuildResult:
+                               page: int = RECONCILE_PAGE_SIZE,
+                               max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> RebuildResult:
     """Queue everything the index should hold and does not, without writing to anything.
 
     Two walks, because there are two ways for a document to be missing and only one of them has
@@ -176,9 +199,13 @@ async def reconcile_generation(store: Store, *, papra=None,
     consulting — and a health gate here would be worse than useless, because resuming an
     interrupted queueing pass during an index outage is exactly when it is most needed. The gate
     belongs to the command that bumps the generation, and it is in `rebuild_index`.
+
+    `max_document_bytes` is the operator's `PAPRA_MAX_DOCUMENT_BYTES`, passed by `run_ledger` and
+    forwarded to the enrolment walk below. The default is the number the knob defaults to, so an
+    un-wired caller refuses what an operator gets by default rather than something else.
     """
     generation = store.get_generation()
-    result = RebuildResult(generation=generation)
+    result = RebuildResult(generation=generation, max_document_bytes=max_document_bytes)
 
     cursor: tuple[str, str] | None = None
     while True:
@@ -233,7 +260,8 @@ async def reconcile_generation(store: Store, *, papra=None,
         if not candidates:
             break
         for row in candidates:
-            await _enrol_one(store, papra, row, generation, result)
+            await _enrol_one(store, papra, row, generation, result,
+                             max_document_bytes=max_document_bytes)
         cursor = (candidates[-1].papra_org_id, candidates[-1].papra_document_id)
     return _finish(store, result)
 
@@ -249,7 +277,8 @@ def _finish(store: Store, result: RebuildResult) -> RebuildResult:
     return result
 
 async def _enrol_one(store: Store, papra, row, generation: int,
-                     result: RebuildResult) -> None:
+                     result: RebuildResult, *,
+                     max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> None:
     """Turn one seen-but-unledgered document into a reference plus queued work.
 
     Every early return is a document this pass is leaving out on purpose, and each one increments
@@ -279,21 +308,21 @@ async def _enrol_one(store: Store, papra, row, generation: int,
                     where, record.get("mimeType") or row.mime or "an unknown type")
         return
     declared = record.get("originalSize")
-    if declared is not None and declared > OCR_MAX_DOCUMENT_BYTES:
+    if declared is not None and declared > max_document_bytes:
         # Refused on the size Papra declared, without fetching the body. The resource limit is
         # the reason this population was invisible in the first place, and paying the transfer to
         # rediscover it is how a rebuild becomes the incident it was meant to fix.
-        result.skipped_oversized += 1
-        logger.warning("ledger reconcile: %s is %s bytes, over the %s byte limit, not enrolled",
-                       where, declared, OCR_MAX_DOCUMENT_BYTES)
+        _refuse_oversized(store, result, where=where, org=row.papra_org_id,
+                          document_id=row.papra_document_id, size=declared,
+                          limit=max_document_bytes)
         return
     file_hash = record.get("originalSha256Hash")
     if not file_hash:
         body = await papra.download_file(row.papra_org_id, row.papra_document_id)
-        if len(body) > OCR_MAX_DOCUMENT_BYTES:
-            result.skipped_oversized += 1
-            logger.warning("ledger reconcile: %s downloaded %s bytes, over the %s byte limit, "
-                           "not enrolled", where, len(body), OCR_MAX_DOCUMENT_BYTES)
+        if len(body) > max_document_bytes:
+            _refuse_oversized(store, result, where=where, org=row.papra_org_id,
+                              document_id=row.papra_document_id, size=len(body),
+                              limit=max_document_bytes)
             return
         file_hash = hashlib.sha256(body).hexdigest()
     job_id = _enqueue_index(
@@ -310,7 +339,8 @@ async def _enrol_one(store: Store, papra, row, generation: int,
 
 
 async def rebuild_index(store: Store, kz: KreuzaktClient, *, papra=None,
-                        page: int = RECONCILE_PAGE_SIZE) -> RebuildResult:
+                        page: int = RECONCILE_PAGE_SIZE,
+                        max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> RebuildResult:
     """Throw the current ids away, then queue everything that needs new ones.
 
     **The health gate comes first, before any state changes.** `bump_generation` is a one-row
@@ -340,7 +370,8 @@ async def rebuild_index(store: Store, kz: KreuzaktClient, *, papra=None,
             "bad moment into an outage of search, because the re-queued work has nowhere to go")
 
     store.bump_generation()
-    return await reconcile_generation(store, papra=papra, page=page)
+    return await reconcile_generation(store, papra=papra, page=page,
+                                      max_document_bytes=max_document_bytes)
 
 def add_subparser(subparsers) -> None:
     """Register `ledger` on the entry point's subparser table."""
@@ -422,9 +453,11 @@ def run_ledger(config, args, *, store: Store | None = None, papra=None,
         if owns_kreuzakt:
             kreuzakt = KreuzaktClient(config.kreuzakt_base_url)
         if args.requeue:
-            command = partial(_requeue, store, papra, args)
+            command = partial(_requeue, store, papra, args,
+                              max_document_bytes=config.max_document_bytes)
         elif args.reindex_all:
-            command = partial(_reindex_all, store, kreuzakt, papra, args)
+            command = partial(_reindex_all, store, kreuzakt, papra, args,
+                              max_document_bytes=config.max_document_bytes)
         else:
             command = partial(_cleanup, store, papra, kreuzakt, args)
         to_close = [client for client, owned in ((papra, owns_papra), (kreuzakt, owns_kreuzakt))
@@ -557,7 +590,9 @@ def _report(result: RebuildResult) -> int:
         # line that exists to say *which* documents stayed outside the index.
         print("left out of the index on purpose: "
               f"{result.skipped_deleted} in papra's trash, {result.skipped_non_pdf} not a pdf, "
-              f"{result.skipped_oversized} over the {OCR_MAX_DOCUMENT_BYTES} byte limit")
+              f"{result.skipped_oversized} over the {result.max_document_bytes} byte limit "
+              "(`papra-suite check` counts them; compress and re-upload to papra, or raise "
+              "PAPRA_MAX_DOCUMENT_BYTES)")
     if result.unledgered:
         print(f"still unledgered: {result.unledgered} — the populations above, plus anything "
               "papra would not describe")
@@ -570,7 +605,8 @@ def _report(result: RebuildResult) -> int:
     return EXIT_OK if result.complete else EXIT_INCOMPLETE
 
 
-async def _requeue(store: Store, papra, args) -> int:
+async def _requeue(store: Store, papra, args, *,
+                   max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> int:
     """Queue what the current generation calls un-indexed, and bump nothing.
 
     The other half of `--reindex-all`, and it has to be a separate command because the two differ
@@ -590,7 +626,8 @@ async def _requeue(store: Store, papra, args) -> int:
               f"{stats['stale']} stale reference(s) and try {stats['unledgered']} unledgered "
               "document(s)")
         return EXIT_OK
-    result = await reconcile_generation(store, papra=papra)
+    result = await reconcile_generation(store, papra=papra,
+                                        max_document_bytes=max_document_bytes)
     if not result.stale and not result.enrolled:
         print(f"generation {result.generation}: nothing is stale, so nothing was queued "
               f"({stats['indexed_current']} of {stats['references']} reference(s) are indexed "
@@ -598,7 +635,8 @@ async def _requeue(store: Store, papra, args) -> int:
     return _report(result)
 
 
-async def _reindex_all(store: Store, kreuzakt: KreuzaktClient, papra, args) -> int:
+async def _reindex_all(store: Store, kreuzakt: KreuzaktClient, papra, args, *,
+                       max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> int:
     """Confirm, gate, bump, queue. In that order, because each step is dearer than the last.
 
     The confirmation names the cost in the currency the operator is spending: queue entries, and,
@@ -623,7 +661,8 @@ async def _reindex_all(store: Store, kreuzakt: KreuzaktClient, papra, args) -> i
               "Run with --yes-i-mean-it")
         return EXIT_INCOMPLETE
     try:
-        result = await rebuild_index(store, kreuzakt, papra=papra)
+        result = await rebuild_index(store, kreuzakt, papra=papra,
+                                    max_document_bytes=max_document_bytes)
     except RuntimeError as error:
         print(f"ledger refused: {error}", file=sys.stderr)
         return EXIT_REFUSED

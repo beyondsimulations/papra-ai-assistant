@@ -258,6 +258,31 @@ async def test_run_ocr_job_rejects_oversized_document(store, config):
     assert papra.content_updates == []
 
 
+async def test_run_ocr_job_refuses_at_the_configured_ceiling_not_the_constant(store):
+    """`PAPRA_MAX_DOCUMENT_BYTES` is what the OCR worker obeys, not the import-time constant.
+
+    A real (small) PDF and a ceiling of eight bytes, because the mutation this pins is "keep using
+    `OCR_MAX_DOCUMENT_BYTES`": at the shipped 100 MiB default that mutation is indistinguishable
+    from correct wiring unless a test asks with a different number.
+    """
+    import fitz
+
+    pdf = fitz.open()
+    pdf.new_page()
+    pdf_bytes = pdf.tobytes()
+    pdf.close()
+    papra = StubPapra(pdf_bytes)
+    llm, calls = make_llm(["# md"])
+    tight = load_config({**BASE_ENV, "DATA_DIR": "/tmp/x", "PAPRA_MAX_DOCUMENT_BYTES": "8"})
+
+    with pytest.raises(ValueError, match="too large"):
+        await run_ocr_job(papra, llm, make_job(store), config=tight)
+
+    assert calls["n"] == 0
+    assert papra.content_updates == []
+    assert len(pdf_bytes) > 8, "the fixture has to be over the ceiling"
+
+
 def test_on_job_done_enqueues_title_job(store):
     job = make_job(store)
     on_job_done(store, job, ocr_result="# Rechnung\n\nInhalt")
@@ -1271,3 +1296,66 @@ async def test_sweep_skips_oversized_document(store, caplog):
     assert papra.download_calls == 0  # never downloaded the huge body
     assert any("oversized" in record.getMessage() and "doc_big" in record.getMessage()
                for record in caplog.records)
+
+
+class SizedPdfPapra(StubPapra):
+    """A listing that declares `originalSize` for every pdf, so a ceiling has something to read.
+
+    `StubPapra`'s rows carry no size at all, which is a shape a compliant Papra does serve — and a
+    test that passed a ceiling to a listing without sizes would prove nothing about the ceiling.
+    """
+
+    def __init__(self, **sizes):
+        super().__init__()
+        self.download_calls = 0
+        self.documents = {"org_1": {
+            doc_id: {"id": doc_id, "name": f"{doc_id}.pdf", "mimeType": "application/pdf",
+                     "originalSize": size, "originalSha256Hash": "ab" * 32}
+            for doc_id, size in sizes.items()
+        }}
+
+    async def download_file(self, org_id, document_id):
+        self.download_calls += 1
+        return self.pdf
+
+
+async def test_the_sweep_records_the_refusal_it_made(store):
+    """The sweep sees an oversized document ONCE and never again, so it has to write it down.
+
+    It marks the document seen precisely so it stops looking, so after this pass the skip exists
+    nowhere except in the record: no ledger row, no job, no sighting that means anything, and a log
+    line that ages out of the ring buffer. `papra-suite check` and `index_status` can print the
+    reason only if the pass recorded it at the moment it decided.
+    """
+    from papra_suite.oversized import oversized_seen
+
+    papra = SizedPdfPapra(doc_big=150, doc_small=10)
+
+    result = await sweep_once(store, papra, max_document_bytes=100)
+
+    assert result.oversized_skipped == 1 and result.errors == 0
+    record = oversized_seen(store)
+    assert record.count == 1
+    assert [(d.org_id, d.document_id, d.size) for d in record.documents] == [
+        ("org_1", "doc_big", 150)]
+    assert record.limit == 100 and record.largest == 150
+    # The one that fit went in as usual; the big one is enrolled by nothing, and never downloaded.
+    assert result.documents_enqueued == 1
+    assert store.ledger_get("org_1", "doc_big") is None
+    assert papra.download_calls == 0
+
+
+async def test_the_sweep_obeys_the_configured_ceiling_not_the_imported_constant(store):
+    """A 200-byte document under a 10-byte ceiling is oversized.
+
+    At the shipped default the constant and the knob agree, so only a test that passes a different
+    number can tell "read the config" from "read the module attribute".
+    """
+    from papra_suite.oversized import oversized_seen
+
+    result = await sweep_once(store, SizedPdfPapra(doc_big=200), max_document_bytes=10)
+
+    assert result.oversized_skipped == 1 and result.documents_enqueued == 0
+    assert oversized_seen(store).limit == 10
+    # ...and the default ceiling admits the same document.
+    assert (await sweep_once(store, SizedPdfPapra(doc_big=200))).oversized_skipped == 0

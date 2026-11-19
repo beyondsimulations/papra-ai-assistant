@@ -176,8 +176,20 @@ def ocr_jobs(store):
     return [job for job in store.list_jobs(limit=500) if job.kind == "ocr"]
 
 
-def run(store, papra, **over):
-    return run_backfill(None, cli_args(**over), store=store, papra=papra)
+def run(store, papra, *, config=None, max_document_bytes=None, **over):
+    """One CLI invocation, with a real `Config` because the command reads a value out of it.
+
+    `PAPRA_MAX_DOCUMENT_BYTES` is that value, so `max_document_bytes=` here is the operator's knob
+    and `max_document_bytes=` on `backfill_corpus` is the same ceiling one level down.
+    """
+    if config is None:
+        from papra_suite.config import load_config
+
+        env = dict(BASE_ENV)
+        if max_document_bytes is not None:
+            env["PAPRA_MAX_DOCUMENT_BYTES"] = str(max_document_bytes)
+        config = load_config({**env, "DATA_DIR": "/tmp/x"})
+    return run_backfill(config, cli_args(**over), store=store, papra=papra)
 
 
 # --- the rehearsal, and the eligibility rule it rehearses -------------------------
@@ -455,22 +467,103 @@ async def test_a_listing_without_a_hash_is_hashed_from_the_body(store):
     assert index_jobs(store)[0].content_hash == hashlib.sha256(PDF_BYTES).hexdigest()
 
 
-async def test_a_document_too_big_to_hash_is_refused_after_the_download(store, monkeypatch):
+async def test_a_document_too_big_to_hash_is_refused_after_the_download(store):
     """The re-check on measured bytes, at a size a test can afford.
 
-    The constant is patched rather than the body inflated: the branch under test is "the download
-    turned out to be over the limit", and allocating 100 MB per test would make the suite slower
-    without testing anything the small version does not.
+    The ceiling is passed in at eight bytes rather than the body inflated: the branch under test is
+    "the download turned out to be over the limit", and allocating 100 MB per test would make the
+    suite slower without testing anything the small version does not. Passing it, rather than
+    monkeypatching a module constant, is also what makes this a test of the wiring and not of a name
+    some other module happens to hold.
     """
-    monkeypatch.setattr("papra_suite.backfill_cli.OCR_MAX_DOCUMENT_BYTES", 8)
     papra = FakeListing()
     papra.add("doc-quiet-huge", content_hash=None)
     papra.body = b"x" * 9
 
-    result = await backfill_corpus(store, papra, orgs=[ORG])
+    result = await backfill_corpus(store, papra, orgs=[ORG], max_document_bytes=8)
 
     assert (result.asked_for, result.skipped_oversized) == (0, 1)
     assert store.list_jobs() == []
+
+
+async def test_a_refused_document_is_written_to_the_record_at_the_moment_of_the_skip(store):
+    """`check` counts these; it can only do that if the walk wrote them down.
+
+    An oversized document has no ledger row — it is refused before enrollment — so there is nothing
+    for a count to read afterwards. The skip is the last moment anyone knows about it.
+    """
+    from papra_suite.oversized import oversized_seen
+
+    papra = FakeListing()
+    papra.add("doc-huge", size=OCR_MAX_DOCUMENT_BYTES + 1)
+    papra.add("doc-quiet-huge", content_hash=None)
+    papra.body = b"x" * 9      # only reachable by the download leg, under the ceiling below
+
+    await backfill_corpus(store, papra, orgs=[ORG])
+
+    record = oversized_seen(store)
+    assert record.count == 1, "the declared-size refusal is the one this walk made"
+    assert record.documents[0].document_id == "doc-huge"
+    assert record.documents[0].size == OCR_MAX_DOCUMENT_BYTES + 1
+    assert record.limit == OCR_MAX_DOCUMENT_BYTES
+
+
+async def test_a_refusal_after_the_download_is_recorded_too(store):
+    """Two gates, one record. The measured body is the truer of the two sizes."""
+    from papra_suite.oversized import oversized_seen
+
+    papra = FakeListing()
+    papra.add("doc-quiet-huge", content_hash=None)
+    papra.body = b"x" * 9
+
+    await backfill_corpus(store, papra, orgs=[ORG], max_document_bytes=8)
+
+    record = oversized_seen(store)
+    assert [(d.document_id, d.size) for d in record.documents] == [("doc-quiet-huge", 9)]
+    assert record.limit == 8
+
+
+def test_a_dry_run_names_every_refused_document_with_its_size(store, capsys):
+    """The rehearsal has to say what it would refuse, or the operator learns it from the real run.
+
+    This population is the one the pre-handover corpus left behind, and until now the only place it
+    appeared was a WARNING per document in a log line nobody reads. No dashboard ships yet, so
+    `backfill --dry-run` and `check` are the surfaces.
+    """
+    from papra_suite.oversized import oversized_seen
+
+    papra = FakeListing()
+    papra.add("doc-big", size=400)
+    papra.add("doc-bigger", size=500)
+
+    assert run(store, papra, dry_run=True, max_document_bytes=100) == EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "org-a/doc-big (400 bytes)" in out
+    assert "org-a/doc-bigger (500 bytes)" in out
+    assert "2" in out and "100" in out
+    assert oversized_seen(store).count == 0, "a dry run records nothing, reasons included"
+
+
+def test_the_named_refusals_are_bounded_and_the_total_is_printed(store, capsys):
+    """A backlog of 400 scans must not become 400 lines in a terminal.
+
+    The cap is stated on the line that carries it, and the total comes from the counter rather than
+    from the listing — a number read out of a capped list can only ever shorten.
+    """
+    from papra_suite.backfill_cli import OVERSIZED_NAMES_SHOWN
+
+    papra = FakeListing()
+    for index in range(OVERSIZED_NAMES_SHOWN + 5):
+        papra.add(f"doc-{index}", size=200 + index)
+
+    assert run(store, papra, max_document_bytes=100) == EXIT_OK
+
+    out = capsys.readouterr().out
+    assert f"{OVERSIZED_NAMES_SHOWN} of 15" in out
+    assert "doc-0 (200 bytes)" in out
+    assert f"doc-{OVERSIZED_NAMES_SHOWN} (210 bytes)" not in out, "the cap has to be a cap"
+    assert "15" in out and "largest 214" in out
 
 
 # --- the walk itself ---------------------------------------------------------------
@@ -766,7 +859,7 @@ def test_an_empty_scope_is_refused_rather_than_reported_as_finished(tmp_path, ca
     blank = Store(tmp_path / "blank.db")
     blank.migrate()
     try:
-        code = run_backfill(None, cli_args(), store=blank, papra=FakeListing())
+        code = run(blank, FakeListing())
     finally:
         blank.close()
 

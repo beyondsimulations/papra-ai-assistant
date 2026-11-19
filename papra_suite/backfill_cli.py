@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 
 from papra_suite.indexing import IndexFailed, papra_document_is_deleted
 from papra_suite.kreuzakt_client import KreuzaktError
+from papra_suite.oversized import record_oversized_skip
 from papra_suite.papra_client import PapraClient, PapraError
 from papra_suite.pipeline import (
     OCR_MAX_DOCUMENT_BYTES,
@@ -90,6 +91,12 @@ CURRENT = "current"
 STALE = "stale"
 UNLEDGERED = "unledgered"
 DELETED = "deleted"
+
+#: How many refused documents one run names. The counter prints the total and this prints a list an
+#: operator can read; a corpus with 400 scans in it would otherwise bury its own summary in 400
+#: lines of ids. The cap is stated on the line that carries it, because a truncated list that does
+#: not say it was truncated is a shorter list of lies.
+OVERSIZED_NAMES_SHOWN = 10
 
 
 @dataclass
@@ -139,6 +146,16 @@ class BackfillResult:
     skipped_oversized: int = 0
     needs_download: int = 0
     remaining: int = 0
+    #: The ceiling this walk enforced — printed, never assumed. A run under a raised
+    #: `PAPRA_MAX_DOCUMENT_BYTES` that quoted the default would tell the operator their own setting
+    #: was not in force. The summary line and the named list both quote this field, so they cannot
+    #: disagree with each other.
+    max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES
+    #: The biggest refusal this run saw. Tracked beside the capped list below for the reason the
+    #: stored record tracks it: the largest is the one most likely to fall off a cap.
+    oversized_largest: int = 0
+    #: The refused documents this run named, newest last, held to `OVERSIZED_NAMES_SHOWN`.
+    oversized: list[tuple[str, str, int]] = field(default_factory=list)
     unreadable: list[str] = field(default_factory=list)
     read_errors: list[str] = field(default_factory=list)
     aborted: str | None = None
@@ -310,9 +327,44 @@ def _queue(store: Store, org: str, document_id: str, *, file_hash: str, name: st
                 result.generation)
 
 
+def _refuse_oversized(store: Store, result: BackfillResult, *, org: str, document_id: str,
+                      size: int, limit: int, dry_run: bool) -> None:
+    """One document that is too big: counted, named, and — unless this is a rehearsal — recorded.
+
+    Three outputs, because three things are true at once:
+
+    * the counter says how many this run refused, and it is a counter rather than the length of the
+      named list, so a 400-scan corpus cannot print "10";
+    * the run's own output names them with their sizes, because this is the moment the operator is
+      reading, and the size is the whole reason (`backfill --dry-run` is how that population was
+      discovered in the first place);
+    * the durable record gets the row, because a document refused here has **no ledger row** — it is
+      skipped before enrollment — so there is nothing else in the database left for `check` or
+      `index_status` to count afterwards.
+
+    A `--dry-run` writes nothing, the record included: what a rehearsal promises is that no queue,
+    ledger or seen state changes, and a settings row is state. It still names them, which is the
+    whole point of asking.
+    """
+    result.skipped_oversized += 1
+    result.oversized_largest = max(result.oversized_largest, size)
+    if len(result.oversized) < OVERSIZED_NAMES_SHOWN:
+        # The FIRST ones this run met, not the last: the line reads as "the head of the corpus is
+        # full of scans", and the counter beside it carries the total either way.
+        result.oversized.append((org, document_id, size))
+    if not dry_run:
+        record_oversized_skip(store, papra_org_id=org, document_id=document_id, size=size,
+                              limit=limit)
+    logger.warning("backfill: %s/%s is %s bytes, over the %s byte limit, not enrolled and not "
+                   "indexed — compress it and re-upload to papra, or raise "
+                   "PAPRA_MAX_DOCUMENT_BYTES and run this command again", org, document_id, size,
+                   limit)
+
+
 async def _consider(store: Store, papra, org: str, document: dict, generation: int,
                     budget: _Budget, decided: set, result: BackfillResult, *,
-                    dry_run: bool) -> None:
+                    dry_run: bool,
+                    max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> None:
     """One listing row, one verdict, counted in the bucket that says why.
 
     The order of the tests is the order of their cost: Papra's trash and non-PDFs are decided from
@@ -353,13 +405,12 @@ async def _consider(store: Store, papra, org: str, document: dict, generation: i
         result.already_current += 1
         return
     declared = document.get("originalSize")
-    if declared is not None and declared > OCR_MAX_DOCUMENT_BYTES:
+    if declared is not None and declared > max_document_bytes:
         # Refused on the size Papra declared, without fetching the body: this limit is the reason
         # the population was invisible in the first place, and paying the transfer to rediscover it
         # is how a backfill becomes the incident it was meant to fix.
-        result.skipped_oversized += 1
-        logger.warning("backfill: %s/%s is %s bytes, over the %s byte limit, not queued", org,
-                       document_id, declared, OCR_MAX_DOCUMENT_BYTES)
+        _refuse_oversized(store, result, org=org, document_id=document_id, size=declared,
+                          limit=max_document_bytes, dry_run=dry_run)
         return
 
     file_hash = document.get("originalSha256Hash")
@@ -379,10 +430,9 @@ async def _consider(store: Store, papra, org: str, document: dict, generation: i
                              "not queued and the bucket was not fully walked — run the command "
                              "again once it answers", org, document_id, error)
                 return
-            if len(body) > OCR_MAX_DOCUMENT_BYTES:
-                result.skipped_oversized += 1
-                logger.warning("backfill: %s/%s downloaded %s bytes, over the %s byte limit, not "
-                               "queued", org, document_id, len(body), OCR_MAX_DOCUMENT_BYTES)
+            if len(body) > max_document_bytes:
+                _refuse_oversized(store, result, org=org, document_id=document_id,
+                                  size=len(body), limit=max_document_bytes, dry_run=dry_run)
                 return
             file_hash = hashlib.sha256(body).hexdigest()
     if not budget.allows():
@@ -395,7 +445,8 @@ async def _consider(store: Store, papra, org: str, document: dict, generation: i
 
 async def _walk_listing(store: Store, papra, org: str, generation: int, budget: _Budget,
                         decided: set, result: BackfillResult, *, page: int,
-                        dry_run: bool) -> str | None:
+                        dry_run: bool,
+                        max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> str | None:
     """Page through one bucket until a short page ends it. Returns why it stopped early.
 
     Pagination is by page index because enqueuing never creates a Papra document, so the listing is
@@ -418,7 +469,7 @@ async def _walk_listing(store: Store, papra, org: str, generation: int, budget: 
             return moved
         for document in documents:
             await _consider(store, papra, org, document, generation, budget, decided, result,
-                            dry_run=dry_run)
+                            dry_run=dry_run, max_document_bytes=max_document_bytes)
         if len(documents) < page:
             return None
         page_index += 1
@@ -465,7 +516,8 @@ def _queue_stale_references(store: Store, org: str, generation: int, budget: _Bu
 
 async def backfill_corpus(store: Store, papra, *, orgs: list[str], limit: int | None = None,
                           all_stale: bool = False, page: int = LISTING_PAGE_SIZE,
-                          dry_run: bool = False) -> BackfillResult:
+                          dry_run: bool = False,
+                          max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> BackfillResult:
     """Queue everything the index should hold and does not, in the buckets this store knows.
 
     Two walks per bucket, because there are two ways to be missing: Papra's listing (the documents
@@ -475,16 +527,23 @@ async def backfill_corpus(store: Store, papra, *, orgs: list[str], limit: int | 
     counted a second time by the ledger walk, and a remainder printed twice would be a remainder
     that never empties.
 
-    `dry_run` performs neither walk's writes: no job, no reference, no seen record, and no
-    downloads either — a rehearsal that transfers the corpus to count it is not a rehearsal.
+    `dry_run` performs neither walk's writes: no job, no reference, no seen record, no oversized
+    record, and no downloads either — a rehearsal that transfers the corpus to count it is not a
+    rehearsal. It still names what it would refuse, because that is what the rehearsal is for.
+
+    `max_document_bytes` is the operator's `PAPRA_MAX_DOCUMENT_BYTES`, which the CLI passes and the
+    result echoes back on every line that quotes a ceiling: the default here is the same number the
+    knob defaults to, so an un-wired caller refuses what an operator gets by default rather than
+    something else.
     """
     generation = store.get_generation()
-    result = BackfillResult(generation=generation)
+    result = BackfillResult(generation=generation, max_document_bytes=max_document_bytes)
     budget = _Budget(limit)
     decided: set[tuple[str, str]] = set()
     for org in orgs:
         stopped = await _walk_listing(store, papra, org, generation, budget, decided, result,
-                                      page=page, dry_run=dry_run)
+                                      page=page, dry_run=dry_run,
+                                      max_document_bytes=max_document_bytes)
         if stopped:
             result.aborted = stopped
             return result
@@ -553,7 +612,22 @@ def _report(store: Store, args, result: BackfillResult) -> int:
     print(f"  {result.listed} document(s) listed; {result.already_current} already current in the "
           f"ledger, {result.skipped_non_pdf} not a pdf, {result.skipped_deleted} in papra's trash "
           "or queued for deletion, "
-          f"{result.skipped_oversized} over the {OCR_MAX_DOCUMENT_BYTES} byte limit")
+          f"{result.skipped_oversized} over the {result.max_document_bytes} byte limit")
+    if result.skipped_oversized:
+        # Named, with the cap and the total on the same line. This is the population the
+        # operator can act on — compress it and re-upload — and no dashboard ships yet, so this
+        # command and
+        # `papra-suite check` are the only two places it is written down.
+        print(f"  oversized: {result.skipped_oversized} document(s) over "
+              f"{result.max_document_bytes} bytes are not enrolled and not indexed "
+              f"(largest {result.oversized_largest}). Compress them and re-upload to papra, or "
+              "raise PAPRA_MAX_DOCUMENT_BYTES and run this command again — `papra-suite check` "
+              "counts them between runs")
+        named = ", ".join(f"{org}/{document_id} ({size} bytes)"
+                          for org, document_id, size in result.oversized)
+        cap = (f" — first {len(result.oversized)} of {result.skipped_oversized} named here"
+               if result.skipped_oversized > len(result.oversized) else "")
+        print(f"    {named}{cap}")
     if result.enrolled or result.stale_queued:
         # `new_rows`, not `asked_for`: `enrolled` and `stale_queued` partition the rows this run
         # took, and an absorbed document belongs to neither bucket.
@@ -562,12 +636,13 @@ def _report(store: Store, args, result: BackfillResult) -> int:
               "generation calls un-indexed")
     if result.needs_download:
         print(f"  {result.needs_download} candidate(s) carry no content hash in the listing: each "
-              "is downloaded and hashed before it is queued, and refused if it is over the limit"
+              "is downloaded and hashed before it is queued, and refused if it is over the "
+              f"{result.max_document_bytes} byte limit"
               + (" (a dry run does not download them)" if args.dry_run else ""))
     print("  " + _cost_line(store))
     if args.dry_run:
-        print("  dry run: nothing was queued, no ledger row was written and no document was marked "
-              "seen")
+        print("  dry run: nothing was queued, no ledger row was written, no document was marked "
+              "seen and no record of refused documents was written")
     if result.already_queued:
         print(f"  {result.already_queued} candidate(s) were already queued under a live row and "
               "were left alone — the cap counts new rows, so this run went on to the next "
@@ -586,7 +661,8 @@ def _report(store: Store, args, result: BackfillResult) -> int:
     return EXIT_OK if result.complete else EXIT_INCOMPLETE
 
 
-async def _execute(store: Store, papra, args, orgs, to_close) -> int:
+async def _execute(store: Store, papra, args, orgs, to_close,
+                   max_document_bytes: int = OCR_MAX_DOCUMENT_BYTES) -> int:
     """Walk, report, then close the clients on the loop that used them.
 
     The `finally` is inside the coroutine, so it runs before `asyncio.run` closes the loop — the
@@ -598,7 +674,8 @@ async def _execute(store: Store, papra, args, orgs, to_close) -> int:
     """
     try:
         result = await backfill_corpus(store, papra, orgs=orgs, limit=args.limit,
-                                       all_stale=args.all_stale, dry_run=args.dry_run)
+                                       all_stale=args.all_stale, dry_run=args.dry_run,
+                                       max_document_bytes=max_document_bytes)
         return _report(store, args, result)
     finally:
         for client in to_close:
@@ -658,7 +735,8 @@ def run_backfill(config, args, *, store: Store | None = None, papra=None) -> int
         if owns_papra:
             papra = PapraClient(config.papra_base_url, config.papra_api_key)
         to_close = [papra] if owns_papra and getattr(papra, "aclose", None) is not None else []
-        return asyncio.run(_execute(store, papra, args, orgs, to_close))
+        return asyncio.run(_execute(store, papra, args, orgs, to_close,
+                                    config.max_document_bytes))
     except READ_ERRORS as error:
         # The store's own integrity refusals (`get_generation` on a corrupt `index_generation`), a
         # database that is locked or busy, and anything a client raised before the walk could guard

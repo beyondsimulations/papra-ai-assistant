@@ -598,3 +598,45 @@ def test_index_whitespace_only_env_falls_back_to_the_default():
 
     assert config.index_wait_timeout_s == 900
     assert config.kreuzakt_base_url == "http://kreuzakt:3000"
+
+
+# --- PAPRA_MAX_DOCUMENT_BYTES: one operator-facing ceiling, strictly parsed ----------------
+
+
+def test_max_document_bytes_defaults_to_the_ocr_ceiling():
+    """The env knob and the OCR constant are one number, and the constant is its default."""
+    from papra_suite.pipeline import OCR_MAX_DOCUMENT_BYTES
+
+    config = load_config({**BASE_ENV})
+
+    assert OCR_MAX_DOCUMENT_BYTES == 104857600
+    assert config.max_document_bytes == OCR_MAX_DOCUMENT_BYTES
+
+
+def test_max_document_bytes_honours_what_the_operator_set():
+    config = load_config({**BASE_ENV, "PAPRA_MAX_DOCUMENT_BYTES": "1048576"})
+
+    assert config.max_document_bytes == 1048576
+
+
+@pytest.mark.parametrize("bad", ["10MB", "1e8", "-5", "0", "twelve", "10 MB", "100_000_000b"])
+def test_a_malformed_max_document_bytes_refuses_and_names_the_value(bad):
+    """A typo must refuse, never silently fall back to 100 MiB.
+
+    The rule is the delivery flags' and the ports': a value that cannot be used as given is a
+    startup error naming itself. Here the silent version would be worse than a wrong port — the
+    operator raises the ceiling to index a big scan, the typo is swallowed, and the documents keep
+    being refused at the default with nothing in the log saying the knob was never read.
+    """
+    with pytest.raises(ConfigError) as caught:
+        load_config({**BASE_ENV, "PAPRA_MAX_DOCUMENT_BYTES": bad})
+
+    assert "PAPRA_MAX_DOCUMENT_BYTES" in str(caught.value)
+    assert bad in str(caught.value)
+
+
+def test_whitespace_only_max_document_bytes_falls_back_to_the_default():
+    """Empty is "unset", which is what every sibling parser here means by it."""
+    config = load_config({**BASE_ENV, "PAPRA_MAX_DOCUMENT_BYTES": "   "})
+
+    assert config.max_document_bytes == 104857600
