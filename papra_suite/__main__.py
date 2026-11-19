@@ -485,6 +485,11 @@ def main() -> int:
     from papra_suite import backfill_cli
 
     backfill_cli.add_subparser(sub)
+    # Same registration shape again, for the same reason: `mcp` sets the two rows the listener is
+    # gated on; the entry point stays a table of where to go, not a second implementation.
+    from papra_suite import mcp_cli
+
+    mcp_cli.add_subparser(sub)
 
     args = parser.parse_args()
 
@@ -614,6 +619,14 @@ def main() -> int:
         from papra_suite import backfill_cli
 
         return backfill_cli.run_backfill(config, args)
+
+    if args.command == "mcp":
+        # Through the module, as with `jobs` and `backfill`: the dispatch is what makes the
+        # documented command reachable, and `tests/test_mcp_cli.py` swaps `mcp_cli.run_mcp` to pin
+        # that this branch exists.
+        from papra_suite import mcp_cli
+
+        return mcp_cli.run_mcp(config, args)
 
     if args.command == "serve":
         import asyncio
