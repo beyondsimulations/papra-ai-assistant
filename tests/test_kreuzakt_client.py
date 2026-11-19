@@ -454,15 +454,49 @@ async def test_get_document_has_no_field_holding_a_kreuzakt_path():
 
 
 async def test_get_document_keeps_only_the_fields_the_bridge_may_write_back():
+    """The field set is a list, compared to a list, because "keeps only" is the containment.
+
+    `page_count` joined it in Task 14: the MCP document view reports how long the document is, and
+    the index is the only side that knows. It is a count, and the rule this test guards is about
+    *identifiers and paths* — `stored_filename`, `thumbnail_url`, `download_url`, `link_for_user` —
+    so the three link keys are asserted absent by name rather than inferred from the field list
+    staying small.
+    """
     document = load("kreuzakt_document.json")
     client, _ = make_client([("/api/documents/15", ok(document))])
     doc = await client.get_document(15)
-    assert {f for f in vars(doc)} == {"id", "title", "description", "content",
+    assert {f for f in vars(doc)} == {"id", "title", "description", "content", "page_count",
                                       "document_date", "original_filename", "updated_at"}
     assert doc.id == 15 and doc.title == "Papra Seq0004 9e9e9e9e"
     assert doc.updated_at == "2026-11-17 20:02:42"
     assert "Rechnung Nr. 4711" in doc.content
+    for link in ("stored_filename", "thumbnail_url", "download_url", "link_for_user"):
+        assert not hasattr(doc, link)
     await client.aclose()
+
+
+async def test_get_document_reads_page_count_as_a_count_or_an_absence_not_a_guess():
+    """Null and absent are `None`; a string is a shape surprise.
+
+    `0` would be the alternative, and it would say "a document with no pages" about a document whose
+    page count the server did not send — the same invented zero this client refuses for `title` and
+    `content`, one size smaller.
+    """
+    for missing, expected in (("absent", None), ("null", None), ("string", "error")):
+        document = load("kreuzakt_document.json")
+        if missing == "absent":
+            document.pop("page_count", None)
+        elif missing == "null":
+            document["page_count"] = None
+        else:
+            document["page_count"] = "3"
+        client, _ = make_client([("/api/documents/15", ok(document))])
+        if expected == "error":
+            with pytest.raises(KreuzaktError, match="page_count"):
+                await client.get_document(15)
+        else:
+            assert (await client.get_document(15)).page_count is expected
+        await client.aclose()
 
 
 async def test_list_documents_returns_the_captured_rows_in_the_servers_order():

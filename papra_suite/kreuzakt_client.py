@@ -130,6 +130,13 @@ class KzDocument:
     turned into `""` and written over the user's text. `description`, `document_date` and
     `updated_at` stay optional because the bridge reads them but never overwrites Papra
     with an empty value on their account.
+
+    `page_count` is nullable for the same reason it is nullable on `QueueEntry`: the
+    measured document body carries it, and a null is the server's own absence rather than a
+    shape surprise. It is here because the MCP document view reports it — it is the one fact
+    about the file that Papra does not hold and the index does — and a `0` for a document whose
+    count is unknown would be a claim about the PDF rather than a gap in knowledge. Still no path:
+    `stored_filename`, `thumbnail_url`, `download_url` and `link_for_user` stay where they are.
     """
 
     id: int
@@ -139,6 +146,7 @@ class KzDocument:
     document_date: str | None
     original_filename: str
     updated_at: str | None
+    page_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -602,6 +610,7 @@ class KreuzaktClient:
             document_date=body.get("document_date"),
             original_filename=body.get("original_filename") or "",
             updated_at=body.get("updated_at"),
+            page_count=_require_int_or_none(body, "page_count", where),
         )
 
     async def delete_document(self, document_id: int) -> None:
