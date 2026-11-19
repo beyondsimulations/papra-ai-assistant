@@ -1090,17 +1090,73 @@ class Store:
                 (_now(), _now(), job_id),
             )
 
-    def list_jobs(self, *, status: str | None = None, limit: int = 100) -> list[Job]:
+    def list_jobs(self, *, kind: str | None = None, status: str | None = None,
+                  document_id: str | None = None, limit: int = 100) -> list[Job]:
+        """The queue, newest first. Every filter is applied in SQL, never afterwards.
+
+        That is about the limit, not tidiness: filtering rows after `LIMIT n` answers
+        `jobs --kind ocr` with nothing while fifty `index` rows sit ahead of them, which is the
+        reading that makes an operator believe a queue has drained. `document_id` exists because
+        "what is happening to this document?" is the question the `jobs` CLI was written to
+        answer, and a filter that silently does nothing answers it with the whole queue — Task 6
+        met exactly that behind a passing `xfailed`.
+
+        Since migration 004 one `(kind, papra_org_id, document_id, content_hash)` can hold
+        several rows — the live one plus the superseded history — so a caller must not read a row
+        count as a document count. `rowid DESC` breaks ties between rows created in the same
+        instant, without which one document's history could reorder between two reads of an
+        unchanged table.
+        """
         query = "SELECT * FROM jobs"
-        params: tuple = ()
+        clauses: list[str] = []
+        params: list[object] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
         if status:
-            query += " WHERE status = ?"
-            params = (status,)
-        query += " ORDER BY created_at DESC LIMIT ?"
-        params = params + (limit,)
+            clauses.append("status = ?")
+            params.append(status)
+        if document_id:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        params.append(limit)
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [_row_to_job(row) for row in rows]
+
+    def count_jobs(self, kind: str | None = None, status: str | None = None, *,
+                   document_id: str | None = None) -> int:
+        """How many job ROWS match, counted by SQLite.
+
+        `jobs --drain` is the middle step of the `content` handover, where the price of a wrong
+        reading is two writers on one column, so the number has to be exact rather than "as many
+        rows as a listing was willing to carry": a count derived from a capped listing can report
+        a quiet queue with rows still behind the cap. Same filters as `list_jobs`, same meaning.
+
+        It counts rows and not documents, deliberately: since migration 004 a document can own a
+        settled row and a live one at the same time, and the thing the drain has to be sure about
+        is that no row is waiting to be claimed or being worked.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if document_id:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        query = "SELECT COUNT(*) FROM jobs"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            row = self._conn.execute(query, params).fetchone()
+        return int(row[0])
 
     # -- orgs ---------------------------------------------------------------
 
