@@ -29,8 +29,9 @@ operator means it, and names the address it refused.
 counter, the pending-probe list — are made against that context, on the far side from any argument a
 client controls.
 
-This module is the skeleton: one tool, no writes. `search_documents` and the read tools arrive in
-Tasks 13 and 14 on top of the same context.
+This module is the skeleton: one tool, and one narrow write — the throttled "this token was used"
+stamp, on the auth path, on its own connection. `search_documents` and the read tools arrive in
+Tasks 13 and 14 on top of the same context, and on top of the same read-only views.
 """
 
 from __future__ import annotations
@@ -58,8 +59,14 @@ from papra_suite import indexing
 from papra_suite.config import _safe_echo
 from papra_suite.kreuzakt_client import KreuzaktError
 from papra_suite.logging_setup import SECRET_REGISTRY
-from papra_suite.mcp_tokens import TokenContext, token_counts
-from papra_suite.readers import KreuzaktReader, LedgerReader, PapraReader, require_read_only
+from papra_suite.mcp_tokens import TokenContext, resolve_token, stamp_token_use, token_counts
+from papra_suite.readers import (
+    KreuzaktReader,
+    LedgerReader,
+    McpContainmentError,
+    PapraReader,
+    require_read_only,
+)
 from papra_suite.store import Store, sanitize_event_text
 
 logger = logging.getLogger("papra_suite.mcp_server")
@@ -181,7 +188,7 @@ def resolve_bind(config, store: Store | None = None) -> McpBind:
     """Loopback by default; anything else needs a setting as well as the environment.
 
     `PAPRA_MCP_HOST` names the interface; this says whether naming it is enough. Binding a reachable
-interface is not a formatting choice — it moves the bearer token from "presented across a
+    interface is not a formatting choice — it moves the bearer token from "presented across a
     private
     tailnet behind TLS" to "presented to whatever can route to this port" — so the two have to be
     said separately, and the refusal has to name the address it refused.
@@ -303,19 +310,46 @@ class StoreTokenVerifier:
     because it is ours and not an OAuth scope.
 
     The plaintext lives in this object for the lifetime of one request and is never logged by us.
+
+    It is also **the only place in the request path that writes anything**, and that is a boundary,
+    not an accident: the stamp of "this credential just authenticated" goes through
+    `mcp_tokens.stamp_token_use` on its own short-lived connection, behind a 60 s per-token
+    throttle, and this object is never handed to a tool. The store it reads is a `LedgerReader`
+    under
+    `PRAGMA query_only=ON`, so a mutable `Store` here is a construction error — which is the point:
+    the write is allowed for one settings key, by one object, and nowhere else.
     """
 
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: LedgerReader) -> None:
+        require_read_only(store, role="store")
+        db_path = getattr(store, "db_path", None)
+        if db_path is None:
+            raise McpContainmentError(
+                "the token verifier needs the ledger's db_path: it is the only code on the request "
+                "path allowed to write, and it writes on its own connection, not through the view")
         self._store = store
+        self._db_path = db_path
+
+    def _resolve_and_stamp(self, token: str) -> TokenContext | None:
+        """The two database touches one request costs, both off the event loop.
+
+        Resolve first, and the resolved context is the proof `stamp_token_use` requires: nothing is
+        written for a token that did not authenticate, so a stranger with a guessed bearer string
+        costs a digest and no database work. The stamp is throttled per credential, so the second
+        touch happens once a minute rather than once per request.
+        """
+        context = resolve_token(self._store, token)
+        if context is None:
+            return None
+        stamp_token_use(self._db_path, token, context)
+        return context
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        from papra_suite.mcp_tokens import resolve_token
-
-        # Off the loop, like the counts: this runs once per request, and `get_setting` is blocking
-        # SQLite on the same single-writer connection the pollers, the OCR workers and the sweep
-        # use. One primary-key read is cheap; a loop that stops for it while a delivery write
-        # holds the lock is not.
-        context = await asyncio.to_thread(resolve_token, self._store, token)
+        # Off the loop, like the counts: this runs once per request, and both touches are blocking
+        # SQLite. Reading now goes through this listener's own read-only connection, so it no longer
+        # queues behind the pollers' writes at all; the stamp is the only thing here that wants the
+        # write lock, and it asks for it at most once a minute per credential.
+        context = await asyncio.to_thread(self._resolve_and_stamp, token)
         if context is None:
             return None
         # A token minted in another process reaches this suite for the first time here, so this is
@@ -369,10 +403,10 @@ class BucketStatus(BaseModel):
     bucket restriction changes exactly one of these numbers per field, and one test per field is
     what notices.
 
-`unledgered` and `delivery_blocked` are the two that were invisible before this task. The
+    `unledgered` and `delivery_blocked` are the two that were invisible before this task. The
     first is
     documents this suite saw and the ledger never held — the population the sweep skips by name, so
-`refs` and `current` can both look healthy on a corpus with a chunk permanently outside the
+    `refs` and `current` can both look healthy on a corpus with a chunk permanently outside the
     index.
     The second is documents Papra has refused five content writes in a row: they will never become
     searchable on their own, and until now the only place that said so was a log line every six
@@ -670,12 +704,12 @@ def build_mcp_app(store: LedgerReader, papra: PapraReader, kz: KreuzaktReader, *
     test double that exposes the same reads still builds.
 
     `papra` is a Task 13/14 argument, kept in the signature now so the wiring does not change shape
-later. No tool registered here reads Papra — the read-only-ness of this task is asserted
+    later. No tool registered here reads Papra — the read-only-ness of this task is asserted
     against a
     Papra that raises on any call, not asserted in prose.
 
     The server never migrates. Schema ownership stays with `serve` and the CLI, so a fresh
-`DATA_DIR` cannot become a silently empty archive; whatever opened this store did the
+    `DATA_DIR` cannot become a silently empty archive; whatever opened this store did the
     migrations. `LedgerReader` refuses to open a database with no schema, which is the same refusal
     `check` names.
     """
@@ -704,7 +738,7 @@ later. No tool registered here reads Papra — the read-only-ness of this task i
         `stale` above zero means work is queued or owed, which is a different answer from "this
         document is not in your archive", and the two must not be conflated by whoever reads it.
         `unledgered` above zero means documents that no pass will ever find, and is the number
-`papra-suite ledger --reindex-all` exists to bring down. A missing `queue` means the token
+    `papra-suite ledger --reindex-all` exists to bring down. A missing `queue` means the token
         is
         scoped to buckets, not that the queue is empty.
         """

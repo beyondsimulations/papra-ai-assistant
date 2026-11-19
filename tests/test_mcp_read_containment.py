@@ -425,3 +425,16 @@ async def test_the_listener_builds_the_app_on_views_and_closes_what_it_opened(mo
     assert isinstance(captured["kreuzakt"], KreuzaktReader)
     with pytest.raises(sqlite3.ProgrammingError):
         captured["ledger"].get_setting("anything")     # closed on the way out, not leaked
+
+
+def test_the_auth_gate_refuses_a_write_capable_store_too(store):
+    """The verifier writes one settings key, on its own connection, so it is checked too.
+
+    A `Store` here would let the credential stamp grow into "and one more write while we are here".
+    """
+    from papra_suite.mcp_server import StoreTokenVerifier
+    from papra_suite.readers import McpContainmentError
+
+    with pytest.raises(McpContainmentError) as caught:
+        StoreTokenVerifier(store)
+    assert "store" in str(caught.value)

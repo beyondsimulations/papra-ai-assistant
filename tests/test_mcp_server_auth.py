@@ -630,7 +630,7 @@ async def test_the_per_request_credential_read_does_not_run_on_the_event_loop(st
                                                                              monkeypatch):
     """`verify_token` is a lookup that happens on every request, so it may not block the loop.
 
-    `resolve_token` is `Store.get_setting`: blocking SQLite on the single-writer connection the
+    `resolve_token` read `Store.get_setting`: blocking SQLite on the single-writer connection the
     pollers, the OCR workers and the sweep share. One primary-key read is nothing on its own; what
     matters is the read that queues behind a delivery write holding the lock, which turns a status
     call into a stalled pipeline. `index_status` already reads off the loop for that reason (review
@@ -640,17 +640,21 @@ async def test_the_per_request_credential_read_does_not_run_on_the_event_loop(st
     import threading
 
     from papra_suite.mcp_server import StoreTokenVerifier
+    from papra_suite.readers import LedgerReader
 
     loop_thread = threading.get_ident()
     seen = []
-    real = Store.get_setting
+    real = LedgerReader.get_setting
 
     def spy(self, *args, **kwargs):
         seen.append(threading.get_ident())
         return real(self, *args, **kwargs)
 
-    monkeypatch.setattr(Store, "get_setting", spy)
+    monkeypatch.setattr(LedgerReader, "get_setting", spy)
 
-    assert await StoreTokenVerifier(store).verify_token(token) is not None
+    # Spied on the view, not on `Store`: `LedgerReader` aliases the same function once, so patching
+    # the class it came from would spy on a read this path no longer performs — the listener reads
+    # through its own `PRAGMA query_only` connection, which is the point of option C.
+    assert await StoreTokenVerifier(view_for(store)).verify_token(token) is not None
     assert seen, "the verifier read nothing at all, so the assertion below would prove nothing"
     assert loop_thread not in seen, "the credential read ran on the thread that must not block"

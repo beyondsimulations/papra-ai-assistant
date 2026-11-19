@@ -32,7 +32,9 @@ import logging
 import secrets
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.store import Store
@@ -42,6 +44,29 @@ logger = logging.getLogger("papra_suite.mcp_tokens")
 
 #: Settings-key prefix for one row per token. `Store.list_setting_keys(prefix=...)` enumerates it.
 TOKEN_SETTING_PREFIX = "mcp_token:"
+
+#: Settings-key prefix for the one write the MCP request path may make: when this token last
+#: authenticated. A separate family rather than a sixth key in the token row, because `_parse`
+#: refuses a row whose key set is not exactly the five it knows — a new field in the row would stop
+#: every credential minted before this change from authenticating. That is the authorisation
+#: surface;
+#: this is a report. The prefixes differ at the eleventh character (`_` against `:`), so the token
+#: enumeration cannot pick a stamp up as a credential.
+TOKEN_USE_PREFIX = "mcp_token_use:"
+
+#: One settings write per token per minute, however many requests that token carries. The listener
+#: shares `serve`'s single-writer WAL database with the delivery writes and the sweep, so without
+#: this the write is per request: the difference between a timestamp and a contention source.
+TOKEN_USE_THROTTLE_S = 60.0
+
+#: How long the stamp's own connection waits for the write lock. Short on purpose — this happens
+#: while a client waits on a tool call, and a stale timestamp is worth nothing beside a stalled one.
+TOKEN_USE_BUSY_TIMEOUT_MS = 1000
+
+#: digest → monotonic reading of the last write. In-process, so a restart loses at most a minute on
+#: a stamp nobody reads for a week, and bounded by the number of credentials: only a token that
+#: resolved is ever remembered here (`stamp_token_use`).
+_recent_stamps: dict[str, float] = {}
 
 #: Bytes of entropy behind `secrets.token_urlsafe`, per the 2026-11-16 spec's Operations section.
 TOKEN_ENTROPY_BYTES = 32
@@ -304,6 +329,68 @@ def resolve_token(store: Store, raw: str) -> TokenContext | None:
         return None
     return TokenContext(label=document["label"], org_ids=frozenset(document["org_ids"]),
                         scope_all=bool(document["scope_all"]))
+
+
+def _connect(db_path):
+    """The one seam the stamp's connection goes through.
+
+    A function rather than a direct `sqlite3.connect`, so a test can count the connections the
+    request path opens: "the throttle coalesced" has to be observable, not inferred from a value.
+    """
+    return sqlite3.connect(db_path)
+
+
+def _token_use_key(raw: str) -> str:
+    return TOKEN_USE_PREFIX + hashlib.sha256(raw.encode()).hexdigest()
+
+
+def stamp_token_use(db_path: Path | str, raw: str, context: TokenContext | None, *,
+                    now: float | None = None) -> bool:
+    """Record that a credential that just authenticated was seen. True when a row was written.
+
+    **The one write on the request path, and the narrowest shape it could take.** It is called by
+    `StoreTokenVerifier` after a token resolved, and it takes the resolved `TokenContext` as proof:
+    without one it returns False before opening anything, so a stranger presenting a guessed bearer
+    string costs a digest and no database work at all. It is not a method on `Store`, and the
+    `LedgerReader` the handlers hold runs under `PRAGMA query_only=ON`, so nothing reachable from a
+    tool call can make this write even if it wanted to.
+
+    Three details, each worth the sentence:
+
+    * its own short-lived connection, opened per write and closed on the way out — the long-lived
+      write handle belongs to `serve`, and this process must not acquire a second one that a request
+      path can reach;
+    * `time.monotonic` for the window, because Docker Desktop's VM clock steps and an NTP correction
+      must not freeze the record or release a burst of writes;
+    * a failure is a skipped stamp, reported at INFO. A timestamp nobody reads for a week is not
+      worth a failed request or a traceback, and the alternative — waiting out a delivery write on a
+      client's clock — is the worse trade.
+    """
+    if context is None or not isinstance(raw, str) or not raw:
+        return False
+    key = _token_use_key(raw)
+    moment = time.monotonic() if now is None else now
+    last = _recent_stamps.get(key)
+    if last is not None and moment - last < TOKEN_USE_THROTTLE_S:
+        return False
+
+    try:
+        conn = _connect(db_path)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={TOKEN_USE_BUSY_TIMEOUT_MS}")
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, _store_now()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as error:
+        logger.info("mcp: could not record that a token was used (%s)", type(error).__name__)
+        return False
+    _recent_stamps[key] = moment
+    return True
 
 
 def list_tokens(store: Store) -> list[TokenInfo]:
