@@ -78,8 +78,7 @@ def kz_document_row(**overrides):
 
     The fields that must not survive are in it on purpose — `stored_filename`, `thumbnail_url`,
     `download_url`, `link_for_user` — because the claim is about a response that really carries
-    them,
-    not about a request to a thinner server.
+    them, not about a request to a thinner server.
     """
     row = {
         "id": KZ_ID,
@@ -419,11 +418,11 @@ async def test_a_document_with_no_ledger_row_fails_closed(store):
     """An id the ledger does not know is `not-found` with both upstreams untouched.
 
     The Papra document exists in this fixture and the Kreuzakt row exists too: what is missing is
-    the
-    reference that makes either of them *this archive's* document. Answering from Papra alone would
-    show a document the bridge never enrolled; answering from the index alone would show one that
-    belongs to nobody's bucket. Both refusals cost nothing, which is the point — the ledger answers
-    first precisely so that the expensive question is only asked about documents it can vouch for.
+    the reference that makes either of them *this archive's* document. Answering from Papra alone
+    would show a document the bridge never enrolled; answering from the index alone would show one
+    that belongs to nobody's bucket. Both refusals cost nothing, which is the point — the ledger
+    answers first precisely so that the expensive question is only asked about documents it can
+    vouch for.
     """
     papra = FakePapra({"doc-unknown": papra_doc("doc-unknown")})
     index = ScriptedIndex()
@@ -468,10 +467,9 @@ async def test_deleted_in_papra_is_not_found_even_though_the_index_still_has_it(
     """Mutation check (e): trust the ledger and skip Papra, and this dies.
 
     The delete pass marks the ledger on its own schedule, so there is a window where the reference
-    is
-    live, the index still serves the row, and Papra says `isDeleted`. Papra is the archive, so its
-    answer wins, and it wins *before* the content is fetched: the index is never asked for text that
-    is about to be refused.
+    is live, the index still serves the row, and Papra says `isDeleted`. Papra is the archive, so
+    its answer wins, and it wins *before* the content is fetched: the index is never asked for text
+    that is about to be refused.
     """
     papra = corpus(store)
     papra.documents["doc-1"]["isDeleted"] = True

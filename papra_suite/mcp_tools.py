@@ -1004,11 +1004,10 @@ class NotInScope(ToolError):
 
     See `_NOT_IN_SCOPE_MESSAGE`: this is the one place on the MCP surface where a scoped token is
     told that something exists that it cannot have. The alternative — answering `not-found` — was
-    the
-    spec's own rule (`not_found_or_not_accessible`: "distinguishing them leaks existence across the
-    allow-list boundary"), and the plan for this milestone overrode it so that an operator debugging
-    an empty result can tell "wrong token" from "no document". Both are true, which is why the code
-    says as little as it can and the report argues the rest.
+    the spec's own rule (`not_found_or_not_accessible`: "distinguishing them leaks existence across
+    the allow-list boundary"), and the plan for this milestone overrode it so that an operator
+    debugging an empty result can tell "wrong token" from "no document". Both are true, which is
+    why the code says as little as it can and the report argues the rest.
     """
 
     def __init__(self, reason: str = _NOT_IN_SCOPE_MESSAGE):
@@ -1086,10 +1085,9 @@ def _require_document_id(document_id: object, *, what: str) -> str:
     Two refusals, in the order that matters. An empty or whitespace id is `invalid-request`: nothing
     was asked of the archive, so nothing may be answered about it. A digits-only id is `not-found`
     and is refused **before any read at all** — the shape is the whole test, so a probe of the
-    index's
-    rowid space costs a ledger query and an index read for the answer, and gets neither. Papra ids
-    are
-    prefixed and entropy-bearing, so no real document is refused by this rule; `"0000007"` included.
+    index's rowid space costs a ledger query and an index read for the answer, and gets neither.
+    Papra ids are prefixed and entropy-bearing, so no real document is refused by this rule;
+    `"0000007"` included.
     """
     if not isinstance(document_id, str) or not document_id.strip():
         raise InvalidRequest(f"{what} needs a papra document id, got {document_id!r}")
@@ -1145,10 +1143,8 @@ async def _live_record(papra, ref, *, what: str) -> dict:
     **A read that errors is the outage code, not `not-found`.** In a search page an unchecked hit is
     dropped and counted, because the page has `partial` to say "this may be missing something". Here
     the document *is* the answer, and `not-found` would be a claim about the archive this call did
-    not
-    get to make — the failure the spec's error model exists to prevent, in its smallest possible
-    form.
-    Logged with the exception's class and not its message, which is another process's prose.
+    not get to make — the failure the spec's error model exists to prevent, in its smallest possible
+    form. Logged with the exception's class and not its message, which is another process's prose.
 
     **`isDeleted` is the archive's own no**, and it is asked before the index is touched: a document
     in the Papra trash still has a live ledger row until the delete pass gets to it, and Kreuzakt
@@ -1237,14 +1233,11 @@ def _papra_origin(base_url: object) -> str:
 
     An URL is operator configuration, and this one is about to be printed into a link an agent may
     click. So: http(s) and nothing else (an `ftp://`, `file://` or javascript-shaped base is a
-    refusal,
-    not a string concatenation), credentials refused rather than carried forward, and the query and
-    fragment dropped — a base that arrived with `?token=…` would otherwise hand that token to
-    whoever
-    opened the link. Neither the value nor a piece of it reaches the client's message or the log
-    line:
-    `PAPRA_BASE_URL` is the address of the archive, and a bearer of a read token is not owed the
-    deployment's internal hostnames.
+    refusal, not a string concatenation), credentials refused rather than carried forward, and the
+    query and fragment dropped — a base that arrived with `?token=…` would otherwise hand that
+    token to whoever opened the link. Neither the value nor a piece of it reaches the client's
+    message or the log line: `PAPRA_BASE_URL` is the address of the archive, and a bearer of a read
+    token is not owed the deployment's internal hostnames.
     """
     unusable = IndexUnavailable(
         "this server has no usable papra address configured, so it cannot offer a link. That is an "
@@ -1271,14 +1264,11 @@ async def get_document(ctx, store, papra, kz, document_id: str, *,
     """One document's metadata, by its Papra id, for this principal.
 
     The three steps are the whole design and they run in this order for cost reasons and for
-    security
-    ones at the same time: the **ledger** decides whose it is (one query, no network), **Papra**
-    says
-    whether it is still there (one GET), and **Kreuzakt** supplies what only the index knows (the
-    page
-    count, the index's own description and filename). A document that fails the first step never
-    causes a request to either service, which is what makes "a disallowed document is never fetched"
-    true of this tool rather than merely intended.
+    security ones at the same time: the **ledger** decides whose it is (one query, no network),
+    **Papra** says whether it is still there (one GET), and **Kreuzakt** supplies what only the
+    index knows (the page count, the index's own description and filename). A document that fails
+    the first step never causes a request to either service, which is what makes "a disallowed
+    document is never fetched" true of this tool rather than merely intended.
 
     An index outage is refused here too, even though the fields that would have come from it are
     metadata. A view that quietly omitted `page_count` and `description` during an outage would be a
