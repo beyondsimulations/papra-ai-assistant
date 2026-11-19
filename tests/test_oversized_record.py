@@ -15,7 +15,8 @@ Three failures it exists to prevent, one per test group below:
   reason would outlive the problem: `check` would go on saying "3 oversized" over a corpus with
   nothing oversized in it, which is worse than saying nothing.
 * **The label.** "N oversized seen since <pass>", never "your corpus has N": the record holds what
-  the passes happened to walk, so it is a floor on the corpus and not a census of it.
+  the passes happened to walk. It is not a census and not a lower bound either — `count` tallies
+  refusal *observations*, and the tests below pin exactly how far that claim reaches.
 """
 
 import pytest
@@ -101,8 +102,9 @@ def test_a_different_limit_starts_the_record_again(store):
     """Every entry in the record was refused by the limit the record names.
 
     Entries refused under 100 MiB printed beside a limit of 500 MiB read as a contradiction —
-    "150 MB is oversized at 500 MB?" — and it is a real contradiction the moment an operator raises
-    the knob. So raising it starts a new record: `since`, `count` and `largest` describe the ceiling
+    "150 MB is oversized at 500 MB?" — and it is a real contradiction the moment an operator
+    raises the knob. So raising it starts a new record: `since`, `count` and `largest` describe
+    the ceiling
     that is in force, and the old ones go with the ceiling that produced them.
     """
     skip(store, "doc_big", size=400, limit=100)
@@ -138,6 +140,68 @@ def test_the_listing_is_capped_and_evicts_the_oldest_first(store):
     assert record.evicted == 10
     # The row itself stays bounded, not merely the list this function rebuilt.
     assert len(store.get_setting(OVERSIZED_SETTING)) < 20_000
+
+
+def test_a_second_walk_over_evicted_documents_counts_observations_not_documents(store):
+    """What the cap really costs, stated as behaviour rather than as a promise.
+
+    A document that has left the listing cannot be recognised when a later pass walks it again, so
+    it is counted again — and when it is finally enrolled, there is no entry to remove, so the
+    number does not fall. Both halves are deliberate: the alternative is a counter that quietly
+    under-reports, or a second unbounded set of ids kept to remember what the capped one forgot.
+    This is why every surface says "N oversized **seen** since <pass>" and never "there are N":
+    `count` is a tally of refusal observations, and a reader who takes it for a distinct-document
+    count is being lied to by the label,
+    not by the number.
+    """
+    total = OVERSIZED_RECORD_LIMIT + 10
+    for index in range(total):
+        skip(store, f"doc-{index:03d}", size=200)
+    evicted = "doc-000"  # pushed out of the listing by the 10 records after the cap
+    assert evicted not in [d.document_id for d in oversized_seen(store).documents]
+
+    # A second pass walks the head of the corpus again: the same document, refused again.
+    skip(store, evicted, size=200)
+    record = oversized_seen(store)
+    assert record.count == total + 1, "a re-walked refusal is a new observation, and is counted"
+    assert len(record.documents) == OVERSIZED_RECORD_LIMIT
+
+    # Enrolling a document that is still listed removes it; the number comes down by one.
+    listed = oversized_seen(store).documents[-1].document_id
+    assert clear_oversized_skip(store, papra_org_id=ORG, document_id=listed) is True
+    assert oversized_seen(store).count == total
+
+    # Enrolling the evicted one changes nothing, and says so: no entry, no decrement, False.
+    assert clear_oversized_skip(store, papra_org_id=ORG, document_id=evicted) is False
+    assert oversized_seen(store).count == total
+
+
+def test_a_row_that_moved_while_clearing_is_reported_as_not_cleared(store):
+    """The fence is only worth having if losing it is reported as losing it.
+
+    The last entry leaving deletes the row with `expected=`, because a skip recorded between the
+    read and the delete is a document that is *still* oversized. `clear_setting` answers False
+    when the row moved. Returning True there would tell the caller its enrollment left nothing
+    behind while a live
+    refusal sat in the row — so the False is propagated, and the row survives intact.
+    """
+    skip(store, "doc-scan", size=157286400)
+    raw = store.get_setting(OVERSIZED_SETTING)
+
+    class ContendedStore:
+        """The store as seen by a writer that lost the row to somebody else mid-call."""
+
+        def get_setting(self, key):
+            return store.get_setting(key)
+
+        def set_setting(self, key, value):
+            store.set_setting(key, value)
+
+        def clear_setting(self, key, *, expected):
+            return False  # the row moved: another pass recorded a refusal
+
+    assert clear_oversized_skip(ContendedStore(), papra_org_id=ORG, document_id="doc-scan") is False
+    assert store.get_setting(OVERSIZED_SETTING) == raw, "the live refusal is still recorded"
 
 
 def test_the_count_outlives_the_entries_it_evicted(store):

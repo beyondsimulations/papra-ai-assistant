@@ -1283,8 +1283,11 @@ surfaces, and when a dashboard exists it reads this same field. Do not go lookin
 | `papra-suite backfill --dry-run` | the refused documents **named, with their sizes**, bounded to the first 10 with the cap and the total stated on the line (`— first 10 of 37 named here`). A dry run still writes nothing, this record included. |
 
 The number is **"N oversized seen since <pass>"**, never "your corpus has N": the record holds what
-the passes walked, and this suite has no catalogue of the corpus except the walks it performed. It is
-a floor, and it goes down on its own — when a document comes back under the limit it is enrolled, and
+the passes walked, and this suite has no catalogue of the corpus except the walks it performed. It is a
+tally of **refusal observations**, which is weaker than a document count in both directions, and the
+weakness is worth knowing before you quote the number: a document already evicted from the capped
+listing is counted again when a later pass walks it, and enrolling it cannot take it back off. It does
+go down on its own where it can — when a document comes back under the limit it is enrolled, and
 `enqueue_index_job` drops it out of the record. That is the whole point of writing the entry at skip
 time: a reason that outlives its problem has you compressing a document that is already fine.
 
@@ -1294,8 +1297,11 @@ the new ceiling starts a fresh record, because entries refused by the old rule a
 the new one are different claims about the corpus.
 
 ```bash
-PAPRA_MAX_DOCUMENT_BYTES=524288000     # 500 MiB, then:
-papra-suite check                      # confirms the ceiling actually loaded
-papra-suite backfill --dry-run         # what would come in now, and what still will not
+export PAPRA_MAX_DOCUMENT_BYTES=524288000   # 500 MiB, exported so the next commands see it
+papra-suite check                            # confirms the ceiling actually loaded
+papra-suite backfill --dry-run               # what would come in now, and what still will not
 papra-suite backfill
 ```
+
+A bare `PAPRA_MAX_DOCUMENT_BYTES=524288000` on its own line sets a shell variable and exports nothing:
+the next command still runs at 100 MiB, which is the typo this section exists to make impossible.

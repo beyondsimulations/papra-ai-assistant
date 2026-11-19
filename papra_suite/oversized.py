@@ -12,10 +12,14 @@ Three bounds, because a "helpful" unbounded diagnostic is its own outage:
 * **Capped listing, oldest-first eviction.** One settings row, at most `OVERSIZED_RECORD_LIMIT`
   documents in it. A corpus of 400 scans must not grow a settings value without end or put 400
   document ids on an operator's line.
-* **The count is not the listing.** `count` counts the refusals; `documents` lists the ones still
-  held. Deriving the number from a capped list is how a report can only ever shorten, which reads as
-  "the problem got better" when the list merely filled up.
-* **It is a floor, never a census.** "N oversized seen since <pass>" is what the passes walked.
+* **The count is not the listing, and it counts observations, not documents.** `count` counts the
+  refusals this record saw; `documents` lists up to `OVERSIZED_RECORD_LIMIT` of them. Deriving the
+  number from a capped list is how a report can only ever shorten, which reads as "the problem got
+  better" when the list filled up. What the cap costs is stated rather than hidden: a document
+  already evicted from the listing is counted again when a later pass walks it, and enrolling it
+  cannot take it back off, so `count` is a tally of refusal *observations* — neither a distinct-
+  document count nor a lower bound on one. `since`, `limit` and `largest` bound what it means.
+* **It is a tally, never a census.** "N oversized seen since <pass>" is what the passes walked.
   Every string here and in its callers keeps that wording: a line saying "your corpus has N"
   claims knowledge of documents nobody listed, and this suite has no catalogue of the corpus except
   the walks it performed.
@@ -72,7 +76,9 @@ class OversizedSeen:
     """What the record holds, exactly as it was recorded.
 
     `since` is when this record began — the first refusal since it was last empty — and it is what
-    makes `count` an honest number: "N seen since then", not "N in your corpus".
+    makes `count` an honest number: "N seen since then", not "N in your corpus". `count` counts
+    refusal *observations*, not distinct documents (see the module docstring): say "seen", and
+    never "there are N".
 
     `limit` is the ceiling that refused them, and it is `None` only when nothing has been refused.
     It is the ceiling in force *at the time of the refusals*: `record_oversized_skip` starts a new
@@ -108,8 +114,9 @@ def _clean_id(value: object) -> str:
 def _entries(document: dict) -> tuple[OversizedDoc, ...] | None:
     """The `docs` list, or None when any element of it is not one.
 
-    All-or-nothing on purpose, and the caller drops the whole record on None: a count printed beside
-    a listing that failed to parse is two numbers that disagree, and this record has no authority to
+    All-or-nothing on purpose, and the caller drops the whole record on None: a count printed
+    beside a listing that failed to parse is two numbers that disagree, and this record has no
+    authority to
     guess which part of a broken row was meant to be real.
     """
     entries = []
@@ -135,7 +142,16 @@ def oversized_seen(store) -> OversizedSeen:
     reading of an unreadable row is "I have no record" rather than a crash in the command the
     operator runs to find out what is wrong.
     """
-    raw = store.get_setting(OVERSIZED_SETTING)
+    return _parse(store.get_setting(OVERSIZED_SETTING))
+
+
+def _parse(raw: str | None) -> OversizedSeen:
+    """Read the row's text, on its own.
+
+    Split from the read so a writer can parse the exact snapshot it fences on:
+    `clear_oversized_skip` reading the record again would derive its write from a row that is
+    not the one its `expected=` deletes on, which turns a fence into a formality.
+    """
     if not raw:
         return EMPTY
     try:
@@ -196,6 +212,14 @@ def record_oversized_skip(store, *, papra_org_id: str, document_id: str, size: i
 
     A different `limit` starts the record again. Those are different claims about the corpus, and
     mixing them is how "3 oversized" comes to mean "3 documents that were too big at some point".
+
+    **The race this does not close.** The read above and the write below are not one transaction.
+    The settings row has no fenced setter (`set_setting` has no fence because its callers mean
+    "make it so"). If a pass in `serve` and an operator's `backfill` record a refusal at the same
+    instant, one observation can be lost. That is accepted for a capped diagnostic: nothing is
+    gated on this record, and fencing it would mean widening the shared settings API for a report.
+    The eviction notice below
+    is the honest counterweight: the record says when it stopped listing all of them.
     """
     org = _clean_id(papra_org_id)
     document = _clean_id(document_id)
@@ -232,8 +256,9 @@ def record_oversized_skip(store, *, papra_org_id: str, document_id: str, size: i
 def clear_oversized_skip(store, *, papra_org_id: str, document_id: str) -> bool:
     """Drop one document from the record because it has been enrolled. False when it was not listed.
 
-    False is the ordinary answer — every document that was never refused for size takes this path on
-    its way through `enqueue_index_job` — so it must not write, and it does not: an untouched row is
+    False is the ordinary answer — every document that was never refused for size takes this path
+    on its way through `enqueue_index_job` — so it must not write, and it does not: an untouched
+    row is
     the difference between "this enrollment changed the report" and a settings write per document.
 
     When the last entry leaves, the row is deleted rather than zeroed, and deleted with
@@ -243,7 +268,7 @@ def clear_oversized_skip(store, *, papra_org_id: str, document_id: str) -> bool:
     raw = store.get_setting(OVERSIZED_SETTING)
     if not raw:
         return False
-    record = oversized_seen(store)
+    record = _parse(raw)
     org, document = _clean_id(papra_org_id), _clean_id(document_id)
     kept = tuple(doc for doc in record.documents
                  if (doc.org_id, doc.document_id) != (org, document))
@@ -251,7 +276,12 @@ def clear_oversized_skip(store, *, papra_org_id: str, document_id: str) -> bool:
         return False
     count = max(0, record.count - 1)
     if not kept and count == 0:
-        store.clear_setting(OVERSIZED_SETTING, expected=raw)
+        # False here means the row moved since the read above — a skip was recorded in between — and
+        # "nothing was cleared" is the honest answer, not a success to report.
+        if not store.clear_setting(OVERSIZED_SETTING, expected=raw):
+            logger.info("%s moved while its last entry was being cleared, so nothing was cleared",
+                        OVERSIZED_SETTING)
+            return False
         return True
     _write(store, OversizedSeen(since=record.since, limit=record.limit, largest=record.largest,
                                 count=count, documents=kept))
