@@ -731,6 +731,61 @@ async def test_one_ledger_query_per_page_never_one_per_hit(store):
     assert all(count <= KREUZAKT_PAGE_ROWS for count in calls)
 
 
+async def test_one_generation_judges_the_whole_call_even_if_a_rebuild_lands_mid_scan(store):
+    """The generation is read once per tool call, not once per fetched page.
+
+    `resolve_hits` is told which index epoch to resolve against, and the caller reads it once, for
+    the reason stated there: a rebuild that lands between page 1 and page 2 must not leave half a
+    page resolved under a generation the other half did not use — which is not an error, it is a
+    page where some of your documents quietly resolved and some did not. The fake store bumps the
+    generation on the *second* read, so a per-page read answers this page with nothing.
+    """
+    for n in range(151, 201):
+        bind(store, ORG_A, f"doc-{n}", n)
+    papra = FakePapra({f"doc-{n}": papra_doc(f"doc-{n}") for n in range(151, 201)})
+    index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 201)])
+    reads = []
+
+    class RebuildingStore:
+        """The store as the tools see it, with `bump_generation` landing on the second read."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def get_generation(self):
+            reads.append(1)
+            if len(reads) > 1:
+                self._inner.bump_generation()      # the rebuild lands mid-scan
+            return self._inner.get_generation()
+
+        def ledger_resolve(self, ids, *, generation):
+            return self._inner.ledger_resolve(ids, generation=generation)
+
+    page = await search_documents(ctx(ORG_A), RebuildingStore(store), papra, index.reader(),
+                                  "rechnung", page_size=5)
+    assert reads == [1], f"the generation was read {len(reads)} times for one call"
+    assert [item.document_id for item in page.items] == [f"doc-{n}" for n in range(151, 156)]
+    assert page.scanned == 200 and page.partial is False     # the corpus was exhausted
+
+
+def test_both_search_tools_carry_the_fifteen_second_budget_by_default():
+    """The 15 s per-call deadline is the default, not something a caller has to remember to ask for.
+
+    The only test of the budget passed its own `deadline_s=0.01`, so changing both signatures'
+    default to `None` — no deadline at all, a sick index answering nothing at 30 s per upstream
+    call instead of refusing at 15 — survived the whole suite. A signature assertion is the honest
+    pin for a default: the number itself is pinned to the spec's literal above.
+    """
+    import inspect
+
+    from papra_suite.mcp_tools import TOOL_DEADLINE_S
+
+    for tool in (search_documents, list_recent_documents):
+        default = inspect.signature(tool).parameters["deadline_s"].default
+        assert default == TOOL_DEADLINE_S, f"{tool.__name__} would run without a deadline"
+        assert default == 15.0
+
+
 # --- the page: filled, exhausted, or honest about which --------------------------------------
 
 
@@ -816,13 +871,14 @@ async def test_page_past_the_end_is_an_empty_page_not_an_error(store):
     assert page.partial is False
 
 
-async def test_papra_reads_are_bounded_by_the_requested_page_not_the_scanned_window(store):
-    """The cost half of the liveness rule: 500 scanned rows do not cost 500 Papra requests.
+async def test_a_first_page_costs_one_liveness_read_per_item_not_per_scanned_row(store):
+    """The cost half of the liveness rule, **on the first page**: 100 scanned rows, 5 requests.
 
-    The window is scanned because a caller may ask for page 9, but the liveness check is only owed
-    to the items that can be returned — and it is the checking that costs a request. A page of 5
-    out of 100 live hits is five reads, and the row budget is what bounds a call, not the number of
-    documents a search happened to look at.
+    The window is scanned because a caller may ask for page 9, but a first page owes its checks to
+    the items it can return — and it is the checking that costs a request. (The name of this test
+    used to claim the bound held for any page, which it does not: `want` is `page * page_size`, so a
+    deep page asks the question for every candidate it has to step over. That cost is asserted here
+    honestly rather than wished away.)
     """
     papra = own_corpus(store, 100)
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 101)])
@@ -830,6 +886,28 @@ async def test_papra_reads_are_bounded_by_the_requested_page_not_the_scanned_win
                                   page_size=5)
     assert len(page.items) == 5
     assert papra.get_calls == 5
+
+
+async def test_a_deep_page_checks_every_candidate_it_has_to_step_over(store):
+    """The cost that the paragraph above does not claim: `page * page_size` reads, not `page_size`.
+
+    Measured at the reviewer's shape (`page=40, page_size=50` over a 500-row corpus: 500 Papra
+    lookups and 5 index pages for an empty page, `partial=False` because the corpus really was
+    exhausted) and reproduced here at a size the suite can afford. Asserted rather than documented
+    away, because the two ways out were both considered: truncating *before* the liveness check is
+    the wrong one (a deleted document of yours would then eat a slot of the page — that mutant dies
+    on two tests for good reason), and an explicit per-call lookup budget is a change to what `page`
+    means, which belongs to the spec, not to a quiet optimisation.
+    """
+    papra = own_corpus(store, 100)
+    index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 101)])
+    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung",
+                                  page=3, page_size=50)
+    assert [item.document_id for item in page.items] == [f"doc-{n}" for n in range(101, 101)]
+    assert page.scanned == 100 and page.partial is False
+    assert index.search_calls == [(1, 100)]          # every row it could get, all of them asked
+    assert papra.get_calls == 100                         # the whole scan, not the page
+    assert page.page == 3 and page.page_size == 50
 
 
 # --- the fan-out bound, enforced here rather than at mint time --------------------------------
@@ -896,14 +974,35 @@ async def test_a_scoped_token_never_hits_the_fanout_bound(store):
 
 
 async def test_lookups_run_at_most_four_at_a_time(store):
-    """The spec's fan-out concurrency, measured on the fake rather than asserted in prose."""
+    """The spec's fan-out concurrency, measured on the fake, against the number **in this file**.
+
+    The literal 4 is what makes this a test: the version of it asserted `peak_concurrent <=
+    MAX_CONCURRENT_LOOKUPS` imported the constant it was supposed to pin, so raising that constant
+    to 1000 — fifty simultaneous requests at a single-user Papra — survived all 1424 tests. The
+    constant is pinned separately below, which is where a deliberate change to it can be recorded.
+    """
     orgs, index, papra = twelve_buckets(store)
     papra.delay_s = 0.01
     await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung",
                            page_size=50)
-    assert papra.peak_concurrent <= MAX_CONCURRENT_LOOKUPS
+    assert papra.peak_concurrent <= 4, "the spec's `Content size` section says 4 concurrent lookups"
     assert papra.peak_concurrent > 1          # and it really is concurrent, not serial
     assert papra.get_calls == MAX_BUCKETS_PER_CALL
+
+
+def test_the_fanout_constants_are_the_numbers_the_spec_names():
+    """`MAX_CONCURRENT_LOOKUPS = 4`, `MAX_BUCKETS_PER_CALL = 8`, `TOOL_DEADLINE_S = 15`.
+
+    The behavioural tests hold the literals so a widened constant cannot pass them; this one holds
+    the literals too, so the three numbers are stated once in the suite with their source
+    (`docs/superpowers/specs/2026-11-16-mcp-search-server-design.md`, `Content size`). Moving a
+    bound is then two deliberate edits and a spec conversation, not a one-character diff.
+    """
+    from papra_suite.mcp_tools import TOOL_DEADLINE_S
+
+    assert MAX_CONCURRENT_LOOKUPS == 4
+    assert MAX_BUCKETS_PER_CALL == 8
+    assert TOOL_DEADLINE_S == 15.0
 
 
 async def test_a_papra_document_is_asked_about_once_per_call_and_again_on_the_next(store):
@@ -1467,6 +1566,58 @@ async def test_a_ledger_that_cannot_name_a_generation_refuses_rather_than_resolv
         await search_documents(ctx(scope_all=True), store, FakePapra(), index.reader(), "rechnung")
     assert "SELECT" not in str(caught.value)
     assert INDEX_GENERATION_KEY not in str(caught.value)
+
+
+async def test_a_papra_record_that_is_not_a_mapping_is_a_refusal_not_a_crash(store):
+    """`_guarded` had no catch-all, so a malformed record escaped the module entirely.
+
+    Measured at function level: `AttributeError: 'list' object has no attribute 'get'` out of
+    `resolve_hits`. The SDK kept the text off the wire, so nothing leaked — but the client read an
+    undocumented fourth error shape with no code in it, and a caller that retries on
+    `index_unavailable` could not know what happened. The archive's shape is not the caller's
+    problem; "this could not be answered" is the answer.
+    """
+    own_corpus(store, 1)
+    index = ScriptedIndex(hits=[kz_row(1)])
+    papra = FakePapra({"doc-1": papra_doc("doc-1")})
+
+    async def not_a_record(org_id, document_id):
+        return ["papra", "answered", "a", "list"]
+
+    papra.get_document = not_a_record
+    with pytest.raises(ToolError, match="index_unavailable") as caught:
+        await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung")
+    assert "attribute" not in str(caught.value)
+    assert "list" not in str(caught.value).replace("index_unavailable", "")
+
+
+async def test_a_ledger_that_raises_from_the_resolve_is_a_refusal_too(store):
+    """The second shape of the `(ValueError, sqlite3.Error)` branch, which had exactly one test.
+
+    A corrupt `index_generation` was the covered case; a database that refuses the authorization
+    query itself is the one that actually happens during a locked WAL write, and it must not be the
+    case nobody checked.
+    """
+    import sqlite3
+
+    own_corpus(store, 2)
+    index = ScriptedIndex(hits=[kz_row(1), kz_row(2)])
+
+    class LockedStore:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def get_generation(self):
+            return self._inner.get_generation()
+
+        def ledger_resolve(self, ids, *, generation):
+            raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(ToolError, match="index_unavailable") as caught:
+        await search_documents(ctx(scope_all=True), LockedStore(store), FakePapra(),
+                               index.reader(), "rechnung")
+    assert "locked" not in str(caught.value)      # Papra's/SQLite's prose is not the client's text
+    assert "ledger" in str(caught.value)
 
 
 async def test_a_call_that_overruns_its_budget_refuses_instead_of_answering_late(store):
