@@ -28,6 +28,31 @@ OCR-written content" — is the contract this design is built to satisfy.
 `papra-suite serve`. The pipeline's crash-restart loops, OCR workers, and an agent-facing
 request path have no business sharing a process.
 
+> **Decided differently, 2026-11-19 (option C).** The listener ships inside `serve`, and the operator chose
+> **one process with objects that cannot write** over splitting the process (option B) or accepting the shared
+> handles as they were (option A). The paragraph above stays as the argument that was not taken, so the change is
+> legible rather than silent.
+>
+> What C commits to, and how each part is checked:
+>
+> - Everything reachable from a tool call gets capabilities with **no write surface**: a store connection under
+>   `PRAGMA query_only=ON` that never runs a migration, and Papra/Kreuzakt views whose method sets contain no
+>   `update_document`, `delete_document`, `retag_document`, `create_organization`, no POST, PATCH or DELETE —
+>   absent from the object, not merely unused by the current handler bodies.
+> - Handlers take those view types as dependencies, so a handler that reaches for a write fails to construct
+>   instead of failing review.
+> - The one legitimate write on the request path, `mcp_tokens.last_used_at`, stays on its own short-lived
+>   connection behind the existing 60-second throttle and is never handed to a handler.
+> - Not `mode=ro`: the ledger is WAL (`journal_mode=WAL`), and a read-only URI open of a WAL database is fragile —
+>   it needs a usable `-shm` and fails where it would have to create a WAL index. `query_only` is a property of the
+>   connection, so it works against the live database while `serve` holds it.
+> - The claim stays narrow on purpose: this is not a boundary against an already-compromised process, and it is
+>   not tenancy. Its promise is that code reached from a tool call cannot mutate Papra or the ledger, and a test
+>   says so. Option B becomes the right answer the day a second consumer or a second human appears; it would also
+>   isolate listener availability from scheduler availability.
+> - Availability, same decision: when the listener task dies inside `serve`, the process must exit **non-zero**.
+>   Exiting 0 means a Dokploy `restart: on-failure` policy never fires and a dead port stays silent.
+
 | Variable | Meaning | Required |
 |---|---|---|
 | `PAPRA_BASE_URL` | Papra API base | yes |
@@ -40,6 +65,12 @@ request path have no business sharing a process.
 Schema ownership stays with the pipeline: `papra-suite serve` and the CLI migrate, **MCP never
 does**. MCP opens the existing database read-only and fails if the schema is unrecognised, so a
 fresh `DATA_DIR` is a startup error rather than a silently empty archive.
+
+Two values in the table above are not what shipped, recorded so the next reader does not implement the spec
+instead of the product: the default bind is **`127.0.0.1:8765`**, not `:8100`; and the bearer secret is not
+`PAPRA_MCP_TOKEN` at all — tokens live in the `mcp_tokens` table, hashed, each labelled and scoped to a list of
+organisation ids (`papra-suite mcp-token --create --label … --org-id …`), which is what makes per-bucket scoping
+and revocation without a redeploy possible.
 
 Missing or insufficient configuration means **refuse to start**, name the variable, exit
 non-zero — including a missing `DATA_DIR`, a malformed allow-list, and a short or absent token.
