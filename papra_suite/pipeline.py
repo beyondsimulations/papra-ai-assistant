@@ -126,7 +126,8 @@ def metadata_writer_state(delivery: bool, legacy: bool) -> str:
 
         papra-suite jobs --kind title --drain
 
-    Two zeroes proves the second writer has no work left. It does NOT change this string,
+    Two quiet readings a minute apart prove the second writer has no work left. It does NOT
+    change this string,
     which is computed from the two flags and not from the queue: while `legacy_workers` is on
     the line keeps saying `two writers`, and that is the honest reading — the loops are still
     running and would claim title work if any existed. The string becomes `index bridge` when
