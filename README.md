@@ -104,6 +104,7 @@ trust boundary is verified for a specific provider.
 | `papra-suite jobs [--kind K] --drain` | the handover gate: exits `1` while anything is `pending` or `running`, naming both counts |
 | `papra-suite backfill [--org-id ID] [--limit N] [--all-stale] [--dry-run]` | queue what the index does not currently hold — including the documents the sweep will never visit — through the intake path, in bounded slices |
 | `papra-suite mcp-token (--create --label X [--org-id ID \| --all-buckets] \| --list \| --revoke --label X)` | mint, list and revoke the bearer tokens the MCP listener accepts. The plaintext is printed exactly once and only its sha256 is stored |
+| `papra-suite mcp [--status] [--enable \| --disable] [--allow-nonloopback \| --deny-nonloopback] [--dry-run] [--yes-i-mean-it]` | read or set the two settings rows that gate the MCP listener. Names the transition it wrote (`mcp_server_enabled: unset → 1`), refuses an enable whose bind or public URL `serve` would not start under, needs `--yes-i-mean-it` to let the listener leave loopback, and never prints a token or a token digest |
 
 `check` ends with one line — `events (last 24h): sender_denied=3, upload_failed=1`
 — because `check` is the command an operator already runs when something is wrong,
@@ -424,20 +425,33 @@ papra-suite mcp-token --revoke --label hermes
 
 | | |
 |---|---|
-| `mcp_server_enabled` (settings) | start the listener with `serve`. Unset means no listener, and `check` says `mcp: disabled` |
-| `mcp_bind_nonloopback` (settings) | required in addition to `PAPRA_MCP_HOST` before the listener will bind anything but loopback |
+| `mcp_server_enabled` (settings) | start the listener with `serve`. Unset means no listener, and `check` says `mcp: disabled`. `papra-suite mcp --enable` sets it |
+| `mcp_bind_nonloopback` (settings) | required in addition to `PAPRA_MCP_HOST` before the listener will bind anything but loopback. `papra-suite mcp --allow-nonloopback --yes-i-mean-it` sets it |
 | `PAPRA_MCP_URL` | the public URL, e.g. `https://papra-mcp.ts.net`. Host and Origin are checked against it: a `Host` it does not name is a **421**, an `Origin` it does not name a **403** |
 | `PAPRA_MCP_HOST` | the interface to bind: `127.0.0.1` by default; `::1` and `[::1]` both work, and anything routable needs the setting above |
 | `PAPRA_MCP_PORT` | `8765` by default |
 
-There is no `papra-suite` command that sets the two settings rows yet (Task 16 writes one). Until
-there is, they are SQLite, and that is the literal command — `PAPRA_MCP_HOST` alone will not open the
-listener, and setting it to a routable address without `mcp_bind_nonloopback` is a refusal, not a bind:
+`PAPRA_MCP_HOST` alone will not open the listener, and setting it to a routable address without
+`mcp_bind_nonloopback` is a refusal rather than a bind. Both rows are `papra-suite mcp`'s:
 
 ```bash
-sqlite3 "$DATA_DIR/state.db" "INSERT OR REPLACE INTO settings(key, value) VALUES ('mcp_server_enabled', '1');"
-sqlite3 "$DATA_DIR/state.db" "INSERT OR REPLACE INTO settings(key, value) VALUES ('mcp_bind_nonloopback', '1');"  # only if you mean it
+papra-suite mcp                                               # reads both rows back, plus the bind and the token counts
+papra-suite mcp --enable                                      # mcp_server_enabled: unset → 1
+papra-suite mcp --enable --dry-run                            # the same line, no row written
+papra-suite mcp --allow-nonloopback --yes-i-mean-it           # the listener may leave loopback — only if you mean it
+papra-suite mcp --disable                                     # nothing answers the network again
 ```
+
+`--enable` refuses with exit `2` and writes nothing when the state it would produce is one `serve`
+will not start under — a routable `PAPRA_MCP_HOST` with the non-loopback row unset, or no usable
+`PAPRA_MCP_URL`. That is the point of having a command rather than a statement: writing a row that
+produces a process which cannot start is Task 12's availability defect with a signature on it, and
+`check` would only report it after the fact. `--allow-nonloopback` is the one flag that needs a second
+flag, because it is the one that moves a bearer token: it prints what that means and asks for
+`--yes-i-mean-it`, the discipline `ledger --reindex-all` uses. Both rows are read when `serve` starts,
+so **restart `serve`** after changing either; `papra-suite check` prints the `mcp:` line, and
+`papra-suite mcp` reads the rows back with the store's own reading beside each one — `unset`, `off`
+and `maybe` all mean 0, and only you can say whether one of them was a mistake.
 
 Publishing it is `tailscale serve` in front of `127.0.0.1:8765`, which is why the default bind is
 loopback and why a non-loopback bind needs a settings row and not only an environment variable: a
@@ -511,8 +525,11 @@ here.
    `pytest tests/test_mcp_server_auth.py tests/test_mcp_listener_lifecycle.py -m "not integration"`
    against the new environment first: the authentication and transport code the listener runs on lives
    in that dependency closure, not in this repository.
-3. Write the command that sets `mcp_server_enabled` and `mcp_bind_nonloopback`. Until it exists the
-   only way is `sqlite3`, which is not a thing to hand an operator at 2am.
+3. **`papra-suite mcp` sets both rows now** — `--enable` / `--disable`,
+   `--allow-nonloopback --yes-i-mean-it` / `--deny-nonloopback`, and a bare `papra-suite mcp` that reads
+   them back with the bind and the token counts. What this item still owes is item 1 **before** the
+   command is used: `--enable` refuses a bind or a public URL it can see is wrong, and it cannot see
+   what `tailscale serve` forwards.
 4. Turn the listener on, then confirm the `check` counts, one scoped token and one `--all-buckets`
    token, and that a token can be revoked without a restart.
 5. Set a restart policy on the suite container and say which one in this README. No policy is
