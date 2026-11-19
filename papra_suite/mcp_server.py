@@ -808,9 +808,12 @@ def build_mcp_app(store: LedgerReader, papra: PapraReader, kz: KreuzaktReader, *
     which reports the state and not the value, so a server assembled without it cannot hand out
     links by accident.
 
-    `papra` is the liveness dependency the four content-reading tools share. No tool registered here
-    writes, and the three read-only views are what makes that a construction-time fact rather than a
-    habit: the apps in the containment tests are built on a Papra that raises on any call.
+    `papra` is the liveness dependency every tool that says anything about a document shares:
+    the two search tools check each hit, and all three document tools check the one they were asked
+    for, `open_document` included. A link is a claim about the archive rather than a neutral
+    direction, so it earns the same check. No tool registered here writes, and the three read-only
+    views are what makes that a construction-time fact rather than a habit: the apps in the
+    containment tests are built on a Papra that raises on any call.
 
     The server never migrates. Schema ownership stays with `serve` and the CLI, so a fresh
     `DATA_DIR` cannot become a silently empty archive; whatever opened this store did the
