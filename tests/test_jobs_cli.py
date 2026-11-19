@@ -43,6 +43,7 @@ from papra_suite.jobs_cli import (
     EXIT_REFUSED,
     JOB_STATUSES,
     LIVE_STATUSES,
+    MAX_LIMIT,
     add_subparser,
     run_jobs,
 )
@@ -507,6 +508,47 @@ def test_drain_ignores_the_spent_rows_that_are_history_not_work(store, capsys):
     assert "safe to switch" in out and "2" in out
 
 
+def test_drain_refuses_a_document_scope_because_it_is_not_a_gate(store, capsys):
+    """`--drain --document-id DOC` reads as "is this document quiet?" and is not the handover gate.
+
+    The gate is judged over everything in scope, so answering it from one document would print the
+    quiescence sentence above every row that is still work. It is also a flag `_drain` never passes
+    anywhere: typed beside `--drain` it silently asked for something the command does not do — the
+    reading this CLI refuses instead of reinterpreting, and the refusal has to name the flag or the
+    operator cannot see what to drop.
+    """
+    seed_job(store, kind="index", document_id="doc-1")
+
+    assert run_jobs(None, cli_args(drain=True, document_id="doc-1"), store=store) == EXIT_REFUSED
+
+    err = capsys.readouterr().err
+    assert "drain" in err and "--document-id" in err
+    assert store.count_jobs() == 1                 # nothing drained, nothing changed
+
+
+def test_the_drain_refusal_names_a_kind_the_listing_cap_would_hide(store, capsys):
+    """1001 `ocr` rows must not silence the one `index` row that is also holding work.
+
+    The counts and the exit code have been exact all along — they come from SQL — but the *names* in
+    the refusal came from a capped listing, so past roughly a thousand live rows the sentence read
+    `still holding work: ocr` while an `index` job sat waiting, and the operator went to watch the
+    loop that was already quiet. The listing is newest-first, which is what hides the oldest kind:
+    the `index` row is seeded first here so a capped read cannot see it.
+    """
+    seed_job(store, kind="index", document_id="doc-index")        # the oldest live row
+    for index in range(MAX_LIMIT + 1):
+        store.enqueue_job(kind="ocr", papra_org_id=ORG, document_id=f"doc-{index}",
+                          content_hash=H, payload={})
+    capped = store.list_jobs(status="pending", limit=MAX_LIMIT)
+    assert len(capped) == MAX_LIMIT and "index" not in {row.kind for row in capped}
+
+    assert run_jobs(None, cli_args(drain=True), store=store) == EXIT_INCOMPLETE
+
+    out = capsys.readouterr().out
+    assert f"{MAX_LIMIT + 2} pending" in out, out
+    assert "still holding work: index, ocr" in out, out
+
+
 def test_drain_refuses_filters_that_would_narrow_the_reading(store, capsys):
     """A drain that reads one status is not a drain.
 
@@ -517,6 +559,78 @@ def test_drain_refuses_filters_that_would_narrow_the_reading(store, capsys):
         args = cli_args(kind="ocr", drain=True, **over)
         assert run_jobs(None, args, store=store) == EXIT_REFUSED, over
     assert "drain" in capsys.readouterr().err
+
+
+def test_the_listing_prints_newest_first_after_the_rowid_ordering(store, capsys):
+    """The queue view's contract, at the terminal rather than in the store.
+
+    `ORDER BY rowid DESC` replaced `ORDER BY created_at DESC, rowid DESC` to stop the bare listing —
+    no `--kind`, no `--status`, the first view an operator types — sorting the whole table. What it
+    owes the terminal is the same page newest-first, because that page is how a person picks the row
+    to name in `--reset`; the store-level pins cover the rows and the plan, this covers the column.
+    Deliberately the unfiltered listing: the ordering clause is shared by every shape of this read,
+    and the one that got cheaper is the one with no filters.
+    """
+    first = seed_job(store, kind="ocr", document_id="doc-first")
+    second = seed_job(store, kind="title", document_id="doc-second")
+    third = seed_job(store, kind="index", document_id="doc-third")
+
+    assert run_jobs(None, cli_args(), store=store) == 0
+
+    body = [line for line in capsys.readouterr().out.splitlines()
+            if line.startswith(("yes\t", "no\t"))]
+    assert [line.split("\t")[1] for line in body] == [third, second, first]
+
+
+@pytest.mark.parametrize("flag,over", [("--document-id", {"document_id": ""}),
+                                      ("--kind", {"kind": ""}),
+                                      ("--document-id", {"document_id": "   "})],
+                         ids=["empty-document", "empty-kind", "blank-document"])
+def test_an_empty_scope_value_is_refused_rather_than_reading_the_whole_queue(store, capsys, flag,
+                                                                            over):
+    """`jobs --document-id "$DOC"` with `DOC` unset is the whole queue, printed as an answer.
+
+    An empty value is dropped by every filter it would have gone into, so a shell variable that
+    never got set means "no filter" and the operator gets rows about other people's documents with
+    no scope echoed above them — the failure class Task 6's xfail was written about, and the
+    plausible-looking wrong answer of the ones this store can give. So an explicitly-passed empty
+    scope is refused, on the listing and on the gate alike.
+    """
+    seed_job(store, kind="index", document_id="doc-1")
+
+    assert run_jobs(None, cli_args(**over), store=store) == EXIT_REFUSED, over
+    assert run_jobs(None, cli_args(drain=True, **over), store=store) == EXIT_REFUSED, over
+
+    err = capsys.readouterr().err
+    assert "empty" in err and flag in err, err
+    assert capsys.readouterr().out == ""            # not even an empty listing
+
+
+def test_a_quiet_drain_names_the_writer_it_proves_quiet(store, capsys):
+    """The operator is holding two flags, and one kind only speaks for its own loop.
+
+    `--kind ocr --drain` is step two of the `content` handover: it says the legacy OCR loop has no
+    work left, which is what makes `PAPRA_INDEX_CONTENT_DELIVERY` safe to switch on. It says nothing
+    about the title loop, and `--kind title --drain` says nothing about the delivery flag — so the
+    sentence has to name the loop it read, the flag that reading covers, and the flag it does not,
+    or a person who drained one queue switches both.
+    """
+    assert run_jobs(None, cli_args(kind="ocr", drain=True), store=store) == 0
+
+    out = capsys.readouterr().out
+    assert "safe to switch" in out and "PAPRA_INDEX_CONTENT_DELIVERY" in out
+    assert "`ocr` loop" in out and "`title`" in out and "separate reading" in out
+
+    capsys.readouterr()
+    assert run_jobs(None, cli_args(kind="title", drain=True), store=store) == 0
+    out = capsys.readouterr().out
+    assert "PAPRA_LEGACY_WORKERS" in out and "`title` loop" in out
+    assert "says nothing about" in out                 # the delivery flag is not this reading
+
+    capsys.readouterr()
+    assert run_jobs(None, cli_args(drain=True), store=store) == 0
+    out = capsys.readouterr().out
+    assert "PAPRA_INDEX_CONTENT_DELIVERY" in out and "PAPRA_LEGACY_WORKERS" in out
 
 
 # --- the store, the database, and the entry point ---------------------------------
@@ -837,6 +951,37 @@ def test_a_row_claimed_between_the_read_and_the_write_is_refused_in_words(store,
     assert store.get_job(job_id).status == "running"
 
 
+def test_the_reset_refusals_travel_on_types_and_not_on_wording(store, capsys, monkeypatch):
+    """A copy edit in the store must not move an exit code an operator acts on.
+
+    `--reset` answers a row a worker is holding with `2` and a row whose work is queued elsewhere
+    with `1`: "leave it alone" and "the work is queued, nothing changed" are different instructions,
+    and the exit code is what a script reads. Matching the message for the words `running` and
+    `already queued` to tell them apart makes rewording a store sentence a wrong exit code here, so
+    the store raises one typed error each — and this test raises them with messages that match
+    neither phrase.
+    """
+    from papra_suite.store import JobAlreadyQueuedError, JobIsRunningError
+
+    job_id = seed_job(store, kind="index", document_id="doc-1")
+
+    def refused(error):
+        def raiser(_job_id):
+            raise error
+
+        return raiser
+
+    monkeypatch.setattr(store, "reset_job",
+                        refused(JobIsRunningError("nothing here matches the old phrase")))
+    assert run_jobs(None, cli_args(reset=job_id), store=store) == EXIT_REFUSED
+    assert "running" in capsys.readouterr().err
+
+    monkeypatch.setattr(store, "reset_job",
+                        refused(JobAlreadyQueuedError("nothing here matches either")))
+    assert run_jobs(None, cli_args(reset=job_id), store=store) == EXIT_INCOMPLETE
+    assert "Traceback" not in capsys.readouterr().err
+
+
 def test_count_jobs_by_status_answers_every_status_in_one_read(store):
     """One GROUP BY over the scope, so a caller can compare statuses without reading twice.
 
@@ -895,7 +1040,9 @@ def test_drain_reads_its_two_numbers_from_one_snapshot(store, capsys):
 #: Every invocation the README prints or a log line names for the two commands in this task.
 CITED_INVOCATIONS = [
     ["jobs"], ["jobs", "--reset", "JOB_ID"], ["jobs", "--drain"],
-    ["jobs", "--kind", "ocr", "--drain"], ["jobs", "--kind", "index", "--status", "failed"],
+    ["jobs", "--kind", "ocr", "--drain"], ["jobs", "--kind", "title", "--drain"],
+    ["jobs", "--kind", "index", "--drain"],
+    ["jobs", "--kind", "index", "--status", "failed"],
     ["jobs", "--document-id", "DOC", "--json"],
     ["backfill"], ["backfill", "--dry-run"], ["backfill", "--limit", "20"],
     ["backfill", "--org-id", "ORG", "--limit", "5"], ["backfill", "--all-stale"],

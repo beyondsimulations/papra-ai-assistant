@@ -124,10 +124,10 @@ def metadata_writer_state(delivery: bool, legacy: bool) -> str:
     has passed is the actionable queue,
     read twice a minute apart while the loops are still running:
 
-        sqlite3 "$DATA_DIR/state.db" "SELECT count(*) FROM jobs WHERE kind='title'
-                                      AND status IN ('pending','running');"
+        papra-suite jobs --kind title --drain
 
-    Two zeroes proves the second writer has no work left. It does NOT change this string,
+    Two quiet readings a minute apart prove the second writer has no work left. It does NOT
+    change this string,
     which is computed from the two flags and not from the queue: while `legacy_workers` is on
     the line keeps saying `two writers`, and that is the honest reading — the loops are still
     running and would claim title work if any existed. The string becomes `index bridge` when
@@ -392,10 +392,10 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     if config.legacy_workers:
         # With the legacy writers switched off these loops are what keeps claiming from a
         # queue nobody is filling any more, and a drain is only provable when the loops are
-        # gone rather than merely idle. The evidence the handover asks for is the state
-        # database reading empty twice a minute apart:
-        # `sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs
-        # GROUP BY 1, 2;"` — no `ocr` row in `pending` or `running`, both times.
+        # gone rather than merely idle. The evidence the handover asks for is the same queue
+        # read empty twice a minute apart:
+        # `papra-suite jobs --kind ocr --drain` — no `ocr` row in `pending` or `running`,
+        # both times.
         for _ in range(config.ocr_concurrency):
             tasks.append(asyncio.create_task(worker_loop(
                 store, kind="ocr",

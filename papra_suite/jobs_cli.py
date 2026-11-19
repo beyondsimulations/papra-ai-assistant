@@ -21,9 +21,13 @@ to, and `recover_running_jobs` owns the restart case — so the command a human 
 
 **`--drain` is a gate, not a summary.** It is step two of the `content` handover (legacy off →
 prove quiescence → delivery on) and it refuses while anything is `pending` or `running`, naming
-both counts. It reads the queue with `count_jobs`, never with the listing's filters, and it
-refuses `--status`/`--limit`/`--json` outright: `--drain --status pending` would answer "no
-pending rows" and print a quiescence sentence above a `running` job.
+both counts and the kinds that hold them. It reads the queue with its own two statements —
+`count_jobs_by_status` for the numbers, `live_job_kinds` for the names — never with the listing's
+filters or under its cap: a listing answers at most `MAX_LIMIT` rows, so a count taken from one can
+call a busy queue quiet and a kind list taken from one can drop a kind that is holding work. It
+refuses `--status`/`--document-id`/`--limit`/`--json` outright: `--drain --status pending` would
+answer "no pending rows" and print the quiescence sentence above a `running` job, and a single
+document is not a gate at all.
 
 Read-only apart from `--reset`, and it never migrates: like `events`, it refuses a missing
 database *before* constructing `Store` — which creates the file it is handed, and would replace
@@ -38,7 +42,7 @@ import sqlite3
 import sys
 from dataclasses import asdict
 
-from papra_suite.store import Store
+from papra_suite.store import JobAlreadyQueuedError, JobIsRunningError, Store
 
 #: Exit codes, with the meaning `check`, `replay`, `metadata` and `ledger` already give them:
 #: `0` the command did what was asked, `1` it stopped or declined to change anything, `2` it
@@ -116,10 +120,23 @@ def run_jobs(config, args, *, store: Store | None = None) -> int:
     matters here is what a command does against a store it cannot read, and that is not something
     to stage by locking a database by hand.
     """
-    if args.drain and (args.status or args.json
+    blank = [flag for flag, value in (("--kind", args.kind), ("--document-id", args.document_id))
+             if value is not None and not value.strip()]
+    if blank:
+        # `jobs --document-id "$DOC"` with `DOC` unset. An empty value is dropped by every filter it
+        # would have gone into — `if document_id:` in the store, `if args.document_id:` in the scope
+        # line — so a typo'd shell variable answers "what is happening to this document?" with the
+        # whole queue and no scope echoed above it. A filter that silently does nothing is the
+        # failure this flag exists to avoid, so an empty one is refused rather than ignored.
+        print(f"jobs refused: {' and '.join(blank)} was given an empty value, and an empty scope "
+              "means no scope: that lists the whole queue", file=sys.stderr)
+        print("pass the id the listing printed, or drop the flag to ask about every document",
+              file=sys.stderr)
+        return EXIT_REFUSED
+    if args.drain and (args.status or args.document_id or args.json
                        or (args.limit or DEFAULT_LIMIT) != DEFAULT_LIMIT):
-        print("drain reads the whole queue in scope: --status, --limit and --json narrow a "
-              "listing, and a narrowed reading is not a drain", file=sys.stderr)
+        print("drain reads the whole queue in scope: --status, --document-id, --limit and --json "
+              "narrow a listing, and a narrowed reading is not a drain", file=sys.stderr)
         print("run `papra-suite jobs --drain` on its own (add --kind to scope it)",
               file=sys.stderr)
         return EXIT_REFUSED
@@ -307,41 +324,68 @@ def _reset(store: Store, args) -> int:
                 if row.content_hash == job.content_hash and row.id != job.id]
     try:
         store.reset_job(job.id)
-    except ValueError as error:
-        if "running" in str(error):
-            # The row was claimed after the read above said `pending`. The guard next to the write
-            # is the one that holds, and the operator gets the same refusal either way — a
-            # traceback here would bury the one fact that matters, which row is now a worker's.
-            print(f"refusing to reset {job.id}: it is running, a worker claimed it just now",
-                  file=sys.stderr)
-            print("let it settle, then read the document: "
-                  f"`papra-suite jobs --document-id {job.document_id}`", file=sys.stderr)
-            return EXIT_REFUSED
-        if "already queued" in str(error):
-            # Nothing to fix and nothing changed: the work IS queued, under another row. Exit 1
-            # rather than 0 because the row that was named is still settled, and 0 would read as
-            # "this row runs now".
-            print(error)
-            print("nothing was changed — that other row is the same work and it will be claimed. "
-                  f"Read it with `papra-suite jobs --document-id {job.document_id}`")
-            return EXIT_INCOMPLETE
-        raise
+    except JobIsRunningError:
+        # The row was claimed after the read above said `pending`. The guard next to the write is
+        # the one that holds, and the operator gets the same refusal either way — a traceback here
+        # would bury the one fact that matters, which row is now a worker's.
+        #
+        # Matched on the exception TYPE rather than on its message: this branch decides exit `2`,
+        # and while it was looking for the word `running` in a sentence, rewording that sentence in
+        # the store moved an exit code that an operator and a runbook both act on.
+        print(f"refusing to reset {job.id}: it is running, a worker claimed it just now",
+              file=sys.stderr)
+        print("let it settle, then read the document: "
+              f"`papra-suite jobs --document-id {job.document_id}`", file=sys.stderr)
+        return EXIT_REFUSED
+    except JobAlreadyQueuedError as error:
+        # Nothing to fix and nothing changed: the work IS queued, under another row. Exit 1 rather
+        # than 0 because the row that was named is still settled, and 0 would read as "this row runs
+        # now". Typed for the same reason as the refusal above.
+        print(error)
+        print("nothing was changed — that other row is the same work and it will be claimed. "
+              f"Read it with `papra-suite jobs --document-id {job.document_id}`")
+        return EXIT_INCOMPLETE
     _print_reset(job, siblings)
     return EXIT_OK
 
 
 def _kinds_holding_work(store: Store, kind: str | None) -> list[str]:
-    """Which kinds the refusal is about, named.
+    """Which kinds the refusal is about, named — from the table, never from the listing.
 
-    Listing rows only to read their `kind` is deliberate: `count_jobs` gives the exact totals the
-    gate is judged on, and this gives the names. The listing cap can therefore only ever shorten
-    a name list, never inflate the count that decides the answer.
+    These names are the sentence an operator acts on, and the listing is capped: read through it, a
+    queue past `MAX_LIMIT` live rows of one kind drops the *other* kind from `still holding work:`,
+    and the operator goes to stop a loop that was already quiet while the one holding work stays
+    unnamed. The counts come from `count_jobs_by_status` and the names from `live_job_kinds`, both
+    of which read the whole scope, so neither the number nor the name list can be truncated.
     """
-    kinds: set[str] = set()
-    for status in LIVE_STATUSES:
-        kinds.update(row.kind for row in
-                     store.list_jobs(kind=kind, status=status, limit=MAX_LIMIT))
-    return sorted(kinds)
+    return store.live_job_kinds(kind)
+
+
+def _handover_line(kind: str | None) -> str:
+    """Which flag this reading proves safe, and which one it says nothing about.
+
+    The handover has two independent switches — `PAPRA_LEGACY_WORKERS` (stop the loops that write
+    Papra's text and titles) and `PAPRA_INDEX_CONTENT_DELIVERY` (start the bridge writing them) —
+    and a drain of one kind speaks only for the loop that claims that kind. Saying "the writer"
+    without naming it is how a quiet `ocr` queue becomes `PAPRA_LEGACY_WORKERS=false` while a
+    `title` job is still in flight, or the delivery flag goes on over a queue that never drained.
+    """
+    if kind == "ocr":
+        return ("the legacy `ocr` loop is the one this proves quiet, and it is the reading "
+                "PAPRA_INDEX_CONTENT_DELIVERY waits on: turn that one on. The `title` loop is a "
+                "separate reading (`papra-suite jobs --kind title --drain`) and "
+                "PAPRA_LEGACY_WORKERS is a separate decision — leave both until that reads 0 twice")
+    if kind == "title":
+        return ("the legacy `title` loop is the one this proves quiet, and it is the reading "
+                "PAPRA_LEGACY_WORKERS waits on. It says nothing about the `ocr` queue or about "
+                "PAPRA_INDEX_CONTENT_DELIVERY: read those with `--kind ocr --drain`")
+    if kind:
+        return (f"the legacy `{kind}` queue is the only one this proves quiet. Name the flag you "
+                "are switching and read the kind that covers it: `ocr` for "
+                "PAPRA_INDEX_CONTENT_DELIVERY, `title` for PAPRA_LEGACY_WORKERS")
+    return ("every queue is quiet, which is the reading both flags wait on: turn "
+            "PAPRA_INDEX_CONTENT_DELIVERY on and, when the handover is complete, take "
+            "PAPRA_LEGACY_WORKERS off")
 
 
 def _drain(store: Store, args) -> int:
@@ -373,5 +417,6 @@ def _drain(store: Store, args) -> int:
     print(f"{scope}: 0 pending, 0 running — quiet ({settled} settled row(s) are history, not "
           "work)")
     print("safe to switch the writer over once a second reading a minute from now is also 0: run "
-          "`papra-suite jobs --drain` again, then turn the delivery flag on")
+          f"`papra-suite jobs --drain{f' --kind {args.kind}' if args.kind else ''}` again, then "
+          + _handover_line(args.kind))
     return EXIT_OK

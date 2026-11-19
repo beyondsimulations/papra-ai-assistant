@@ -13,8 +13,10 @@ a rebuild every document in the corpus would look already-done and the command w
 finished backfill over an empty index. A document is work when the current generation has no usable
 reference for it — the same predicate `ledger_needs_index` implements — and the population this
 exists for is the one the sweep will never visit: `document_seen` knows it, the ledger never held
-it. Those are the PDFs mailed before the handover and the oversized skips; enrolling one writes the
-ledger reference **before** the job becomes visible, the intake ordering, because a queued job with
+it. Those are the PDFs mailed before the handover and the documents a restore left with a sighting
+and no reference; the oversized skips are named only to say they are **counted and refused**, not
+admitted, and they stay outside the index. Enrolling one document writes the ledger reference
+**before** the job becomes visible, the intake ordering, because a queued job with
 no row behind it is work no later pass can see.
 
 **A remainder is printed, never implied.** `--limit 5` over 12 candidates prints `7 remaining`, and
@@ -79,6 +81,7 @@ class FakeListing:
         self.download_calls = 0
         self.patched = []
         self.raise_on_list = None          # an Exception, or {org: Exception}
+        self.raise_on_download = None      # an Exception, or {document_id: Exception}
         self.body = PDF_BYTES
         self.closed = False
         for record in records or []:
@@ -120,8 +123,15 @@ class FakeListing:
         self.get_calls += 1
         raise PapraError(f"GET document failed: 404 {document_id} not found", 404)
 
+    def _raise_for_download(self, document_id):
+        error = (self.raise_on_download.get(document_id)
+                 if isinstance(self.raise_on_download, dict) else self.raise_on_download)
+        if error is not None:
+            raise error
+
     async def download_file(self, org_id, document_id):
         self.download_calls += 1
+        self._raise_for_download(document_id)
         return self.body
 
     async def update_document(self, org_id, document_id, **body):
@@ -183,7 +193,7 @@ async def test_dry_run_counts_the_work_and_changes_nothing(store):
 
     result = await backfill_corpus(store, papra, orgs=[ORG], dry_run=True)
 
-    assert (result.candidates, result.enqueued, result.remaining) == (12, 12, 0)
+    assert (result.candidates, result.asked_for, result.remaining) == (12, 12, 0)
     assert store.list_jobs() == [] and store.ledger_org_ids() == []
     assert store.document_seen(ORG, "doc-0") is False
     assert papra.patched == [] and papra.download_calls == 0
@@ -196,7 +206,7 @@ def test_backfill_dry_run_counts_without_enqueuing(store, capsys):
     assert run(store, papra, dry_run=True) == 0
 
     assert papra.list_calls and store.list_jobs() == []
-    assert "would enqueue 12" in capsys.readouterr().out
+    assert "would queue 12" in capsys.readouterr().out
 
 
 async def test_documents_the_ledger_calls_current_are_walked_past(store):
@@ -213,11 +223,11 @@ async def test_documents_the_ledger_calls_current_are_walked_past(store):
 
     result = await backfill_corpus(store, papra, orgs=[ORG])
 
-    assert (result.enqueued, result.already_current, result.remaining) == (0, 10, 0)
+    assert (result.asked_for, result.already_current, result.remaining) == (0, 10, 0)
     assert store.list_jobs() == []
 
 
-def test_backfill_reports_zero_enqueued_beside_the_ten_it_examined(store, capsys):
+def test_backfill_reports_zero_new_rows_beside_the_ten_it_examined(store, capsys):
     papra = seed_listing(FakeListing(), count=10)
     for index in range(10):
         seed_ledger(store, document_id=f"doc-{index}", kreuzakt_id=index + 1,
@@ -226,7 +236,7 @@ def test_backfill_reports_zero_enqueued_beside_the_ten_it_examined(store, capsys
     assert run(store, papra) == 0
 
     out = capsys.readouterr().out
-    assert "0 of 10" in out and "10" in out and "remaining" in out
+    assert "queued 0 new row(s)" in out and "0 of 10" in out and "remaining" in out
 
 
 async def test_seen_is_not_eligibility_a_mailed_pdf_with_no_reference_is_enrolled(store):
@@ -244,7 +254,7 @@ async def test_seen_is_not_eligibility_a_mailed_pdf_with_no_reference_is_enrolle
 
     result = await backfill_corpus(store, papra, orgs=[ORG])
 
-    assert (result.enqueued, result.enrolled) == (3, 3)
+    assert (result.asked_for, result.enrolled) == (3, 3)
     assert len(index_jobs(store)) == 3
     assert [ref.papra_document_id for ref in store.ledger_needs_index(
         generation=store.get_generation())] == ["doc-0", "doc-1", "doc-2"]
@@ -289,7 +299,7 @@ async def test_a_stale_reference_is_work_without_any_extra_flag(store):
 
     result = await backfill_corpus(store, papra, orgs=[ORG])
 
-    assert (result.enqueued, result.stale_queued, result.enrolled) == (4, 4, 0)
+    assert (result.asked_for, result.stale_queued, result.enrolled) == (4, 4, 0)
     assert len(index_jobs(store)) == 4
 
 
@@ -307,7 +317,7 @@ async def test_all_stale_reaches_references_the_listing_never_showed(store):
     store.bump_generation()
 
     without = await backfill_corpus(store, papra, orgs=[ORG])
-    assert (without.enqueued, without.remaining) == (1, 0)
+    assert (without.asked_for, without.remaining) == (1, 0)
     # Spend that row so the second run has to ask again for the same bytes: since migration 004 a
     # terminal row does not block it, so the second run takes a row of its own — which is why the
     # assertion below counts live rows, the only sense in which a document is queued once.
@@ -315,7 +325,7 @@ async def test_all_stale_reaches_references_the_listing_never_showed(store):
 
     with_flag = await backfill_corpus(store, papra, orgs=[ORG], all_stale=True)
 
-    assert with_flag.enqueued >= 1
+    assert with_flag.asked_for >= 1
     live = [job.document_id for job in index_jobs(store) if job.status == "pending"]
     assert "doc-invisible" in live
     assert live.count("doc-0") == 1, "the second walk queued the listing's document twice"
@@ -334,7 +344,7 @@ async def test_the_limit_caps_the_run_and_the_remainder_is_measured(store):
 
     result = await backfill_corpus(store, papra, orgs=[ORG], limit=5)
 
-    assert (result.enqueued, result.remaining, result.candidates) == (5, 7, 12)
+    assert (result.asked_for, result.remaining, result.candidates) == (5, 7, 12)
     assert len(index_jobs(store)) == 5
 
 
@@ -359,7 +369,6 @@ def test_a_limit_is_a_deliberate_slice_and_not_a_failure(store, capsys):
     assert run(store, papra, limit=1) == 0
 
     assert "9 remaining" in capsys.readouterr().out
-    assert EXIT_INCOMPLETE != 0
 
 
 def test_the_dry_run_respects_the_limit_too(store, capsys):
@@ -373,7 +382,7 @@ def test_the_dry_run_respects_the_limit_too(store, capsys):
     assert run(store, papra, dry_run=True, limit=5) == 0
 
     out = capsys.readouterr().out
-    assert "would enqueue 5" in out and "7 remaining" in out
+    assert "would queue 5" in out and "7 remaining" in out
 
 
 # --- what is left out, and why it is said out loud --------------------------------
@@ -383,7 +392,7 @@ async def test_non_pdf_documents_are_outside_a_pdf_only_index(store):
 
     result = await backfill_corpus(store, papra, orgs=[ORG])
 
-    assert (result.enqueued, result.skipped_non_pdf, result.candidates) == (0, 4, 0)
+    assert (result.asked_for, result.skipped_non_pdf, result.candidates) == (0, 4, 0)
     assert store.list_jobs() == []
 
 
@@ -409,7 +418,7 @@ async def test_a_document_in_papra_s_trash_is_the_deletion_pass_s_work(store):
 
     result = await backfill_corpus(store, papra, orgs=[ORG])
 
-    assert (result.enqueued, result.skipped_deleted) == (1, 1)
+    assert (result.asked_for, result.skipped_deleted) == (1, 1)
     assert store.ledger_get(ORG, "doc-trashed") is None
 
 
@@ -424,7 +433,7 @@ async def test_an_oversized_document_is_refused_on_the_size_papra_declared(store
 
     result = await backfill_corpus(store, papra, orgs=[ORG])
 
-    assert (result.enqueued, result.skipped_oversized) == (0, 1)
+    assert (result.asked_for, result.skipped_oversized) == (0, 1)
     assert papra.download_calls == 0
     assert store.ledger_get(ORG, "doc-huge") is None
 
@@ -442,7 +451,7 @@ async def test_a_listing_without_a_hash_is_hashed_from_the_body(store):
 
     result = await backfill_corpus(store, papra, orgs=[ORG])
 
-    assert result.enqueued == 1 and papra.download_calls == 1
+    assert result.asked_for == 1 and papra.download_calls == 1
     assert index_jobs(store)[0].content_hash == hashlib.sha256(PDF_BYTES).hexdigest()
 
 
@@ -460,7 +469,7 @@ async def test_a_document_too_big_to_hash_is_refused_after_the_download(store, m
 
     result = await backfill_corpus(store, papra, orgs=[ORG])
 
-    assert (result.enqueued, result.skipped_oversized) == (0, 1)
+    assert (result.asked_for, result.skipped_oversized) == (0, 1)
     assert store.list_jobs() == []
 
 
@@ -476,7 +485,7 @@ async def test_a_corpus_bigger_than_a_page_is_walked_to_its_end(store):
 
     result = await backfill_corpus(store, papra, orgs=[ORG])
 
-    assert (result.enqueued, result.listed) == (120, 120)
+    assert (result.asked_for, result.listed) == (120, 120)
     assert [call[1] for call in papra.list_calls if call[0] == ORG] == [0, 1]
 
 
@@ -502,7 +511,7 @@ async def test_every_known_bucket_is_walked_when_none_is_named(store):
 async def test_one_bucket_that_will_not_answer_does_not_end_the_others(store):
     """Papra refusing a listing is a fact about that bucket, not a reason to stop.
 
-    The walk still has to report itself unfinished though: "enqueued 4" with one bucket unread
+    The walk still has to report itself unfinished though: "queued 4" with one bucket unread
     is not a corpus that has been backfilled, and the exit code is what the runbook checks.
     """
     papra = FakeListing()
@@ -512,8 +521,131 @@ async def test_one_bucket_that_will_not_answer_does_not_end_the_others(store):
 
     result = await backfill_corpus(store, papra, orgs=[ORG, "org-b"])
 
-    assert result.enqueued == 1 and result.unreadable == ["org-b"]
+    assert result.asked_for == 1 and result.unreadable == ["org-b"]
     assert result.complete is False
+
+
+@pytest.mark.parametrize("error", [
+    PapraError("GET file failed: 500 upstream died", 500),
+    PapraError("GET file failed after 3 attempts: connection reset by peer", None)],
+    ids=["papra-500", "transport-exhausted"])
+async def test_a_body_that_will_not_arrive_is_an_unfinished_walk(store, error):
+    """A 500 mid-download is a bucket that was not read, not a stack trace.
+
+    The listing is guarded and the download was not: this is the second network call the walk
+    makes, and it happens for every document one of Papra's servers does not publish a content
+    hash for — which is the atlas deployment. Both shapes come from the same client (an HTTP
+    failure and a transport failure it exhausted its retries on), and the handler is the wide
+    tuple `ledger` carries, so a store refusal or a locked database takes the same road rather
+    than a traceback. The verdict is the listing's, for the listing's reason: documents already
+    queued stay queued, the run is incomplete, and the instruction is to run it again once Papra
+    answers. A traceback is the wrong shape twice over — an operator cannot re-run what looks like
+    a crash, and one unread document would read as a whole unread bucket.
+    """
+    papra = FakeListing()
+    papra.add("doc-1")                                 # carries a hash: queued without a download
+    papra.add("doc-2", content_hash=None)              # needs the body, and Papra refuses it
+    papra.raise_on_download = {"doc-2": error}
+
+    result = await backfill_corpus(store, papra, orgs=[ORG])
+
+    assert result.new_rows == 1 and len(index_jobs(store)) == 1
+    assert result.unreadable == [ORG] and result.complete is False
+    assert "doc-2" in result.read_errors[0]
+    assert type(error).__name__ in result.read_errors[0]
+
+
+def test_a_download_that_dies_mid_corpus_exits_1_and_prints_no_traceback(store, capsys):
+    """The same fact at the exit code and on the terminal.
+
+    `backfill` is the command an operator reaches for during an unhappy-service window, which is
+    exactly when a body fetch fails, so this is the failure the file's own promise is about: an
+    unreadable population is reported as unfinished, in words, with exit `1`.
+    """
+    papra = FakeListing()
+    papra.add("doc-1")
+    papra.add("doc-2", content_hash=None)
+    papra.raise_on_download = {"doc-2": PapraError("GET file failed: 500 upstream died", 500)}
+
+    assert run(store, papra) == EXIT_INCOMPLETE
+
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "could not read" in err and "doc-2" in err
+    assert len(index_jobs(store)) == 1                 # what was queued stays queued
+
+
+def test_a_client_that_refuses_to_be_built_is_a_refusal_and_not_a_traceback(tmp_path, capsys,
+                                                                           monkeypatch):
+    """Nothing in this command may reach a terminal as a traceback.
+
+    The listing's failures are handled where they happen; this is the catch-all beside them, and it
+    is the tuple `ledger` already carries — a client that cannot be built, a transport error, a
+    locked store. Narrowing it to `sqlite3.Error` is what let a `PapraError` out of a download.
+    """
+    from papra_suite.config import load_config
+
+    seeded = Store(tmp_path / "state.db")
+    seeded.migrate()
+    seeded.create_org(papra_org_id=ORG, name="Org A")
+    seeded.close()
+
+    def no_client(*args, **kwargs):
+        raise PapraError("could not build a client: no api key", None)
+
+    monkeypatch.setattr("papra_suite.backfill_cli.PapraClient", no_client)
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path)})
+
+    assert run_backfill(config, cli_args()) == EXIT_REFUSED
+
+    err = capsys.readouterr().err
+    assert "refused" in err and "Traceback" not in err
+
+
+async def test_another_buckets_live_row_does_not_absorb_this_documents_request(store):
+    """"Already queued" is a statement about this bucket, not about a document id.
+
+    The work key is `(kind, papra_org_id, document_id, content_hash)`, and Papra's ids are scoped
+    to their organization, so a live row in `org-b` says nothing about whether `org-a`'s copy is
+    queued. Read without the bucket, the run reports "already queued, unchanged" and enqueues
+    nothing — and since the eligibility rule is the ledger's, nothing else will queue it either.
+    """
+    store.create_org(papra_org_id="org-b", name="Org B")
+    store.enqueue_job(kind="index", papra_org_id="org-b", document_id="doc-1",
+                      content_hash=HASH, payload={})
+    papra = FakeListing()
+    papra.add("doc-1", org=ORG)
+
+    result = await backfill_corpus(store, papra, orgs=[ORG])
+
+    assert (result.new_rows, result.already_queued) == (1, 0)
+    assert sorted(job.papra_org_id for job in index_jobs(store)) == [ORG, "org-b"]
+
+
+async def test_the_corpus_walk_never_reads_the_queue_through_the_listing(store):
+    """The per-document queue check goes to the store's work-key lookup, not to a listing.
+
+    `--limit` and `--all-stale` make this call once per PDF over a corpus of thousands, and the
+    listing read was correct — it was just a per-kind filter plus a sort, per document, on the
+    command that is supposed to be the bounded way in. So the shape is forbidden rather than
+    discouraged: a run whose listing read is asked for anything fails here, the same way
+    `test_drain_reads_its_two_numbers_from_one_snapshot` forbids per-status counting.
+    """
+    papra = seed_listing(FakeListing(), count=3)
+
+    class NoListing:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def list_jobs(self, *args, **kwargs):
+            raise AssertionError("the per-document queue check read the queue through the listing")
+
+    result = await backfill_corpus(NoListing(store), papra, orgs=[ORG])
+
+    assert result.new_rows == 3 and len(index_jobs(store)) == 3
 
 
 async def test_the_walk_touches_papra_only_through_the_listing(store):
@@ -750,11 +882,11 @@ def test_the_entry_point_walks_a_real_store_end_to_end(tmp_path, monkeypatch, ca
 
     assert main() == 0
     out = capsys.readouterr().out
-    assert "would enqueue 7" in out and "backfill" in out
+    assert "would queue 7" in out and "backfill" in out
 
 
 def test_the_summary_names_the_buckets_it_queued_across(store, capsys):
-    """The headline's shape: `enqueued N new row(s) across K bucket(s); asked for N+A of C
+    """The headline's shape: `queued N new row(s) across K bucket(s); asked for N+A of C
     candidate(s); L remaining`.
 
     Bucket count is in it because an operator deciding whether to run again wants to know whether
@@ -769,7 +901,7 @@ def test_the_summary_names_the_buckets_it_queued_across(store, capsys):
     assert run(store, papra) == 0
 
     out = capsys.readouterr().out
-    assert "enqueued 2 new row(s) across 2 bucket(s)" in out
+    assert "queued 2 new row(s) across 2 bucket(s)" in out
     assert "asked for 2 of 2 candidate(s)" in out and "0 remaining" in out
 
 
@@ -790,11 +922,12 @@ def test_the_parses_surface_is_what_the_readme_prints():
 def test_a_limit_of_zero_is_refused_rather_than_run_as_nothing(store, capsys):
     """`--limit 0` is a typo for "do not run", and there is no run that enqueues zero.
 
-    Saying so costs one line and saves the operator from reading "enqueued 0 of 843 candidates" as a
-    backfill that finished.
+    Saying so costs one line and saves the operator from reading "asked for 0 of 843 candidate(s)"
+    as a backfill that finished.
     """
     assert run(store, FakeListing(), limit=0) == EXIT_REFUSED
-    assert "--limit" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "--limit" in err and "row" in err and "document" not in err
     assert store.list_jobs() == []
 
 
@@ -804,25 +937,25 @@ async def test_a_stuck_head_does_not_eat_the_next_slice(store, capsys):
     An absorbed request changes nothing — a live row already carries that work — so it must not
     spend the cap. If it did, a stalled worker would make every limited run re-report the same two
     documents and the rest of the corpus would never be reached, while the line still read
-    `enqueued 2 new row(s)`.
+    `queued 2 new row(s)`.
 
-    All three of `enqueued`, `new_rows` and `already_queued` are pinned here because the second run
+    All three of `asked_for`, `new_rows` and `already_queued` are pinned here because the second run
     is the shape that separates them: the absorbed documents were still asked for, so they count in
-    `enqueued` and in `already_queued` while `new_rows` — the number `--limit` caps — stays at 2.
-    Pinning two of the three is how `enqueued` was able to sit equal to `new_rows` through a unit
-    suite of over a thousand tests.
+    `asked_for` and in `already_queued` while `new_rows` — the number `--limit` caps — stays at 2.
+    Pinning two of the three is how the asked-for count was able to sit equal to `new_rows` through
+    a unit suite of over a thousand tests, under a field name that promised the other thing.
     """
     papra = FakeListing()
     for index in range(1, 5):
         papra.add(f"doc-{index}", content_hash=f"{index:02}" * 32)
 
     first = await backfill_corpus(store, papra, orgs=[ORG], limit=2)
-    assert (first.enqueued, first.new_rows, first.already_queued) == (2, 2, 0)
+    assert (first.asked_for, first.new_rows, first.already_queued) == (2, 2, 0)
     assert first.remaining == 2
 
     second = await backfill_corpus(store, papra, orgs=[ORG], limit=2)
 
-    assert (second.enqueued, second.new_rows, second.already_queued) == (4, 2, 2)
+    assert (second.asked_for, second.new_rows, second.already_queued) == (4, 2, 2)
     assert second.remaining == 0
     assert store.count_jobs("index") == 4
 
@@ -833,7 +966,7 @@ def test_the_report_names_the_rows_it_only_found_already_queued(store, capsys):
     The leading number is what changed, because that is what an operator can act on: a corpus whose
     workers are stalled produces a run that asked for everything and changed nothing, and a headline
     that led with the asked-for count would read as progress. The asked-for count is printed too,
-    since it is what `enqueued` means, and the parenthesis is what makes the totals add up.
+    since it is what `asked_for` counts, and the parenthesis is what makes the totals add up.
     """
     papra = FakeListing()
     for index in range(1, 5):
@@ -844,12 +977,12 @@ def test_the_report_names_the_rows_it_only_found_already_queued(store, capsys):
     assert run(store, papra) == EXIT_OK
 
     out = capsys.readouterr().out
-    assert "enqueued 0 new row(s) across 0 bucket(s)" in out
+    assert "queued 0 new row(s) across 0 bucket(s)" in out
     assert "asked for 4 of 4 candidate(s) (4 already queued, unchanged)" in out
 
 
 async def test_the_machine_payload_carries_two_different_counts(store):
-    """The serialized result has to keep `enqueued` and `new_rows` apart, not clone them.
+    """The serialized result has to keep `asked_for` and `new_rows` apart, not clone them.
 
     `backfill` prints prose and has no `--json` flag, so the assertion runs the result through the
     project's own machine serializer (`_dump_json`, the one `jobs --json` uses) over
@@ -873,6 +1006,6 @@ async def test_the_machine_payload_carries_two_different_counts(store):
     payload["orgs_queued"] = sorted(payload["orgs_queued"])
     machine = json.loads(_dump_json(payload))
 
-    assert (machine["enqueued"], machine["new_rows"], machine["already_queued"]) == (4, 0, 4)
-    assert machine["enqueued"] != machine["new_rows"]
-    assert machine["enqueued"] == machine["new_rows"] + machine["already_queued"]
+    assert (machine["asked_for"], machine["new_rows"], machine["already_queued"]) == (4, 0, 4)
+    assert machine["asked_for"] != machine["new_rows"]
+    assert machine["asked_for"] == machine["new_rows"] + machine["already_queued"]

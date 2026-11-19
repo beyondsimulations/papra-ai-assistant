@@ -353,6 +353,21 @@ def _migration_005_delivery_refusals(conn) -> None:
 # queue ends up with a row that is live to one query and invisible to another.
 LIVE_JOB_STATUS_SQL = "status IN ('pending','running')"
 
+#: One work key, live rows only, as one statement. Written here rather than inside the method so
+#: the query plan can be pinned against what ships (`tests/test_store.py`): the four key columns in
+#: `idx_jobs_idempotency`'s own order, plus migration 004's partial predicate, are what turn "is
+#: this exact work already queued?" into a seek instead of a scan of every row of that kind — and
+#: the bucket is part of the key, because a live row in another organization is not this document.
+LIVE_JOB_FOR_KEY_SQL = (
+    "SELECT 1 FROM jobs WHERE kind = ? AND papra_org_id = ? AND document_id = ?"
+    f" AND content_hash = ? AND {LIVE_JOB_STATUS_SQL} LIMIT 1"
+)
+
+#: Which kinds hold work, named, over the whole table. `papra-suite jobs --drain` prints these in
+#: its refusal; taken from a capped listing instead, that sentence can only ever lose a kind, which
+#: sends the operator to the loop that was already quiet.
+LIVE_JOB_KINDS_SQL = f"SELECT DISTINCT kind FROM jobs WHERE {LIVE_JOB_STATUS_SQL}"
+
 
 def _migration_004_jobs_live_idempotency(conn) -> None:
     """004: the jobs idempotency key constrains live rows only.
@@ -641,6 +656,24 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+class JobIsRunningError(ValueError):
+    """The named row is a worker's right now, so a reset would give the document a second one.
+
+    It is a `ValueError` because that is what every caller of this store already catches. The type
+    is the point: `papra-suite jobs --reset` maps this refusal to exit `2` and the one below to
+    exit `1`, and if it had to read the sentence to tell them apart then rewording a message would
+    change an exit code an operator acts on.
+    """
+
+
+class JobAlreadyQueuedError(ValueError):
+    """The named row's work is live under another id, so reviving it would collide with it.
+
+    Nothing is wrong and nothing needs changing — which is why it is not the refusal above. See
+    `JobIsRunningError` for why this is a type rather than a message an operator reads.
+    """
 
 
 class Store:
@@ -1021,6 +1054,28 @@ and a listing helper that returned both would be the thing that leaks a token in
             ).fetchone()
         return row["id"]
 
+    def has_live_job(self, *, kind: str, papra_org_id: str, document_id: str,
+                     content_hash: str) -> bool:
+        """Is this exact work sitting in the queue right now, in this bucket?
+
+        The same key `enqueue_job` absorbs on and the same liveness rule migration 004 indexes on,
+        asked before a write so a caller can tell progress from a repeat. Two properties are
+        load-bearing here rather than incidental:
+
+        * **The whole key, bucket included.** Papra's document ids are scoped to their
+          organization, so a live row for another bucket's copy of the same id is a different piece
+          of work, and answering "already queued" for it leaves this document queued by nothing.
+        * **A seek, not a scan.** Callers ask this once per document across a whole corpus. Read on
+          `kind` and `document_id` alone, SQLite takes the claim index, filters the rest of that
+          kind row by row and sorts what is left in a temporary B-tree - per document. The full key
+          plus the partial index's own predicate is one seek on `idx_jobs_idempotency`.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                LIVE_JOB_FOR_KEY_SQL, (kind, papra_org_id, document_id, content_hash)
+            ).fetchone()
+        return row is not None
+
     def claim_next_job(self, kind: str) -> Job | None:
         now = _now()
         with self._lock, self._conn:
@@ -1110,11 +1165,11 @@ and a listing helper that returned both would be the thing that leaks a token in
                  row["content_hash"], job_id),
             ).fetchone()
             if live is not None:
-                raise ValueError(
+                raise JobAlreadyQueuedError(
                     f"job {job_id}: the same work is already queued as {live['id']}"
                 )
             if row["status"] == "running":
-                raise ValueError(f"job {job_id}: it is running, a worker is holding it")
+                raise JobIsRunningError(f"job {job_id}: it is running, a worker is holding it")
             # Guarded again in the write itself: a worker can claim the row between the read above
             # and this statement, and a reset that lands then puts a second claimer on a document
             # somebody is uploading. The condition is evaluated where SQLite holds the write lock,
@@ -1125,7 +1180,9 @@ and a listing helper that returned both would be the thing that leaks a token in
                 (_now(), _now(), job_id),
             )
             if moved.rowcount != 1:
-                raise ValueError(f"job {job_id}: it is running, a worker is holding it")
+                # The row was claimed between the read above and this statement; the same refusal,
+                # decided where SQLite holds the write lock.
+                raise JobIsRunningError(f"job {job_id}: it is running, a worker is holding it")
 
     def list_jobs(self, *, kind: str | None = None, status: str | None = None,
                   document_id: str | None = None, limit: int = 100) -> list[Job]:
@@ -1140,9 +1197,17 @@ and a listing helper that returned both would be the thing that leaks a token in
 
         Since migration 004 one `(kind, papra_org_id, document_id, content_hash)` can hold
         several rows — the live one plus the superseded history — so a caller must not read a row
-        count as a document count. `rowid DESC` breaks ties between rows created in the same
-        instant, without which one document's history could reorder between two reads of an
-        unchanged table.
+        count as a document count.
+
+        Newest first here means most recently *inserted* first: `rowid DESC`, the table's own order,
+        not `created_at DESC`. `enqueue_job` stamps `created_at` as it inserts, so while the clock
+        runs forward the two orders coincide; the rowid ordering is the order the rows are
+        physically in, which lets SQLite read the tail and stop at the limit instead of putting the
+        whole queue, every settled row it ever wrote included, into a temporary B-tree in order to
+        print fifty lines. It is also the order that does not lean on a wall clock: a row's rowid
+        never changes, so two reads of an unchanged table cannot disagree, and a row written while a
+        corrected clock ran backwards is listed where it was written rather than where it was
+        stamped.
         """
         query = "SELECT * FROM jobs"
         clauses: list[str] = []
@@ -1158,7 +1223,7 @@ and a listing helper that returned both would be the thing that leaks a token in
             params.append(document_id)
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        query += " ORDER BY rowid DESC LIMIT ?"
         params.append(limit)
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
@@ -1221,6 +1286,24 @@ and a listing helper that returned both would be the thing that leaks a token in
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
+
+    def live_job_kinds(self, kind: str | None = None) -> list[str]:
+        """Which kinds still hold live rows, named, whatever the row count is.
+
+        `papra-suite jobs --drain` prints these so the operator knows which loop to go and stop.
+        The names come from the table rather than from a listing because a listing is capped, and a
+        name list read through a cap can only ever shorten: past a thousand live rows of one kind,
+        the refusal would name the busy kind and stay silent about the second one holding work. A
+        kind whose rows are all settled is not in the answer — history is not work.
+        """
+        query = LIVE_JOB_KINDS_SQL
+        params: list[object] = []
+        if kind:
+            query += " AND kind = ?"
+            params.append(kind)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return sorted(str(row[0]) for row in rows)
 
     # -- orgs ---------------------------------------------------------------
 
