@@ -110,7 +110,8 @@ def test_the_ledger_view_exposes_exactly_the_reads_and_no_write(tmp_path, store)
     try:
         public = {name for name in dir(reader) if not name.startswith("_")}
         assert public == {"db_path", "close", "get_setting", "settings_flag", "table_columns",
-                          "get_generation", "ledger_org_ids", "documents_org_ids", "ledger_stats"}
+                          "get_generation", "ledger_org_ids", "documents_org_ids", "ledger_stats",
+                          "ledger_resolve"}
         for name in sorted(FORBIDDEN_WRITE_NAMES):
             assert not hasattr(reader, name), f"the ledger view can {name}"
         assert not hasattr(reader, "migrate"), "the listener would migrate on first read"
@@ -143,6 +144,57 @@ def test_the_ledger_view_answers_what_the_handlers_ask(tmp_path, store):
         assert reader.ledger_stats(org_ids=[])["references"] == 0
     finally:
         reader.close()
+
+
+def test_the_ledger_view_resolves_the_authorization_query(tmp_path, store):
+    """Task 13's one authorization read is on the view, because the tool may not reach `Store`.
+
+    `ledger_resolve` is the whole scope filter: the hits an agent may see are exactly the rows it
+    returns for the current generation. So it is a **read** — a `SELECT` over `index_ledger` that
+    hides soft-deleted and stale-generation rows — and it was mis-filed among the write names, which
+    is why the assertion below says it is *not* forbidden: a name on that list is a name the shipped
+    view must not have, and leaving it there would mean the tool got its authorization from some
+    second query written beside the store's own. One implementation, and it is the one
+    `papra-suite ledger` uses.
+    """
+    from papra_suite.readers import FORBIDDEN_WRITE_NAMES, require_read_only
+
+    store.ledger_upsert_reference(papra_org_id=ORG, papra_document_id="doc-1",
+                                 file_hash="ab" * 32)
+    store.ledger_upsert_reference(papra_org_id=ORG, papra_document_id="doc-2", file_hash="cd" * 32)
+    store.ledger_set_kreuzakt_id(papra_org_id=ORG, papra_document_id="doc-1", kreuzakt_id=7,
+                                generation=1)
+    assert "ledger_resolve" not in FORBIDDEN_WRITE_NAMES
+    reader = LedgerReader(store.db_path)
+    try:
+        require_read_only(reader, role="store")
+        assert [ref.papra_document_id for ref in reader.ledger_resolve([7], generation=1)] \
+            == ["doc-1"]
+        # The two fail-closed shapes of the store's own contract, kept on the view: a stale
+        # generation resolves to nothing, and an empty input is nothing rather than the table.
+        assert reader.ledger_resolve([7], generation=2) == []
+        assert reader.ledger_resolve([], generation=1) == []
+    finally:
+        reader.close()
+
+
+def test_a_papra_view_that_cannot_read_a_document_is_refused(tmp_path, store):
+    """Task 13 registers tools that ask Papra whether a document is still alive.
+
+    `REQUIRED_READS["papra"]` was empty while no handler read Papra, and the comment there said the
+    day one did was meant to be a one-line change. This is that day, and the refusal direction is
+    the point: a listener built on a Papra handle that cannot answer `get_document` would answer a
+    liveness question with an `AttributeError` inside a tool call.
+    """
+    from papra_suite.readers import McpContainmentError, require_read_only
+
+    class CannotReadADocument:
+        async def list_tags(self, org_id):
+            return []
+
+    with pytest.raises(McpContainmentError) as caught:
+        require_read_only(CannotReadADocument(), role="papra")
+    assert "get_document" in str(caught.value)
 
 
 async def test_the_ledger_view_is_read_from_whichever_worker_thread_asked(tmp_path, store):
@@ -277,13 +329,25 @@ PUBLIC_URL = "https://papra-mcp.test"
 
 
 class OkKreuzakt:
-    """The two reads `index_status` performs, and nothing else."""
+    """The reads the shipped handlers are allowed to ask the index for, and nothing else.
+
+    `search`/`list_documents` exist so that the containment check has something to find: since
+    Task 13 they are on `REQUIRED_READS["kreuzakt"]`, so a double that cannot answer them is
+    refused at construction — which is the assertion, not an inconvenience. No test in this file
+    calls them.
+    """
 
     async def health(self):
         return {"status": "ok", "documents": 1}
 
     async def queue_counts(self):
         return {"pending": 0}
+
+    async def search(self, query, *, page=1, limit=100):
+        raise AssertionError("no test here reads the index's contents")
+
+    async def list_documents(self, *, page=1, limit=100, since=None):
+        raise AssertionError("no test here reads the index's contents")
 
 
 def views(tmp_path, store):
@@ -302,7 +366,15 @@ def build(store_like, papra=None, kz=None, *, url=PUBLIC_URL):
 
 
 class OkPapraLike:
-    """A stand-in for `PapraReader`: reads only, no writes. No tool calls it today."""
+    """A stand-in for `PapraReader`: reads only, no writes.
+
+    It names `get_document` because that is a read a shipped handler performs (Task 13's liveness
+    check), and an empty class is refused by `REQUIRED_READS` for exactly that reason. Nothing here
+    calls it: the apps in this file serve `index_status`, which never touches Papra.
+    """
+
+    async def get_document(self, org_id, document_id):
+        raise AssertionError("no test here reads a papra document")
 
 
 def test_the_store_the_listener_builds_on_is_a_view_not_the_writer(tmp_path, store):

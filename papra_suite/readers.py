@@ -93,12 +93,18 @@ class McpContainmentError(TypeError):
 #: `create_organization`). The last two do not exist anywhere in this codebase yet; they are listed
 #: because the spec's promise is that a view never grows them, and a test asserts they are absent
 #: from every view object.
+#:
+#: `ledger_resolve` is deliberately **not** on this list, and it was until Task 13. While it was,
+#: the one read the search tools' scope filter is built on was a name the shipped view was forbidden
+#: to have, which pushes a tool toward writing its own `SELECT` beside the store's — two
+#: implementations of one authorization rule, drifting. It is a `SELECT` over `index_ledger` and
+#: nothing else, so it lives on the view and not on this list.
 FORBIDDEN_WRITE_NAMES = frozenset({
     # store
     "migrate", "set_setting", "clear_setting", "bump_generation", "append_log_line",
     "record_ingest_event", "ledger_upsert_reference", "ledger_mark_deleted",
     "ledger_mark_restored", "ledger_queue_cleanup", "ledger_record_delivery",
-    "ledger_resolve", "ledger_set_gate", "add_document", "add_org",
+    "ledger_set_gate", "add_document", "add_org",
     # papra
     "create_document", "update_document", "update_content", "add_tag", "delete_document",
     "retag_document", "create_organization",
@@ -106,14 +112,19 @@ FORBIDDEN_WRITE_NAMES = frozenset({
     "upload", "retry_queue",
 })
 
-#: The reads the shipped handlers actually perform, per role. `papra` is empty because no tool
-#: registered today reads Papra; the entry exists so the shape of the check — and the day a handler
-#: gains a Papra read, which is Task 14 — is a one-line change rather than a new decision.
+#: The reads the shipped handlers actually perform, per role. Task 12 shipped with `papra` empty
+#: because no registered tool read Papra; Task 13 grew all three sets, because `search_documents`
+#: and `list_recent_documents` are the first handlers that read the index's contents and Papra's
+#: stored documents. A name belongs here for every read a shipped handler performs: that is what
+#: makes the check mean "this dependency can answer what the tools will ask", which a double earns
+#: by naming its reads rather than being waved through.
 REQUIRED_READS = {
     "store": frozenset({"get_setting", "settings_flag", "get_generation", "ledger_org_ids",
-                        "documents_org_ids", "ledger_stats"}),
-    "papra": frozenset(),
-    "kreuzakt": frozenset({"health", "queue_counts"}),
+                        "documents_org_ids", "ledger_stats", "ledger_resolve"}),
+    # The liveness check: the ledger decides what a token may see, Papra whether the document is
+    # still there. Every returned item needs both answers.
+    "papra": frozenset({"get_document"}),
+    "kreuzakt": frozenset({"health", "queue_counts", "search", "list_documents"}),
 }
 
 
@@ -224,8 +235,14 @@ class LedgerReader:
     ledger_org_ids = Store.ledger_org_ids
     documents_org_ids = Store.documents_org_ids
     ledger_stats = Store.ledger_stats
+    #: The authorization boundary of Task 4: the active references of one generation that point at
+    #: these Kreuzakt ids, and nothing else. Exposed because the search tools' scope filter is
+    #: *this* query — the one `papra-suite ledger` answers from — rather than a second copy that can
+    #: disagree with it about what "soft-deleted" or "stale generation" means. Hiding rows is this
+    #: function's job, and the tools depend on the hiding.
+    ledger_resolve = Store.ledger_resolve
     # `get_generation` reads through this pair, and they are reads too; they stay private so the
-    # public surface stays the seven names above.
+    # public surface stays the reads named above, and `dir()` on the view is still a reviewable list.
     _read_generation_or_none = Store._read_generation_or_none
     _read_generation = Store._read_generation
 
@@ -312,7 +329,7 @@ class PapraReader:
 
 
 class KreuzaktReader:
-    """The index, read-only: the two calls `index_status` makes, plus what Task 14 will need.
+    """The index, read-only: `index_status`'s two calls, plus the two the search tools page through.
 
     `upload`, `delete_document` and `retry_queue` are the writes, and they are absent here in the
     same way `update_document` is absent from `PapraReader`. `wait_for_queue_row` is not a write,

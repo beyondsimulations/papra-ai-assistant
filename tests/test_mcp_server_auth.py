@@ -49,7 +49,14 @@ ORG = "org-1"
 
 
 class OkKreuzakt:
-    """The two calls `index_status` makes, with the calls counted."""
+    """Every read a shipped handler may ask the index for, the two counted.
+
+    `search`/`list_documents` are named because `REQUIRED_READS["kreuzakt"]` asks for them since
+    Task 13: a double that cannot answer them is refused at construction, and every auth test in
+    this file needs the app to *build*. None of them calls a search, so the two that exist only
+    fail loudly — a credential test that served search results from a fake nobody scripted would
+    be a credential test measuring nothing.
+    """
 
     def __init__(self, *, counts=None):
         self.counts = {"pending": 3, "completed": 12} if counts is None else counts
@@ -64,10 +71,26 @@ class OkKreuzakt:
         self.queue_calls += 1
         return dict(self.counts)
 
+    async def search(self, query, *, page=1, limit=100):
+        raise AssertionError("no auth test here reads the index's contents")
+
+    async def list_documents(self, *, page=1, limit=100, since=None):
+        raise AssertionError("no auth test here reads the index's contents")
+
 
 class OkPapra:
+    """The liveness read Task 13's tools make, and the org listing the old spec's tool wanted.
+
+    `get_document` is required for the app to build at all (see `OkKreuzakt` above for why that is a
+    check rather than a formality); no test in this file reaches it, because these tests are about
+    getting in the door.
+    """
+
     def __init__(self):
         self.calls = 0
+
+    async def get_document(self, org_id, document_id):
+        raise AssertionError("no auth test here reads a papra document")
 
     async def list_organizations(self):
         self.calls += 1

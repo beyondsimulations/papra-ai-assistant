@@ -59,7 +59,13 @@ OTHER = "org-2"
 
 
 class FakeKreuzakt:
-    """`health` and `queue_counts`, counted. Everything `index_status` is allowed to ask."""
+    """`health` and `queue_counts`, counted, plus the two content reads named so the app can build.
+
+    Everything `index_status` is allowed to ask is scripted; the two reads that belong to
+    `search_documents` and `list_recent_documents` raise, because a status test that answered a
+    search from an unscripted fake would report an archive it never seeded. The search tests in
+    `tests/test_mcp_search.py` script those two themselves.
+    """
 
     def __init__(self, *, counts=None, health_body=None, error=None):
         self.counts = {"pending": 40, "completed": 900} if counts is None else counts
@@ -80,14 +86,23 @@ class FakeKreuzakt:
             raise self.error
         return dict(self.counts)
 
+    async def search(self, query, *, page=1, limit=100):
+        raise AssertionError("an index_status test asked the index for search results")
+
+    async def list_documents(self, *, page=1, limit=100, since=None):
+        raise AssertionError("an index_status test asked the index for a document listing")
+
 
 class NoPapra:
-    """Task 12 has no tool that reads Papra, so a call to it is a failure, not a stub.
+    """No tool these tests register reads Papra, so a call to it is a failure, not a stub.
 
     The five names are written out rather than fabricated by `__getattr__`, because containment
     option C refuses to build an app on an object whose capability surface cannot be enumerated: a
     proxy fake answers `update_document` as readily as `list_tags`, which is precisely what
     `readers.require_read_only` must not wave through. Same promise, one that can be checked.
+
+    `index_status` still never reads Papra; `search_documents` does, and those tests use their own
+    scripted double in `tests/test_mcp_search.py`.
     """
 
     async def get_document(self, org_id, document_id):

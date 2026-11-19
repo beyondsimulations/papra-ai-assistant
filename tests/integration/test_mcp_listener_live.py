@@ -46,7 +46,13 @@ ORG = "org-live"
 
 
 class LiveKreuzakt:
-    """The two calls `index_status` makes. Counted, so a leak would show as a call."""
+    """The reads `index_status` may ask for, counted so a leak would show as a call.
+
+    `search`/`list_recent_documents` are on `REQUIRED_READS["kreuzakt"]` since Task 13, so the app
+    this listener builds on has to be able to answer them; nothing here calls them — the live suite
+    for the search tools is the SDK-session test, and the corpus behind those two lives in the unit
+    suite where the paging can be scripted.
+    """
 
     def __init__(self):
         self.queue_calls = 0
@@ -57,6 +63,12 @@ class LiveKreuzakt:
     async def queue_counts(self):
         self.queue_calls += 1
         return {"pending": 7, "completed": 3}
+
+    async def search(self, query, *, page=1, limit=100):
+        raise AssertionError("no live listener test here searches the index")
+
+    async def list_documents(self, *, page=1, limit=100, since=None):
+        raise AssertionError("no live listener test here lists the index")
 
 
 def free_port():
