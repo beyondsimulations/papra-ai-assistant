@@ -62,6 +62,8 @@ ORG_A = "org-a"
 ORG_B = "org-b"
 ORG_C = "org-c"
 ORG_D = "org-d"
+#: A bucket whose name *begins* with a granted one: the corpus the prefix-match mutant needs.
+ORG_AB = "org-ab"
 KREUZAKT_URL = "http://kreuzakt.test"
 PAPRA_URL = "http://papra.test"
 
@@ -229,6 +231,10 @@ class FakePapra:
 
     def __init__(self, documents=None):
         self.documents = dict(documents or {})
+        # Two buckets may hold the same Papra *id*, so `documents` (keyed by id alone) cannot
+        # express it. Entries added with `add_for` win over it, which is how the per-bucket
+        # granularity of the liveness cache is tested.
+        self.by_org = dict()
         self.get_calls = 0
         self.peak_concurrent = 0
         self.in_flight = 0
@@ -240,6 +246,15 @@ class FakePapra:
         self.documents[document_id] = papra_doc(document_id, **overrides)
         return self.documents[document_id]
 
+    def add_for(self, org_id, document_id, **overrides):
+        """The document of one *bucket*, addressed by `(org_id, document_id)`.
+
+        Papra ids are per organisation, so the same id can be two different documents; a fake that
+        keys by id alone cannot say so, and the cache-key mutant needs it to.
+        """
+        self.by_org[(org_id, document_id)] = papra_doc(document_id, org=org_id, **overrides)
+        return self.by_org[(org_id, document_id)]
+
     async def get_document(self, org_id, document_id):
         self.get_calls += 1
         self.requested.append((org_id, document_id))
@@ -250,7 +265,7 @@ class FakePapra:
                 await asyncio.sleep(self.delay_s)
             if self.raise_on_get:
                 raise KreuzaktError("papra refused the read")     # any failure: same handling
-            doc = self.documents.get(document_id)
+            doc = self.by_org.get((org_id, document_id)) or self.documents.get(document_id)
             if doc is None or doc.get("organizationId") != org_id:
                 raise KreuzaktError(f"404 for {document_id}")
             return dict(doc)
@@ -319,6 +334,29 @@ async def test_oversized_query_and_page_bounds_are_refused(store):
         with pytest.raises(ToolError, match="invalid-request") as caught:
             await search_documents(ctx(ORG_A), store, papra, index.reader(), **kwargs)
         assert str(caught.value).startswith("invalid-request")
+
+
+async def test_the_query_that_is_measured_is_the_query_that_leaves(store):
+    """`PAPRA_INDEX_QUERY_MAX_CHARS` bounds what the index is sent, not a copy of it.
+
+    Nine hundred spaces and an `x` is a one-character question. Measuring the stripped copy while
+    forwarding the raw one let 901 characters past a 512-character bound, so the bound did not bound
+    the request at all; and a caller who padded a genuinely over-long query must still be refused,
+    with the length they are being refused for. Both halves are asserted against the recorded query
+    string, because the claim is about the request, not about a local variable.
+    """
+    papra = own_corpus(store, 1)
+    index = ScriptedIndex(hits=[kz_row(1)])
+    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), " " * 900 + "x")
+    assert [item.document_id for item in page.items] == ["doc-1"]
+    assert [params["q"] for params in index.search_params] == ["x"]
+
+    over = " " * 900 + "x" * (DEFAULT_LIMITS.query_max_chars + 1)
+    before = len(index.search_calls)
+    with pytest.raises(ToolError, match="invalid-request") as caught:
+        await search_documents(ctx(ORG_A), store, papra, index.reader(), over)
+    assert str(DEFAULT_LIMITS.query_max_chars + 1) in str(caught.value)
+    assert len(index.search_calls) == before        # refused before the index was asked
 
 
 async def test_recent_list_limit_is_refused_rather_than_clamped(store):
@@ -428,6 +466,151 @@ async def test_one_hit_two_authorized_references_yields_two_items(store):
     assert [item.org_id for item in page.items] == [ORG_A, ORG_B]
     assert page.stats.expanded == 1
     assert page.stats.kept == 2
+
+
+# --- I-1: per-reference authorization, the case nothing else in this file contains ------------
+
+
+def shared_hit(store, granted, foreign, *, kreuzakt_id=1):
+    """One Kreuzakt row that is two buckets' documents, only one of them this token's.
+
+    The shape is not exotic: two buckets hold byte-identical uploads, the content-addressed index
+    stores one row, and `store.ledger_resolve` answers it with both references ordered by
+    `papra_org_id` (`store.py:1748-1752`). That ordering is what makes a per-*hit* filter dangerous:
+    whichever bucket sorts first decides the whole hit's fate — so the helper is used with the
+    granted bucket in both positions.
+    """
+    bind(store, granted, f"doc-{granted}", kreuzakt_id)
+    bind(store, foreign, f"doc-{foreign}", kreuzakt_id)
+    papra = FakePapra()
+    papra.add_for(granted, f"doc-{granted}")
+    papra.add_for(foreign, f"doc-{foreign}")
+    return ScriptedIndex(hits=[kz_row(kreuzakt_id)]), papra
+
+
+@pytest.mark.parametrize("granted,foreign", [(ORG_A, ORG_B), (ORG_B, ORG_A)])
+async def test_a_hit_shared_with_a_foreign_bucket_shows_only_the_granted_reference(store, granted,
+                                                                                   foreign):
+    """Authorization is per `LedgerRef`, and both reference orderings are asserted.
+
+    This is the corpus that distinguishes "filter every reference by its own bucket" from "admit a
+    hit if its first reference's bucket is granted", which the suite could not: `ledger_resolve`
+    orders by `papra_org_id`, so a granted `org-a` sorts first and a per-hit filter hands it
+    `org-b`'s id, title and filename, while a granted `org-b` sorts last and the same filter
+    silently withholds a document that *is* the caller's. Both directions are here because each
+    kills a different half of that mistake.
+
+    The load-bearing assertion is the second one: `papra.requested` names only the granted
+    reference, so the foreign document is not merely absent from the answer — it is never asked
+    about at all.
+    """
+    index, papra = shared_hit(store, granted, foreign)
+    page = await search_documents(ctx(granted), store, papra, index.reader(), "rechnung")
+
+    assert [(item.org_id, item.document_id) for item in page.items] == [(granted, f"doc-{granted}")]
+    assert papra.requested == [(granted, f"doc-{granted}")]
+    assert papra.get_calls == 1
+    assert page.stats.kept == 1 and page.stats.expanded == 0
+    assert page.buckets_reached == [granted] and page.buckets_skipped == []
+    # The hit survived, so a withheld *reference* is not a withheld hit, and nothing here is
+    # uncertain: `partial` stays false and `expanded` stays 0 for the same reason.
+    assert page.partial is False
+
+
+async def test_a_bucket_whose_name_only_begins_like_a_granted_one_is_not_granted(store):
+    """`org-a` does not grant `org-ab`: the comparison on a bucket id is exact, not a prefix.
+
+    A prefix match (`ref.papra_org_id.startswith(o)`) reads as harmless because bucket ids are short
+    and distinct in practice, and it over-grants every bucket whose id extends a granted one. Both
+    shapes are asserted because they fail differently: on a shared hit nothing is even counted, and
+    on two separate rows the counter tells the operator something.
+    """
+    index, papra = shared_hit(store, ORG_A, ORG_AB)
+    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung")
+    assert [(item.org_id, item.document_id) for item in page.items] == [(ORG_A, "doc-org-a")]
+    assert papra.requested == [(ORG_A, "doc-org-a")]
+
+    # …and the foreign bucket as its own index row, which a prefix match would also have kept.
+    bind(store, ORG_AB, "doc-ab-2", 2)
+    other = ScriptedIndex(hits=[kz_row(1), kz_row(2)])
+    fresh = FakePapra()
+    fresh.add_for(ORG_A, "doc-org-a")
+    fresh.add_for(ORG_AB, "doc-ab-2")
+    second = await search_documents(ctx(ORG_A), store, fresh, other.reader(), "rechnung")
+    assert [item.org_id for item in second.items] == [ORG_A]
+    assert second.stats.kept == 1
+    assert fresh.requested == [(ORG_A, "doc-org-a")]
+
+
+async def test_the_same_papra_id_in_two_granted_buckets_is_two_items(store):
+    """Deduplication is keyed by `(org_id, document_id)`, because a Papra id is per bucket.
+
+    Two organisations can hold documents whose ids happen to be equal. Dropping the bucket from the
+    emitted key turns the second one's result into a duplicate of the first's and quietly halves the
+    answer, which no assertion on `document_id` alone can see.
+    """
+    bind(store, ORG_A, "doc-shared", 1)
+    bind(store, ORG_B, "doc-shared", 1)
+    index = ScriptedIndex(hits=[kz_row(1)])
+    papra = FakePapra()
+    papra.add_for(ORG_A, "doc-shared")
+    papra.add_for(ORG_B, "doc-shared")
+    page = await search_documents(ctx(ORG_A, ORG_B), store, papra, index.reader(), "rechnung")
+    assert [(item.org_id, item.document_id) for item in page.items] == [(ORG_A, "doc-shared"),
+                                                                        (ORG_B, "doc-shared")]
+    assert papra.requested == [(ORG_A, "doc-shared"), (ORG_B, "doc-shared")]
+    assert page.stats.kept == 2 and page.stats.expanded == 1
+
+
+async def test_the_liveness_answer_is_cached_per_bucket_not_per_document_id(store):
+    """The cache key is the reference, so one bucket's `isDeleted` never answers for another's.
+
+    The two documents share an id and disagree about being in the trash. A cache keyed by document
+    id alone lets the first lookup answer for the second, which would show a deleted document — the
+    one stale answer an agent could act on by opening it — and count nothing.
+    """
+    bind(store, ORG_A, "doc-shared", 1)
+    bind(store, ORG_B, "doc-shared", 1)
+    index = ScriptedIndex(hits=[kz_row(1)])
+    papra = FakePapra()
+    papra.add_for(ORG_A, "doc-shared")
+    papra.add_for(ORG_B, "doc-shared", isDeleted=True)
+    page = await search_documents(ctx(ORG_A, ORG_B), store, papra, index.reader(), "rechnung")
+    assert [(item.org_id, item.document_id) for item in page.items] == [(ORG_A, "doc-shared")]
+    assert papra.requested == [(ORG_A, "doc-shared"), (ORG_B, "doc-shared")]
+    assert papra.get_calls == 2                      # both buckets asked, once each
+    assert page.stats.kept == 1 and page.stats.dropped_deleted == 1
+
+
+async def test_the_wire_hides_the_foreign_reference_of_a_shared_hit(store):
+    """The mixed-bucket hit over the real transport: bearer gate → scope → per-reference filter.
+
+    The in-process version above could be satisfied by a helper called with a convenient context;
+    this one goes through the registered tool with a minted token, which is where a scope that
+    quietly widened would actually appear.
+    """
+    index, papra = shared_hit(store, ORG_A, ORG_B)
+    token = mint_token(store, label="scoped", org_ids=[ORG_A])
+    _response, message = wire_call(store, token, "search_documents", {"query": "rechnung"},
+                                   kz=index.reader(), papra=papra)
+    payload = message["result"]["structuredContent"]
+    assert [(i["org_id"], i["document_id"]) for i in payload["items"]] == [(ORG_A, "doc-org-a")]
+    assert papra.requested == [(ORG_A, "doc-org-a")]
+    assert ORG_B not in json.dumps(message)
+
+
+async def test_the_recent_listing_hides_the_foreign_reference_of_a_shared_hit(store):
+    """The same hit through `list_recent_documents`, which shares `resolve_hits` and must share it.
+
+    Two resolvers would be two scope rules, and a listing that filtered differently from a search
+    would leak the bucket the search hid.
+    """
+    index, papra = shared_hit(store, ORG_A, ORG_B)
+    index.rows = [kz_document_row(1)]        # the same row, in the listing envelope
+    page = await list_recent_documents(ctx(ORG_A), store, papra, index.reader(), limit=10)
+    assert [(item.org_id, item.document_id) for item in page.items] == [(ORG_A, "doc-org-a")]
+    assert papra.requested == [(ORG_A, "doc-org-a")]
+    assert page.stats.kept == 1 and page.stats.expanded == 0
 
 
 async def test_the_same_document_twice_in_one_page_is_emitted_once(store):
@@ -874,8 +1057,29 @@ async def test_since_goes_upstream_in_kreuzakts_own_form(store):
     assert index.list_calls[0][2] == "2026-11-17 22:28:05"
 
 
+@pytest.mark.parametrize("since", ["2026-01-01", " 2026-01-01 ", "2026-01-01\n",
+                                   "2026-11-17 22:28:05", "\t2026-11-17 22:28:05 "])
+def test_every_since_this_tool_accepts_the_wire_validator_also_accepts(since):
+    """One value, checked twice, agreed on both times.
+
+    The whole of I-3 in one line: the tool validated a stripped copy while the client validated and
+    sent the raw one, so a watermark could clear the first check and fail the second — and the
+    failure came back to the caller as an index outage. Asserting the two validators agree on the
+    forwarded value is cheaper and steadier than asserting it about any particular message.
+    """
+    from papra_suite.kreuzakt_client import _require_documents_since
+    from papra_suite.mcp_tools import check_recent_request
+
+    forwarded = check_recent_request(5, since, limits=DEFAULT_LIMITS)
+    assert _require_documents_since(forwarded) == forwarded.strip()
+
+
 @pytest.mark.parametrize("since", ["2026-11-17T22:28:05Z", "2026-11-17T22:28:05", "1700000000",
-                                   "17.11.2026", "yesterday", ""])
+                                   "17.11.2026", "yesterday", "",
+                                   # the shapes `str.strip()` cannot rescue: a second line, a suffix,
+                                   # and a time the two-field form cannot mean
+                                   "2026-01-01\n2026-01-02", "2026-01-01 22:28:05 UTC",
+                                   "2026-01-01 1:02:03"])
 async def test_a_since_the_index_would_ignore_is_refused(store, since):
     """`invalid-request`, not a conversion: rewriting it would pick a timezone and hide that.
 
@@ -890,6 +1094,29 @@ async def test_a_since_the_index_would_ignore_is_refused(store, since):
         await list_recent_documents(ctx(ORG_A), store, papra, index.reader(), limit=5, since=since)
     assert "YYYY-MM-DD" in str(caught.value)
     assert index.list_calls == []          # refused before anything was asked of the index
+
+
+@pytest.mark.parametrize("since", [" 2026-01-01 ", "2026-01-01\n", "\t2026-11-17 22:28:05"])
+async def test_a_padded_since_is_stripped_before_it_leaves(store, since):
+    """A watermark padded with whitespace means the day the caller meant, and leaves stripped.
+
+    Measured before the fix: `" 2026-01-01 "` was checked stripped, forwarded raw, rejected by the
+    client's own validator, and reported to the agent as **`index_unavailable`: the index would not
+    answer this request** — an outage for the caller's own typo, which invites an agent to retry a
+    request that can never succeed. `"2026-01-01\n"` was worse: it cleared both validators (Python's
+    `$` matches before a trailing newline) and reached the wire with the newline on it, which is the
+    exact shape this file says it refuses. One stripped value is checked and sent, so neither
+    happens: padding is padding, and a `\n` in the middle is a refusal, not a mystery filter.
+    """
+    papra = own_corpus(store, 1)
+    index = ScriptedIndex(rows=[kz_document_row(1)])
+    page = await list_recent_documents(ctx(ORG_A), store, papra, index.reader(), limit=5,
+                                       since=since)
+    forwarded = index.list_params[0]["since"]
+    assert forwarded == since.strip()
+    assert forwarded == forwarded.strip()          # nothing whitespace-shaped left to confuse anyone
+    assert not any(c in forwarded for c in "\n\t")
+    assert [item.document_id for item in page.items] == ["doc-1"]
 
 
 # --- the principal is the only scope, and it comes from the bearer gate -----------------------
