@@ -781,3 +781,14 @@ def test_the_parses_surface_is_what_the_readme_prints():
     assert parse([]) and parse([]).limit is None and parse([]).all_stale is False
     with pytest.raises(SystemExit):
         parse(["--limit", "many"])
+
+
+def test_a_limit_of_zero_is_refused_rather_than_run_as_nothing(store, capsys):
+    """`--limit 0` is a typo for "do not run", and there is no run that enqueues zero.
+
+    Saying so costs one line and saves the operator from reading "enqueued 0 of 843 candidates" as a
+    backfill that finished.
+    """
+    assert run(store, FakeListing(), limit=0) == EXIT_REFUSED
+    assert "--limit" in capsys.readouterr().err
+    assert store.list_jobs() == []

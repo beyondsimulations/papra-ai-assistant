@@ -970,7 +970,7 @@ class Store:
 
         Handing back a terminal row would be a silent wrong answer:
         `indexing._readmit_index_job` reads the returned id back and acts on it, and
-        `jobs --reset` will hand an id straight to `reset_job`.
+        `papra-suite jobs --reset JOB_ID` hands an id straight to `reset_job`.
         """
         job_id = uuid.uuid4().hex
         now = _now()
@@ -1058,8 +1058,8 @@ class Store:
         Since migration 004 a terminal row no longer *blocks* anything: asking for the
         same work again takes a fresh row, which is the recovery path the sweep and the
         rebuild use. This method is the other path — an operator naming one row
-        (`jobs --reset`), which keeps that row's identity and history in one place
-        instead of growing a second one.
+        (`papra-suite jobs --reset JOB_ID`), which keeps that row's identity and history in one
+        place instead of growing a second one.
 
         It refuses when the two paths would collide. Reviving a terminal row whose key
         already has a live row would violate the partial unique index, so SQLite would

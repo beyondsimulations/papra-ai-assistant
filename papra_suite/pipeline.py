@@ -93,9 +93,9 @@ def content_writer_conflict(delivery: bool, legacy: bool) -> ContentWriterConfli
         "suite's legacy OCR worker and this bridge would both write the `content` column, "
         "which is the race this bridge exists to remove. In the required order: set "
         "PAPRA_LEGACY_WORKERS=false and recreate, prove the queue is empty twice a minute "
-        "apart (proves quiescence: `sqlite3 $DATA_DIR/state.db \"SELECT count(*) FROM jobs "
-        "WHERE kind='ocr' AND status IN ('pending','running')\"` prints 0 both times), and "
-        "only then turn on "
+        "apart (proves quiescence: `papra-suite jobs --kind ocr --drain` prints both counts "
+        "and exits 1 while anything is pending or running; two readings a minute apart must both "
+        "print 0), and only then turn on "
         "the delivery flag PAPRA_INDEX_CONTENT_DELIVERY=true. While an ocr row remains, the "
         "convergence pass is fighting a running job for the same document.")
 
@@ -740,11 +740,11 @@ async def worker_loop(store: Store, *, kind: str, handler,
                             "index job %s for papra document %s failed permanently at "
                             "content %s: nothing will ask about these bytes again on its own. "
                             "The queue no longer blocks a fresh request for them, so the "
-                            "recovery is to name the document — `jobs --reset` on this row "
-                            "once Task 15 ships that command, or a hand-built index row for "
-                            "this content hash until then. A restore or backfill that "
+                            "recovery is to revive THIS row — `papra-suite jobs --reset %s` — "
+                            "because the ledger still calls the document current, so a restore "
+                            "or a backfill walks past it. A restore or backfill that "
                             "reported success without queueing anything has met this row.",
-                            job.id, job.document_id, job.content_hash[:12])
+                            job.id, job.document_id, job.content_hash[:12], job.id)
                 elif max_attempts is None:
                     store.mark_job_failed(job.id, str(error))
                 else:

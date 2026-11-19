@@ -690,3 +690,42 @@ def test_the_parses_surface_is_what_the_readme_prints():
                  ["--limit", "five"]):
         with pytest.raises(SystemExit):
             parse_cli(argv)
+
+
+def test_every_papra_suite_command_the_shipped_code_names_is_one_that_parses():
+    """A message that names a subcommand is a promise about this binary.
+
+    Task 7 pinned this failure from the other side: the plan's handover message cited a
+    `papra-suite jobs` command this branch had not shipped, which reads to an operator at 23:00 as a
+    broken installation rather than as a stale message, so the test asserted the raw-SQL reading
+    instead. Any log line or docstring in any module can reintroduce it, and the standing rule is
+    "never cite a subcommand you did not implement" — so the shipped package is scanned for
+    `papra-suite <command> --flag` and every command named has to be registered by a module of this
+    package on the real entry point's shape.
+    """
+    import argparse
+    import importlib
+    import pkgutil
+    import re
+    from pathlib import Path
+
+    import papra_suite
+
+    parser = argparse.ArgumentParser(prog="papra-suite")
+    sub = parser.add_subparsers(dest="command", required=True)
+    modules = []
+    for info in pkgutil.iter_modules(papra_suite.__path__):
+        module = importlib.import_module(f"papra_suite.{info.name}")
+        modules.append(module)
+        add = getattr(module, "add_subparser", None)
+        if add is not None:
+            add(sub)
+
+    named: set[str] = set()
+    for module in modules:
+        text = Path(module.__file__).read_text(encoding="utf-8")
+        named.update(re.findall(r"papra-suite ([a-z][a-z-]*) +--?[a-z]", text))
+
+    assert named, "the scan matched nothing, which is not the same as nothing being wrong"
+    unregistered = sorted(named - set(sub.choices))
+    assert not unregistered, f"cited but not registered: {unregistered}"

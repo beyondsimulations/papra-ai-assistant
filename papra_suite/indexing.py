@@ -1188,8 +1188,8 @@ async def download_original(papra, job: Job) -> bytes:
     try. What decides it is that the alternative is uploading bytes we cannot name, and
     a retry here downloads from the same body we just refused. Recovery is a fresh job
     for the bytes Papra actually holds — the queue has accepted those bytes again since
-    migration 004, but naming that job is still an operator's act (`jobs --reset`, Task
-    15) rather than something this job can do for itself.
+    migration 004, but naming that job is still an operator's act
+    (`papra-suite jobs --reset JOB_ID`) rather than something this job can do for itself.
     """
     blob = await papra.download_file(job.papra_org_id, job.document_id)
     digest = hashlib.sha256(blob).hexdigest()
