@@ -524,18 +524,14 @@ def test_the_runbook_names_the_command_and_hands_over_no_settings_row():
     and must not hand over a `settings` row to type by hand.
     """
     from tests.test_shipped_citations import (
-        ACCEPTED_RAW_WRITES,
         README,
         mcp_section,
         raw_invocations,
+        sole_handover,
     )
 
     text = README.read_text(encoding="utf-8")
-    offenders = raw_invocations(text)
-    assert len(offenders) == 1, f"raw SQL handed to an operator: {offenders}"
-    number, _line = offenders[0]
-    body = " ".join(text.splitlines()[number - 1:number + 2])
-    assert any(write in body for write in ACCEPTED_RAW_WRITES), body
+    sole_handover(text)
 
     section = mcp_section(text)
     assert "papra-suite mcp --enable" in section

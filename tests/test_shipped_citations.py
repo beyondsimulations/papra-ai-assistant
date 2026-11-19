@@ -20,6 +20,8 @@ SQL.
 import re
 from pathlib import Path
 
+import pytest
+
 import papra_suite
 
 PACKAGE_DIR = Path(papra_suite.__file__).resolve().parent
@@ -46,6 +48,24 @@ _SQLITE_MENTION = re.compile(r"\bsqlite3\b", re.IGNORECASE)
 
 #: The runbook section that turns the listener on, named by its heading.
 MCP_SECTION_HEADING = "### Publishing the index to an agent"
+
+
+def sole_handover(text, *, name="README.md"):
+    """The rule itself, as a function: one raw handover in `text`, and it is the accepted write.
+
+    Raised as a function rather than inline in the test so a canary below can point it at a README
+    with a handover injected — the mutation "let the guard accept any number of raw invocations" has
+    to break something, and a test that only reads a clean tree cannot tell a strict guard from a
+    blind one.
+    """
+    offenders = raw_invocations(text, name=name)
+    assert len(offenders) == 1, f"expected one raw handover in {name}, got {offenders}"
+    # The statement continues on the next line of the code block, so the exception is checked
+    # against the whole incantation rather than against the line the CLI name happens to sit on.
+    number = offenders[0][0]
+    body = " ".join(text.splitlines()[number - 1:number + 2])
+    assert any(write in body for write in ACCEPTED_RAW_WRITES), body
+    return offenders[0]
 
 
 def _lines_with_context(text):
@@ -176,17 +196,15 @@ def test_the_only_raw_statement_left_is_the_one_with_no_command():
              "value) VALUES ('mcp_bind_nonloopback', '1');\"\n```\n")
     assert len(raw_invocations(readme + extra)) == len(raw_invocations(readme)) + 1, \
         "the guard no longer notices a handover being added to the runbook"
+    # The same injection, aimed at the rule rather than the pattern: a guard relaxed to accept any
+    # number of raw invocations stops raising here, and that is what this assertion is for.
+    with pytest.raises(AssertionError, match="one raw handover"):
+        sole_handover(readme + extra)
     # And prose still does not count, or the refinement would just be a mention-counter.
     assert raw_invocations(readme + "\nThe row is prose about `sqlite3`, not a command.\n") == \
         raw_invocations(readme)
 
-    offenders = raw_invocations(readme)
-    assert len(offenders) == 1, f"expected one raw handover in README, got {offenders}"
-    # The statement continues on the next line of the code block, so the exception is checked
-    # against the whole incantation rather than against the line the CLI name happens to sit on.
-    number = offenders[0][0]
-    body = " ".join(readme.splitlines()[number - 1:number + 2])
-    assert any(write in body for write in ACCEPTED_RAW_WRITES), body
+    sole_handover(readme)
 
     # Canary, package: a handover in a shipped module is named too, and by line.
     sources, _readme = _shipped_sources()
