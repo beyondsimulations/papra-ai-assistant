@@ -1053,12 +1053,10 @@ class ContentResult(BaseModel):
     the caller was never offered. `truncated` is the plan's flag; the spec's `chars_omitted` is
     derivable from these two and is not carried twice. `sanitized` says whether the character rule
     changed anything, so "this document contains no control or format characters" is a fact the
-    caller
-    can read rather than an assumption about a tool it cannot see inside.
+    caller can read rather than an assumption about a tool it cannot see inside.
 
     `text` is the whole message: the untrusted-content wrapper is part of the text an agent reads,
-    and
-    an agent that receives the field receives the label with it.
+    and an agent that receives the field receives the label with it.
     """
 
     text: str
@@ -1108,22 +1106,18 @@ def _resolve_reference(ctx, store, document_id: str, *, what: str):
     order is the one the plan's Step 2 gives, and each step is a different lie prevented:
 
     1. `get_generation` first. A reference bound under an epoch that has been rebuilt points at an
-    id
-       that may now be some other document's bytes, so it is not a reference at all.
+       id that may now be some other document's bytes, so it is not a reference at all.
     2. `ledger_refs_for_document` — every row carrying the id, deleted and stale ones included,
        because the distinction between "nowhere", "not yours" and "not any more" is what the three
        refusals are made of.
     3. The scope test, against the **token**, on the **reference**: nothing here asks either API
        whether the document may be shown, so a scope answer costs one query and no network — which
-       is
-       what keeps "is this mine?" from becoming a latency and enumeration question at the index.
+       is what keeps "is this mine?" from becoming a latency and enumeration question at the index.
     4. More than one live in-scope row is `invalid-request`, not a pick. Papra ids are per
        organisation and global uniqueness is unverified; the 2026-11-16 spec's answer to one id in
-       two
-       allowed orgs is `multiple_matches` naming both, and since this tool takes no bucket argument
-       the request itself is under-specified. Both names are safe to print here: the caller is
-       granted
-       every bucket the message lists.
+       two allowed orgs is `multiple_matches` naming both, and since this tool takes no bucket
+       argument the request itself is under-specified. Both names are safe to print here: the caller
+       is granted every bucket the message lists.
     """
     generation = store.get_generation()
     refs = store.ledger_refs_for_document(document_id)
@@ -1209,9 +1203,8 @@ def _content_result(ref, raw: str, *, max_chars: int) -> ContentResult:
     and so a truncated tail cannot end inside an escape sequence that a partial removal produced.
 
     **Then cap**, and the cap applies to the document text, never to the message: cutting the
-    wrapper
-    in half leaves a reader unable to tell where the document stops, which is the one thing the
-    wrapper is for.
+    wrapper in half leaves a reader unable to tell where the document stops, which is the one thing
+    the wrapper is for.
 
     **Then wrap**, in a delimiter carrying a per-call nonce. A fixed `</document-content>` is a tag
     any document can print, and a fence that a payload can close from the inside is worse than no
@@ -1222,8 +1215,7 @@ def _content_result(ref, raw: str, *, max_chars: int) -> ContentResult:
 
     The header carries the two ids percent-encoded: an id that contained `>` would otherwise end the
     opening tag inside its own attribute, and an attribute is exactly where an id-shaped string has
-    no
-    business having structure.
+    no business having structure.
     """
     text = strip_unsafe_text(raw)
     truncated = len(text) > max_chars
@@ -1315,9 +1307,8 @@ async def get_document_content(ctx, store, papra, kz, document_id: str, *,
     result to say which. So an outage is `index_unavailable`, and the worse copy stays unread.
 
     `max_chars` is bounded by `MAX_CONTENT_CHARS` and refused outside it rather than clamped, for
-    the
-    reason every other bound here is refused: a caller that asked for 200 000 characters and got 20
-    000
+    the reason every other bound here is refused: a caller that asked for 200 000 characters and got
+    20 000
     believes it got 200 000. `truncated` and `chars_total` together say what was withheld, and
     `open_document` is where the rest of it lives.
     """
@@ -1350,8 +1341,7 @@ async def open_document(ctx, store, document_id: str, *, papra_base_url: str | N
 
     * It buys a tool that still works while the index is down (which is when an operator most wants
       the link), and one whose answer cannot name a Kreuzakt path, id or host, because it never
-      speaks
-      to Kreuzakt.
+      speaks to Kreuzakt.
     * It costs the live Papra check. A document deleted in Papra a moment ago, whose ledger row the
       delete pass has not marked yet, still gets a URL. No content is disclosed by that — the caller
       already holds the id, and the link goes to the archive's own UI, which is the authority on
