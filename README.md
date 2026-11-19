@@ -55,6 +55,7 @@ listener test imports directly because the SDK's client speaks it, not `httpx`).
 | `DATA_DIR` | defaults to `/app/data`; the SQLite file lives here |
 | `DASHBOARD_BIND` | defaults to `127.0.0.1:8080`; never publish it to the LAN |
 | `OCR_MAX_PAGES`, `OCR_PAGE_PIXEL_BUDGET`, `OCR_DPI`, `OCR_CONCURRENCY`, `SWEEP_INTERVAL_S` | optional tuning |
+| `PAPRA_MAX_DOCUMENT_BYTES` | default `104857600` (100 MiB). Over it a document is **not enrolled, and so never indexed** — the remedy is to compress it and re-upload to Papra, or raise this and re-run `backfill`. One number for both consumers (the OCR worker's memory guard and the enrollment gate). A typo (`10MB`, `1e8`, `-5`, `0`) is a startup refusal naming the bad value, never a silent fall back to the default — see "Documents that are too big" |
 | `PAPRA_KREUZAKT_URL` | the Kreuzakt index, e.g. `http://kreuzakt:3000`; unset means no index, search falls back to Papra |
 | `PAPRA_INDEX_CONTENT_DELIVERY` | default `false` — see "Handing the `content` column over" |
 | `PAPRA_INDEX_METADATA_DELIVERY` | default `false` — see "Handing the title, date and note over" |
@@ -175,6 +176,11 @@ there.
 - **A document is in Papra but not in the index** → `ledger --status` decides which problem this is.
   `unledgered` is the population `papra-suite backfill` enrols; a reference the current generation
   calls already indexed is not backfill's to re-queue, and the row-level `jobs --reset` is the lever.
+- **A document is in Papra, the ledger has never heard of it, and `backfill` will not take it** → it is
+  over `PAPRA_MAX_DOCUMENT_BYTES`. `papra-suite check` prints the count, the largest size seen and the
+  limit in force (`oversized: N seen since …`), and `backfill --dry-run` names the documents with
+  their sizes. Refused for size means **no ledger row**, which is why no ledger count can show it; the
+  remedy is to compress it and re-upload, or raise the ceiling and run `backfill` again.
 
 ## Recovery
 
@@ -194,7 +200,12 @@ the documents; everything about *how* they got there lives in that one file.
 | Poll cursors and `UIDVALIDITY` | every mailbox is read from the beginning again |
 | Content dedup hashes and the seen-document table | everything still in an inbox is attempted again |
 | Job queue (OCR and title work) | pending and in-flight work is gone |
-| Settings | the sweep's resume offsets (`sweep_offset:<org>`), the index generation, the delivery flags that `serve` re-seeds from the environment, and the deletion brakes (`index_marks_rolling`, `index_deletion_quarantine`, the listing-walk and liveness-probe stamps). So the sweep re-scans from page one, every bound index id stops being current — the corpus reads as backlog until a rebuild re-derives it — and the brakes come back **permissive**, because an absent row means "nothing is being held" |
+| Settings | the sweep's resume offsets (`sweep_offset:<org>`), the index generation, the delivery flags that `serve` re-seeds from the environment, and the deletion brakes (`index_marks_rolling`, `index_deletion_quarantine`, the listing-walk and liveness-probe stamps) and the record of documents refused for size
+(`oversized_seen`, capped at 50 with the count kept beside the listing). So the sweep re-scans from
+page one, every bound index id stops being current — the corpus reads as backlog until a rebuild
+re-derives it — the brakes come back **permissive**, because an absent row means "nothing is being
+held", and the count of oversized documents restarts from the next refusal: it was always "seen since
+the record began", never a census of the corpus |
 | `log_lines` ring buffer | the in-app log history |
 | `ingest_events` | the 90-day "why was this skipped" window |
 
@@ -497,6 +508,15 @@ down, which is the case that matters during an incident. So an id that is mistyp
 name a bucket this suite has already seen is still accepted — check the id against Papra's own
 organisation list when you mint.
 
+**`--list` carries a `last used` column, and `never` is a reading.** It is the newest stamp the
+listener left for that credential, and it answers the question worth asking before a `--revoke`: is
+this thing alive? The stamp is written at most once per token per minute, so the column can lag a live
+session by up to a minute — which is a different claim from `never`, and the column says which. It is
+matched by the digest the row is stored under, not by the label: labels are reusable after a revoke by
+design, so joining on them would let a freshly rotated token inherit the old device's last use, wrong
+in the direction that stops you revoking something that matters. The listing prints no plaintext and
+no digest; the label is the only identifier it offers.
+
 **`index_status` answers within 15 s or not at all** — the spec's per-call deadline. An index that is
 thinking too slowly is refused with `index_unavailable` rather than answered late, and a store that
 cannot be read (a corrupt `index_generation`, a locked database, a bug of ours) returns a short stable
@@ -504,6 +524,14 @@ code and never a SQL fragment or a traceback. The traceback belongs to this proc
 happen off `serve`'s event loop, because they are correlated scans over the same single-writer SQLite
 file the pollers and OCR workers are using, and a status call that stalled them would be a worse
 outage than a slow one.
+
+**`index_status` reports what the size ceiling refused.** Its `oversized` field carries the count of
+documents refused for being too big, the largest of them, the ceiling that refused them, and when the
+record began — the same three numbers `check` prints, read through the same function, so the two
+surfaces cannot disagree. It is a privileged field (corpus-wide, and counted out of a capped record, so
+a bucket grant cannot be given a partial version of it) and it names no documents: the ids are for the
+operator, in `check` and `papra-suite backfill --dry-run`. **There is no dashboard yet**, so these two
+are the surfaces that show the reason; see "Documents that are too big".
 
 **A dead listener takes `serve` down with it.** If uvicorn dies — `address already in use` is the
 everyday case — the `mcp` task exits, the supervisor logs it as the crash it is, and the process stops
@@ -1163,11 +1191,12 @@ cadence reads the ledger, so that corpus cannot be reached from anywhere else in
 command is how it gets in.
 
 Say what it does **not** admit, because the population is named in the same breath: a document over
-`OCR_MAX_DOCUMENT_BYTES` is **counted and refused**, not enrolled. It gets its own bucket on the
+`PAPRA_MAX_DOCUMENT_BYTES` is **counted and refused**, not enrolled. It gets its own bucket on the
 summary line and it stays outside the index, and running the command again does not change that. The
 size gate is the OCR intake's own rule and `backfill` enqueues through the intake path rather than
 around it; lifting it for the index alone is a decision about what the index should hold, not a flag
-this command can quietly make for you.
+this command can quietly make for you. What it *does* do is name them, sizes included, so you can
+decide per document (see "Documents that are too big").
 
 ```bash
 papra-suite backfill --dry-run                 # what would be queued, and what it costs
@@ -1220,3 +1249,53 @@ command that queues the same index work *without* the extraction: `--requeue` fi
 
 Backfill walks the buckets this store knows — `orgs` plus whatever the ledger holds — so a bucket it
 has never heard of has to be named with `--org-id`.
+
+### Documents that are too big
+
+`PAPRA_MAX_DOCUMENT_BYTES` is the ceiling, default `104857600` (100 MiB). It is one number serving
+two consumers: the bytes the OCR worker will pull into memory to render, and whether a document is
+enrolled at all. They are one number on purpose — a document over the limit is **never enrolled**, so
+it is never indexed either, and an index ceiling above the OCR ceiling would promise a population this
+suite has no way to read. Over it, a document stays outside the index, and nothing about the index is
+wrong.
+
+Parse is strict, like the delivery flags and the ports: `10MB`, `1e8`, `-5` and `0` are refusals that
+name the bad value, and `papra-suite check` exits `2` on them. The silent version is the one nobody
+would notice — you raise the ceiling to admit a big scan, the typo is swallowed, and the documents
+keep being refused at 100 MiB with nothing in the log saying the knob was ever read.
+
+**The reason has to be visible, and a refused document has no ledger row to carry it.** It is skipped
+*before* enrollment, so there is no reference for a count to read and the sweep marks it seen so it
+will not look again: without a record the population is invisible by construction. Each skip is
+therefore written to the `oversized_seen` settings row when it happens, from the three places a
+document can be refused (the sweep, `backfill`, `ledger --reindex-all`/`--requeue`). The row is
+capped at 50 documents with oldest-first eviction and its count is kept beside the listing, not
+derived from it; a hostile document id is bounded before it is stored; a row this build cannot parse
+reads as no record with a warning rather than crashing the command you ran to find out what is wrong.
+
+Three places say it, and **there is no dashboard yet** — so `check` and `index_status` *are* the
+surfaces, and when a dashboard exists it reads this same field. Do not go looking for a page.
+
+| Where | What you see |
+|---|---|
+| `papra-suite check` | `oversized: 2 seen since 2026-11-19T10:00:00+00:00, largest 209715200 bytes, limit in force 104857600 — not enrolled, not indexed: compress and re-upload to papra, or raise PAPRA_MAX_DOCUMENT_BYTES and run papra-suite backfill again`. Printed even when nothing was refused, because the line doubles as "what is the ceiling set to". |
+| MCP `index_status` | an `oversized` field with the same count, the largest size, the ceiling that refused them and when the record began — and no document ids, which are for the operator. Privileged like the queue depth: a corpus-wide number read through a cap is not something a one-bucket token can be given a partial version of. |
+| `papra-suite backfill --dry-run` | the refused documents **named, with their sizes**, bounded to the first 10 with the cap and the total stated on the line (`— first 10 of 37 named here`). A dry run still writes nothing, this record included. |
+
+The number is **"N oversized seen since <pass>"**, never "your corpus has N": the record holds what
+the passes walked, and this suite has no catalogue of the corpus except the walks it performed. It is
+a floor, and it goes down on its own — when a document comes back under the limit it is enrolled, and
+`enqueue_index_job` drops it out of the record. That is the whole point of writing the entry at skip
+time: a reason that outlives its problem has you compressing a document that is already fine.
+
+Raise the ceiling and the record does not silently change meaning. `check` prints
+`refused at <the older limit>` beside it and says those documents fit now; the next skip recorded under
+the new ceiling starts a fresh record, because entries refused by the old rule and refusals made by
+the new one are different claims about the corpus.
+
+```bash
+PAPRA_MAX_DOCUMENT_BYTES=524288000     # 500 MiB, then:
+papra-suite check                      # confirms the ceiling actually loaded
+papra-suite backfill --dry-run         # what would come in now, and what still will not
+papra-suite backfill
+```
