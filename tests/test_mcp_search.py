@@ -124,11 +124,18 @@ class ScriptedIndex:
     by `offset`" is asserted.
     """
 
-    def __init__(self, *, hits=None, rows=None, total=None, error=None):
+    def __init__(self, *, hits=None, rows=None, total=None, error=None, error_status=None,
+                 error_body=None):
         self.hits = list(hits or [])
         self.rows = list(rows or [])
         self.total = total
         self.error = error
+        # `error` alone answers 503 with a generic body, which is what an outage looks like from the
+        # outside. `error_status`/`error_body` let a test put a *specific* body on the wire, so
+        # that "the body did not reach the client" asserts about something that was there.
+        self.error_status = error_status
+        self.error_body = error_body
+        self.error_hits = 0
         self.search_calls = []
         self.list_calls = []
         # The full query string of every request, because "we page by `page` and never send
@@ -142,7 +149,19 @@ class ScriptedIndex:
 
     async def _handle(self, request):
         if self.error is not None:
-            return httpx.Response(503, json={"detail": "kreuzakt is down"})
+            # The request is recorded before the failure, so a test can prove the scripted index was
+            # the one that answered: an assertion that a secret is absent is worth nothing if the
+            # dependency holding it was never consulted.
+            self.error_hits += 1
+            params = dict(request.url.params)
+            if request.url.path == "/api/search":
+                self.search_calls.append((int(params.get("page", 1)),
+                                          int(params.get("limit", 20))))
+            elif request.url.path == "/api/documents":
+                self.list_calls.append((int(params.get("page", 1)),
+                                        int(params.get("limit", 100)), params.get("since")))
+            return httpx.Response(self.error_status or 503,
+                                  json=self.error_body or {"detail": "kreuzakt is down"})
         path = request.url.path
         params = dict(request.url.params)
         if path == "/api/search":
@@ -1254,14 +1273,13 @@ async def test_a_later_page_fills_from_the_live_ones_in_order(store):
     assert page.partial is False                 # exhausted: five live documents exist, no more
 
 
-async def test_a_budget_that_is_not_a_whole_page_stops_rather_than_re_reading_rows(store):
-    """A 120-row budget buys one 100-row page, and says so, rather than a mis-shaped second one.
+async def test_a_ragged_budget_is_spent_in_pages_that_divide_it(store):
+    """120 rows of allowance buys 60 + 60, so the document on row 105 is reached and counted.
 
-    Kreuzakt addresses rows as `(page - 1) * limit`, so the request that would use the last 20 rows
-    of this budget — `page=2&limit=20` — is rows 21-40. It would re-scan twenty rows that were
-    already scanned, report a `scanned` of 120 as if the budget had been spent honestly, and never
-    look at rows 101-120 at all. Stopping early and setting `partial` is the only answer that is
-    true about the rows it examined.
+    The page size is chosen per scan, not fixed at 100, because the rows are addressed as
+    `(page - 1) * limit`: a second request shrunk to `page=2&limit=20` to fit the leftover budget
+    would be rows 21-40 — twenty rows scanned twice and eighty never scanned. A divisor spends the
+    allowance and tiles it exactly, which is what makes `scanned` a number that can be added up.
     """
     from papra_suite.mcp_tools import SearchLimits
 
@@ -1270,17 +1288,53 @@ async def test_a_budget_that_is_not_a_whole_page_stops_rather_than_re_reading_ro
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 251)])
     page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung",
                                   page_size=5, limits=SearchLimits(scan_rows=120))
-    assert index.search_calls == [(1, KREUZAKT_PAGE_ROWS)]
-    assert page.items == [] and page.scanned == 100
+    assert index.search_calls == [(1, 60), (2, 60)]
+    assert [item.document_id for item in page.items] == ["doc-far"]
+    assert page.scanned == 120                      # the whole allowance, tiled with no overlap
     assert page.partial is True and "budget" in (page.partial_reason or "")
 
 
-async def test_two_pages_of_one_size_reach_the_rows_a_shrunken_page_would_miss(store):
-    """The other half of the same rule: with a whole second page bought, row 105 is found.
+def test_the_scan_never_mixes_page_sizes_in_one_sweep():
+    """One sweep, one `limit` — and never a dribble of one-row requests to fit a prime budget.
 
-    The document this token may see is the fifth row of the second page. A scan that asked for
-    `page=2&limit=20` would never reach it, and would report `scanned: 120` while having looked at
-    rows 21-40 twice.
+    `page_rows_for` has two jobs: divide the allowance where a divisor exists, and refuse to be
+    clever where none does. 101 has no divisor below 100, so it takes a full page and reports the
+    row it could not spend; a function optimising for exactness there would issue a hundred and one
+    one-row reads against a server the caller is trying not to burden.
+    """
+    from papra_suite.mcp_tools import page_rows_for
+
+    assert page_rows_for(500) == KREUZAKT_PAGE_ROWS      # the default: unchanged, one full page
+    assert page_rows_for(120) == 60
+    assert page_rows_for(250) == 50
+    assert page_rows_for(37) == 37                       # a budget under a page is one page
+    for scan_rows in (37, 99, 100, 101, 120, 250, 500, 997, 1024):
+        rows = page_rows_for(scan_rows)
+        assert rows <= KREUZAKT_PAGE_ROWS
+        assert rows >= min(scan_rows, 25)
+        assert scan_rows % rows == 0 or rows == KREUZAKT_PAGE_ROWS
+
+
+async def test_a_prime_allowance_names_the_rows_it_could_not_spend(store):
+    """The one case where the budget is not fully used says so, in the reason, not in `scanned`."""
+    from papra_suite.mcp_tools import SearchLimits
+
+    bind(store, ORG_A, "doc-far", 105)
+    papra = FakePapra({"doc-far": papra_doc("doc-far")})
+    index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 251)])
+    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung",
+                                  page_size=5, limits=SearchLimits(scan_rows=101))
+    assert index.search_calls == [(1, KREUZAKT_PAGE_ROWS)]
+    assert page.items == [] and page.scanned == 100
+    assert page.partial is True and "whole page" in (page.partial_reason or "")
+
+
+async def test_the_page_size_is_asked_for_the_same_way_every_time(store):
+    """The other half of the same rule: a sweep that mixes limits would not be a sweep of rows.
+
+    The document this token may see sits past the first page. Any answer that reached it with two
+    different `limit` values would have re-read some rows and never read others, and reported a
+    `scanned` that no longer means the rows examined.
     """
     from papra_suite.mcp_tools import SearchLimits
 
@@ -1290,9 +1344,11 @@ async def test_two_pages_of_one_size_reach_the_rows_a_shrunken_page_would_miss(s
     page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung",
                                   page_size=5, limits=SearchLimits(scan_rows=250))
     assert [item.document_id for item in page.items] == ["doc-far"]
-    assert index.search_calls == [(1, KREUZAKT_PAGE_ROWS), (2, KREUZAKT_PAGE_ROWS)]
-    assert page.scanned == 200                       # rows 1-100, then 101-200: nothing twice
-    assert page.partial is True                      # the allowance was spent, and says so
+    limits = {limit for (_page, limit) in index.search_calls}
+    assert limits == {50} and len(index.search_calls) == 5
+    assert [page_num for (page_num, _limit) in index.search_calls] == [1, 2, 3, 4, 5]
+    assert page.scanned == 250                       # rows 1-50, 51-100, …: nothing twice
+    assert page.partial is False                     # the corpus ended; nothing is owed
 
 
 # --- the shape an agent is handed --------------------------------------------------------------
@@ -1323,18 +1379,29 @@ async def test_an_index_outage_reaches_the_client_as_one_code_and_no_body(store)
 
     Not a `pytest.raises`: an exception the SDK renders is a different surface from an exception the
     test catches, and this one has to be both stable (`index_unavailable`, retryable) and empty of
-    the upstream body — a Kreuzakt error message quotes its own response, and that body is the one
-    text on this path that neither this program nor the token holder wrote.
+    the upstream body — a Kreuzakt error message interpolates its own response, and that body is the
+    one text on this path that neither this program nor the token holder wrote. The scripted index
+    is therefore built to put a *specific* body on the wire and to record that it was the one asked,
+    because "the secret is absent" is worth nothing if the dependency holding it was never read.
     """
     own_corpus(store, 2)
-    index = ScriptedIndex(hits=[kz_row(1)], error=KreuzaktError(
-        'HTTP 500 /api/search: {"detail": "SECRET UPSTREAM BODY", "documents": 9000}', status=500))
+    secret = {"detail": "SECRET UPSTREAM BODY", "documents": 9000, "path": "/api/documents/7"}
+    index = ScriptedIndex(hits=[kz_row(1)], error=KreuzaktError("boom", status=500),
+                          error_status=500, error_body=secret)
     token = mint_token(store, label="wire", org_ids=[ORG_A])
     _response, message = wire_call(store, token, "search_documents", {"query": "rechnung"},
                                    kz=index.reader())
+    assert index.error_hits == 1 and index.search_calls == [(1, KREUZAKT_PAGE_ROWS)]
     result = message["result"]
     assert result["isError"] is True
-    text = tool_error_text(message)
-    assert "index_unavailable" in text        # the SDK's own prefix is all that comes before it
-    assert "SECRET UPSTREAM BODY" not in text and "9000" not in text
-    assert not result.get("structuredContent")   # no half-an-answer payload beside the refusal
+    assert "index_unavailable" in tool_error_text(message)   # the SDK's prefix is all before it
+    serialised = json.dumps(message, ensure_ascii=False).lower()
+    # Every needle is checked against the whole envelope. One could not be: the SDK's own result
+    # field is called `content`, so scanning for that word would report a leak in every successful
+    # response too. The useful claim there is that no *item* carries a text field, which is what the
+    # closed-field-set test pins by name.
+    for needle in ("secret upstream body", "9000", "/api/documents/", "/documents/", "/thumbnail",
+                   "/original", "kreuzakt", "kreuzakterror", "httpx", "sqlite", "operationalerror",
+                   "snippet", "canary"):
+        assert needle not in serialised, needle
+    assert not result.get("structuredContent")      # no half-an-answer payload beside the refusal

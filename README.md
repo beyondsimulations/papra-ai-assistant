@@ -581,8 +581,9 @@ Two behaviours worth knowing before you debug one:
   `index_unavailable` rather than answering out of Papra or returning an empty list. This suite is a
   bridge; a Papra-backed result behind an "index" tool would be a second, worse index that does not
   say it fell back, and "no documents match" under a dead index is a claim about your archive that
-  the call is not entitled to make. Upstream prose stops at the boundary too: the client sees the
-  exception class and the HTTP status, never Kreuzakt's body.
+  the call is not entitled to make. Upstream prose stops at the boundary too: the client sees
+  `index_unavailable` and the HTTP status — not Kreuzakt's body, and not our exception class names,
+  which tell an agent about our source code and nothing about its question.
 
 `check` ends with the state of all this in one line — `mcp: disabled (…), tokens: 1 active,
 1 revoked` — with counts only: labels name a device and an agent, and `check` output is what gets
@@ -619,7 +620,10 @@ of returning a silently-short list.
 `invalid-request`, and a clamp would turn "give me 51" into an answer that looks like 51. Paging is by
 `page` — `/api/search` and `/api/documents` honour it and ignore `offset` — with one page size per
 scan, because rows are addressed as `(page - 1) * limit` and shrinking the last request to fit a
-ragged budget would re-read some rows while never reading others.
+ragged budget would re-read some rows while never reading others. The page size is chosen per scan to
+divide the allowance where a divisor exists (a 120-row budget scans 60+60 and reaches row 105), and
+where the budget is prime it stops a row short and `partial_reason` says that, rather than reporting
+an exhausted budget that was not spent.
 
 `list_recent_documents` keeps the index's own `added_at` order and re-sorts nothing, and its `since`
 must be `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`: an ISO `…Z` value is refused rather than rewritten,

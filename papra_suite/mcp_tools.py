@@ -522,8 +522,13 @@ class Sweep:
         """Why this answer could be missing something. Empty means it proves itself complete."""
         reasons = []
         if self.budget_spent:
-            reasons.append(f"the scan budget of {scan_rows} index rows was spent after "
-                           f"{self.scanned} rows")
+            spare = scan_rows - self.scanned
+            if spare > 0:
+                reasons.append(f"the scan budget of {scan_rows} rows allowed no further whole page "
+                               f"(scanned {self.scanned}, {spare} row(s) short of one)")
+            else:
+                reasons.append(f"the scan budget of {scan_rows} rows was spent after "
+                               f"{self.scanned} rows")
         if self.stalled:
             reasons.append("the index returned a short page while its own total claimed more rows")
         if call.stats.dropped_lookup_error:
@@ -533,6 +538,29 @@ class Sweep:
             reasons.append(f"{len(call.skipped)} bucket(s) in scope were beyond this call's bound "
                            f"of {call.limits.max_buckets} buckets")
         return reasons
+
+
+def page_rows_for(scan_rows: int) -> int:
+    """One page size for a whole scan: the largest that fits the allowance and divides it exactly.
+
+    Two constraints pull against each other. Kreuzakt addresses rows as `(page - 1) * limit`, so
+    every request in a scan has to ask for the same `limit` — shrinking the last one to fit a budget
+    that is not a multiple of 100 moves the window instead of trimming it: with a budget of 120 a
+    second request of `page=2&limit=20` is rows 21-40: twenty rows scanned twice, eighty never
+    scanned. But a fixed 100 also throws away the tail of a ragged allowance, which the advisor was
+    right to call out as a budget not actually spent. A page size that divides the allowance
+    satisfies both: a budget of 120 scans 60+60 and reaches every row it paid for.
+
+    A prime allowance (101) has no divisor at all, so the floor of 25 keeps one pathological config
+    from turning a scan into a hundred-and-one one-row requests: it falls back to a full page, stops
+    with a row unusable, and `Sweep.reasons` says so rather than claiming the budget ran out.
+    """
+    if scan_rows <= KREUZAKT_PAGE_ROWS:
+        return scan_rows                    # one page, and the ceiling is the whole allowance
+    for rows in range(KREUZAKT_PAGE_ROWS, 0, -1):
+        if scan_rows % rows == 0:
+            return rows if rows >= 25 else KREUZAKT_PAGE_ROWS
+    return KREUZAKT_PAGE_ROWS
 
 
 async def _collect(fetch, resolve, *, want: int, scan_rows: int) -> Sweep:
@@ -557,14 +585,10 @@ async def _collect(fetch, resolve, *, want: int, scan_rows: int) -> Sweep:
     # shrinking the last request to fit a budget that is not a multiple of 100 moves the window
     # instead of trimming it: with a budget of 120, a second request of `page=2&limit=20` is rows
     # 21-40 — twenty rows scanned twice and eighty that were never scanned. The allowance is
-    # therefore counted in whole pages, and a budget under one page buys one page.
-    # One page size for the whole scan. Kreuzakt addresses rows as `(page - 1) * limit`, so
-    # shrinking the last request to fit a budget that is not a multiple of 100 moves the window
-    # instead of trimming it: with a budget of 120, a second request of `page=2&limit=20` is rows
-    # 21-40 — twenty rows scanned twice and eighty that were never scanned. The allowance is
-    # therefore counted in whole pages of one size, and it is floored, so the budget is a ceiling on
-    # rows scanned rather than a target that one more page would overshoot.
-    page_rows = min(KREUZAKT_PAGE_ROWS, scan_rows)
+    # One page size for the whole scan, chosen to divide the allowance: see `page_rows_for`. The
+    # allowance stays a ceiling on rows scanned, and `reasons()` reports the shortfall honestly
+    # when a prime allowance leaves a row or two unusable.
+    page_rows = page_rows_for(scan_rows)
     pages_allowed = max(1, scan_rows // page_rows)
     while upstream_page <= pages_allowed:
         rows, total = await fetch(upstream_page, page_rows)
@@ -622,16 +646,17 @@ async def _guarded(what: str, body, *, deadline_s: float | None):
             "an answer") from None
     except KreuzaktError as error:
         status = getattr(error, "status", None)
-        detail = f" (http {status})" if isinstance(status, int) else ""
-        logger.warning("mcp: %s could not read the index: %s", what,
+        logger.warning("mcp: %s could not read the index (%s): %s", what, type(error).__name__,
                        sanitize_event_text(str(error), limit=CLIENT_MESSAGE_LIMIT))
-        raise IndexUnavailable(
-            f"the index would not answer this request ({type(error).__name__}{detail})") from error
+        detail = f" (http {status})" if isinstance(status, int) else " without answering at all"
+        raise IndexUnavailable(f"the index would not answer this request{detail}") from error
     except (ValueError, sqlite3.Error) as error:
+        # The class name goes to the log, not to the client: `OperationalError` names our storage
+        # engine to an agent that can do nothing with it, and a class name is the kind of internal
+        # that a leak test should not have to learn to forgive.
         logger.warning("mcp: %s could not read the ledger (%s)", what, type(error).__name__)
-        raise IndexUnavailable(
-            f"the ledger would not answer this request ({type(error).__name__}), so no reference "
-            "could be resolved") from error
+        raise IndexUnavailable("the ledger would not answer this request, so no reference could "
+                               "be resolved and nothing can be shown") from error
 
 
 async def search_documents(ctx, store, papra, kz, query: str, *, page: int = 1,
