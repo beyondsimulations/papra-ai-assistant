@@ -94,8 +94,13 @@ class BackfillResult:
 
     * `listed` — documents Papra returned, of any type: the walk's reach.
     * `candidates` — the PDFs among them that are neither trashed nor non-PDF: what "of M" counts.
-    * `enqueued` — documents this run asked for (new rows plus the ones already queued).
-    * `new_rows` — of those, the ones that took a fresh queue row: the only number `--limit` caps.
+    * `enqueued` — documents this run asked for: `new_rows` plus `already_queued`. A document a live
+      row already carried was still asked for, so it belongs to this population even though it
+      changed nothing. The invariant is `enqueued == new_rows + already_queued`, so the two are
+      equal only when nothing was absorbed — were they equal always, a run over a stalled queue
+      would print the same pair as a run over an empty corpus.
+    * `new_rows` — of those, the ones that took a fresh queue row: the only number `--limit` caps,
+      and the total `enrolled` and `stale_queued` partition.
     * `already_queued` — of those, the ones a live row already carried, so nothing changed. Counted
       apart because an absorbed request is not progress: were it to spend the cap, a stalled worker
       would make every limited run re-report the same head of the queue, and the rest would never be
@@ -166,8 +171,10 @@ def add_subparser(subparsers) -> None:
                         help="only this papra organization (default: every organization this "
                              "store knows, from `orgs` and from the ledger)")
     parser.add_argument("--limit", type=int, default=None,
-                        help="queue at most this many documents in one run, and print how many are "
-                             "still eligible (default: no cap — the walk still counts them)")
+                        help="take at most this many new queue rows in one run — a document a "
+                             "live row already carries is absorbed and does not spend the cap — "
+                             "and print how many are still eligible (default: no cap — the walk "
+                             "still counts them)")
     parser.add_argument("--dry-run", action="store_true",
                         help="count what would be queued and change nothing: no job, no ledger "
                              "row, no seen record. Prints the cost before it is paid")
@@ -232,6 +239,10 @@ def _queue(store: Store, org: str, document_id: str, *, file_hash: str, name: st
     skipped is the one that keeps an enrolled document visible afterwards.
     """
     if _already_queued(store, document_id, file_hash):
+        # Asked for, and already carried: it counts in `enqueued` beside the documents that took a
+        # row, while `new_rows` and the cap stay where they were — an absorbed request is not
+        # progress.
+        result.enqueued += 1
         result.already_queued += 1
         logger.debug("backfill: %s/%s is already queued, nothing changed", org, document_id)
         return
@@ -484,24 +495,28 @@ def _report(store: Store, args, result: BackfillResult) -> int:
     next, and a summary that ends with its own successes reads as finished.
     """
     verb = "would enqueue" if args.dry_run else "enqueued"
-    if result.already_queued:
-        # The honest headline: work that was already in the queue was not queued by this run, and a
-        # number for it would read as progress on a corpus whose workers are stalled.
-        head = (f"backfill: {verb} {result.new_rows} new of {result.candidates} candidate(s) "
-                f"({result.already_queued} already queued, unchanged) across "
-                f"{len(result.orgs_queued)} bucket(s); {result.remaining} remaining")
-    else:
-        head = (f"backfill: {verb} {result.enqueued} of {result.candidates} candidate(s) across "
-                f"{len(result.orgs_queued)} bucket(s); {result.remaining} remaining")
+    # Two different numbers belong on this line, so each is named by what it counts. The leading one
+    # is what the run changed (new queue rows: the only thing `--limit` caps, the only thing an
+    # operator can act on), because leading with the asked-for count is how a run over a stalled
+    # queue reads as progress. `asked for` is `enqueued` — new rows plus what a live row had already
+    # taken — decomposed in the parenthesis so the totals add up under the eye.
+    head = (f"backfill: {verb} {result.new_rows} new row(s) across "
+            f"{len(result.orgs_queued)} bucket(s); asked for {result.enqueued} of "
+            f"{result.candidates} candidate(s)"
+            + (f" ({result.already_queued} already queued, unchanged)"
+               if result.already_queued else "")
+            + f"; {result.remaining} remaining")
     print(head)
     print(f"  {result.listed} document(s) listed; {result.already_current} already current in the "
           f"ledger, {result.skipped_non_pdf} not a pdf, {result.skipped_deleted} in papra's trash "
           "or queued for deletion, "
           f"{result.skipped_oversized} over the {OCR_MAX_DOCUMENT_BYTES} byte limit")
     if result.enrolled or result.stale_queued:
-        print(f"  of those {result.enqueued}: {result.enrolled} had no ledger reference at all and "
-              f"are enrolled now, {result.stale_queued} were references the current generation "
-              "calls un-indexed")
+        # `new_rows`, not `enqueued`: `enrolled` and `stale_queued` partition the rows this run
+        # took, and an absorbed document belongs to neither bucket.
+        print(f"  of those {result.new_rows} new row(s): {result.enrolled} had no ledger reference "
+              f"at all and are enrolled now, {result.stale_queued} were references the current "
+              "generation calls un-indexed")
     if result.needs_download:
         print(f"  {result.needs_download} candidate(s) carry no content hash in the listing: each "
               "is downloaded and hashed before it is queued, and refused if it is over the limit"
