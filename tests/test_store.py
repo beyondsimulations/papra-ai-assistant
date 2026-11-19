@@ -338,6 +338,33 @@ def test_reset_job_refuses_when_the_bytes_already_have_live_work(store):
     assert store.get_job(live).status == "pending"
 
 
+def test_the_two_reset_refusals_are_types_a_caller_can_tell_apart(store):
+    """`reset_job`'s two refusals are different answers, so they are different exceptions.
+
+    "A worker is holding this row" means leave it alone; "this work is already queued under another
+    id" means nothing needs doing. `papra-suite jobs --reset` gives them exit `2` and `1` for that
+    reason, and it reads the types rather than the sentences — so both stay `ValueError`s for every
+    other caller, and the messages can be reworded without moving an exit code.
+    """
+    running = store.enqueue_job(kind="index", papra_org_id="org-a", document_id="doc-1",
+                                content_hash="ab" * 32, payload={})
+    store.claim_next_job("index")
+
+    spent = store.enqueue_job(kind="index", papra_org_id="org-a", document_id="doc-2",
+                              content_hash="cd" * 32, payload={})
+    store.claim_next_job("index")
+    store.mark_job_failed(spent, "kreuzakt refused", max_attempts=1)
+    store.enqueue_job(kind="index", papra_org_id="org-a", document_id="doc-2",
+                      content_hash="cd" * 32, payload={})
+
+    with pytest.raises(store_module.JobIsRunningError):
+        store.reset_job(running)
+    with pytest.raises(store_module.JobAlreadyQueuedError):
+        store.reset_job(spent)
+    assert issubclass(store_module.JobIsRunningError, ValueError)
+    assert issubclass(store_module.JobAlreadyQueuedError, ValueError)
+
+
 def test_two_connections_cannot_queue_the_same_live_work(tmp_path):
     """The narrowed constraint still holds across connections.
 
@@ -506,8 +533,16 @@ def test_log_ring_buffer_tuple_order(store):
 
 
 def test_list_jobs_newest_first(store):
-    """list_jobs must return the newest job first (ORDER BY created_at DESC);
-    the dashboard queue view relies on this ordering."""
+    """list_jobs must return the newest job first (`ORDER BY rowid DESC`); the dashboard
+    queue view and `papra-suite jobs` rely on this ordering.
+
+    `rowid` is the insertion order, and `enqueue_job` stamps `created_at` with `_now()` as it
+    inserts, so the newest row is the highest rowid and the newest-first answer is the same either
+    way — with one difference that matters on a real queue: the rowid ordering is the table's own
+    order, so SQLite reads the tail and stops at the limit instead of sorting the whole `jobs`
+    table to answer "what is on screen?". `test_the_bare_listing_read_does_not_sort_the_queue`
+    is the pin that keeps it that way.
+    """
     a_id = store.enqueue_job(kind="ocr", papra_org_id="org_1", document_id="doc_a",
                              content_hash="h1", payload={})
     time.sleep(0.01)
@@ -516,6 +551,138 @@ def test_list_jobs_newest_first(store):
 
     assert [job.document_id for job in store.list_jobs()] == ["doc_b", "doc_a"]
     assert [job.id for job in store.list_jobs()] == [b_id, a_id]
+
+
+class _RecordingConn:
+    """The store's connection, with the statements a call executed left on the table.
+
+    The query-plan pins below need the SQL that actually shipped, not a copy of it in the test:
+    a pin written against a hand-copied statement passes while the product code sorts the queue.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.statements = []
+
+    def execute(self, sql, params=()):
+        self.statements.append(sql)
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _plan(store, sql):
+    """SQLite's own plan for a shipped statement, with plausible values in its placeholders."""
+    rows = store._conn.execute("EXPLAIN QUERY PLAN " + sql, ["index"] * sql.count("?"))
+    return " | ".join(row[3] for row in rows.fetchall())
+
+
+def _statements(store, call):
+    recorder = _RecordingConn(store._conn)
+    store._conn = recorder
+    try:
+        call()
+    finally:
+        store._conn = recorder._conn
+    assert recorder.statements, "the call read nothing, so a plan pin would pin nothing"
+    return recorder.statements
+
+
+def test_has_live_job_answers_for_one_exact_work_key(store):
+    """"Is this exact work queued?"" — one key, one bucket, live rows only.
+
+    `papra-suite backfill` asks this per document to decide whether the request was progress or a
+    repeat, and every part of the key is a different wrong answer: another bucket's row, another
+    document's row, or another generation's bytes all say "already queued" about work that is not
+    queued here, and the document is then never enqueued at all.
+    """
+    store.enqueue_job(kind="index", papra_org_id="org-a", document_id="doc-1",
+                      content_hash="ab" * 32, payload={})
+
+    def asked(kind="index", org="org-a", document_id="doc-1", content_hash="ab" * 32):
+        return store.has_live_job(kind=kind, papra_org_id=org, document_id=document_id,
+                                  content_hash=content_hash)
+
+    assert asked() is True
+    assert asked(org="org-b") is False, "another bucket's live row absorbed this document"
+    assert asked(document_id="doc-2") is False
+    assert asked(content_hash="cd" * 32) is False, "other bytes are not this work"
+    assert asked(kind="ocr") is False
+
+
+def test_a_settled_row_is_not_live_work_for_the_queue_check(store):
+    """Migration 004's rule, on the predicate the backfill reads.
+
+    A `done` or `failed` row is history, not a lock: if this check counted it, a document indexed
+    once could never be re-queued by `backfill`, and the corpus would silently stop accepting work
+    the second any job finished.
+    """
+    done = store.enqueue_job(kind="index", papra_org_id="org-a", document_id="doc-done",
+                             content_hash="ab" * 32, payload={})
+    store.claim_next_job("index")
+    store.mark_job_done(done)
+    failed = store.enqueue_job(kind="index", papra_org_id="org-a", document_id="doc-failed",
+                               content_hash="cd" * 32, payload={})
+    store.claim_next_job("index")
+    store.mark_job_failed(failed, "kreuzakt refused", max_attempts=1)
+
+    for document_id, content_hash in (("doc-done", "ab" * 32), ("doc-failed", "cd" * 32)):
+        assert store.has_live_job(kind="index", papra_org_id="org-a", document_id=document_id,
+                                  content_hash=content_hash) is False
+
+
+def test_the_queue_check_seeks_the_idempotency_index(store):
+    """The per-document queue check is a seek, not a scan of everything of that kind.
+
+    `backfill` runs this once per PDF over a corpus of thousands. Read on `kind` + `document_id`
+    alone, SQLite takes `idx_jobs_claim` (kind only) and builds a temporary B-tree to sort every
+    `index` row for every document in the corpus — on the command whose whole purpose is being the
+    bounded way into the index. The full work key plus migration 004's live predicate is a seek on
+    `idx_jobs_idempotency`, which is what this asserts on SQLite's own answer.
+    """
+    statements = _statements(store, lambda: store.has_live_job(
+        kind="index", papra_org_id="org-a", document_id="doc-1", content_hash="ab" * 32))
+    plan = _plan(store, statements[-1])
+
+    assert "idx_jobs_idempotency" in plan, plan
+    assert "TEMP B-TREE" not in plan, plan
+
+
+def test_the_bare_listing_read_does_not_sort_the_queue(store):
+    """`papra-suite jobs` with no filter must read the tail, not sort the table.
+
+    The listing is the first thing an operator types in an incident, on a queue that also carries
+    every settled row the system ever wrote. `ORDER BY created_at DESC` has no index behind it, so
+    SQLite answers it by putting the whole table in a temporary B-tree before printing fifty rows;
+    the rowid ordering is the same newest-first answer taken straight from the table's own order.
+    """
+    statements = _statements(store, lambda: store.list_jobs())
+    plan = _plan(store, statements[-1])
+
+    assert "TEMP B-TREE" not in plan, plan
+
+
+def test_live_job_kinds_names_every_kind_with_live_rows(store):
+    """Which kinds hold work, named — from the table, so no listing cap can hide one.
+
+    `papra-suite jobs --drain` prints these names in its refusal. Derived from a capped listing,
+    a queue past that cap loses a kind from the sentence, and the operator goes to look at the
+    loop that was already quiet. A kind holding only settled rows stays out: it is history.
+    """
+    store.enqueue_job(kind="index", papra_org_id="org-a", document_id="doc-1",
+                      content_hash="ab" * 32, payload={})
+    store.enqueue_job(kind="ocr", papra_org_id="org-a", document_id="doc-1",
+                      content_hash="ab" * 32, payload={})
+    settled = store.enqueue_job(kind="title", papra_org_id="org-a", document_id="doc-1",
+                                content_hash="ab" * 32, payload={})
+    store.claim_next_job("title")
+    store.mark_job_failed(settled, "no writer left", max_attempts=1)
+
+    assert store.live_job_kinds() == ["index", "ocr"]
+    assert store.live_job_kinds("ocr") == ["ocr"]
+    assert store.live_job_kinds("title") == []
+    assert store.live_job_kinds("no-such-kind") == []
 
 
 def test_failed_job_is_not_claimable_during_backoff(store):
