@@ -31,6 +31,7 @@ from papra_suite.mcp_tokens import (
     MAX_ORG_IDS,
     ORG_ID_MAX_CHARS,
     TOKEN_SETTING_PREFIX,
+    TOKEN_USE_PREFIX,
     TokenContext,
     TokenError,
     add_subparser,
@@ -39,6 +40,7 @@ from papra_suite.mcp_tokens import (
     resolve_token,
     revoke_token,
     run_mcp_token,
+    stamp_token_use,
     token_counts,
 )
 from papra_suite.store import Store
@@ -509,7 +511,9 @@ def test_list_flags_a_grant_that_names_no_bucket(store, capsys):
     assert "org-01" in out and "hermes" in out
     assert "no bucket" in out
     rows = [line for line in out.splitlines() if line.startswith(("hermes", "pi"))]
-    assert len(rows) == 2 and all(len(line.split("\t")) == 4 for line in rows)
+    # Five columns since `last used` joined the table: the point of the assertion is unchanged — the
+    # unknown-bucket warning is a FOOTER, so no row may gain a sixth field or lose its shape.
+    assert len(rows) == 2 and all(len(line.split("\t")) == 5 for line in rows)
 
 
 def test_list_is_quiet_when_every_grant_names_a_real_bucket(store, capsys):
@@ -546,3 +550,92 @@ def test_a_rejected_row_is_reported_as_a_count_and_not_as_its_key(store, caplog)
     assert digest not in printed and "cd" * 32 not in printed
     assert f"{TOKEN_SETTING_PREFIX}{digest}" not in printed
 
+
+
+# --- the `last used` column ---------------------------------------------------------------
+
+def test_a_used_token_lists_the_moment_it_was_seen(store):
+    """`stamp_token_use` has written rows since Task 11 and nothing has ever read them.
+
+    The question this answers is the one an operator actually has when they are about to revoke
+    something: is this credential in use? `mcp-token --revoke` is destructive precisely when the
+    answer is yes, and until now the only way to find out was an sqlite session.
+    """
+    token = mint_token(store, label="laptop", org_ids=[ORG])
+    stamp_token_use(store.db_path, token, resolve_token(store, token), now=1000.0)
+
+    listed = {info.label: info for info in list_tokens(store)}
+
+    assert listed["laptop"].last_used is not None
+    assert listed["laptop"].last_used.endswith("+00:00")
+
+
+def test_a_token_that_never_authenticated_reads_never(store):
+    """`never` is a fact about the record; an empty cell would be a missing one."""
+    mint_token(store, label="spare", org_ids=[ORG])
+
+    assert list_tokens(store)[0].last_used is None
+
+
+def test_a_revoked_token_keeps_its_last_use(store):
+    """The row outlives the credential on purpose: "revoked, last used 3 weeks ago" is the audit."""
+    token = mint_token(store, label="old-phone", org_ids=[ORG])
+    stamp_token_use(store.db_path, token, resolve_token(store, token), now=1000.0)
+    revoke_token(store, label="old-phone")
+
+    listed = {info.label: info for info in list_tokens(store)}
+    assert listed["old-phone"].revoked_at is not None
+    assert listed["old-phone"].last_used is not None
+
+
+def test_a_stamp_is_matched_by_digest_not_by_label(store):
+    """A label is the operator's name and can be re-minted; the digest is what ties the rows.
+
+    Rotating a device under the same label must not inherit the old device's last use — that would
+    make a credential nobody has used look like one that is in use, which is the wrong reason not to
+    revoke it.
+    """
+    first = mint_token(store, label="pi", org_ids=[ORG])
+    stamp_token_use(store.db_path, first, resolve_token(store, first), now=1000.0)
+    revoke_token(store, label="pi")
+    mint_token(store, label="pi", org_ids=[ORG])          # the rotation, same label
+
+    listed = [info for info in list_tokens(store) if info.label == "pi"]
+    by_state = {info.revoked_at is None: info for info in listed}
+    assert by_state[True].last_used is None, "the new token has never authenticated"
+    assert by_state[False].last_used is not None, "the revoked one keeps its own stamp"
+
+
+def test_the_listing_prints_the_column_and_never_a_credential(store, capsys):
+    token = mint_token(store, label="laptop", org_ids=[ORG])
+    stamp_token_use(store.db_path, token, resolve_token(store, token), now=1000.0)
+    mint_token(store, label="spare", org_ids=[ORG])
+    capsys.readouterr()
+
+    code = run_mcp_token(config_for(store), parse(["--list"]), store=store)
+
+    out = capsys.readouterr().out
+    assert code == 0
+    header, *rows = out.strip().splitlines()
+    assert "last used" in header
+    body = {line.split("\t")[0]: line.split("\t") for line in rows}
+    assert body["laptop"][-1] not in ("never", "") and body["laptop"][-1] != "last used"
+    assert any(cell == "never" for cell in body["spare"])
+    # The promise of the whole command, restated for the new column: no plaintext, and no digest of
+    # anything — the stamp rows are keyed by the same sha256 as the token rows, and that key must
+    # not become a printable identifier.
+    assert token not in out and TOKEN_SETTING_PREFIX not in out
+    assert hashlib.sha256(token.encode()).hexdigest() not in out
+
+
+def test_a_stamp_row_cannot_forge_a_column(store):
+    """`mcp_token_use:*` is a settings row, and settings rows can be hand-edited."""
+    token = mint_token(store, label="laptop", org_ids=[ORG])
+    stamp_token_use(store.db_path, token, resolve_token(store, token), now=1000.0)
+    store.set_setting(TOKEN_USE_PREFIX + hashlib.sha256(token.encode()).hexdigest(),
+                      "2026-11-19T10:00:00+00:00\tnext\\tand\nmore")
+
+    info = list_tokens(store)[0]
+
+    assert info.last_used is not None
+    assert "\n" not in info.last_used and "\t" not in info.last_used

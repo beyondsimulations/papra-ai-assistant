@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from papra_suite.logging_setup import SECRET_REGISTRY
-from papra_suite.store import Store
+from papra_suite.store import Store, sanitize_event_text
 from papra_suite.store import _now as _store_now
 
 logger = logging.getLogger("papra_suite.mcp_tokens")
@@ -78,6 +78,11 @@ TOKEN_MAX_CHARS = 512
 LABEL_MAX_CHARS = 64
 ORG_ID_MAX_CHARS = 128
 
+#: How much of a `mcp_token_use:` row is printed as the `last used` column. `_store_now()` writes an
+#: ISO-8601 timestamp (25-32 characters); the bound is for a row that is not one, because a settings
+#: value is hand-editable text and this column goes into a tab-separated table.
+_LAST_USED_MAX_CHARS = 64
+
 #: The spec's ceiling on organisation fan-out, enforced where a scope is created: a token naming a
 #: ninth bucket is a scope the server could never honour, and "never silently use a subset" is the
 #: rule that makes refusing it the only honest option.
@@ -117,6 +122,12 @@ class TokenInfo:
     prefix of the key the row is stored under, and eight hex characters is a third of a sha256's
     input space rather than a hint. The label is the operator's name for the device, and it is
     enough to revoke by.
+
+    `last_used` is the newest stamp `stamp_token_use` left for this credential, or None when it has
+    never authenticated. It answers the question an operator asks before a `--revoke`: is
+    this thing in use? The stamp is throttled to one write per token per minute, so the reading can
+    lag a live session by up to a minute — which is a different claim from a credential that has no
+    stamp at all, and it is printed as `never`.
     """
 
     label: str
@@ -124,6 +135,7 @@ class TokenInfo:
     scope_all: bool
     created_at: str
     revoked_at: str | None
+    last_used: str | None
 
 
 def _has_control_chars(text: str) -> bool:
@@ -397,8 +409,29 @@ def list_tokens(store: Store) -> list[TokenInfo]:
     """Every token row, active and revoked, sorted by label. Never a credential."""
     return [TokenInfo(label=document["label"], org_ids=tuple(document["org_ids"]),
                       scope_all=bool(document["scope_all"]),
-                      created_at=document["created_at"], revoked_at=document["revoked_at"])
-            for _, document in sorted(_rows(store), key=lambda pair: pair[1]["label"])]
+                      created_at=document["created_at"], revoked_at=document["revoked_at"],
+                      last_used=_last_used(store, key))
+            for key, document in sorted(_rows(store), key=lambda pair: pair[1]["label"])]
+
+
+def _last_used(store: Store, token_key: str) -> str | None:
+    """The stamp for one token row, found by digest — the only link that survives a re-mint.
+
+    `stamp_token_use` writes `mcp_token_use:<sha256 of the plaintext>` and the token row is
+    `mcp_token:` plus the same digest, so the two are joined by swapping the prefix. Not by label: a
+    label is the operator's name for a device and it is deliberately reusable after a revoke, so
+    joining on it would let a rotated credential inherit the old device's last use — wrong in the
+    dangerous direction, a token nobody has used since the theft reading as alive.
+
+    Nothing derived from the key is returned. The digest identifies the credential as surely as the
+    plaintext does, and this column is printed to a terminal somebody may screenshot. The value goes
+    through the house sanitizer because a settings row is hand-editable and this table is
+    tab-separated: an unsanitized tab forges a column and a newline forges a row.
+    """
+    raw = store.get_setting(TOKEN_USE_PREFIX + token_key[len(TOKEN_SETTING_PREFIX):])
+    if raw is None:
+        return None
+    return sanitize_event_text(raw, limit=_LAST_USED_MAX_CHARS)
 
 
 def token_counts(store: Store) -> tuple[int, int]:
@@ -427,7 +460,7 @@ def add_subparser(subparsers) -> None:
                         help="mint a token; prints the plaintext exactly once, between two "
                              "warnings, and stores only its sha256")
     intent.add_argument("--list", dest="list", action="store_true",
-                        help="print label, buckets, created and revoked for every token; "
+                        help="label, buckets, created, last used, revoked for every token; "
                              "never a token")
     intent.add_argument("--revoke", action="store_true",
                         help=f"stop one active token accepting requests, by label "
@@ -553,10 +586,14 @@ def _print_tokens(store: Store) -> int:
         print("no tokens: nothing can call the MCP server's tools until "
               "`papra-suite mcp-token --create --label NAME --org-id ID` mints one")
         return EXIT_OK
-    print("label\tbuckets\tcreated\trevoked")
+    print("label\tbuckets\tcreated\tlast used\trevoked")
     for info in tokens:
         scope = "ALL" if info.scope_all else (",".join(info.org_ids) or "none")
-        print(f"{info.label}\t{scope}\t{info.created_at}\t{info.revoked_at or 'active'}")
+        # `never` is a reading, not a blank: the column exists to tell "not used since it was
+        # minted" apart from "nothing is known". Revoking a credential that is in use is the
+        # mistake this is meant to prevent.
+        print(f"{info.label}\t{scope}\t{info.created_at}\t{info.last_used or 'never'}\t"
+              f"{info.revoked_at or 'active'}")
     # A footer, never a column: this table is tab-separated and its `buckets` field is what an
     # operator copies into a client, so a marker in it would read as part of an id.
     _warn_unknown_buckets(store, {info.label: list(info.org_ids) for info in tokens},
