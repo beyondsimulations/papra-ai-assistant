@@ -999,7 +999,7 @@ and a listing helper that returned both would be the thing that leaks a token in
 
         Handing back a terminal row would be a silent wrong answer:
         `indexing._readmit_index_job` reads the returned id back and acts on it, and
-        `jobs --reset` will hand an id straight to `reset_job`.
+        `papra-suite jobs --reset JOB_ID` hands an id straight to `reset_job`.
         """
         job_id = uuid.uuid4().hex
         now = _now()
@@ -1087,8 +1087,8 @@ and a listing helper that returned both would be the thing that leaks a token in
         Since migration 004 a terminal row no longer *blocks* anything: asking for the
         same work again takes a fresh row, which is the recovery path the sweep and the
         rebuild use. This method is the other path — an operator naming one row
-        (`jobs --reset`), which keeps that row's identity and history in one place
-        instead of growing a second one.
+        (`papra-suite jobs --reset JOB_ID`), which keeps that row's identity and history in one
+        place instead of growing a second one.
 
         It refuses when the two paths would collide. Reviving a terminal row whose key
         already has a live row would violate the partial unique index, so SQLite would
@@ -1113,23 +1113,114 @@ and a listing helper that returned both would be the thing that leaks a token in
                 raise ValueError(
                     f"job {job_id}: the same work is already queued as {live['id']}"
                 )
-            self._conn.execute(
+            if row["status"] == "running":
+                raise ValueError(f"job {job_id}: it is running, a worker is holding it")
+            # Guarded again in the write itself: a worker can claim the row between the read above
+            # and this statement, and a reset that lands then puts a second claimer on a document
+            # somebody is uploading. The condition is evaluated where SQLite holds the write lock,
+            # so the rowcount is the only answer that can be trusted.
+            moved = self._conn.execute(
                 "UPDATE jobs SET status = 'pending', attempts = 0, error = NULL, "
-                "next_attempt_at = ?, updated_at = ? WHERE id = ?",
+                "next_attempt_at = ?, updated_at = ? WHERE id = ? AND status != 'running'",
                 (_now(), _now(), job_id),
             )
+            if moved.rowcount != 1:
+                raise ValueError(f"job {job_id}: it is running, a worker is holding it")
 
-    def list_jobs(self, *, status: str | None = None, limit: int = 100) -> list[Job]:
+    def list_jobs(self, *, kind: str | None = None, status: str | None = None,
+                  document_id: str | None = None, limit: int = 100) -> list[Job]:
+        """The queue, newest first. Every filter is applied in SQL, never afterwards.
+
+        That is about the limit, not tidiness: filtering rows after `LIMIT n` answers
+        `jobs --kind ocr` with nothing while fifty `index` rows sit ahead of them, which is the
+        reading that makes an operator believe a queue has drained. `document_id` exists because
+        "what is happening to this document?" is the question the `jobs` CLI was written to
+        answer, and a filter that silently does nothing answers it with the whole queue — Task 6
+        met exactly that behind a passing `xfailed`.
+
+        Since migration 004 one `(kind, papra_org_id, document_id, content_hash)` can hold
+        several rows — the live one plus the superseded history — so a caller must not read a row
+        count as a document count. `rowid DESC` breaks ties between rows created in the same
+        instant, without which one document's history could reorder between two reads of an
+        unchanged table.
+        """
         query = "SELECT * FROM jobs"
-        params: tuple = ()
+        clauses: list[str] = []
+        params: list[object] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
         if status:
-            query += " WHERE status = ?"
-            params = (status,)
-        query += " ORDER BY created_at DESC LIMIT ?"
-        params = params + (limit,)
+            clauses.append("status = ?")
+            params.append(status)
+        if document_id:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        params.append(limit)
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [_row_to_job(row) for row in rows]
+
+    def count_jobs(self, kind: str | None = None, status: str | None = None, *,
+                   document_id: str | None = None) -> int:
+        """How many job ROWS match, counted by SQLite.
+
+        `jobs --drain` is the middle step of the `content` handover, where the price of a wrong
+        reading is two writers on one column, so the number has to be exact rather than "as many
+        rows as a listing was willing to carry": a count derived from a capped listing can report
+        a quiet queue with rows still behind the cap. Same filters as `list_jobs`, same meaning.
+
+        It counts rows and not documents, deliberately: since migration 004 a document can own a
+        settled row and a live one at the same time, and the thing the drain has to be sure about
+        is that no row is waiting to be claimed or being worked.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if document_id:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        query = "SELECT COUNT(*) FROM jobs"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            row = self._conn.execute(query, params).fetchone()
+        return int(row[0])
+
+    def count_jobs_by_status(self, kind: str | None = None, *,
+                             document_id: str | None = None) -> dict[str, int]:
+        """Every status count for a scope, from one statement.
+
+        `jobs --drain` is the middle step of the `content` handover and its wrong answer is two
+        writers on one column. Asked for `pending` and `running` as two queries, SQLite may answer
+        from two instants: a worker restart runs `recover_running_jobs`, which moves a `running`
+        row back to `pending`, so a first count of `pending` and a second of `running` can both
+        come home 0 above a queue that holds work. One GROUP BY cannot be split that way, and a
+        status missing from the result means zero rather than an unknown.
+        """
+        query = "SELECT status, COUNT(*) FROM jobs"
+        params: list[object] = []
+        clauses: list[str] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if document_id:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " GROUP BY status"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
 
     # -- orgs ---------------------------------------------------------------
 

@@ -83,6 +83,10 @@ trust boundary is verified for a specific provider.
 | `papra-suite events [--limit N] [--mailbox-id ID] [--kind K] [--since YYYY-MM-DD] [--json]` | why messages and attachments were **not** ingested |
 | `papra-suite metadata [--restore-auto \| --force] [--org-id ID] [--document-id ID] [--field name\|date\|notes] [--dry-run]` | deliver Kreuzakt's title, date and note into Papra, or hand a protected field back to automatic delivery |
 | `papra-suite ledger (--status \| --reindex-all \| --requeue \| --cleanup \| --clear-marks) [--dry-run] [--yes-i-mean-it]` | read the index ledger's counts; rebuild the index from Papra's bytes after Kreuzakt was wiped (`--invalidate` is the same command) or resume the queueing half of one (`--requeue`); settle upstream deletes the retries gave up on; release the deletion marks brake |
+| `papra-suite jobs [--kind K] [--status S] [--document-id ID] [--limit N] [--json]` | read the queue: every row about a document, with attempts and the stored error. Never migrates, and speaks to neither service |
+| `papra-suite jobs --reset JOB_ID` | put **one** settled row back to `pending` (attempts and the stored error cleared). Refuses a row a worker is running right now |
+| `papra-suite jobs [--kind K] --drain` | the handover gate: exits `1` while anything is `pending` or `running`, naming both counts |
+| `papra-suite backfill [--org-id ID] [--limit N] [--all-stale] [--dry-run]` | queue what the index does not currently hold — including the documents the sweep will never visit — through the intake path, in bounded slices |
 | `papra-suite mcp-token (--create --label X [--org-id ID \| --all-buckets] \| --list \| --revoke --label X)` | mint, list and revoke the bearer tokens the MCP listener accepts. The plaintext is printed exactly once and only its sha256 is stored |
 
 `check` ends with one line — `events (last 24h): sender_denied=3, upload_failed=1`
@@ -148,6 +152,12 @@ there.
   This is the only durable place a skipped attachment appears: the message it came
   in on is marked `\Seen` and, with delete-after-download, deleted, so there is
   nothing left to go and look at.
+- **An index job stopped and nothing asks again** → `papra-suite jobs --kind index --status failed`
+  names the row and the stored error; `papra-suite jobs --reset JOB_ID` puts that one row back. The
+  worker's own ERROR line prints the id and the command to run.
+- **A document is in Papra but not in the index** → `ledger --status` decides which problem this is.
+  `unledgered` is the population `papra-suite backfill` enrols; a reference the current generation
+  calls already indexed is not backfill's to re-queue, and the row-level `jobs --reset` is the lever.
 
 ## Recovery
 
@@ -491,13 +501,16 @@ ordered operation:
    disagree, and the MCP status tool reports it per bucket for whatever a token may read.
 
    ```bash
-   sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs GROUP BY 1, 2;"
+   papra-suite jobs --kind ocr --drain
    ```
 
    Wait for `ocr` rows in `pending` or `running` to reach zero **while the legacy loops are
-   still running**, so the worker drains its own backlog. The convergence pass ignores
+   still running**, so the worker drains its own backlog. `--drain` counts exactly those two
+   statuses, prints both counts, and exits `1` while either is non-zero; `papra-suite jobs --kind
+   ocr --status running` names the rows if you want to see which document is in flight. The
+   convergence pass ignores
    pending work, and a delivery landing while an OCR job is in flight is the race above.
-3. Set `PAPRA_LEGACY_WORKERS=false` and restart, then prove the same query reads zero twice a
+3. Set `PAPRA_LEGACY_WORKERS=false` and restart, then prove the same command reads zero twice a
    minute apart. You are now in the handover window: `check` prints
    `content writer: none (handover window)` and `serve` logs the same at ERROR. Neither of our
    two writers touches `content` in this state, and a document uploaded now keeps only what
@@ -744,11 +757,11 @@ comes out:
 4. Prove the second writer is out of work, counting only the rows that are still work:
 
    ```bash
-   sqlite3 "$DATA_DIR/state.db" \
-     "SELECT count(*) FROM jobs WHERE kind='title' AND status IN ('pending','running');"
+   papra-suite jobs --kind title --drain
    ```
 
-   Two zeroes a minute apart. Counting every status proves nothing, because `completed` rows
+   Two zeroes a minute apart — `--drain` exits `1` while a `title` row is `pending` or `running`
+   and prints both counts. Counting every status proves nothing, because `completed` rows
    accumulate forever and that total never reaches zero. With the flag on,
    `on_job_done` refuses the ocr-done-to-title transition and `run_title_job` drops anything it
    still claims, so nothing this pipeline owns refills the queue. Two other readings are both
@@ -838,7 +851,8 @@ Three limits worth stating plainly, because all three look like bugs on the day 
   enqueues what the ledger calls stale will walk past it. `check` cannot see any of this,
   because its counters are all ledger-derived and a job moving from `done` to `failed`
   changes none of them; the worker's ERROR line is what names it, and naming the document
-  again is an operator's act (`jobs --reset` is Task 15's).
+  again is an operator's act: `papra-suite jobs --status failed --kind index` finds the row and
+  `papra-suite jobs --reset JOB_ID` puts it back.
 
 ### Rebuilding the index
 
@@ -918,8 +932,9 @@ Five properties make it safe to run against a live corpus:
 intake also enqueues a legacy OCR job so Papra's `content` keeps a writer; the rebuild asks for
 the index job alone, because re-enrolling a corpus would otherwise order one paid VLM extraction
 per document in order to rewrite a column Papra already holds. If the point really is to run the
-suite's own extraction over the corpus, that is `papra-suite backfill` (Task 15), which says so in
-its own `--dry-run`.
+suite's own extraction over the corpus, that is `papra-suite backfill`, which says so in
+its own `--dry-run`: it prints the cost per document before it queues anything, and `--limit` is
+how you take the corpus in slices.
 
 **What stays `unledgered` afterwards, and why.** `--reindex-all` prints these buckets rather than
 leaving them inside a bare count, because each one needs a different sentence. The line appears
@@ -976,3 +991,99 @@ that output
 (that is Kreuzakt answering "no text" for documents it accepted, and it is the number that says
 whether the corpus is worth indexing at all); and the count in each `left out of the index on
 purpose` bucket, so the next rebuild has something to compare against.
+
+
+### Reading the queue, and repairing one row
+
+`papra-suite jobs` is the queue read on its own: it never migrates, refuses a missing database
+before it opens one (constructing the store would create the file and turn "wrong `DATA_DIR`" into
+"empty queue"), and reads neither Papra nor Kreuzakt.
+
+```bash
+papra-suite jobs --kind index --status failed        # what stopped, with the stored error
+papra-suite jobs --document-id 01J...                # everything about one document
+papra-suite jobs --json | jq -r '.[].error'          # the records: full hashes, no display dashes
+```
+
+**A row is not a document.** Migration 004 made the jobs idempotency index partial — it constrains
+`pending` and `running` rows only — so a `failed` row and the fresh `pending` row a later pass
+queued for the same bytes coexist by design: the first is history, the second is work. The listing
+prints both, marks which one is live, and says when a document holds more than one. Nothing here
+assumes one row per document, because that assumption is how a retry gets mistaken for a duplicate.
+
+`--reset JOB_ID` revives **one row by id**: attempts back to zero, the stored error cleared, the row
+claimable on the worker's next poll. It does not sweep the tuple — reviving superseded rows would
+run the same bytes twice and rewrite a history nobody asked to revisit — and it refuses two cases:
+
+- a row that is **`running`**: a worker is between its gate check and its own
+  `mark_job_done`/`mark_job_failed`, and a second claimer would corrupt that transition. Let it
+  settle, then read the document with `--document-id`.
+- a row whose work is **already queued under another id**: exit `1`, and the live row's id is
+  printed. The work will run; the row you named stays history.
+
+A `pending` row waiting out a backoff is fair game — it is in nobody's hands, and this is how
+"retry now, do not wait eight minutes" is said.
+
+`--drain` is the handover gate, not a summary. It counts `pending` and `running` in scope from one
+SQL statement — so no listing cap can make a busy queue look quiet, and the two numbers cannot come
+from two different instants — refuses with exit `1` and both counts while either is non-zero, and
+refuses to be narrowed: `--drain --status pending` would answer "no pending rows" above a `running`
+job. Read it twice a minute apart and flip the delivery flag only when both readings are 0; one
+empty reading is what a loop that claims the next row a second later looks like.
+
+
+### Backfilling a corpus, and enrolling the documents the sweep will never visit
+
+`papra-suite backfill` queues work the automatic passes will not ask for. Say plainly what that
+population is, because it is the part of a corpus that stays invisible until something is written
+down: **every document `documents` says this suite ingested but `index_ledger` has never held** —
+the PDFs mailed in before the handover, the oversized skips the sweep recorded as seen and never
+indexed, anything a store restore left with a sighting and no reference. The sweep skips documents
+it has already seen, and every eligibility rule, count and cadence reads the ledger, so that corpus
+cannot be reached from anywhere else in the system. This command is how it gets in.
+
+```bash
+papra-suite backfill --dry-run                 # what would be queued, and what it costs
+papra-suite backfill --limit 20                # one slice, then read `check`
+papra-suite backfill --all-stale               # plus the stale references the listing never showed
+```
+
+**Eligibility is the ledger's, never `document_seen`.** A document is queued when the current
+generation has no usable reference for it — the same predicate `ledger_needs_index` implements, and
+the one the sweep and `ledger --reindex-all` already use. The seen flag records *ingestion*: after a
+generation bump every document in the corpus would look already-done, and a rule built on it would
+report a finished backfill over an index holding nothing. `--all-stale` adds the ledger's own
+worklist, walked by keyset from the reference table, for stale references Papra's listing does not
+hand this command.
+
+**Enrolling goes through the intake path, so the ordering rule holds.** Reference first, then the
+index job, then the seen record last. A queued job with no ledger row behind it is work no later
+pass can see — the document would be enqueued once and be invisible forever after — so this command
+does not implement its own enqueue. Nothing is written to Papra and Kreuzakt is
+never contacted, so a backfill runs through an index outage — but Papra itself has to answer the
+listing, because Papra's listing is the only catalogue of the corpus. A bucket Papra will not list
+is reported as unreadable and the run exits `1`; it is never reported as empty.
+
+**The remainder is printed, never implied.** `--limit` caps the *new rows* one run takes, and the
+walk keeps listing after the cap so the rest can be counted rather than guessed:
+
+```
+backfill: enqueued 5 of 12 candidate(s) across 1 bucket(s); 7 remaining
+```
+
+A run that stopped at the cap could not tell "the rest is eligible" from "the rest is already
+indexed", and that difference decides whether you run it again. Documents whose work a live row
+already carries are counted apart (`(4 already queued, unchanged)`) and do not spend the cap, so a
+stalled queue cannot make every later run re-report the same head of the corpus. Documents
+deliberately left out get their own buckets (not a PDF, in Papra's trash or queued for deletion,
+over the size limit) and are not remaining work.
+
+**It costs a VLM extraction per document, and says so first.** While `PAPRA_INDEX_CONTENT_DELIVERY`
+is off, intake also fills the legacy `ocr` queue, so a backfill re-extracts Papra's text — one paid
+extraction each, which is the point only when that text came out with the wrong `OCR_LANGUAGES`.
+`--dry-run` prints the cost before anything is queued, and `papra-suite ledger --requeue` is the
+command that queues the same index work *without* the extraction: `--requeue` finishes a rebuild,
+`backfill` brings a corpus in.
+
+Backfill walks the buckets this store knows — `orgs` plus whatever the ledger holds — so a bucket it
+has never heard of has to be named with `--org-id`.

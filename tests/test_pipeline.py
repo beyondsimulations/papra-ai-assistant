@@ -368,13 +368,13 @@ async def test_serve_refuses_two_writers_of_the_same_column(tmp_path, store, cap
     assert "quiesc" in message.lower()
     assert message.index("PAPRA_LEGACY_WORKERS") < message.lower().index("quiesc")
     assert message.lower().index("quiesc") < message.lower().index("delivery flag")
-    # And the runbook has to be runnable on THIS build. The plan drafted this message
-    # around a `papra-suite jobs` command this branch never shipped, so copying it
-    # verbatim would tell an operator at 23:00 to type a subcommand that does not exist —
-    # which reads as a broken installation rather than as a stale message. The queue is
-    # named where it actually is readable, in `state.db`.
-    assert "papra-suite jobs" not in message, message
-    assert "FROM jobs" in message, message
+    # And the runbook has to be runnable on THIS build. Task 7 left these two assertions as a
+    # deliberate tripwire, and Task 15 fired it by shipping the command it talked about:
+    # so an operator at 23:00 was never told to type a subcommand that would not parse. Both halves
+    # are now asserted the other way round: the command named, the raw-SQL reading out of the
+    # message. The order it teaches (legacy off, quiescence proven, delivery flag) is unchanged.
+    assert "papra-suite jobs" in message, message
+    assert "FROM jobs" not in message, message
     assert touched == []                     # neither service was asked for anything
     assert store.get_job(job_id).status == "pending"
     assert any(record.levelno >= logging.ERROR for record in caplog.records)

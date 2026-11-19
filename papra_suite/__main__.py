@@ -475,6 +475,16 @@ def main() -> int:
     from papra_suite import mcp_tokens
 
     mcp_tokens.add_subparser(sub)
+    # Registered the same way, for the same reason: `jobs` is an operator command with its own
+    # exit-code meaning, and the entry point stays a table of where to go.
+    from papra_suite import jobs_cli
+
+    jobs_cli.add_subparser(sub)
+    # Same registration shape again, same reason: `backfill` is an operator command with its own
+    # exit-code meaning and its own Papra walk, and the entry point stays a table of where to go.
+    from papra_suite import backfill_cli
+
+    backfill_cli.add_subparser(sub)
 
     args = parser.parse_args()
 
@@ -588,6 +598,22 @@ def main() -> int:
         from papra_suite import mcp_tokens
 
         return mcp_tokens.run_mcp_token(config, args)
+
+    if args.command == "jobs":
+        # Through the module, as above: `tests/test_jobs_cli.py` swaps `jobs_cli.run_jobs` to pin
+        # that this branch exists, and binding the function by name here would make that test
+        # assert about a copy nothing calls.
+        from papra_suite import jobs_cli
+
+        return jobs_cli.run_jobs(config, args)
+
+    if args.command == "backfill":
+        # Through the module, as with `jobs`: the dispatch is what a README citation depends on,
+        # and binding the function by name would let this branch drift from the module the tests
+        # swap out.
+        from papra_suite import backfill_cli
+
+        return backfill_cli.run_backfill(config, args)
 
     if args.command == "serve":
         import asyncio
