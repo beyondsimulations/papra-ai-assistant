@@ -729,3 +729,21 @@ def test_every_papra_suite_command_the_shipped_code_names_is_one_that_parses():
     assert named, "the scan matched nothing, which is not the same as nothing being wrong"
     unregistered = sorted(named - set(sub.choices))
     assert not unregistered, f"cited but not registered: {unregistered}"
+
+
+def test_drain_counts_a_queue_bigger_than_any_listing_cap(store, capsys):
+    """The claim "no cap can make a busy queue look quiet" is only true in SQL.
+
+    A count taken from `list_jobs` would answer a 120-row `ocr` backlog with "0 pending" once the
+    listing stopped at 100 — and that reading is the one an operator turns into
+    `PAPRA_INDEX_CONTENT_DELIVERY=true`.
+    """
+    for index in range(120):
+        store.enqueue_job(kind="ocr", papra_org_id=ORG, document_id=f"doc-{index}",
+                          content_hash=H, payload={})
+
+    assert run_jobs(None, cli_args(kind="ocr", drain=True), store=store) == EXIT_INCOMPLETE
+
+    out = capsys.readouterr().out
+    assert "120 pending" in out and "cannot drain" in out
+    assert store.count_jobs("ocr", "pending") == 120
