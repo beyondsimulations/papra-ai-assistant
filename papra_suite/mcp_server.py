@@ -60,6 +60,7 @@ from papra_suite.config import _safe_echo
 from papra_suite.kreuzakt_client import KreuzaktError
 from papra_suite.logging_setup import SECRET_REGISTRY
 from papra_suite.mcp_tokens import TokenContext, resolve_token, stamp_token_use, token_counts
+from papra_suite.oversized import oversized_seen
 from papra_suite.readers import (
     BORROWED_FROM,
     KreuzaktReader,
@@ -434,6 +435,30 @@ class MarksBrake(BaseModel):
     allowance: int
 
 
+class OversizedField(BaseModel):
+    """The documents the size ceiling refused, as three numbers and nothing else.
+
+    A document over `PAPRA_MAX_DOCUMENT_BYTES` is refused **before enrollment**, so it has no ledger
+    row and none of the bucket counts above can describe it. Until this field existed the population
+    was invisible to an agent, which is the same invisibility the whole bridge was built to remove.
+
+    Three numbers, because that is all an agent can use: how many refusals the passes recorded, the
+    largest size among them, and the ceiling that refused them — plus when the record began,
+    which is
+    what makes the count a report rather than a census ("seen since", not "your corpus has"). No
+    document ids: the listing in the record is capped and is for the operator, who reads it in
+    `papra-suite check` or `papra-suite backfill --dry-run`.
+
+    `limit` is `None` when nothing has been refused: no ceiling has been applied to anything this
+    store saw, and `0` would say the opposite.
+    """
+
+    seen: int
+    seen_since: str | None
+    largest: int
+    limit: int | None
+
+
 class IndexStatus(BaseModel):
     """Index state, restricted to what the presented token may see.
 
@@ -443,7 +468,9 @@ class IndexStatus(BaseModel):
     `queue`, `marks` and `probe_rereads` are corpus-wide aggregates with no per-bucket form, so they
     are `None` for anything but an all-buckets token. `None` rather than `0` because `pending: 0`
     reads as "your documents are indexed", which is a different claim from "you may not see the
-    queue". `gated_until` is timing rather than counting, so every token gets it: it is what stops
+    queue". `oversized` is `None` for the same reason and one more: the number is read out of a
+    capped record, so restricting it to a bucket answers with whatever the cap left.
+    `gated_until` is timing rather than counting, so every token gets it: it is what stops
     an operator reading a pass that is sitting out its cadence as propagation being broken.
     """
 
@@ -458,6 +485,7 @@ class IndexStatus(BaseModel):
     queue: dict[str, int] | None = None
     marks: MarksBrake | None = None
     probe_rereads: int | None = None
+    oversized: OversizedField | None = None
 
 
 def buckets_in_scope(store: Store, context: TokenContext) -> list[str]:
@@ -551,7 +579,8 @@ class _CorruptGeneration(Exception):
 
 
 def _store_state(store: Store, context: TokenContext) -> tuple[list, MarksBrake | None,
-                                                               int | None, str | None]:
+                                                               int | None, str | None,
+                                                               OversizedField | None]:
     """Every store read this tool performs, in one blocking function, off the event loop.
 
     These are correlated `NOT EXISTS` scans over `documents`/`index_ledger` against a single-writer
@@ -572,7 +601,8 @@ def _store_state(store: Store, context: TokenContext) -> tuple[list, MarksBrake 
 
 
 def _store_state_body(store: Store, context: TokenContext) -> tuple[list, MarksBrake | None,
-                                                                   int | None, str | None]:
+                                                                   int | None, str | None,
+                                                                   OversizedField | None]:
     """The blocking reads themselves, already on the worker thread."""
     quarantined = _quarantined_buckets(store)
     buckets = [
@@ -581,6 +611,7 @@ def _store_state_body(store: Store, context: TokenContext) -> tuple[list, MarksB
     ]
     marks: MarksBrake | None = None
     probe_rereads: int | None = None
+    oversized: OversizedField | None = None
     if context.scope_all:
         # Privileged because each is a corpus-wide aggregate: the number of deletion marks in the
         # rolling window, and the size of the pending liveness-probe list.
@@ -592,7 +623,16 @@ def _store_state_body(store: Store, context: TokenContext) -> tuple[list, MarksB
             # is the tool's business, and the row is named by `ledger --status`.
             marks = None
         probe_rereads = indexing.pending_probe_rereads(store)
-    return buckets, marks, probe_rereads, indexing.listing_walk_gate(store)
+        # The size-ceiling record, read the same way the quarantine list and the marks counter are:
+        # through the reader's own `get_setting`, with the parsing in one shared function so this
+        # number cannot disagree with `papra-suite check`'s line. That is the containment rule for
+        # the request path — new ledger data goes onto the reader's method set, never around
+        # it — and
+        # a settings row read by a read the view already exposes widens no surface at all.
+        record = oversized_seen(store)
+        oversized = OversizedField(seen=record.count, seen_since=record.since,
+                                   largest=record.largest, limit=record.limit)
+    return buckets, marks, probe_rereads, indexing.listing_walk_gate(store), oversized
 
 
 async def _index_status_body(store: Store, kz, context: TokenContext) -> IndexStatus:
@@ -628,7 +668,7 @@ async def _index_status_body(store: Store, kz, context: TokenContext) -> IndexSt
             raise IndexUnavailable(
                 f"kreuzakt refused the queue read ({_upstream_reason(error)})") from error
 
-    buckets, marks, probe_rereads, gated_until = await asyncio.to_thread(
+    buckets, marks, probe_rereads, gated_until, oversized = await asyncio.to_thread(
         _store_state, store, context)
 
     return IndexStatus(
@@ -643,6 +683,7 @@ async def _index_status_body(store: Store, kz, context: TokenContext) -> IndexSt
         queue=queue,
         marks=marks,
         probe_rereads=probe_rereads,
+        oversized=oversized,
     )
 
 

@@ -390,6 +390,48 @@ def _mcp_line(store, config) -> str:
         return f"mcp: unavailable ({type(error).__name__})"
 
 
+def _oversized_line(store, config) -> str:
+    """`oversized: ...` — the documents the ceiling refused, and which ceiling that was.
+
+    One line, three numbers: the count, the largest size seen, the limit in force. It is here
+    because a refused document has **no ledger row** — it is skipped before enrollment — so
+    `_index_line` above cannot see this population at all, and before the record existed nothing
+    printed it.
+
+    The wording is load-bearing: "N seen since <pass>" is what the record holds, namely what the
+    passes walked. "Your corpus has N" would claim a census of documents nobody listed, and this
+    suite has no catalogue of the corpus except the walks it performed.
+
+    It never fails `check`, for the reason the lines above it do not: a scan over 100 MB is not a
+    configuration error, and a check that exits non-zero on one trains people to stop running check.
+
+    **There is no dashboard yet.** This line and the `oversized` field of the MCP `index_status`
+    tool are the two surfaces that show the reason; when a dashboard exists it reads this
+    same record.
+    """
+    from papra_suite.oversized import OVERSIZED_RECORD_LIMIT, oversized_seen
+
+    try:
+        record = oversized_seen(store)
+    except sqlite3.Error as error:
+        # Same degradation as `_index_line`: `check` is run *because* something looks wrong, often
+        # while the daemon is mid-write, and a traceback here would cost the operator every line of
+        # this output rather than the one they came for.
+        return f"oversized: unavailable ({type(error).__name__})"
+    if record.count == 0:
+        return (f"oversized: none seen (limit in force {config.max_document_bytes} bytes) — over "
+                "it a document is neither enrolled nor indexed: compress it and re-upload to papra")
+    moved = (f" (refused at {record.limit}; they fit the limit now, and each drops out of this "
+             "count when it is enrolled)"
+             if record.limit is not None and record.limit != config.max_document_bytes else "")
+    evicted = (f", {record.evicted} not named (the record lists the newest "
+               f"{OVERSIZED_RECORD_LIMIT})" if record.evicted else "")
+    return (f"oversized: {record.count} seen since {record.since}, largest {record.largest} bytes, "
+            f"limit in force {config.max_document_bytes}{moved}{evicted} — not enrolled, not "
+            "indexed: compress and re-upload to papra, or raise PAPRA_MAX_DOCUMENT_BYTES and run "
+            "`papra-suite backfill` again")
+
+
 def _content_writer_line(config) -> str:
     """`content writer: ...` — who writes Papra's text under this configuration.
 
@@ -526,6 +568,7 @@ def main() -> int:
             index_line = _index_line(store)
             deletion_line = _deletion_pass_line(store)
             mcp_line = _mcp_line(store, config)
+            oversized_line = _oversized_line(store, config)
         finally:
             store.close()
         print(f"config ok; store migrated; data dir: {config.data_dir}")
@@ -535,6 +578,7 @@ def main() -> int:
         print(recent_events)
         print(index_line)
         print(deletion_line)
+        print(oversized_line)
         print(_content_writer_line(config))
         print(_metadata_writer_line(config))
         print(mcp_line)

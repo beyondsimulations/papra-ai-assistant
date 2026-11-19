@@ -784,3 +784,93 @@ def test_the_wire_carries_the_stable_code_and_not_the_store(seeded):
     assert "index_unavailable" in text
     assert "database is locked" not in text and "SELECT" not in text.upper()
 
+
+
+# --- the oversized field: the reason an operator cannot get from the ledger ---------------
+
+
+def seed_oversized(store, *documents, size=157286400, limit=104857600, org=OTHER):
+    """Refusals written the way a pass writes them, in the bucket the scoped token cannot see."""
+    from papra_suite.oversized import record_oversized_skip
+
+    for index, document_id in enumerate(documents):
+        record_oversized_skip(store, papra_org_id=org, document_id=document_id,
+                              size=size + index, limit=limit,
+                              now="2026-11-19T10:00:00+00:00")
+    return store
+
+
+async def test_index_status_carries_the_three_numbers(seeded):
+    """Count, largest size, and the ceiling that refused them — the same three `check` prints.
+
+    A document refused for size has no ledger row, so no bucket count can describe it: this field is
+    the only way the reason reaches an agent at all. There is no dashboard yet, so `check` and here
+    are the two surfaces, and they read one record through one function.
+    """
+    seed_oversized(seeded, "doc-huge")
+
+    status = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
+
+    assert status.oversized is not None
+    assert status.oversized.seen == 1
+    assert status.oversized.largest == 157286400
+    assert status.oversized.limit == 104857600
+    assert status.oversized.seen_since == "2026-11-19T10:00:00+00:00"
+
+
+async def test_the_oversized_field_dumps_no_documents(seeded):
+    """Bounded on purpose: this goes to a model, and 400 refused scans are not a status.
+
+    The count is the fact an agent can act on ("this corpus has material outside the index"); the
+    ids are for the operator: `papra-suite check` and `backfill --dry-run` name them.
+    """
+    import json
+
+    seed_oversized(seeded, *(f"doc-huge-{index}" for index in range(5)))
+
+    status = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
+
+    payload = json.dumps(status.model_dump(mode="json"))
+    assert "doc-huge" not in payload
+    assert status.oversized.seen == 5
+
+
+async def test_the_oversized_field_is_privileged(seeded):
+    """The count is corpus-wide and read through a cap, so a bucket grant gets nothing.
+
+    `None` rather than `0` for the same reason the queue depth is: `seen: 0` would read as "your
+    buckets have no oversized documents", and the record cannot answer that — it does not know which
+    buckets the refusals belonged to once the cap has evicted them.
+    """
+    seed_oversized(seeded, "doc-huge")
+
+    scoped = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    everything = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
+
+    assert scoped.oversized is None
+    assert everything.oversized is not None and everything.oversized.seen == 1
+
+
+async def test_no_refusals_is_a_zero_count_with_no_ceiling(seeded):
+    """`limit: null` because nothing was refused, so no ceiling was ever applied to anything."""
+    status = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
+
+    assert status.oversized is not None
+    assert status.oversized.seen == 0 and status.oversized.limit is None
+    assert status.oversized.seen_since is None and status.oversized.largest == 0
+
+
+async def test_the_oversized_field_survives_a_corrupt_record(seeded):
+    """`index_status` answers, with zeros, rather than refusing the whole status over a report.
+
+    The corrupt row is the store's problem to notice and `check`'s to show; a tool that will not
+    answer counts because its diagnostic row is unparseable is a diagnostic that caused an outage.
+    """
+    from papra_suite.oversized import OVERSIZED_SETTING
+
+    seeded.set_setting(OVERSIZED_SETTING, "{not json")
+
+    status = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
+
+    assert status.oversized is not None and status.oversized.seen == 0
+    assert status.buckets, "the rest of the status is still answered"

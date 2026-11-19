@@ -836,3 +836,99 @@ def test_check_prints_the_marks_counter_the_walk_gate_and_the_probe_queue(monkey
         "check names the state but not the command that clears it"
     assert "gated until" in out, "a skipped pass read as a pass that just ran"
     assert "probe re-reads: 3" in out
+
+
+# --- the oversized line ---------------------------------------------------------------
+
+
+def _seed_oversized(tmp_path, *, size=157286400, limit=104857600, extra=None):
+    """Two documents refused for size, written the way a pass writes them."""
+    from papra_suite.oversized import record_oversized_skip
+    from papra_suite.store import Store
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    record_oversized_skip(store, papra_org_id="org_1", document_id="doc-scan",
+                          size=size, limit=limit, now="2026-11-19T10:00:00+00:00")
+    for doc, doc_size in (extra or []):
+        record_oversized_skip(store, papra_org_id="org_1", document_id=doc, size=doc_size,
+                              limit=limit, now="2026-11-19T10:00:01+00:00")
+    store.close()
+
+
+def test_check_prints_the_oversized_counts(monkeypatch, tmp_path, capsys):
+    """One line with the count, the largest size seen, and the limit in force.
+
+    The wording is the contract: "N oversized seen since <pass>" is what the record knows, because
+    it holds what the passes walked. "Your corpus has N oversized documents" would claim a census of
+    documents nobody listed — the confident wrong answer, printed by the one command an operator
+    trusts. There is no dashboard yet, so this line and the MCP `index_status` field are the two
+    places the reason is written down.
+    """
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _seed_oversized(tmp_path, extra=[("doc-scan-2", 209715200)])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "oversized: 2 seen since 2026-11-19T10:00:00+00:00" in out
+    assert "largest 209715200" in out
+    assert "limit in force 104857600" in out
+    assert "compress" in out and "papra" in out
+
+
+def test_check_prints_the_oversized_line_even_with_nothing_to_report(monkeypatch, tmp_path,
+                                                                      capsys):
+    """The line doubles as "what is the ceiling set to", so an empty record still prints it."""
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "oversized: none seen" in out
+    assert "104857600" in out
+
+
+def test_check_says_so_when_the_ceiling_moved_under_the_record(monkeypatch, tmp_path, capsys):
+    """Raise the knob and the record still describes the ceiling that refused them.
+
+    Printing "150 MB oversized, ceiling 500 MB" is a contradiction, and an operator who just raised
+    `PAPRA_MAX_DOCUMENT_BYTES` needs telling the count is about the old rule and clears on the
+    next walk — not sent off to compress a document that now fits.
+    """
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PAPRA_MAX_DOCUMENT_BYTES", "524288000")
+    _seed_oversized(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "limit in force 524288000" in out
+    assert "refused at 104857600" in out
+
+
+def test_check_says_which_refusals_the_cap_left_out(monkeypatch, tmp_path, capsys):
+    """The count outlives the listing, and the line has to say so rather than imply less."""
+    from papra_suite.oversized import OVERSIZED_RECORD_LIMIT
+
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _seed_oversized(tmp_path, extra=[(f"doc-{index}", 200)
+                                     for index in range(OVERSIZED_RECORD_LIMIT)])
+    monkeypatch.setattr(sys, "argv", ["papra-suite", "check"])
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert f"oversized: {OVERSIZED_RECORD_LIMIT + 1} seen since" in out
+    assert "50" in out
