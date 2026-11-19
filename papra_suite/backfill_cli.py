@@ -3,9 +3,14 @@
 This is the command that enrols the documents the sweep will never visit. `documents` says this
 suite ingested them, `index_ledger` never held them, and since every count, cadence and eligibility
 rule in the system reads the ledger, that population is invisible from every other angle: the PDFs
-emailed before the handover, and the oversized skips the sweep recorded as seen and never indexed.
+emailed before the handover, and anything a store restore left with a sighting and no reference.
 It is also the command that slices a corpus into the index on purpose — `--limit 20`, read `check`,
 then more — which is how the atlas run is meant to be done.
+
+The oversized skips are named in the same breath in README, so they are answered here: a document
+over `OCR_MAX_DOCUMENT_BYTES` is **counted and refused**, not enrolled. It gets its own bucket on
+the summary line and it stays outside the index, because this command enqueues through the intake
+path — the one that owns that limit — rather than around it.
 
 **Eligibility is the ledger's, never `document_seen`.** The seen flag records *ingestion*, so after
 a generation bump every document in the corpus would look already-done and the command would report
@@ -43,9 +48,9 @@ import sqlite3
 import sys
 from dataclasses import dataclass, field
 
-from papra_suite.indexing import papra_document_is_deleted
-from papra_suite.jobs_cli import LIVE_STATUSES
-from papra_suite.papra_client import PapraClient
+from papra_suite.indexing import IndexFailed, papra_document_is_deleted
+from papra_suite.kreuzakt_client import KreuzaktError
+from papra_suite.papra_client import PapraClient, PapraError
 from papra_suite.pipeline import (
     OCR_MAX_DOCUMENT_BYTES,
     _is_pdf,
@@ -65,11 +70,16 @@ EXIT_REFUSED = 2
 #: Rows per listing page. The sweep's cadence, so a backfill and a sweep ask Papra the same
 #: question the same way.
 LISTING_PAGE_SIZE = 100
-# Queue rows one document can hold in one kind since migration 004. Read as a yes/no, not a
-# page: a document with more live rows than this is a queue nobody is backfilling anyway.
-DOC_ROW_LIMIT = 100
 
 PDF_MIME = "application/pdf"
+
+#: Everything a read of Papra or of the store can raise, cloned from `ledger_cli`'s handler so the
+#: two commands refuse and interrupt in the same shape. `ValueError` and `sqlite3.Error` are the
+#: store's own integrity refusals and a locked database; `PapraError` is every HTTP and transport
+#: failure the client reports, including a 500 part-way through a corpus; `KreuzaktError` and
+#: `IndexFailed` complete the tuple rather than narrow it — a command that is only guarded against
+#: the failures its author thought of is guarded against none of them.
+READ_ERRORS = (ValueError, KreuzaktError, PapraError, IndexFailed, sqlite3.Error)
 
 #: Provenance written into `documents.ingested_via` for a document this command enrols. When the
 #: question is "why is this in the index?", the answer is the command that put it there.
@@ -94,11 +104,13 @@ class BackfillResult:
 
     * `listed` — documents Papra returned, of any type: the walk's reach.
     * `candidates` — the PDFs among them that are neither trashed nor non-PDF: what "of M" counts.
-    * `enqueued` — documents this run asked for: `new_rows` plus `already_queued`. A document a live
-      row already carried was still asked for, so it belongs to this population even though it
-      changed nothing. The invariant is `enqueued == new_rows + already_queued`, so the two are
+    * `asked_for` — documents this run asked for: `new_rows` plus `already_queued`. A document a
+      live row already carried was still asked for, so it belongs to this population even though it
+      changed nothing. The invariant is `asked_for == new_rows + already_queued`, so the two are
       equal only when nothing was absorbed — were they equal always, a run over a stalled queue
-      would print the same pair as a run over an empty corpus.
+      would print the same pair as a run over an empty corpus. It is not called `enqueued` because
+      it is not what got enqueued: the row count is `new_rows`, and a headline that used one word
+      for both printed `enqueued 0 new row(s)` above a field holding four.
     * `new_rows` — of those, the ones that took a fresh queue row: the only number `--limit` caps,
       and the total `enrolled` and `stale_queued` partition.
     * `already_queued` — of those, the ones a live row already carried, so nothing changed. Counted
@@ -116,7 +128,7 @@ class BackfillResult:
     orgs_queued: set[str] = field(default_factory=set)
     listed: int = 0
     candidates: int = 0
-    enqueued: int = 0
+    asked_for: int = 0
     new_rows: int = 0
     already_queued: int = 0
     enrolled: int = 0
@@ -203,6 +215,20 @@ class _Budget:
         self.used += 1
 
 
+def _mark_unreadable(result: BackfillResult, org: str, detail: str) -> None:
+    """Record that part of a bucket was not read, once per bucket whatever failed.
+
+    Both of the walk's network reads end up here — Papra's listing, and the fallback body fetch for
+    a document whose hash the listing does not publish. They share the verdict because they share
+    the consequence: the documents behind the failure are neither queued nor counted, so the run is
+    incomplete and the instruction is to run it again. The bucket is named once however many
+    documents failed, or one dead server would print a hundred identical sentences.
+    """
+    if org not in result.unreadable:
+        result.unreadable.append(org)
+    result.read_errors.append(f"{org}: {detail}")
+
+
 def _moved(store: Store, generation: int) -> str | None:
     """Has somebody reopened the index underneath this walk?
 
@@ -218,15 +244,20 @@ def _moved(store: Store, generation: int) -> str | None:
             "re-run this command to queue what is left under the new generation")
 
 
-def _already_queued(store: Store, document_id: str, content_hash: str) -> bool:
-    """Is this exact work sitting in the queue right now?
+def _already_queued(store: Store, org: str, document_id: str, content_hash: str) -> bool:
+    """Is this exact work sitting in the queue right now, in this bucket?
 
     Read before the enqueue, because afterwards it is always true: `enqueue_job` names the live row
     that already carries the key instead of taking a second one. The answer decides whether this
-    document is progress or a repeat, which decides whether it spends the `--limit` cap.
+    document is progress or a repeat, which decides whether it spends the `--limit` cap — and it is
+    the store's own work-key lookup rather than a listing for two reasons that are both about this
+    command specifically. The bucket is part of the key, so a live row in another organization must
+    not answer "already queued" for a document this one has never queued; and the question is asked
+    once per PDF over a corpus, where reading it off the listing means filtering and sorting every
+    row of that kind for every document in it.
     """
-    rows = store.list_jobs(kind="index", document_id=document_id, limit=DOC_ROW_LIMIT)
-    return any(row.status in LIVE_STATUSES and row.content_hash == content_hash for row in rows)
+    return store.has_live_job(kind="index", papra_org_id=org, document_id=document_id,
+                              content_hash=content_hash)
 
 
 def _queue(store: Store, org: str, document_id: str, *, file_hash: str, name: str,
@@ -238,16 +269,16 @@ def _queue(store: Store, org: str, document_id: str, *, file_hash: str, name: st
     record. A backfill with its own enqueue would be a second intake path, and the ordering rule it
     skipped is the one that keeps an enrolled document visible afterwards.
     """
-    if _already_queued(store, document_id, file_hash):
-        # Asked for, and already carried: it counts in `enqueued` beside the documents that took a
+    if _already_queued(store, org, document_id, file_hash):
+        # Asked for, and already carried: it counts in `asked_for` beside the documents that took a
         # row, while `new_rows` and the cap stay where they were — an absorbed request is not
         # progress.
-        result.enqueued += 1
+        result.asked_for += 1
         result.already_queued += 1
         logger.debug("backfill: %s/%s is already queued, nothing changed", org, document_id)
         return
     if dry_run:
-        result.enqueued += 1
+        result.asked_for += 1
         result.new_rows += 1
         result.orgs_queued.add(org)
         budget.spend()        # the rehearsal caps itself the way the run does
@@ -268,7 +299,7 @@ def _queue(store: Store, org: str, document_id: str, *, file_hash: str, name: st
                        "left out of this run", org, document_id)
         return
     budget.spend()
-    result.enqueued += 1
+    result.asked_for += 1
     result.new_rows += 1
     result.orgs_queued.add(org)
     if standing == UNLEDGERED:
@@ -335,7 +366,19 @@ async def _consider(store: Store, papra, org: str, document: dict, generation: i
     if not file_hash:
         result.needs_download += 1
         if not dry_run and budget.allows():
-            body = await papra.download_file(org, document_id)
+            try:
+                body = await papra.download_file(org, document_id)
+            except READ_ERRORS as error:
+                # The listing is guarded and this is the walk's other network read: a document whose
+                # bytes would not arrive is neither queued nor refused, so the bucket is unfinished.
+                # The instruction is the listing's — run it again once Papra answers — because the
+                # rows already taken stay taken and the re-run is idempotent.
+                _mark_unreadable(result, org, f"body of {document_id} — "
+                                 f"{type(error).__name__}: {error}")
+                logger.error("backfill: papra would not hand over %s/%s (%s), so that document was "
+                             "not queued and the bucket was not fully walked — run the command "
+                             "again once it answers", org, document_id, error)
+                return
             if len(body) > OCR_MAX_DOCUMENT_BYTES:
                 result.skipped_oversized += 1
                 logger.warning("backfill: %s/%s downloaded %s bytes, over the %s byte limit, not "
@@ -366,8 +409,7 @@ async def _walk_listing(store: Store, papra, org: str, generation: int, budget: 
                 org, page_index=page_index, page_size=page,
                 sort_field="createdAt", sort_order="desc")
         except Exception as error:  # noqa: BLE001 - one bucket must not end the corpus
-            result.unreadable.append(org)
-            result.read_errors.append(f"{org}: {type(error).__name__}: {error}")
+            _mark_unreadable(result, org, f"{type(error).__name__}: {error}")
             logger.error("backfill: papra would not list %s (%s), so that bucket was not walked — "
                          "run the command again once it answers", org, error)
             return None
@@ -494,14 +536,15 @@ def _report(store: Store, args, result: BackfillResult) -> int:
     The remainder line comes last on purpose: it is the sentence that decides what the operator does
     next, and a summary that ends with its own successes reads as finished.
     """
-    verb = "would enqueue" if args.dry_run else "enqueued"
-    # Two different numbers belong on this line, so each is named by what it counts. The leading one
-    # is what the run changed (new queue rows: the only thing `--limit` caps, the only thing an
-    # operator can act on), because leading with the asked-for count is how a run over a stalled
-    # queue reads as progress. `asked for` is `enqueued` — new rows plus what a live row had already
-    # taken — decomposed in the parenthesis so the totals add up under the eye.
+    verb = "would queue" if args.dry_run else "queued"
+    # Two different numbers belong on this line, so each is named by exactly one of them and neither
+    # word is used twice. The leading number is what the run changed (`queued N new row(s)`: the
+    # only thing `--limit` caps, the only thing an operator can act on), because leading with the
+    # asked-for count is how a run over a stalled queue reads as progress. The second is the
+    # population it vouched for (`asked for`), decomposed in the parenthesis so the totals add up
+    # under the eye: `asked_for == new_rows + already_queued`, on the face of the line.
     head = (f"backfill: {verb} {result.new_rows} new row(s) across "
-            f"{len(result.orgs_queued)} bucket(s); asked for {result.enqueued} of "
+            f"{len(result.orgs_queued)} bucket(s); asked for {result.asked_for} of "
             f"{result.candidates} candidate(s)"
             + (f" ({result.already_queued} already queued, unchanged)"
                if result.already_queued else "")
@@ -512,7 +555,7 @@ def _report(store: Store, args, result: BackfillResult) -> int:
           "or queued for deletion, "
           f"{result.skipped_oversized} over the {OCR_MAX_DOCUMENT_BYTES} byte limit")
     if result.enrolled or result.stale_queued:
-        # `new_rows`, not `enqueued`: `enrolled` and `stale_queued` partition the rows this run
+        # `new_rows`, not `asked_for`: `enrolled` and `stale_queued` partition the rows this run
         # took, and an absorbed document belongs to neither bucket.
         print(f"  of those {result.new_rows} new row(s): {result.enrolled} had no ledger reference "
               f"at all and are enrolled now, {result.stale_queued} were references the current "
@@ -584,7 +627,8 @@ def run_backfill(config, args, *, store: Store | None = None, papra=None) -> int
     most often wanted.
     """
     if args.limit is not None and args.limit < 1:
-        print(f"--limit wants at least 1 document, got {args.limit}", file=sys.stderr)
+        print(f"--limit counts new queue rows and wants at least 1, got {args.limit}",
+              file=sys.stderr)
         print("queue nothing by hand instead: there is no run that enqueues zero and means it",
               file=sys.stderr)
         return EXIT_REFUSED
@@ -615,10 +659,11 @@ def run_backfill(config, args, *, store: Store | None = None, papra=None) -> int
             papra = PapraClient(config.papra_base_url, config.papra_api_key)
         to_close = [papra] if owns_papra and getattr(papra, "aclose", None) is not None else []
         return asyncio.run(_execute(store, papra, args, orgs, to_close))
-    except (ValueError, sqlite3.Error) as error:
-        # The store's own integrity refusals (`get_generation` on a corrupt `index_generation`) and
-        # a database that is locked or busy. "This will not start" is a different report from "I
-        # walked part of the corpus and one bucket did not read", and it must not be counted as one.
+    except READ_ERRORS as error:
+        # The store's own integrity refusals (`get_generation` on a corrupt `index_generation`), a
+        # database that is locked or busy, and anything a client raised before the walk could guard
+        # it. "This will not start" is a different report from "I walked part of the corpus and one
+        # bucket did not read", and it must not be counted as one.
         print(f"backfill refused: {error}", file=sys.stderr)
         return EXIT_REFUSED
     except KeyboardInterrupt:

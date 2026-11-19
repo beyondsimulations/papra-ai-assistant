@@ -106,7 +106,7 @@ async def test_backfill_enrols_a_live_bucket_from_the_listing_without_downloadin
 
     result = await backfill_corpus(live.store, live.papra, orgs=[live.org_id])
 
-    assert (result.enqueued, result.enrolled, result.remaining) == (2, 2, 0)
+    assert (result.asked_for, result.enrolled, result.remaining) == (2, 2, 0)
     assert live.papra.downloads == 0 and live.papra.patches == []
     jobs = {job.document_id: job for job in live.store.list_jobs(limit=50)
             if job.kind == "index"}
@@ -133,13 +133,13 @@ async def test_backfill_is_idempotent_against_a_live_bucket(live):
     # document, and a fresh store holds no job until something enqueues one. Missing this call is
     # what made this test die with IndexError on `list_jobs(...)[0]` the first time it ran.
     once = await backfill_corpus(live.store, live.papra, orgs=[live.org_id])
-    assert (once.enqueued, once.new_rows, once.already_queued) == (1, 1, 0)
+    assert (once.asked_for, once.new_rows, once.already_queued) == (1, 1, 0)
 
     first_id = live.store.list_jobs(kind="index")[0].id
     again = await backfill_corpus(live.store, live.papra, orgs=[live.org_id])
 
     # The second run asks for the document and the live row absorbs it: nothing new, same id.
-    assert (again.enqueued, again.new_rows, again.already_queued) == (1, 0, 1)
+    assert (again.asked_for, again.new_rows, again.already_queued) == (1, 0, 1)
     assert [job.id for job in live.store.list_jobs(kind="index")] == [first_id]
     assert live.store.count_jobs("index") == 1
     # A terminal row does not block a retry — migration 004's whole point — and the retry takes a
@@ -161,8 +161,36 @@ async def test_backfill_limit_leaves_a_counted_remainder_against_live_data(live)
 
     result = await backfill_corpus(live.store, live.papra, orgs=[live.org_id], limit=1)
 
-    assert (result.enqueued, result.remaining, result.candidates) == (1, 2, 3)
+    assert (result.asked_for, result.remaining, result.candidates) == (1, 2, 3)
     assert live.store.count_jobs("index") == 1
+
+
+async def test_backfill_limit_does_not_spend_itself_on_work_already_queued(live):
+    """`--limit 20` over a stalled queue is the documented atlas procedure, so it is tested live.
+
+    The unit suite already kills the mutant where an absorbed document spends the cap. The live
+    suite did not, because the live `--limit` test runs over a fresh corpus where nothing is queued
+    yet — every document is new, so the budget cannot visibly be spent on the wrong population. Here
+    the first slice is left unclaimed, which is exactly what a stopped worker looks like from the
+    queue: the second run has to reach the documents BEHIND that slice, or every limited run against
+    a stalled index re-reports the same head of the corpus while printing a number that looks like
+    progress, and the atlas corpus never finishes.
+    """
+    for index in range(4):
+        await upload(live, f"rechnung-{index}.pdf", f"g{index}")
+
+    first = await backfill_corpus(live.store, live.papra, orgs=[live.org_id], limit=2)
+    assert (first.asked_for, first.new_rows, first.already_queued) == (2, 2, 0)
+    assert first.remaining == 2
+    # Nothing is claimed between the two runs on purpose: the rows the first run queued are still
+    # live, and they are what the second run must absorb rather than pay its cap for.
+
+    second = await backfill_corpus(live.store, live.papra, orgs=[live.org_id], limit=2)
+
+    assert (second.asked_for, second.new_rows, second.already_queued) == (4, 2, 2)
+    assert second.remaining == 0
+    assert live.store.count_jobs("index") == 4
+    assert len({job.document_id for job in live.store.list_jobs(kind="index", limit=50)}) == 4
 
 
 async def test_backfill_dry_run_leaves_a_live_bucket_untouched(live):
@@ -171,7 +199,7 @@ async def test_backfill_dry_run_leaves_a_live_bucket_untouched(live):
 
     result = await backfill_corpus(live.store, live.papra, orgs=[live.org_id], dry_run=True)
 
-    assert result.enqueued == 1 and result.remaining == 0
+    assert result.asked_for == 1 and result.remaining == 0
     assert live.store.list_jobs() == []
     assert live.store.ledger_get(live.org_id, document["id"]) is None
     assert live.store.document_seen(live.org_id, document["id"]) is False
@@ -247,6 +275,51 @@ def test_several_rows_of_one_live_tuple_are_all_visible_and_only_one_is_reset(tm
         store.close()
 
 
+def test_the_queue_reads_hold_their_plans_on_a_queue_of_real_size(tmp_path):
+    """The two reads `backfill` and `jobs` make, EXPLAINed against the migrated schema.
+
+    A query plan on a two-row table is not evidence: SQLite will happily sort three rows. This is
+    the same two statements at a size a corpus actually has, against the schema the migrations
+    produced rather than a re-creation of it — the shape the atlas run hits, where `backfill` asks
+    the per-document question once per PDF and `jobs` answers while an operator is waiting. If a
+    future migration narrows an index, this is where the per-document scan comes back into view.
+    """
+    from papra_suite.store import LIVE_JOB_FOR_KEY_SQL
+
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    try:
+        for index in range(600):
+            for kind in ("index", "ocr", "title"):
+                store.enqueue_job(kind=kind, papra_org_id=f"org-{index % 3}",
+                                  document_id=f"doc-{index}", content_hash=f"{index:03x}" * 21,
+                                  payload={})
+
+        def plan(sql):
+            rows = store._conn.execute("EXPLAIN QUERY PLAN " + sql, ["index"] * sql.count("?"))
+            return " | ".join(row[3] for row in rows)
+
+        key_plan = plan(LIVE_JOB_FOR_KEY_SQL)
+        listing_plan = plan("SELECT * FROM jobs ORDER BY rowid DESC LIMIT ?")
+        assert "idx_jobs_idempotency" in key_plan, key_plan
+        assert "TEMP B-TREE" not in key_plan, key_plan
+        assert "TEMP B-TREE" not in listing_plan, listing_plan
+
+        # And the same question at scale answers for one bucket, which is the correctness half of
+        # the same statement: 1800 rows, three organizations, and `doc-7` filed under `org-1`
+        # (`7 % 3`) and nowhere else.
+        hash_of_7 = f"{7:03x}" * 21
+        assert store.has_live_job(kind="index", papra_org_id="org-1", document_id="doc-7",
+                                  content_hash=hash_of_7) is True
+        for other_bucket in ("org-0", "org-2"):
+            assert store.has_live_job(kind="index", papra_org_id=other_bucket,
+                                      document_id="doc-7", content_hash=hash_of_7) is False
+        assert store.live_job_kinds() == ["index", "ocr", "title"]
+        assert store.live_job_kinds("title") == ["title"]
+    finally:
+        store.close()
+
+
 async def test_backfill_of_a_live_bucket_the_store_knows_from_the_ledger_only(live):
     """A bucket that is in the ledger but not in `orgs` is still walked by the default scope.
 
@@ -265,6 +338,6 @@ async def test_backfill_of_a_live_bucket_the_store_knows_from_the_ledger_only(li
     result = await backfill_corpus(live.store, live.papra,
                                    orgs=live.store.ledger_org_ids())
 
-    assert result.enqueued == 1
+    assert result.asked_for == 1
     assert [job.document_id for job in live.store.list_jobs(limit=50)
             if job.kind == "index"] == [document["id"]]
