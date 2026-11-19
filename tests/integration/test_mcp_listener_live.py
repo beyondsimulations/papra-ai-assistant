@@ -295,7 +295,10 @@ async def test_the_sdk_client_completes_a_session_and_calls_the_tool(listener):
                 "index_status", "search_documents", "list_recent_documents",
                 "get_document", "get_document_content", "open_document"]
             for tool in tools.tools:
-                assert not [name for name in tool.inputSchema.get("properties", {})
+                # `input_schema` is the SDK's pythonic field; the wire key is `inputSchema`. What is
+                # asserted is that no tool lets a caller state its own grant — or name the host a
+                # returned link points at.
+                assert not [name for name in tool.input_schema.get("properties", {})
                             if any(word in name.lower() for word in
                                    ("org", "scope", "bucket", "token", "url"))], tool.name
             result = await client.call_tool("index_status")
@@ -369,6 +372,11 @@ async def test_a_document_the_ledger_cannot_vouch_for_never_reaches_the_index_li
     async with raw_client(token) as http:
         async with Client(streamable_http_client(listener.endpoint, http_client=http)) as client:
             for name in ("get_document", "get_document_content", "open_document"):
-                with pytest.raises(MCPError) as caught:
-                    await client.call_tool(name, {"document_id": "d1"})
-                assert "not-found" in str(caught.value), name
+                result = await client.call_tool(name, {"document_id": "d1"})
+                assert result.is_error, name
+                text = " ".join(getattr(part, "text", "") for part in result.content)
+                # The SDK writes its own prefix ("Error executing tool <name>: ") in front of the
+                # stable code, so a client matches the code inside the message rather than at its
+                # start. Measured here so the README's "stable codes" claim is quoted honestly.
+                assert "not-found" in text, (name, text)
+                assert ORG not in text and "kreuzakt" not in text.lower(), (name, text)
