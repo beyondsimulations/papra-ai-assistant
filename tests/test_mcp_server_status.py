@@ -448,10 +448,32 @@ async def test_index_status_raises_index_unavailable_when_kreuzakt_is_down(store
         await status_for(store, kz, token)
 
 
-async def test_a_health_body_that_is_not_ok_is_also_unavailable(store):
+async def test_a_health_body_that_is_not_ok_is_reported_without_its_text(store, caplog):
+    """The state is the refusal; the string Kreuzakt wrote is not.
+
+    A measured run of this branch carried `/var/lib/kreuzakt/index` to whoever held a token, so the
+    message now says what is true (`a status other than ok`) and the value goes to the log, where
+    the operator can still tell `degraded` from `full` from an empty string.
+    """
+    import logging
+
     token = scoped_token(store, SCOPED)
     kz = FakeKreuzakt(health_body={"status": "degraded"})
-    with pytest.raises(IndexUnavailable, match="degraded"):
+    caplog.set_level(logging.WARNING, logger="papra_suite.mcp_server")
+    with pytest.raises(IndexUnavailable) as caught:
+        await status_for(store, kz, token)
+    message = str(caught.value)
+    assert "index_unavailable" in message
+    assert "reported a status other than ok" in message
+    assert "degraded" not in message, "the upstream status string reached the agent"
+    assert "degraded" in caplog.text, "the operator lost the one fact the value carried"
+
+
+async def test_a_health_status_of_unknown_shape_is_still_a_refusal(store):
+    """A body whose `status` is not a string is refused, and its type is not quoted either."""
+    token = scoped_token(store, SCOPED)
+    kz = FakeKreuzakt(health_body={"status": 7})
+    with pytest.raises(IndexUnavailable, match="a status other than ok"):
         await status_for(store, kz, token)
 
 
@@ -521,6 +543,25 @@ async def test_a_refused_health_read_reaches_the_wire_with_no_upstream_prose(sto
                    "kreuzakterror", "operationalerror"):
         assert needle not in serialised, needle
     assert "index_unavailable" in serialised and "http 500" in serialised
+
+
+async def test_a_health_status_carrying_prose_and_a_path_never_reaches_the_agent(store, seeded):
+    """The canary, on the wire: what the health body says must not be in what the client reads.
+
+    `sanitize_event_text` bounds length and turns control characters into spaces — it is not
+    redaction, and the value this probe puts on it is a sentence with a filesystem path in it, which
+    is what a real `degraded` body looks like. The whole envelope is scanned, not just the message:
+    the assertion is that no part of a tool result carried the text out.
+    """
+    token = scoped_token(seeded, SCOPED)
+    kz = FakeKreuzakt(health_body={"status": "CANARY-PROSE /var/lib/kreuzakt/index is 97% full"})
+    _response, message = wire_call(seeded, token, kz=kz)
+    assert message["result"]["isError"] is True
+    serialised = json.dumps(message, ensure_ascii=False)
+    for needle in ("CANARY-PROSE", "canary-prose", "/var/lib", "97%", "97", "is 97", "full"):
+        assert needle not in serialised, needle
+    assert "index_unavailable" in serialised
+    assert "a status other than ok" in serialised
 
 
 # --- the tool, over the wire ---------------------------------------------------------------

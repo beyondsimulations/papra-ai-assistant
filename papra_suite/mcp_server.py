@@ -686,8 +686,15 @@ async def _index_status_body(store: Store, kz, context: TokenContext) -> IndexSt
         raise IndexUnavailable(f"kreuzakt did not answer ({_upstream_reason(error)})") from error
     status = health.get("status") if isinstance(health, dict) else None
     if status != "ok":
-        reported = sanitize_event_text(status, limit=40) or "unknown"
-        raise IndexUnavailable(f"kreuzakt reports status {reported}, so these counts would "
+        # The value stays on this side of the boundary. It is a string Kreuzakt wrote, and a probe
+        # of this branch carried a container path (`CANARY-PROSE /var/lib/kreuzakt/index is …`) out
+        # to whoever held a token; `sanitize_event_text` bounds text and turns control characters
+        # into spaces, which is a formatting rule, not redaction. The operator still needs to know
+        # whether the index said degraded, full or something unprintable, so the bounded value goes
+        # to the log, where a path is one of the operator's own facts rather than a leak.
+        logger.warning("mcp: index_status refused: kreuzakt reported a status other than ok (%s)",
+                       sanitize_event_text(status, limit=120) or "absent")
+        raise IndexUnavailable("kreuzakt reported a status other than ok, so these counts would "
                                "describe an index that is not answering")
 
     queue: dict[str, int] | None = None
