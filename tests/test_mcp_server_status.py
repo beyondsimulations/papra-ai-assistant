@@ -1,0 +1,505 @@
+"""Task 12, part 3: `index_status`, and the rule that a scope is a boundary.
+
+The brief's mutation target is one sentence: *global queue counts reaching a one-bucket token is a
+leak.* That is the shape of every test here. A corpus-wide number does not have to be a secret to be
+a leak — it tells a reader how big the archive is, how much of it is missing, and how much delete
+debt it carries, and none of that belongs to a credential that was minted for one bucket.
+
+So the scoping rule is applied field by field, and tested field by field: one test per field,
+because a single "the whole response is scoped" assertion is one assertion, and a mutation that
+leaks one number out of nine passes it. The same discipline gave this task its `unledgered` and
+`delivery-blocked` fields: a warning in a README is not a control, a number is — and the number is
+only a control if the person who is allowed to see it is the person who sees it.
+
+Two deliberate asymmetries:
+
+* **Queue depth is privileged.** It is a corpus-wide aggregate with no per-bucket form, so it is
+  `None` for anything but an `--all-buckets` token.
+* **An outage is an error, never a Papra-backed answer.** This suite is a bridge; answering from
+  Papra while Kreuzakt is down would be a second index with worse search and no warning.
+"""
+
+import itertools
+import json
+from datetime import UTC, datetime
+
+import pytest
+from starlette.testclient import TestClient
+
+from papra_suite.indexing import (
+    DELETION_QUARANTINE_SETTING,
+    LISTING_WALK_STAMP_SETTING,
+    LIVENESS_PROBE_UNANSWERED_SETTING,
+    MARKS_ROLLING_SETTING,
+)
+from papra_suite.kreuzakt_client import KreuzaktError
+from papra_suite.mcp_server import (
+    IndexStatus,
+    IndexUnavailable,
+    build_mcp_app,
+    index_status_for,
+    token_context_of,
+)
+from papra_suite.mcp_tokens import mint_token
+from papra_suite.store import EMPTY_EXTRACTION_SHA, Store
+
+PUBLIC_URL = "https://papra-mcp.ts.net"
+HOST = "papra-mcp.ts.net"
+SCOPED = "org-1"
+OTHER = "org-2"
+
+
+class FakeKreuzakt:
+    """`health` and `queue_counts`, counted. Everything `index_status` is allowed to ask."""
+
+    def __init__(self, *, counts=None, health_body=None, error=None):
+        self.counts = {"pending": 40, "completed": 900} if counts is None else counts
+        self.health_body = {"status": "ok"} if health_body is None else health_body
+        self.error = error
+        self.health_calls = 0
+        self.queue_calls = 0
+
+    async def health(self):
+        self.health_calls += 1
+        if self.error is not None:
+            raise self.error
+        return dict(self.health_body)
+
+    async def queue_counts(self):
+        self.queue_calls += 1
+        if self.error is not None:
+            raise self.error
+        return dict(self.counts)
+
+
+class NoPapra:
+    """Task 12 has no tool that reads Papra, so a call to it is a failure, not a stub."""
+
+    async def __getattr__(self, name):
+        raise AssertionError(f"index_status must not read papra, called {name!r}")
+
+
+@pytest.fixture
+def store(tmp_path):
+    store = Store(tmp_path / "state.db")
+    store.migrate()
+    yield store
+    store.close()
+
+
+def seed_bucket(store, org, *, refs=0, indexed=0, empty=0, blocked=0,
+                cleanup_pending=0, cleanup_failed=0, unledgered=0):
+    """One bucket, with each population built through the store's own API.
+
+    The knobs are nested rather than independent, because the real counts are: `empty` and `blocked`
+    are subsets of `indexed` (a refusal is charged to a binding that exists, and so is an empty
+    delivery), and `cleanup_failed` is a subset of `cleanup_pending`. Anything else would describe a
+    ledger the passes could not have produced.
+
+    `unledgered` is the population Task 7's review found invisible: `documents` says this suite saw
+    it, `index_ledger` never held it. It is built by the seen-record write alone, which is exactly
+    how the pre-handover mail path left it.
+    """
+    generation = store.get_generation()
+    ids = []
+    for index in range(refs):
+        document_id = f"{org}-doc-{index}"
+        store.ledger_upsert_reference(papra_org_id=org, papra_document_id=document_id,
+                                      file_hash=f"{index:02x}" * 32,
+                                      papra_original_name=f"{document_id}.pdf")
+        ids.append(document_id)
+    for index, document_id in enumerate(ids[:indexed]):
+        store.ledger_set_kreuzakt_id(papra_org_id=org, papra_document_id=document_id,
+                                     kreuzakt_id=index + 1, generation=generation)
+    for document_id in ids[:empty]:
+        store.ledger_record_delivery(papra_org_id=org, papra_document_id=document_id,
+                                     delivered_at="2026-11-19T10:00:00+00:00",
+                                     delivered_sha=EMPTY_EXTRACTION_SHA, generation=generation)
+    for index, document_id in enumerate(ids):
+        if not empty <= index < empty + blocked:
+            continue
+        for _ in range(5):
+            store.ledger_record_delivery_failure(
+                papra_org_id=org, papra_document_id=document_id,
+                expected_kreuzakt_id=index + 1, generation=generation,
+                reason="413 too large")
+    for document_id in ids[:cleanup_pending]:
+        store.ledger_queue_cleanup(papra_org_id=org, papra_document_id=document_id,
+                                   due_at="2026-11-19T10:00:00+00:00", kreuzakt_id=1,
+                                   generation=generation)
+    if cleanup_failed:
+        with store._conn:
+            store._conn.execute(
+                "UPDATE index_ledger SET cleanup_state = 'failed' WHERE papra_org_id = ? "
+                "AND papra_document_id IN (" + ",".join("?" * cleanup_failed) + ")",
+                [org, *ids[:cleanup_failed]])
+    for index in range(unledgered):
+        store.record_document_seen(papra_org_id=org, papra_document_id=f"{org}-orphan-{index}",
+                                   name=f"{org}-orphan-{index}.pdf", mime="application/pdf",
+                                   ingested_via="mail")
+    return generation
+
+
+_minted = itertools.count()
+
+
+def scoped_token(store, *orgs):
+    # A unique label per mint: a test that asks for two tokens on the same bucket must get two, and
+    # `mint_token` refuses a duplicate active label on purpose.
+    return mint_token(store, label=f"scoped-{next(_minted)}", org_ids=list(orgs))
+
+
+def all_token(store):
+    return mint_token(store, label=f"operator-{next(_minted)}", org_ids=[], scope_all=True)
+
+
+async def status_for(store, kz, token):
+    from papra_suite.mcp_tokens import resolve_token
+
+    context = resolve_token(store, token)
+    assert context is not None
+    return await index_status_for(store, kz, context)
+
+
+# --- the fields a scoped token may see, one test each --------------------------------------
+#
+# In scope: `org-1` — 4 references, 2 of them indexed, 1 of those delivered an empty extraction and
+# 1 blocked after five refusals, 1 owed delete, plus 1 document Papra has and the ledger never held.
+# Out of scope: `org-2`, larger in every dimension. Every assertion below is therefore a different
+# mutation: dropping the bucket restriction turns each of these numbers into the corpus total, and
+# each test dies on its own field.
+
+IN_SCOPE = dict(refs=4, indexed=2, empty=1, blocked=1, cleanup_pending=1, unledgered=1)
+OUT_OF_SCOPE = dict(refs=5, indexed=3, empty=2, blocked=1, cleanup_pending=3, cleanup_failed=2,
+                    unledgered=4)
+
+
+@pytest.fixture
+def seeded(store):
+    seed_bucket(store, SCOPED, **IN_SCOPE)
+    seed_bucket(store, OTHER, **OUT_OF_SCOPE)
+    # Both scheduling brakes are armed in the shared fixture, stamped against the real clock because
+    # they are read against it: a scoped token must still see the gate (it is timing, not counting),
+    # and the probe list is asserted to be privileged below.
+    moment = datetime.now(UTC).isoformat()
+    store.set_setting(LIVENESS_PROBE_UNANSWERED_SETTING, f"{moment}|11,12,13")
+    store.set_setting(LISTING_WALK_STAMP_SETTING, moment)
+    return store
+
+
+async def bucket_status(store, kz, token, org=SCOPED):
+    status = await status_for(store, kz, token)
+    matching = [bucket for bucket in status.buckets if bucket.org_id == org]
+    assert len(matching) == 1, status
+    return matching[0]
+
+
+async def test_a_scoped_token_sees_only_its_own_references(seeded):
+    kz = FakeKreuzakt()
+    bucket = await bucket_status(seeded, kz, scoped_token(seeded, SCOPED))
+    assert bucket.references == IN_SCOPE["refs"]
+
+
+async def test_a_scoped_token_sees_only_its_own_indexed_count(seeded):
+    bucket = await bucket_status(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    assert bucket.indexed_current == IN_SCOPE["indexed"]
+
+
+async def test_a_scoped_token_sees_only_its_own_stale_count(seeded):
+    bucket = await bucket_status(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    assert bucket.stale == IN_SCOPE["refs"] - IN_SCOPE["indexed"]
+
+
+async def test_a_scoped_token_sees_only_its_own_unledgered_count(seeded):
+    """The number Task 7's review demanded, per bucket, and never corpus-wide.
+
+    A token minted for one bucket is told how much of *that* bucket never reached the ledger — which
+    is what makes it actionable — and learns nothing about the rest of the corpus.
+    """
+    bucket = await bucket_status(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    assert bucket.unledgered == IN_SCOPE["unledgered"]
+
+
+async def test_a_scoped_token_sees_only_its_own_delivery_blocked_count(seeded):
+    bucket = await bucket_status(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    assert bucket.delivery_blocked == IN_SCOPE["blocked"]
+
+
+async def test_a_scoped_token_sees_only_its_own_empty_extractions(seeded):
+    bucket = await bucket_status(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    assert bucket.extraction_empty == IN_SCOPE["empty"]
+
+
+async def test_a_scoped_token_sees_only_its_own_cleanup_debt(seeded):
+    bucket = await bucket_status(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    assert bucket.cleanup_pending == IN_SCOPE["cleanup_pending"]
+    assert bucket.cleanup_failed == 0
+
+
+async def test_a_scoped_token_sees_only_its_own_set_aside_state(seeded):
+    """Quarantine is per bucket, and so is what a scoped token is allowed to learn about it."""
+    seeded.set_setting(DELETION_QUARANTINE_SETTING, f"{SCOPED},{OTHER}")
+    mine = await bucket_status(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    theirs = await bucket_status(seeded, FakeKreuzakt(), scoped_token(seeded, OTHER), org=OTHER)
+    assert mine.set_aside is True and theirs.set_aside is True
+
+    only_other = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, OTHER))
+    assert [bucket.org_id for bucket in only_other.buckets] == [OTHER]
+    assert only_other.set_aside == [OTHER]
+
+
+async def test_the_response_carries_nothing_about_an_ungranted_bucket(seeded):
+    """Not a number, not a name, not a count of buckets the token does not have."""
+    status = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    assert [bucket.org_id for bucket in status.buckets] == [SCOPED]
+    assert OTHER not in status.model_dump_json()
+
+
+# --- the top line: sums over what is in scope -------------------------------------
+
+async def test_the_totals_are_the_in_scope_sums_not_the_corpus(seeded):
+    status = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    assert status.indexed_for_scope == IN_SCOPE["indexed"]
+    assert status.stale == IN_SCOPE["refs"] - IN_SCOPE["indexed"]
+    assert status.unledgered == IN_SCOPE["unledgered"]
+    assert status.delivery_blocked == IN_SCOPE["blocked"]
+    assert status.scope == "buckets"
+
+
+async def test_an_all_bucket_token_sees_the_corpus_totals(seeded):
+    status = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
+    assert status.scope == "all"
+    assert status.indexed_for_scope == IN_SCOPE["indexed"] + OUT_OF_SCOPE["indexed"]
+    assert status.unledgered == IN_SCOPE["unledgered"] + OUT_OF_SCOPE["unledgered"]
+    assert status.delivery_blocked == IN_SCOPE["blocked"] + OUT_OF_SCOPE["blocked"]
+
+
+async def test_an_all_bucket_token_covers_a_bucket_with_only_unledgered_documents(seeded):
+    """The population has to be reachable by name, not only by a corpus number.
+
+    Enumerating buckets from the ledger alone would show every count for `org-3` as absent while the
+    total said otherwise — the exact shape that hides a whole bucket outside the index.
+    """
+    seed_bucket(seeded, "org-3", unledgered=3)
+    status = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
+    assert [bucket.org_id for bucket in status.buckets] == sorted([OTHER, SCOPED, "org-3"])
+    assert status.buckets[-1].unledgered == 3
+
+
+async def test_a_token_with_no_grant_sees_no_buckets_and_no_counts(seeded):
+    status = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded))
+    assert status.scope == "none"
+    assert status.buckets == [] and status.queue is None
+    assert status.indexed_for_scope == 0 and status.unledgered == 0
+    assert status.delivery_blocked == 0 and status.marks is None
+    assert status.probe_rereads is None
+
+
+# --- what only an all-buckets token may see ---------------------------------------
+
+async def test_index_status_for_a_scoped_token_leaks_no_global_counts(seeded):
+    """The brief's mutation target, in one assertion pair.
+
+    Queue depth is a corpus-wide aggregate: Kreuzakt answers "how much work is there", and that is a
+    statement about every bucket. A one-bucket token gets `None`, and the tool says so rather than
+    inventing a zero — `pending: 0` would read as "your documents are indexed".
+    """
+    kz = FakeKreuzakt(counts={"pending": 40, "completed": 900})
+    status = await status_for(seeded, kz, scoped_token(seeded, SCOPED))
+    assert status.queue is None and status.indexed_for_scope == IN_SCOPE["indexed"]
+    assert kz.queue_calls == 0, "a scoped token must not even ask for the aggregate"
+
+
+async def test_index_status_for_an_all_bucket_token_includes_queue(seeded):
+    kz = FakeKreuzakt(counts={"pending": 40, "completed": 900})
+    status = await status_for(seeded, kz, all_token(seeded))
+    assert status.queue["pending"] == 40 and status.queue["completed"] == 900
+    assert kz.queue_calls == 1
+
+
+async def test_the_marks_brake_counts_are_privileged(seeded):
+    """The window counter is a corpus-wide count of deletion marks; the allowance is a constant.
+
+    Both are `None` for a scoped token: printing the allowance without the count would be a hint
+    about what the hidden number is being judged against, and printing the count is the leak.
+    """
+    seeded.set_setting(MARKS_ROLLING_SETTING, "2026-11-19T00:00:00+00:00|34")
+    scoped = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    everything = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
+    assert scoped.marks is None
+    assert everything.marks is not None and everything.marks.counted == 34
+    assert everything.marks.allowance > 0
+
+
+async def test_the_pending_probe_list_is_privileged(seeded):
+    """The size of the retry list is a corpus fact, so a bucket grant does not unlock it.
+
+    `11,12,13` are Kreuzakt document ids, and how many of them the index will not answer for says
+    how unhealthy the corpus is overall — including the buckets this token was not given. The count
+    is the leak being tested, not the ids.
+    """
+    scoped = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    everything = await status_for(seeded, FakeKreuzakt(), all_token(seeded))
+    assert scoped.probe_rereads is None
+    assert everything.probe_rereads == 3
+
+
+async def test_the_cadence_gate_is_shown_to_every_token(seeded):
+    """When the next deletion pass may run is timing, not a count, and it explains an idle ledger.
+
+    Task 9's review found an operator comparing a stale-looking `check` to a fresh trash and
+    concluding propagation was broken. That reading is corrected by a "gated until" the scoped token
+    can also see — and it names no other bucket.
+    """
+    seeded.set_setting(LISTING_WALK_STAMP_SETTING, "2026-11-19T09:00:00+00:00")
+    scoped = await status_for(seeded, FakeKreuzakt(), scoped_token(seeded, SCOPED))
+    assert scoped.gated_until
+    assert "T" in scoped.gated_until
+
+
+# --- Kreuzakt down is an error, not an answer --------------------------------------
+
+async def test_index_status_raises_index_unavailable_when_kreuzakt_is_down(store):
+    """No Papra-backed fallback anywhere: an outage says "index unavailable"."""
+    token = scoped_token(store, SCOPED)
+    kz = FakeKreuzakt(error=KreuzaktError("connection refused"))
+    with pytest.raises(IndexUnavailable, match="index_unavailable"):
+        await status_for(store, kz, token)
+
+
+async def test_a_health_body_that_is_not_ok_is_also_unavailable(store):
+    token = scoped_token(store, SCOPED)
+    kz = FakeKreuzakt(health_body={"status": "degraded"})
+    with pytest.raises(IndexUnavailable, match="degraded"):
+        await status_for(store, kz, token)
+
+
+async def test_a_refused_queue_read_is_unavailable_even_for_a_scoped_token(store, seeded):
+    """The scoped token never asks for the queue, so the refusal must come from the health probe.
+
+    Otherwise a degraded index would answer a scoped token with confident per-bucket counts, which
+    is the same wrong answer the all-buckets token is refused.
+    """
+    token = scoped_token(seeded, SCOPED)
+    kz = FakeKreuzakt(error=KreuzaktError("502"))
+    with pytest.raises(IndexUnavailable):
+        await status_for(seeded, kz, token)
+    assert kz.queue_calls == 0
+
+
+async def test_the_outage_message_carries_no_counts_and_no_upstream_body(store, seeded):
+    token = scoped_token(seeded, SCOPED)
+    kz = FakeKreuzakt(error=KreuzaktError(
+        'upstream said {"documents":9000,"secret":"internal body"} after 30s'))
+    with pytest.raises(IndexUnavailable) as caught:
+        await status_for(seeded, kz, token)
+    message = str(caught.value)
+    assert "9000" not in message and "internal body" not in message
+    assert message.startswith("index_unavailable")
+    assert len(message) <= 300, "an upstream message is echoed bounded"
+
+
+# --- the tool, over the wire ---------------------------------------------------------------
+
+def wire_call(store, token, name="index_status", arguments=None):
+    """Drive the real MCP handshake against the in-process app and return the tool result."""
+    app = build_mcp_app(store, NoPapra(), FakeKreuzakt(), url=PUBLIC_URL)
+    payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": name, "arguments": arguments or {}}}
+    with TestClient(app) as client:
+        headers = {"host": HOST, "content-type": "application/json",
+                   "accept": "application/json, text/event-stream",
+                   "authorization": f"Bearer {token}"}
+        initialised = client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                       "clientInfo": {"name": "pytest", "version": "0"}}})
+        session = initialised.headers.get("mcp-session-id")
+        headers["mcp-session-id"] = session
+        client.post("/mcp", headers=headers,
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        response = client.post("/mcp", headers=headers, json=payload)
+    frames = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: ")]
+    return response, frames[0] if frames else {}
+
+
+def structured(message):
+    return message.get("result", {}).get("structuredContent")
+
+
+def test_the_tool_answers_the_scope_it_authenticated(store, seeded):
+    """The authorization path end to end: the context comes from the bearer gate, not an argument.
+
+    There is no `org_id` argument to pass and no way to ask for a bucket the token does not carry,
+    which is what makes "the agent may narrow, never widen" true in the schema rather than in a
+    comment.
+    """
+    response, message = wire_call(seeded, scoped_token(seeded, SCOPED))
+    payload = structured(message)
+    assert response.status_code == 200
+    assert payload["scope"] == "buckets"
+    assert [bucket["org_id"] for bucket in payload["buckets"]] == [SCOPED]
+    assert payload["queue"] is None
+    assert payload["buckets"][0]["unledgered"] == IN_SCOPE["unledgered"]
+    assert payload["buckets"][0]["delivery_blocked"] == IN_SCOPE["blocked"]
+
+
+def test_the_tool_returns_a_pydantic_model(store, seeded):
+    """N7: structured output, so the client parses rather than pattern-matches prose."""
+    response, message = wire_call(seeded, all_token(seeded))
+    payload = structured(message)
+    assert IndexStatus.model_validate(payload).scope == "all"
+    assert set(payload) >= {"scope", "buckets", "indexed_for_scope", "unledgered",
+                            "delivery_blocked", "queue", "set_aside", "gated_until"}
+
+
+def test_the_tool_reports_the_outage_as_a_tool_error(store, monkeypatch):
+    """A hard error, and not one number in place of it."""
+    import papra_suite.mcp_server as mcp_server
+
+    token = mint_token(store, label="pi", org_ids=[SCOPED])
+    seed_bucket(store, SCOPED, refs=1, indexed=1)
+    broken = FakeKreuzakt(error=KreuzaktError("connection refused"))
+    app = mcp_server.build_mcp_app(store, NoPapra(), broken, url=PUBLIC_URL)
+    with TestClient(app) as client:
+        headers = {"host": HOST, "content-type": "application/json",
+                   "accept": "application/json, text/event-stream",
+                   "authorization": f"Bearer {token}"}
+        client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                       "clientInfo": {"name": "pytest", "version": "0"}}})
+        session = client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                       "clientInfo": {"name": "pytest", "version": "0"}}}).headers.get(
+                           "mcp-session-id")
+        headers["mcp-session-id"] = session
+        response = client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "index_status", "arguments": {}}})
+    frames = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: ")]
+    result = frames[0]["result"]
+    assert result["isError"] is True
+    assert "index_unavailable" in result["content"][0]["text"]
+    assert "refs" not in result["content"][0]["text"]
+
+
+def test_index_status_writes_nothing_to_the_ledger_or_the_queue(store, seeded):
+    """N7: no tool in this task mutates Papra, Kreuzakt, or the ledger."""
+    generation_before = seeded.get_generation()
+    jobs_before = len(seeded.list_jobs(limit=500))
+    token = scoped_token(seeded, SCOPED)
+    for _ in range(2):
+        wire_call(seeded, token)
+    assert seeded.get_generation() == generation_before
+    assert len(seeded.list_jobs(limit=500)) == jobs_before
+    assert seeded.ledger_stats()["references"] == IN_SCOPE["refs"] + OUT_OF_SCOPE["refs"]
+
+
+def test_token_context_of_refuses_a_request_with_no_principal():
+    """The tool's own guard: a context that did not authenticate gets nothing, not a wide scope."""
+    assert token_context_of(None) is None
+    assert token_context_of(object()) is None

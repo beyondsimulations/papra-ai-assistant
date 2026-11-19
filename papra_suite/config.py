@@ -1,3 +1,4 @@
+import ipaddress
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ class AppConfig:
     index_wait_timeout_s: int
     index_query_max_chars: int
     mcp_url: str
+    mcp_host: str
     mcp_port: int
 
 
@@ -253,6 +255,48 @@ def _port_env(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _host_env(env: Mapping[str, str], name: str, default: str) -> str:
+    """A bare bind host — no scheme, no port, no userinfo.
+
+    This value goes to a socket bind, so anything else is a paste error rather than a variant: a
+    port belongs to `PAPRA_MCP_PORT` (a `host:port` here would bind the host and silently ignore the
+    port), userinfo carries a credential that a bind cannot use and that stderr would echo, and a
+    scheme means somebody wrote a URL into an interface field. The screening is the one
+    `_parse_bind` already applies to `DASHBOARD_BIND`, minus the part about the port.
+    """
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise ConfigError(f"{name} must not contain whitespace or control characters")
+    if "://" in raw or "/" in raw or "@" in raw or raw.count(":") > 1 or raw.startswith("["):
+        # `[::1]` is the one bracketed form that is legitimate, and it is accepted below by
+        # `ipaddress`; what is refused here is a URL or an `host:port` pair landing in this field.
+        if not raw.startswith("[") or not _is_literal_bind(raw):
+            raise ConfigError(f"{name} must be a bare host, got: {raw!r}")
+    if not _is_literal_bind(raw):
+        raise ConfigError(f"{name} must be a bare host, got: {raw!r}")
+    return raw.lower()
+
+
+def _is_literal_bind(raw: str) -> bool:
+    """An IP literal or a hostname — and nothing that could be read as something else.
+
+    `127.0.0.1:8765` fails the single-colon rule above; `http://x` and `x/y` fail here; `::1` is the
+    IPv6 literal the loopback default needs and is legal as a bind address.
+    """
+    if ":" in raw:
+        try:
+            ipaddress.IPv6Address(raw)
+            return True
+        except ValueError:
+            return False
+    if raw.startswith("[") or raw.endswith("]"):
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789.-_")
+    return bool(raw) and set(raw.lower()) <= allowed and not raw.startswith("-")
+
+
 def _parse_bind(raw: str) -> tuple[str, int]:
     try:
         parsed = urlparse(f"//{raw}")
@@ -329,5 +373,8 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
         # Empty is legal here and means "no MCP listener"; the MCP app is what refuses to
         # build without it. What is not legal is a URL that cannot be used as given.
         mcp_url=_optional_base_url(env, "PAPRA_MCP_URL", ""),
+        # Loopback by default, and `resolve_bind` refuses anything else until a settings row agrees:
+        # this listener is built to be published by `tailscale serve`, not by a reachable interface.
+        mcp_host=_host_env(env, "PAPRA_MCP_HOST", "127.0.0.1"),
         mcp_port=_port_env(env, "PAPRA_MCP_PORT", 8765),
     )

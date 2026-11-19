@@ -432,6 +432,23 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         _verification_loop(store, papra, kreuzakt,
                            interval_s=DEFAULT_VERIFICATION_INTERVAL_S, stop=stop),
         name="verification"))
+    # The MCP listener is the one part of this process that answers the network, so it starts only
+    # on
+    # an explicit settings row — the same discipline as both delivery flags. Off, the operator gets
+    # no
+    # listener and no mystery port; on, the listener shares `serve`'s store and clients rather than
+    # opening a second set of credentials behind them, and `resolve_bind` inside it is what keeps it
+    # on loopback.
+    from papra_suite import mcp_server
+
+    if mcp_server.mcp_listener_requested(store):
+        tasks.append(asyncio.create_task(
+            mcp_server.run_mcp_listener(config, store, papra=papra, kreuzakt=kreuzakt, stop=stop),
+            name="mcp"))
+    else:
+        logger.info("mcp: listener disabled (set the %s setting to 1 to start it); "
+                    "tokens are minted with `papra-suite mcp-token --create` either way",
+                    mcp_server.MCP_ENABLED_SETTING)
 
     def _supervise(task: asyncio.Task, name: str) -> None:
         """Log a long-lived task's exit, loudly only when it is NOT designed.
