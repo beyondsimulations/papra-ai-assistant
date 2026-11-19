@@ -1,2 +1,8 @@
 httpx==0.28.1
 pymupdf==1.25.1
+# The MCP SDK, exact pin per repo convention and per the 2026-11-16 spec. Its transport behaviour is
+# asserted in tests (401/421/403, `AccessToken` requiring client_id and scopes, and
+# `resource_server_url=None` not advertising a dead issuer), so an unpinned SDK is a test suite that
+# silently changes what it proves. Brings starlette, uvicorn, pydantic 2.x, sse-starlette, pyjwt,
+# jsonschema, cryptography and opentelemetry-api as a transitive tail.
+mcp==2.3.0
