@@ -94,7 +94,9 @@ CLIENT_MESSAGE_LIMIT = 240
 
 #: The two shapes `/api/documents` demonstrably filters on, copied from `kreuzakt_client`'s own
 #: validator (which refuses the others). Kept here so the refusal reaches the caller as
-#: `invalid-request` — their mistake — rather than as an upstream error.
+#: `invalid-request` — their mistake — rather than as an upstream error. Matched with `fullmatch`
+#: below: with `match`, the trailing `$` still permitted a newline, so `2026-01-01\n` passed this
+#: check and a shape nobody chose reached the wire.
 _SINCE_FORM = re.compile(r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?$")
 
 
@@ -252,27 +254,46 @@ DEFAULT_LIMITS = SearchLimits()
 
 
 def check_request(query: str, page: int, page_size: int, *, limits: SearchLimits,
-                  what: str) -> None:
-    """The bounds, checked before anything is fetched. Raises `InvalidRequest`; never clamps."""
+                  what: str) -> str:
+    """The bounds, checked before anything is fetched. Raises `InvalidRequest`; never clamps.
+
+    **It returns the value that is then forwarded**, and that is the point of its signature. A check
+    that measures `query.strip()` while the tool sends `query` bounds one string and ships another:
+    nine hundred spaces plus an `x` cleared the 512-character bound and 901 characters went
+    upstream. Validating the stripped copy and sending the stripped copy is one value, so the bound
+    means what an operator reading `PAPRA_INDEX_QUERY_MAX_CHARS` would assume it means. Stripping
+    changes no meaning here — the tokeniser is upstream and leading whitespace is not a term.
+    """
     if not isinstance(query, str) or not query.strip():
         raise InvalidRequest(f"{what} needs a non-empty query")
-    if len(query.strip()) > limits.query_max_chars:
-        raise InvalidRequest(f"the query is {len(query.strip())} characters, and this tool accepts "
+    asked = query.strip()
+    if len(asked) > limits.query_max_chars:
+        raise InvalidRequest(f"the query is {len(asked)} characters, and this tool accepts "
                              f"at most {limits.query_max_chars}")
     _require_page(page, page_size, limits=limits)
+    return asked
 
 
-def check_recent_request(limit: int, since: object, *, limits: SearchLimits) -> None:
-    """The bounds of `list_recent_documents`: a bounded `limit`, and a `since` that filters."""
+def check_recent_request(limit: int, since: object, *, limits: SearchLimits) -> str | None:
+    """The bounds of `list_recent_documents`, returning the `since` to forward (`None` = no bound).
+
+    Same rule as `check_request`: the validated value is the forwarded one. A padded
+    `" 2026-01-01 "` used to clear this check and then fail the client's own validator, which the
+    caller heard as **`index_unavailable`: the index would not answer this request** — an outage
+    reported for a typo in their own argument, and an invitation to retry something that can never
+    succeed. It is `invalid-request` (or, once stripped, a valid request) and never the other.
+    """
     _require_page(1, limit, limits=limits)
-    if since is not None and (not isinstance(since, str)
-                              or not _SINCE_FORM.match(since.strip())):
+    if since is None:
+        return None
+    if not isinstance(since, str) or _SINCE_FORM.fullmatch(since.strip()) is None:
         raise InvalidRequest(
             f"since must be 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS', got {since!r}. A value in ISO "
             "`…Z` form is refused rather than rewritten: measured against the pinned container it "
             "answers 200 with no rows at all, and the column it would be compared against has no "
             "documented timezone, so converting it would pick a meaning for the instant and hide "
             "that choice from whoever asked for yesterday")
+    return since.strip()
 
 
 def _require_page(page: int, page_size: int, *, limits: SearchLimits) -> None:
@@ -679,14 +700,15 @@ async def search_documents(ctx, store, papra, kz, query: str, *, page: int = 1,
     short because a document of yours is in the Papra trash (the next live one is pulled up into
     that slot, which is what "the archive answered and the answer was no" means for a listing).
     """
-    check_request(query, page, page_size, limits=limits, what="search_documents")
+    asked = check_request(query, page, page_size, limits=limits, what="search_documents")
     call = CallScope(limits=limits)
 
     async def sweep() -> Sweep:
         generation = await asyncio.to_thread(store.get_generation)
 
         async def fetch(upstream_page: int, limit: int):
-            return await kz.search(query, page=upstream_page, limit=limit)
+            # `asked`, not `query`: the value that cleared the bound is the value that leaves.
+            return await kz.search(asked, page=upstream_page, limit=limit)
 
         async def resolve(hits, need):
             resolved, _stats = await resolve_hits(ctx, store, papra, hits,
@@ -718,16 +740,17 @@ async def list_recent_documents(ctx, store, papra, kz, *, limit: int = 20, since
     `limit` is a request, the scan budget applies, and a scan that stops early has to say so — a
     `list` has nowhere to put that. Same fields, same `partial` rule as a search.
     """
-    check_recent_request(limit, since, limits=limits)
+    watermark = check_recent_request(limit, since, limits=limits)
     call = CallScope(limits=limits)
 
     async def sweep() -> Sweep:
         generation = await asyncio.to_thread(store.get_generation)
 
         async def fetch(upstream_page: int, row_limit: int):
-            # `since` is passed through untouched: it is Kreuzakt's own format, checked by the
-            # client that refuses the shapes it demonstrably does not filter on.
-            rows = await kz.list_documents(page=upstream_page, limit=row_limit, since=since)
+            # `watermark` is the `since` that cleared `check_recent_request`, stripped: what the
+            # caller wrote is validated and forwarded as one value, so no padded shape can reach
+            # the client's own validator and be reported to the caller as an index outage.
+            rows = await kz.list_documents(page=upstream_page, limit=row_limit, since=watermark)
             # The same required-fields check `/api/search` rows go through: a listing row missing
             # `added_at` is an error naming the row, not `""`, which would sort as the oldest
             # document in the archive.
