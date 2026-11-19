@@ -562,6 +562,34 @@ async def test_the_same_papra_id_in_two_granted_buckets_is_two_items(store):
     assert page.stats.kept == 2 and page.stats.expanded == 1
 
 
+async def test_the_liveness_helper_answers_a_repeated_question_from_its_call_cache(store):
+    """`_live_document` asks Papra once per call, at the helper level — and that is all it can pin.
+
+    Stated plainly, because the honest finding is that this is not a gap the tools can show:
+    `resolve_hits` adds every candidate to `call.emitted` before it queues it, so no reachable tool
+    path ever asks about the same `(org, document)` twice inside one call, and deleting the cache
+    therefore changes nothing observable through `search_documents` (measured: 0 of 1462 fail).
+    That makes the cache redundant with the dedup today, not wrong — and the one place its own
+    promise is observable is the helper itself, which is where this pins it, so the first change
+    to make candidates repeatable does not silently turn a bounded call into fifty reads of one
+    document. It proves the helper's contract. It does not prove, and must not be read as proving,
+    that the tools exercise it.
+    """
+    from papra_suite.mcp_tools import CallScope, _live_document
+
+    papra = FakePapra({"doc-1": papra_doc("doc-1")})
+    call = CallScope()
+    ref = SimpleNamespace(papra_org_id=ORG_A, papra_document_id="doc-1")
+    first = await _live_document(papra, call, ref)
+    second = await _live_document(papra, call, ref)
+    assert papra.get_calls == 1, "the second question should have been answered from the cache"
+    assert first == second
+    # …and a different bucket's copy of the same id is a different question.
+    await _live_document(papra, call, SimpleNamespace(papra_org_id=ORG_B,
+                                                      papra_document_id="doc-1"))
+    assert papra.get_calls == 2
+
+
 async def test_the_liveness_answer_is_cached_per_bucket_not_per_document_id(store):
     """The cache key is the reference, so one bucket's `isDeleted` never answers for another's.
 

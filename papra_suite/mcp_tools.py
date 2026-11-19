@@ -466,6 +466,12 @@ async def _live_document(papra, call: CallScope, ref) -> dict | None | object:
     knowledge of a document somebody may have deleted in between. Bounded by the number of documents
     one call can return, because a call is bounded.
 
+    **It is defensive today, and the test that pins it says so.** `resolve_hits` admits each
+    `(org_id, document_id)` to the candidate list once per call (`call.emitted`), so no tool path
+    reachable right now asks this function the same question twice — which is why deleting the cache
+    changes no observable behaviour of `search_documents`. The contract is still worth pinning, at
+    the helper, because it is the helper that would be reused the first time that stops being true.
+
     Any exception at all is `UNKNOWN`. Not distinguishing a 404 from a timeout is deliberate — both
     mean "cannot be shown", and the difference is Papra's internals rather than something the caller
     may act on. It is counted, so an outage is a number rather than a quietly short page.
