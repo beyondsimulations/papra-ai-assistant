@@ -70,6 +70,12 @@ class LiveKreuzakt:
     async def list_documents(self, *, page=1, limit=100, since=None):
         raise AssertionError("no live listener test here lists the index")
 
+    async def get_document(self, document_id):
+        raise AssertionError(
+            "no live listener test here reads a document from the index: the ones that call "
+            "get_document/get_document_content are fail-closed cases, which must refuse before "
+            "reaching this object")
+
 
 class LivePapra:
     """The one Papra read the search tools make, so the containment check lets the app build at all.
@@ -111,7 +117,13 @@ async def listener(tmp_path):
                                   papra_original_name="d1.pdf")
     port = free_port()
     config = SimpleNamespace(**dict(BASE_ENV, DATA_DIR=str(tmp_path)),
-                             mcp_host="127.0.0.1", mcp_port=port, mcp_url=PUBLIC_URL)
+                             mcp_host="127.0.0.1", mcp_port=port, mcp_url=PUBLIC_URL,
+                             # What `open_document` builds its two URLs out of. Named here rather
+                             # than left to `getattr(…, None)`, so the live listener advertises a
+                             # tool that is wired the way production wires it: a listener whose
+                             # links could never resolve would pass the tool-list test while
+                             # answering nothing.
+                             papra_base_url="http://papra.test:1221")
     kreuzakt = LiveKreuzakt()
     stop = asyncio.Event()
     task = asyncio.create_task(run_mcp_listener(config, store, papra=LivePapra(), kreuzakt=kreuzakt,
@@ -269,17 +281,23 @@ async def test_the_sdk_client_completes_a_session_and_calls_the_tool(listener):
     are all SDK behaviour; a hand-rolled client would test our parsing of our own request shapes and
     miss a client that cannot get in the door.
 
-    The advertised list is three now that the search tools exist, and it is still asserted by name
-    and in order: an agent's first act is `tools/list`, so a fourth tool appearing here, or a scope
-    argument on one of these three, is a surface change reaching the agents before any code review
-    would notice it.
+    The advertised list is six since Task 14 added the document tools, and it is asserted by name
+    and in order: an agent's first act is `tools/list`, so a seventh tool appearing here — or a
+    bucket, scope or base-URL argument on any of the six — is a surface change reaching the agents
+    before any code review would notice it. The order is registration order, and it is the order an
+    agent meets the surface in: state, search, then the three ways of reading one document.
     """
     token = mint_token(listener.store, label="sdk", org_ids=[ORG])
     async with raw_client(token) as http:
         async with Client(streamable_http_client(listener.endpoint, http_client=http)) as client:
             tools = await client.list_tools()
             assert [tool.name for tool in tools.tools] == [
-                "index_status", "search_documents", "list_recent_documents"]
+                "index_status", "search_documents", "list_recent_documents",
+                "get_document", "get_document_content", "open_document"]
+            for tool in tools.tools:
+                assert not [name for name in tool.inputSchema.get("properties", {})
+                            if any(word in name.lower() for word in
+                                   ("org", "scope", "bucket", "token", "url"))], tool.name
             result = await client.call_tool("index_status")
 
     payload = result.structured_content
@@ -334,3 +352,23 @@ def test_nothing_listens_until_the_setting_enables_it(tmp_path):
     with pytest.raises(OSError):
         with socket.create_connection(("127.0.0.1", port), 0.25):
             pass
+
+
+async def test_a_document_the_ledger_cannot_vouch_for_never_reaches_the_index_live(listener):
+    """The scope-before-index rule, on a real socket, with an index that would raise if asked.
+
+    `d1` has a ledger row and no Kreuzakt binding, so no generation makes it a live reference: the
+    honest answer is `not-found`, and the honest *cost* is zero requests.
+    `LiveKreuzakt.get_document` and `LivePapra.get_document` both raise, so this fails loudly if a
+    future version decides to ask first and judge afterwards — which is the difference between a
+    scope check and a scope check with a latency and enumeration side effect. It is asserted over
+    uvicorn rather than through `TestClient` because the point is what the shipped listener sends on
+    the wire.
+    """
+    token = mint_token(listener.store, label="fail-closed", org_ids=[ORG])
+    async with raw_client(token) as http:
+        async with Client(streamable_http_client(listener.endpoint, http_client=http)) as client:
+            for name in ("get_document", "get_document_content", "open_document"):
+                with pytest.raises(MCPError) as caught:
+                    await client.call_tool(name, {"document_id": "d1"})
+                assert "not-found" in str(caught.value), name

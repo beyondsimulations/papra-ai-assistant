@@ -1314,15 +1314,18 @@ def registered_tools(store, token):
     return {tool["name"]: tool for tool in frames[0]["result"]["tools"]}
 
 
-async def test_only_the_two_search_tools_are_registered(store):
-    """Task 14 owns `get_document`, `get_document_content` and `open_document`: none is here yet.
+async def test_the_surface_is_the_six_registered_read_tools(store):
+    """The tool list, asserted as a set, so an addition has to be a decision.
 
-    A tool that is registered early is a tool whose authorization path has not been reviewed, and
-    the write flag this milestone gates on is switched on by what the surface can do.
+    Task 14 added `get_document`, `get_document_content` and `open_document` (their schemas and
+    their scope rules are pinned in `tests/test_mcp_documents.py`). What this test is for has not
+    changed: a tool that appears here without a reviewed authorization path widens the surface, and
+    the milestone's write flag is switched on by what the surface can do.
     """
     token = mint_token(store, label="wire", org_ids=[ORG_A])
     assert set(registered_tools(store, token)) == {
-        "index_status", "search_documents", "list_recent_documents"}
+        "index_status", "search_documents", "list_recent_documents",
+        "get_document", "get_document_content", "open_document"}
 
 
 async def test_the_listener_serves_one_route_and_no_other(store):

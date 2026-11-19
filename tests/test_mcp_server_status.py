@@ -59,12 +59,12 @@ OTHER = "org-2"
 
 
 class FakeKreuzakt:
-    """`health` and `queue_counts`, counted, plus the two content reads named so the app can build.
+    """`health` and `queue_counts`, counted, plus the content reads named so the app can build.
 
-    Everything `index_status` is allowed to ask is scripted; the two reads that belong to
-    `search_documents` and `list_recent_documents` raise, because a status test that answered a
-    search from an unscripted fake would report an archive it never seeded. The search tests in
-    `tests/test_mcp_search.py` script those two themselves.
+    Everything `index_status` is allowed to ask is scripted; the three reads that belong to
+    `search_documents`, `list_recent_documents` and the document tools raise, because a status test
+    that answered a search from an unscripted fake would report an archive it never seeded. The
+    search and document tests script those three themselves.
     """
 
     def __init__(self, *, counts=None, health_body=None, error=None):
@@ -91,6 +91,9 @@ class FakeKreuzakt:
 
     async def list_documents(self, *, page=1, limit=100, since=None):
         raise AssertionError("an index_status test asked the index for a document listing")
+
+    async def get_document(self, document_id):
+        raise AssertionError("an index_status test asked the index for one document")
 
 
 class NoPapra:

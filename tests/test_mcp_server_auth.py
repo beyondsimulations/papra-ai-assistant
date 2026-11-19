@@ -52,10 +52,10 @@ class OkKreuzakt:
     """Every read a shipped handler may ask the index for, the two counted.
 
     `search`/`list_documents` are named because `REQUIRED_READS["kreuzakt"]` asks for them since
-    Task 13: a double that cannot answer them is refused at construction, and every auth test in
-    this file needs the app to *build*. None of them calls a search, so the two that exist only
-    fail loudly — a credential test that served search results from a fake nobody scripted would
-    be a credential test measuring nothing.
+    Task 13, and `get_document` since Task 14: a double that cannot answer them is refused at
+    construction, and every auth test in this file needs the app to *build*. None of them calls a
+    read, so the three that exist only fail loudly — a credential test that served document contents
+    from a fake nobody scripted would be a credential test measuring nothing.
     """
 
     def __init__(self, *, counts=None):
@@ -76,6 +76,9 @@ class OkKreuzakt:
 
     async def list_documents(self, *, page=1, limit=100, since=None):
         raise AssertionError("no auth test here reads the index's contents")
+
+    async def get_document(self, document_id):
+        raise AssertionError("no auth test here reads one document from the index")
 
 
 class OkPapra:

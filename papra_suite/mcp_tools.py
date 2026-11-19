@@ -42,13 +42,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
 import sqlite3
 from dataclasses import dataclass, field
+from urllib.parse import quote, urlparse
 
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel
 
-from papra_suite.kreuzakt_client import KreuzaktError, KzHit, _hit_from_row
+from papra_suite.kreuzakt_client import KreuzaktError, KzDocument, KzHit, _hit_from_row
 
 # `_hit_from_row` is imported rather than re-written: it is the single check that a Kreuzakt row
 # carries the fields the bridge depends on, and the house precedent for borrowing a private
@@ -56,6 +58,7 @@ from papra_suite.kreuzakt_client import KreuzaktError, KzHit, _hit_from_row
 # here by hand would be a second rule about `added_at`, and the drift would look like a document
 # that is older than everything.
 from papra_suite.store import sanitize_event_text
+from papra_suite.untrusted_text import strip_unsafe_text
 
 logger = logging.getLogger("papra_suite.mcp_tools")
 
@@ -934,3 +937,439 @@ def _page(swept: Sweep, call: CallScope, *, items: list[SearchItem], page: int, 
         buckets_skipped=list(call.skipped),
         partial_reason="; ".join(reasons) or None,
     )
+
+
+# --- the three document tools ------------------------------------------------------------------
+
+#: The 2026-11-16 spec's `Content size` ceiling for one document read, and the bound of the
+#: `max_chars` argument. The realistic failure it protects against is not an exploit but a 400-page
+#: bank statement, so the ceiling is a refusal a caller can see and work around (`truncated`,
+#: `chars_total`, and `open_document` for the rest of it) rather than a clamp nobody notices.
+MAX_CONTENT_CHARS = 20_000
+
+#: What a `DocumentView` says about where the document lives, and the only value it ever says. A
+#: constant rather than a per-call observation because it is a fact about this deployment's identity
+#: model: everything a caller can act on is a Papra address. Naming a second system here — even a
+#: truthful "kreuzakt" — would tell an agent about a service it has no business addressing and no
+#: credential for.
+OPENED_FROM = "papra"
+
+#: The refusal for "this id is not a document the caller may read, and here is what that does and
+#: does not mean". The negative half is not decoration: `not-found` is what a stale generation, a
+# : soft-deleted row and a never-indexed document all answer, and a caller who reads it as "the
+# archive
+#: has no such document" will tell a user their invoice was never uploaded.
+_NOT_FOUND_MESSAGE = (
+    "no live reference to that document id exists in the part of this archive this token may read. "
+    "That covers a document that was never indexed, one that is deleted, and one whose index entry "
+    "belongs to a generation that has since been rebuilt; it is not a claim that the archive does "
+    "not hold the document")
+
+#: …and the refusal for "it exists, elsewhere". `not-in-scope` is the plan's code, and it is an
+#: existence oracle about buckets this caller was not given: with a guessable id, `not-in-scope` and
+#: `not-found` are two answers where the safe deployment would give one. Two things narrow it as far
+#: as the code allows — it fires only for a reference that is live and bound to the current
+# : generation (a foreign row that is deleted or stale answers `not-found`, like everything else),
+# and
+# : it never names the bucket or the document's title — and the argument for retiring it is written
+# up
+#: in the task report rather than settled here.
+_NOT_IN_SCOPE_MESSAGE = (
+    "a live reference to that document id exists in a bucket this token was not given, so nothing "
+    "about it is readable here. The bucket is not named, and no other detail is returned")
+
+# : The shape a Kreuzakt rowid has: digits, and nothing else. Papra's ids are prefixed, entropy-
+# bearing
+# : strings (`doc_bm1plswq9gnov2u9jvvc9s6r` in the 2026-11-17 webhook capture), so this never
+# shadows a
+#: real id — it matches the thing that must not be a lookup.
+_KREUZAKT_ROWID_FORM = re.compile(r"\d+")
+
+
+class DocumentNotFound(ToolError):
+    """`not-found: …` — this caller may not read anything about that id.
+
+    One code for four causes (absent, deleted, stale generation, and a Kreuzakt rowid presented as a
+    document id) because the four are indistinguishable from the outside and one of them is not an
+    answer the caller should be able to distinguish at all: if `"7"` said anything different from
+    `"doc_zzz"`, the first probe would tell a caller whether the index has seven rows.
+    """
+
+    def __init__(self, reason: str = _NOT_FOUND_MESSAGE):
+        super().__init__(f"not-found: {reason}")
+
+
+class NotInScope(ToolError):
+    """`not-in-scope: …` — a live reference exists outside this token's buckets.
+
+    See `_NOT_IN_SCOPE_MESSAGE`: this is the one place on the MCP surface where a scoped token is
+    told that something exists that it cannot have. The alternative — answering `not-found` — was
+    the
+    spec's own rule (`not_found_or_not_accessible`: "distinguishing them leaks existence across the
+    allow-list boundary"), and the plan for this milestone overrode it so that an operator debugging
+    an empty result can tell "wrong token" from "no document". Both are true, which is why the code
+    says as little as it can and the report argues the rest.
+    """
+
+    def __init__(self, reason: str = _NOT_IN_SCOPE_MESSAGE):
+        super().__init__(f"not-in-scope: {reason}")
+
+
+class DocumentView(BaseModel):
+    """One document, in the same terms a `SearchItem` uses — plus the two fields Papra does not
+    hold.
+
+    **Where each field comes from**, because "the archive" is two systems and they disagree:
+
+    * `document_id`, `org_id` — the ledger's, i.e. Papra's. These are the only identifiers.
+    * `title`, `document_date` — Papra's live record when it has them, the index otherwise. Both are
+      fields the operator edits in Papra, and the rule is `_item`'s: a view that showed the index's
+      stale copy of a renamed document would be a small confident wrong answer.
+    * `mime_type` — Papra's, for the same reason.
+    * `description`, `original_filename`, `page_count` — the index's, because that is where they
+      exist. `page_count` is null when the index does not know, never `0`.
+
+    No Kreuzakt integer, no Kreuzakt path: `KzDocument` never carried them and this model has no
+    field that could.
+    """
+
+    document_id: str
+    org_id: str
+    title: str
+    description: str
+    document_date: str | None
+    original_filename: str
+    mime_type: str | None
+    page_count: int | None
+    opened_from: str
+
+
+class ContentResult(BaseModel):
+    """The document's text, bounded, sanitised, and labelled for what it is.
+
+    `chars_total` is the length of the **sanitised** text this tool could have returned, so
+    `chars_total - len(body)` is exactly what was withheld and `chars_total` never counts a
+    character
+    the caller was never offered. `truncated` is the plan's flag; the spec's `chars_omitted` is
+    derivable from these two and is not carried twice. `sanitized` says whether the character rule
+    changed anything, so "this document contains no control or format characters" is a fact the
+    caller
+    can read rather than an assumption about a tool it cannot see inside.
+
+    `text` is the whole message: the untrusted-content wrapper is part of the text an agent reads,
+    and
+    an agent that receives the field receives the label with it.
+    """
+
+    text: str
+    truncated: bool
+    chars_total: int
+    sanitized: bool
+
+
+class OpenResult(BaseModel):
+    """Two Papra URLs, built from nothing but the configured base and the reference's own ids.
+
+    They are the answer to "I need the rest of it" and to "show me the file": the omitted tail is
+    unreachable through MCP by the spec's v1 rule, so the honest offering is a place a human can
+    open. Both are UI routes rather than API routes, measured against the pinned stack:
+    `/organizations/{org}/documents/{id}` and its `/file` answer 200, while
+    `/api/organizations/{org}/documents/{id}/file` answers 401 to anything with no key — a URL an
+    agent cannot authenticate with is not a fallback, it is a dead end that looks like one.
+    """
+
+    viewer_url: str
+    download_url: str
+
+
+def _require_document_id(document_id: object, *, what: str) -> str:
+    """The id bounds, returning the value that is then used. Never a Kreuzakt rowid.
+
+    Two refusals, in the order that matters. An empty or whitespace id is `invalid-request`: nothing
+    was asked of the archive, so nothing may be answered about it. A digits-only id is `not-found`
+    and is refused **before any read at all** — the shape is the whole test, so a probe of the
+    index's
+    rowid space costs a ledger query and an index read for the answer, and gets neither. Papra ids
+    are
+    prefixed and entropy-bearing, so no real document is refused by this rule; `"0000007"` included.
+    """
+    if not isinstance(document_id, str) or not document_id.strip():
+        raise InvalidRequest(f"{what} needs a papra document id, got {document_id!r}")
+    asked = document_id.strip()
+    if _KREUZAKT_ROWID_FORM.fullmatch(asked):
+        raise DocumentNotFound()
+    return asked
+
+
+def _resolve_reference(ctx, store, document_id: str, *, what: str):
+    """The one ledger read these tools make, and the whole authorization decision.
+
+    Blocking by design, so it runs under `asyncio.to_thread` like every other store touch here. The
+    order is the one the plan's Step 2 gives, and each step is a different lie prevented:
+
+    1. `get_generation` first. A reference bound under an epoch that has been rebuilt points at an
+    id
+       that may now be some other document's bytes, so it is not a reference at all.
+    2. `ledger_refs_for_document` — every row carrying the id, deleted and stale ones included,
+       because the distinction between "nowhere", "not yours" and "not any more" is what the three
+       refusals are made of.
+    3. The scope test, against the **token**, on the **reference**: nothing here asks either API
+       whether the document may be shown, so a scope answer costs one query and no network — which
+       is
+       what keeps "is this mine?" from becoming a latency and enumeration question at the index.
+    4. More than one live in-scope row is `invalid-request`, not a pick. Papra ids are per
+       organisation and global uniqueness is unverified; the 2026-11-16 spec's answer to one id in
+       two
+       allowed orgs is `multiple_matches` naming both, and since this tool takes no bucket argument
+       the request itself is under-specified. Both names are safe to print here: the caller is
+       granted
+       every bucket the message lists.
+    """
+    generation = store.get_generation()
+    refs = store.ledger_refs_for_document(document_id)
+    live = [ref for ref in refs
+            if ref.deleted_at is None and ref.delivered_generation == generation]
+    mine = [ref for ref in live if ctx.scope_all or ref.papra_org_id in ctx.org_ids]
+    if len(mine) > 1:
+        buckets = ", ".join(sorted(ref.papra_org_id for ref in mine))
+        raise InvalidRequest(
+            f"{what}: {document_id} is a live document in {len(mine)} buckets ({buckets}), and "
+            "this tool takes no bucket argument, so it cannot answer which one you mean. Ask for "
+            "the document through one bucket's own credential, or open it in papra")
+    if mine:
+        return mine[0]
+    if live:
+        raise NotInScope()
+    raise DocumentNotFound()
+
+
+async def _live_record(papra, ref, *, what: str) -> dict:
+    """Papra's current record for the one document the ledger already handed over.
+
+    Two answers are refused here rather than absorbed, and both are the same mistake:
+
+    **A read that errors is the outage code, not `not-found`.** In a search page an unchecked hit is
+    dropped and counted, because the page has `partial` to say "this may be missing something". Here
+    the document *is* the answer, and `not-found` would be a claim about the archive this call did
+    not
+    get to make — the failure the spec's error model exists to prevent, in its smallest possible
+    form.
+    Logged with the exception's class and not its message, which is another process's prose.
+
+    **`isDeleted` is the archive's own no**, and it is asked before the index is touched: a document
+    in the Papra trash still has a live ledger row until the delete pass gets to it, and Kreuzakt
+    still
+    serves its text. Papra is the archive, so the answer is `not-found` and the index never sees the
+    request.
+
+    A record that is not a mapping raises on `record.get`, and `_guarded` turns that into the outage
+    code — the same treatment a malformed hit gets on the search path.
+    """
+    try:
+        record = await papra.get_document(ref.papra_org_id, ref.papra_document_id)
+    except Exception as error:  # noqa: BLE001 - "could not find out" is one answer here
+        logger.warning("mcp: %s could not read papra's live record for one document (%s), so it is "
+                       "refused rather than reported present or absent", what,
+                       type(error).__name__)
+        raise IndexUnavailable(
+            "papra would not say whether this document is still there, so it can be reported as "
+            "neither") from error
+    if record.get("isDeleted"):
+        raise DocumentNotFound(
+            "papra reports this document as deleted, so it is not shown even though the index "
+            "still holds a row for it")
+    return record
+
+
+def _document_view(ref, record: dict, kz_doc: KzDocument) -> DocumentView:
+    """The one place a Papra record and an index body become a view. See `DocumentView` for which
+    field comes from which, and why a field's owner is a question with two answers here."""
+    document_date = record.get("documentDate") or kz_doc.document_date
+    if isinstance(document_date, str) and len(document_date) > 10 and document_date[10] in "T ":
+        document_date = document_date[:10]      # Papra stores a bare date as an instant
+    return DocumentView(
+        document_id=ref.papra_document_id,
+        org_id=ref.papra_org_id,
+        title=_bounded_text(record.get("name") or kz_doc.title),
+        description=_bounded_text(kz_doc.description),
+        document_date=_bounded_text(document_date, 40) or None,
+        original_filename=_bounded_text(kz_doc.original_filename),
+        mime_type=_bounded_text(record.get("mimeType"), 100) or None,
+        page_count=kz_doc.page_count,
+        opened_from=OPENED_FROM,
+    )
+
+
+def _content_result(ref, raw: str, *, max_chars: int) -> ContentResult:
+    """Sanitise, cap, wrap — in that order, because each step's arithmetic depends on the one
+    before.
+
+    **Sanitise first**, so `chars_total` counts characters the caller could actually have been
+    given,
+    and so a truncated tail cannot end inside an escape sequence that a partial removal produced.
+
+    **Then cap**, and the cap applies to the document text, never to the message: cutting the
+    wrapper
+    in half leaves a reader unable to tell where the document stops, which is the one thing the
+    wrapper is for.
+
+    **Then wrap**, in a delimiter carrying a per-call nonce. A fixed `</document-content>` is a tag
+    any document can print, and a fence that a payload can close from the inside is worse than no
+    fence, because it reads like a boundary that holds. The document's own text is **not** rewritten
+    to defuse it: an invoice that contains that tag keeps saying it, and the only tag that ends the
+    block is the one this call generated. `secrets` rather than a counter or the clock, because the
+    reader this defends against has seen the previous results.
+
+    The header carries the two ids percent-encoded: an id that contained `>` would otherwise end the
+    opening tag inside its own attribute, and an attribute is exactly where an id-shaped string has
+    no
+    business having structure.
+    """
+    text = strip_unsafe_text(raw)
+    truncated = len(text) > max_chars
+    fence = f"document-content-{secrets.token_hex(4)}"
+    header = (f'<{fence} document_id="{quote(ref.papra_document_id, safe="")}" '
+              f'org_id="{quote(ref.papra_org_id, safe="")}" untrusted="true">')
+    return ContentResult(
+        text=f"{header}{text[:max_chars]}</{fence}>",
+        truncated=truncated,
+        chars_total=len(text),
+        # The rule always runs; this says whether it had anything to remove, so a clean document is
+        # reported as one instead of inheriting a warning it did not earn.
+        sanitized=text != raw,
+    )
+
+
+def _papra_origin(base_url: object) -> str:
+    """The configured Papra origin, or a refusal that quotes nothing back.
+
+    An URL is operator configuration, and this one is about to be printed into a link an agent may
+    click. So: http(s) and nothing else (an `ftp://`, `file://` or javascript-shaped base is a
+    refusal,
+    not a string concatenation), credentials refused rather than carried forward, and the query and
+    fragment dropped — a base that arrived with `?token=…` would otherwise hand that token to
+    whoever
+    opened the link. Neither the value nor a piece of it reaches the client's message or the log
+    line:
+    `PAPRA_BASE_URL` is the address of the archive, and a bearer of a read token is not owed the
+    deployment's internal hostnames.
+    """
+    unusable = IndexUnavailable(
+        "this server has no usable papra address configured, so it cannot offer a link. That is an "
+        "operator setting (PAPRA_BASE_URL), not something this request can change")
+    try:
+        parsed = urlparse(base_url) if isinstance(base_url, str) else None
+        port = parsed.port if parsed is not None else None
+    except ValueError:
+        parsed, port = None, None
+    if (parsed is None or parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username or parsed.password):
+        logger.warning("mcp: open_document refused: the configured papra base url is not a usable "
+                       "http(s) origin without credentials")
+        raise unusable
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"                    # an IPv6 literal needs its brackets kept intact
+    netloc = f"{host}:{port}" if port else host
+    return f"{parsed.scheme}://{netloc}{parsed.path.rstrip('/')}"
+
+
+async def get_document(ctx, store, papra, kz, document_id: str, *,
+                       deadline_s: float | None = TOOL_DEADLINE_S) -> DocumentView:
+    """One document's metadata, by its Papra id, for this principal.
+
+    The three steps are the whole design and they run in this order for cost reasons and for
+    security
+    ones at the same time: the **ledger** decides whose it is (one query, no network), **Papra**
+    says
+    whether it is still there (one GET), and **Kreuzakt** supplies what only the index knows (the
+    page
+    count, the index's own description and filename). A document that fails the first step never
+    causes a request to either service, which is what makes "a disallowed document is never fetched"
+    true of this tool rather than merely intended.
+
+    An index outage is refused here too, even though the fields that would have come from it are
+    metadata. A view that quietly omitted `page_count` and `description` during an outage would be a
+    different document than the one served on a healthy day, and the caller has no way to notice.
+    """
+    asked = _require_document_id(document_id, what="get_document")
+
+    async def body() -> DocumentView:
+        ref = await asyncio.to_thread(_resolve_reference, ctx, store, asked, what="get_document")
+        record = await _live_record(papra, ref, what="get_document")
+        kz_doc = await kz.get_document(ref.kreuzakt_id)
+        return _document_view(ref, record, kz_doc)
+
+    return await _guarded("get_document", body(), deadline_s=deadline_s)
+
+
+async def get_document_content(ctx, store, papra, kz, document_id: str, *,
+                               max_chars: int = MAX_CONTENT_CHARS,
+                               deadline_s: float | None = TOOL_DEADLINE_S) -> ContentResult:
+    """One document's text, bounded by `max_chars`, sanitised, and wrapped as data.
+
+    The text comes from the **index** and from nowhere else. Papra's detail payload carries a
+    `content`
+    field too — the copy this suite delivered — and falling back to it during an index outage would
+    answer with a copy that may be older, or blank where the index has text, with nothing in the
+    result to say which. So an outage is `index_unavailable`, and the worse copy stays unread.
+
+    `max_chars` is bounded by `MAX_CONTENT_CHARS` and refused outside it rather than clamped, for
+    the
+    reason every other bound here is refused: a caller that asked for 200 000 characters and got 20
+    000
+    believes it got 200 000. `truncated` and `chars_total` together say what was withheld, and
+    `open_document` is where the rest of it lives.
+    """
+    if (not isinstance(max_chars, int) or isinstance(max_chars, bool)
+            or not 1 <= max_chars <= MAX_CONTENT_CHARS):
+        raise InvalidRequest(
+            f"max_chars must be an integer between 1 and {MAX_CONTENT_CHARS}, got {max_chars!r} — "
+            "the bound is refused rather than clamped, so you are never handed a shorter document "
+            "than the one you asked for")
+    asked = _require_document_id(document_id, what="get_document_content")
+
+    async def body() -> ContentResult:
+        ref = await asyncio.to_thread(_resolve_reference, ctx, store, asked,
+                                      what="get_document_content")
+        # Checked, not read: this is the call that refuses a document Papra has
+        # trashed (and an index outage that must not be answered from Papra's copy).
+        await _live_record(papra, ref, what="get_document_content")
+        kz_doc = await kz.get_document(ref.kreuzakt_id)
+        return _content_result(ref, kz_doc.content, max_chars=max_chars)
+
+    return await _guarded("get_document_content", body(), deadline_s=deadline_s)
+
+
+async def open_document(ctx, store, document_id: str, *, papra_base_url: str | None,
+                        deadline_s: float | None = TOOL_DEADLINE_S) -> OpenResult:
+    """Where this document lives in Papra: two URLs, no other service, and no network call at all.
+
+    The scope rule is the same as the other two tools — same ledger read, same three refusals — and
+    then this stops. That is deliberate, and it is worth stating what it buys and what it costs:
+
+    * It buys a tool that still works while the index is down (which is when an operator most wants
+      the link), and one whose answer cannot name a Kreuzakt path, id or host, because it never
+      speaks
+      to Kreuzakt.
+    * It costs the live Papra check. A document deleted in Papra a moment ago, whose ledger row the
+      delete pass has not marked yet, still gets a URL. No content is disclosed by that — the caller
+      already holds the id, and the link goes to the archive's own UI, which is the authority on
+      whether the document is there and says so itself. The two tools that return text do check, and
+      they are where the disclosure would be.
+
+    Path segments are percent-encoded with `safe=""`, so an id that reads `../../admin?x=1#y` cannot
+    walk out of the route it belongs in: the encoding belongs to the URL, and the id is reported
+    verbatim everywhere else.
+    """
+    asked = _require_document_id(document_id, what="open_document")
+    origin = _papra_origin(papra_base_url)
+
+    async def body() -> OpenResult:
+        ref = await asyncio.to_thread(_resolve_reference, ctx, store, asked,
+                                      what="open_document")
+        path = (f"/organizations/{quote(ref.papra_org_id, safe='')}"
+                f"/documents/{quote(ref.papra_document_id, safe='')}")
+        return OpenResult(viewer_url=f"{origin}{path}", download_url=f"{origin}{path}/file")
+
+    return await _guarded("open_document", body(), deadline_s=deadline_s)

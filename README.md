@@ -673,9 +673,55 @@ strings: no Kreuzakt path (`/api/documents/…`, `/thumbnail`, `/original`), no 
 asserts every one of those needles against Task 3's byte-exact captured search response, which carries
 all of them.
 
-This task ships the transport, the credentials and `index_status`; `search_documents` and
-`list_recent_documents` arrived with Task 13, and `get_document`, `get_document_content` and
-`open_document` are the next task: until they land, a client that connects sees three tools.
+## The three document tools
+
+A client that connects today sees **six** tools: `index_status`, `search_documents`,
+`list_recent_documents`, `get_document`, `get_document_content`, `open_document`. The last three take
+a **Papra** document id — the id a search result carries — and nothing else: not a bucket, not a scope,
+not a base URL. An id that is nothing but digits is `not-found` before anything is read, because the
+index's own row numbers are not document ids here, and treating them as lookups would make an
+integer-space enumeration of a corpus-wide index a supported use of the surface.
+
+Every read goes through the same three read-only views as the search tools, and the order is the
+design: the **ledger** decides whose the document is (one query, no network), **Papra** says whether it
+is still there (one GET), and only then is **Kreuzakt** asked for what only it knows. A document
+outside the token's buckets is refused with zero requests to either service, which is what makes "a
+disallowed document is never fetched" true of these tools rather than merely intended. Fail-closed
+means the same thing here as in a search: no live ledger row at the current generation is
+`not-found`, a document Papra reports deleted is `not-found` even though the index still serves it, and
+a Papra read that **errors** is `index_unavailable` and is logged — "could not find out" is not
+evidence of absence, and here the single document *is* the whole answer, so there is no `partial` flag
+to hide it under.
+
+`get_document_content` returns at most **20 000 characters** (`max_chars` is 1–20 000 and is refused
+outside that range, never clamped), reports `truncated` and `chars_total`, and says with `sanitized`
+whether control and format characters were removed. The character rule is the one `papra-suite events`
+applies to text somebody else sent (`papra_suite/untrusted_text.py`: C0/C1 controls, format characters,
+surrogates, unassigned and private-use code points, U+2028/U+2029) — one rule, shared with the terminal
+renderer rather than a second one that can drift. Newlines and tabs survive, because a document body is
+not a log line. The text is wrapped in a delimiter carrying a per-call nonce, so a document that prints
+`</document-content>` keeps that sentence as data and cannot close the block; and, per the spec, that
+label is **guidance, not a boundary** — it cannot make an agent obey anything. The text itself comes
+from the index only: Papra's delivered copy is not a fallback, because a copy that may be older or
+blank, returned during an outage with nothing saying so, is a worse answer than a refusal.
+
+`open_document` builds both URLs out of `PAPRA_BASE_URL` and the reference's own bucket and id,
+percent-encoded, and speaks to nothing else — no index request, no index host or path in the answer or
+in the refusal. It is the one document tool that does not check Papra's live state: it discloses no
+content, only a place a human can open, and the archive's own UI is the authority behind that address.
+
+**`not-in-scope` is a disclosure, and it is written down here for the same reason the banded counters
+are.** It is the one code on this surface that tells a scoped token that something exists which it
+cannot have. It is as narrow as the code can make it: it fires only for a reference that is live and
+bound to the current generation (a foreign row that is deleted or stale answers `not-found`, like
+everything else), and it never names the bucket, the title, or anything else about the document. What
+it cannot be made not to say is the fact itself: to a leaked single-bucket token that holds a real
+document id, `not-in-scope` and `not-found` are two answers where collapsing them would be one, and
+Papra's ids are the only thing standing between that and an enumeration. The 2026-11-16 spec's own
+error model collapsed the two on exactly that argument; this milestone's plan separated them so that an
+operator debugging an empty result can tell "wrong token" from "no such document". Both are true, the
+code follows the plan, and the argument for collapsing them is in the Task 14 report rather than
+settled here.
 
 ### Handing the `content` column over
 
