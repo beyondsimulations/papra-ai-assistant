@@ -561,6 +561,26 @@ def test_drain_refuses_filters_that_would_narrow_the_reading(store, capsys):
     assert "drain" in capsys.readouterr().err
 
 
+def test_the_listing_prints_newest_first_after_the_rowid_ordering(store, capsys):
+    """The queue view's contract, at the terminal rather than in the store.
+
+    `ORDER BY rowid DESC` replaced `ORDER BY created_at DESC, rowid DESC` to stop the bare listing
+    sorting the whole table, and the claim is that the operator sees the same page, in the same
+    order. `enqueue_job` stamps `created_at` as it inserts, so newest-last-inserted is both
+    orderings; this pins it where it is read, because that order is how an operator picks a row to
+    `--reset`.
+    """
+    first = seed_job(store, kind="index", document_id="doc-first")
+    second = seed_job(store, kind="index", document_id="doc-second")
+    third = seed_job(store, kind="index", document_id="doc-third")
+
+    assert run_jobs(None, cli_args(kind="index"), store=store) == 0
+
+    body = [line for line in capsys.readouterr().out.splitlines()
+            if line.startswith(("yes\t", "no\t"))]
+    assert [line.split("\t")[1] for line in body] == [third, second, first]
+
+
 @pytest.mark.parametrize("flag,over", [("--document-id", {"document_id": ""}),
                                       ("--kind", {"kind": ""}),
                                       ("--document-id", {"document_id": "   "})],
