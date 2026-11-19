@@ -1118,15 +1118,15 @@ def _resolve_reference(ctx, store, document_id: str, *, what: str):
     if mine:
         return mine[0]
     if live:
-        # Out of scope, and answered `not-found` like everything else — one line for both cases, so
-        # no caller can tell them apart. The reason still has to be recorded somewhere, and the
-        # place it is recorded is where the caller cannot read: Task 13's banded counts work the
-        # same way. The withheld fact is worth having when somebody debugs "the assistant cannot
-        # see a
-        # document I can see in papra", and it is not worth handing to the token that asked, so the
-        # holding bucket and that token's label go to the log and the answer stays one line that
-        # names nothing. Delete this line and the collapse costs the operator the diagnosis; that is
-        # what `test_the_reason_goes_to_the_log_that_the_answer_may_not_give` is for.
+        # Out of scope, and answered `not-found` like everything else — one line for both
+        # cases, so no caller can tell them apart. The reason still has to be recorded somewhere,
+        # and where it is recorded is where the caller cannot read: Task 13's banded counts work
+        # the same way. The withheld fact is worth having when somebody debugs "the assistant
+        # cannot see a document I can see in papra", and it is not worth handing to the token that
+        # asked, so the holding bucket and that token's label go to the log and the answer stays
+        # one line that names nothing. Delete this line and the collapse costs the operator the
+        # diagnosis; that is what
+        # `test_the_reason_goes_to_the_log_that_the_answer_may_not_give` is for.
         holders = ", ".join(sorted(ref.papra_org_id for ref in live))
         logger.info("mcp: %s refused %s: the id is a live reference in %s, which token %r is not "
                     "granted (%d row(s) for that id at generation %s)", what, document_id, holders,
@@ -1147,9 +1147,8 @@ async def _live_record(papra, ref, *, what: str) -> dict:
 
     **`isDeleted` is the archive's own no**, and it is asked before the index is touched: a document
     in the Papra trash still has a live ledger row until the delete pass gets to it, and Kreuzakt
-    still
-    serves its text. Papra is the archive, so the answer is `not-found` and the index never sees the
-    request.
+    still serves its text. Papra is the archive, so the answer is `not-found` and the index never
+    sees the request.
 
     A record that is not a mapping raises on `record.get`, and `_guarded` turns that into the outage
     code — the same treatment a malformed hit gets on the search path.
