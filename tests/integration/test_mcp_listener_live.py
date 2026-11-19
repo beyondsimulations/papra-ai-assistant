@@ -71,6 +71,23 @@ class LiveKreuzakt:
         raise AssertionError("no live listener test here lists the index")
 
 
+class LivePapra:
+    """The one Papra read the search tools make, so the containment check lets the app build at all.
+
+    A bare `object()` was enough while `index_status` was the only tool, because it reads no Papra.
+    Task 11 put `get_document` on `REQUIRED_READS["papra"]` for the live-state check, and the
+    containment check refuses to start a listener whose dependencies cannot answer what its handlers
+    may ask — so this fixture was a startup error from that commit on, correctly: a handler reaching
+    for a method its client does not have is exactly the thing that check exists to catch, and it
+    should be caught on the way up rather than on the first agent that asks. Nothing in this file
+    calls the method — the paging and fail-closed matrix is unit-suite work against scripted
+    dependencies — so it refuses loudly if a live test ever starts expecting an answer.
+    """
+
+    async def get_document(self, org_id: str, document_id: str) -> dict:
+        raise AssertionError("no live listener test here reads a Papra document")
+
+
 def free_port():
     """An ephemeral port, released before the listener takes it.
 
@@ -97,7 +114,7 @@ async def listener(tmp_path):
                              mcp_host="127.0.0.1", mcp_port=port, mcp_url=PUBLIC_URL)
     kreuzakt = LiveKreuzakt()
     stop = asyncio.Event()
-    task = asyncio.create_task(run_mcp_listener(config, store, papra=object(), kreuzakt=kreuzakt,
+    task = asyncio.create_task(run_mcp_listener(config, store, papra=LivePapra(), kreuzakt=kreuzakt,
                                                 stop=stop))
     endpoint = f"http://127.0.0.1:{port}/mcp"
     try:
@@ -251,12 +268,18 @@ async def test_the_sdk_client_completes_a_session_and_calls_the_tool(listener):
     Negotiating the protocol version, echoing `mcp-session-id`, and reading structured tool output
     are all SDK behaviour; a hand-rolled client would test our parsing of our own request shapes and
     miss a client that cannot get in the door.
+
+    The advertised list is three now that the search tools exist, and it is still asserted by name
+    and in order: an agent's first act is `tools/list`, so a fourth tool appearing here, or a scope
+    argument on one of these three, is a surface change reaching the agents before any code review
+    would notice it.
     """
     token = mint_token(listener.store, label="sdk", org_ids=[ORG])
     async with raw_client(token) as http:
         async with Client(streamable_http_client(listener.endpoint, http_client=http)) as client:
             tools = await client.list_tools()
-            assert [tool.name for tool in tools.tools] == ["index_status"]
+            assert [tool.name for tool in tools.tools] == [
+                "index_status", "search_documents", "list_recent_documents"]
             result = await client.call_tool("index_status")
 
     payload = result.structured_content
