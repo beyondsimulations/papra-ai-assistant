@@ -631,6 +631,8 @@ def main() -> int:
     if args.command == "serve":
         import asyncio
 
+        from papra_suite.mcp_server import McpListenerDied
+
         try:
             asyncio.run(run_serve(config))
         except ConfigError as error:
@@ -640,6 +642,11 @@ def main() -> int:
             # fixed, and `2` is the exit `check` gives for the same configuration.
             print(f"configuration error: {error}", file=sys.stderr)
             return 2
+        except McpListenerDied as error:
+            # Option C, availability: the port stopped answering, so the process stops with it, and
+            # non-zero — `restart: on-failure` never fires on a clean exit. One sentence, no stack.
+            print(f"fatal: {error}", file=sys.stderr)
+            return 1
         return 0
 
     return 1

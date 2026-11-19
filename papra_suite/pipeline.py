@@ -310,6 +310,20 @@ async def run_title_job(papra: PapraClient, title_llm: LLMClient, job: Job, *,
     await papra.update_document(job.papra_org_id, job.document_id, name=title)
 
 
+def _listener_death(name: str, error: BaseException | None) -> BaseException:
+    """One line naming the dead task and its cause, whatever shape the death took.
+
+    `asyncio.run` prints a traceback for whatever is raised here; this is the sentence an operator
+    actually reads in `docker logs`, so it is flattened (no newlines), redacted, and capped.
+    """
+    from papra_suite.mcp_server import McpListenerDied
+    from papra_suite.store import sanitize_event_text
+
+    detail = ("exited without an error and without being asked to stop" if error is None
+              else f"{type(error).__name__}: {sanitize_event_text(str(error), limit=200)}")
+    return McpListenerDied(" ".join(f"task {name} died: {detail}".split()))
+
+
 async def serve(config, *, stop: asyncio.Event | None = None,
                 store: Store | None = None, papra: PapraClient | None = None,
                 ocr_llm: LLMClient | None = None,
@@ -441,10 +455,12 @@ async def serve(config, *, stop: asyncio.Event | None = None,
     # on loopback.
     from papra_suite import mcp_server
 
+    listener_task = None
     if mcp_server.mcp_listener_requested(store):
-        tasks.append(asyncio.create_task(
+        listener_task = asyncio.create_task(
             mcp_server.run_mcp_listener(config, store, papra=papra, kreuzakt=kreuzakt, stop=stop),
-            name="mcp"))
+            name="mcp")
+        tasks.append(listener_task)
     else:
         logger.info("mcp: listener disabled (set the %s setting to 1 to start it); "
                     "tokens are minted with `papra-suite mcp-token --create` either way",
@@ -469,7 +485,38 @@ async def serve(config, *, stop: asyncio.Event | None = None,
         task.add_done_callback(_on_done)
 
     for task in tasks:
-        _supervise(task, task.get_name())
+        if task is not listener_task:
+            _supervise(task, task.get_name())
+
+    fatal: list[BaseException] = []
+
+    def _watch_listener(task: asyncio.Task) -> None:
+        """The listener's death ends the process; every other hosted task only logs.
+
+        A dead port beside a live `serve` is invisible from outside: `check` still prints
+        `mcp: enabled`, the app's own health endpoint still answers, and a container that eventually
+        stops with exit 0 cannot be restarted by a `restart: on-failure` policy. So the listener's
+        exit — raised OR returned — becomes `McpListenerDied`, reaped below and raised after the
+        other tasks have been cancelled. A shutdown that was already asked for is not a death.
+        """
+        def _on_done(done: asyncio.Task) -> None:
+            if done.cancelled():
+                return                      # the shutdown path: nobody is surprised
+            error = done.exception()
+            if stop.is_set():
+                # Coming down anyway: the exit is a side effect of the shutdown, not its cause.
+                if error is None:
+                    logger.info("task %s exited", done.get_name())
+                else:
+                    logger.error("task %s exited unexpectedly: %s", done.get_name(), error)
+                return
+            fatal.append(_listener_death(done.get_name(), error))
+            logger.error("%s", fatal[-1])
+            stop.set()
+        task.add_done_callback(_on_done)
+
+    if listener_task is not None:
+        _watch_listener(listener_task)
 
     stop_waiter = asyncio.create_task(stop.wait())
     try:
@@ -489,6 +536,11 @@ async def serve(config, *, stop: asyncio.Event | None = None,
                 store.close()
             except Exception:  # noqa: BLE001
                 logger.exception("error closing store during shutdown")
+
+    # Raised after the reap, so a dead listener still gets the orderly shutdown it shares with every
+    # other exit: clients closed, store closed, no cancelled task left running behind the error.
+    if fatal:
+        raise fatal[0]
 
 
 def _sync_settings_from_config(store: Store, config) -> None:
