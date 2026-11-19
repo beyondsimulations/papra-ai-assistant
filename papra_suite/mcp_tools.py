@@ -160,6 +160,33 @@ class SearchItem(BaseModel):
     original_filename: str
 
 
+#: The bands a *scoped* token is told a withheld count in, and the whole information content of
+#: those two fields for such a token: "none", "one", "a few", "many".
+WITHHELD_NONE = "0"
+WITHHELD_ONE = "1"
+#: At and above this many withheld rows, a scoped token is told only "10+".
+WITHHELD_MANY = 10
+
+
+def withheld_band(count: int) -> str:
+    """An exact count of withheld rows, collapsed to "0", "1", "2-9" or "10+".
+
+    Why a band and not the number is in `ResolveStats`: for a token that is not `--all-buckets`, the
+    exact figure states how many of the top `scan_rows` rows matching *the caller's own query*
+    belong to buckets they were not given, and it is quotable per query. That is a census of other
+    people's archive, and the caller can do nothing with it — the number is the denial, not a
+    diagnostic they can act on. A band keeps the useful half ("your query did match elsewhere, and
+    roughly how much") and drops the census. The exact value is logged for the operator.
+    """
+    if count <= 0:
+        return WITHHELD_NONE
+    if count == 1:
+        return WITHHELD_ONE
+    if count < WITHHELD_MANY:
+        return "2-9"
+    return "10+"
+
+
 class ResolveStats(BaseModel):
     """What the resolver did with the rows Kreuzakt returned, including what it threw away.
 
@@ -169,11 +196,28 @@ class ResolveStats(BaseModel):
     already forgotten, or invalidated by a rebuild), `dropped_deleted` is the archive's own answer,
     `dropped_lookup_error` is Papra failing to answer, and `dropped_unreached` is the fan-out bound
     leaving a bucket unconsulted. An empty result with no numbers is a dead end for its reader.
+
+    **Two of them are bands for a scoped token, not counts.** `dropped_unauthorized` and
+    `dropped_unmatched` are strings — `"0"`, `"1"`, `"2-9"`, `"10+"` — unless the caller holds an
+    `--all-buckets` token, in which case they are exact decimal strings. The reason is a disclosure,
+    not a formatting taste: for a scoped token `dropped_unauthorized` is *always* zero when it would
+    otherwise be informative-free (an all-buckets token is never denied), so the field's only
+    possible content is "N of the rows matching your query belong to buckets you were not granted".
+    With a caller-controlled query, that is a counting oracle over the archive, and the only tokens
+    that can produce a non-zero value are the per-device ones that were scoped precisely to see
+    nothing of the rest. `dropped_unmatched` is the same category: it can be drift inside a bucket
+    the caller may not be granted, and it tells them nothing they can act on. The exact counts stay
+    in the server log; the README's MCP section says plainly that a scoped token can learn *that*
+    other buckets have matches, which no field-level change can take away.
+
+    The rest are exact for everybody, because they are the caller's own business: `kept` and
+    `expanded` describe the answer, `dropped_deleted` is the archive's answer about documents in
+    scope, `dropped_lookup_error` is Papra failing, `dropped_unreached` is this call's own bound.
     """
 
     kept: int = 0
-    dropped_unauthorized: int = 0
-    dropped_unmatched: int = 0
+    dropped_unauthorized: str = WITHHELD_NONE
+    dropped_unmatched: str = WITHHELD_NONE
     dropped_deleted: int = 0
     dropped_lookup_error: int = 0
     dropped_unreached: int = 0
@@ -310,6 +354,28 @@ def _require_page(page: int, page_size: int, *, limits: SearchLimits) -> None:
 
 
 @dataclass
+class DropCounts:
+    """The exact counters, internal to one call, before anyone is told about them.
+
+    Kept apart from `ResolveStats` on purpose: the wire model is what a caller may know, and two of
+    these numbers are not in it for a scoped token. Splitting the two means the narrowing happens
+    in one place (`_wire_stats`) rather than wherever a counter happens to be incremented, and the
+    exact values are still there to log.
+    """
+
+    kept: int = 0
+    dropped_unauthorized: int = 0
+    dropped_unmatched: int = 0
+    dropped_deleted: int = 0
+    dropped_lookup_error: int = 0
+    dropped_unreached: int = 0
+    expanded: int = 0
+    #: Exception type names seen by `_live_document`, so one failing Papra can be described in the
+    #: log without logging one line per document.
+    lookup_error_types: list[str] = field(default_factory=list)
+
+
+@dataclass
 class CallScope:
     """What one tool call remembers across the pages it fetches.
 
@@ -330,7 +396,7 @@ class CallScope:
     reached: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     emitted: set = field(default_factory=set)
-    stats: ResolveStats = field(default_factory=ResolveStats)
+    stats: DropCounts = field(default_factory=DropCounts)
     _semaphore: asyncio.Semaphore | None = None
 
     def semaphore(self) -> asyncio.Semaphore:
@@ -413,8 +479,16 @@ async def _live_document(papra, call: CallScope, ref) -> dict | None | object:
         # Any failure at all is UNKNOWN, i.e. "do not show this one". Broad on purpose: the caller's
         # question is whether the document may be shown, and Papra refusing to say is one answer
         # whether it arrived as a 404, a timeout, or a body this client cannot read.
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
             record = UNKNOWN
+            # The type name only, bounded and deduplicated: `_log_what_the_caller_was_not_told`
+            # writes one line for the whole call, so a 50-document outage is one log line that says
+            # what kind of failure it was — and not Papra's message, which is prose from another
+            # process and would be in the log anyway with a traceback if we let one escape.
+            name = type(error).__name__
+            if name not in call.stats.lookup_error_types and len(
+                    call.stats.lookup_error_types) < 3:
+                call.stats.lookup_error_types.append(name)
     call.live[key] = record
     return record
 
@@ -721,7 +795,8 @@ async def search_documents(ctx, store, papra, kz, query: str, *, page: int = 1,
     start = (page - 1) * page_size
     reasons = swept.reasons(call, scan_rows=limits.scan_rows)
     return _page(swept, call, items=swept.items[start:start + page_size], page=page,
-                 page_size=page_size, reasons=reasons)
+                 page_size=page_size, reasons=reasons, scope_all=bool(ctx.scope_all),
+                 what="search_documents")
 
 
 async def list_recent_documents(ctx, store, papra, kz, *, limit: int = 20, since: str | None = None,
@@ -765,11 +840,54 @@ async def list_recent_documents(ctx, store, papra, kz, *, limit: int = 20, since
 
     swept = await _guarded("list_recent_documents", sweep(), deadline_s=deadline_s)
     reasons = swept.reasons(call, scan_rows=limits.scan_rows)
-    return _page(swept, call, items=swept.items[:limit], page=1, page_size=limit, reasons=reasons)
+    return _page(swept, call, items=swept.items[:limit], page=1, page_size=limit,
+                 reasons=reasons, scope_all=bool(ctx.scope_all), what="list_recent_documents")
+
+
+def _wire_stats(counts: DropCounts, *, scope_all: bool) -> ResolveStats:
+    """The exact counters, in the form this caller is allowed to have.
+
+    One place, because it is the only thing standing between a per-device token and a census of the
+    buckets it was not given: an all-buckets caller gets the numbers (`dropped_unauthorized` is zero
+    for them by construction — nothing is ever withheld from a token that covers everything), a
+    scoped caller gets `withheld_band`. Everything else travels exact.
+    """
+    exact = (lambda n: str(n)) if scope_all else withheld_band
+    return ResolveStats(
+        kept=counts.kept,
+        dropped_unauthorized=exact(counts.dropped_unauthorized),
+        dropped_unmatched=exact(counts.dropped_unmatched),
+        dropped_deleted=counts.dropped_deleted,
+        dropped_lookup_error=counts.dropped_lookup_error,
+        dropped_unreached=counts.dropped_unreached,
+        expanded=counts.expanded,
+    )
+
+
+def _log_what_the_caller_was_not_told(what: str, swept: Sweep, call: CallScope,
+                                     *, scope_all: bool) -> None:
+    """The two facts the caller's JSON does not carry, written once per call for the operator.
+
+    The banded counts, because the number is still worth having when somebody is debugging an empty
+    result — and a Papra outage, because `dropped_lookup_error` inside a caller's payload is
+    otherwise the only witness that this program could not read the archive: nothing else logged a
+    line, and an outage nobody can see in a log is an outage nobody knows about. One line per call,
+    with a count and the exception type names (bounded, deduplicated), the way `_guarded` reports a
+    ledger failure: the type is the actionable part, and the messages are Papra's prose.
+    """
+    counts = call.stats
+    if not scope_all and (counts.dropped_unauthorized or counts.dropped_unmatched):
+        logger.info("mcp: %s banded its withheld counts for a scoped token; exact: "
+                    "dropped_unauthorized=%d dropped_unmatched=%d rows_scanned=%d",
+                    what, counts.dropped_unauthorized, counts.dropped_unmatched, swept.scanned)
+    if counts.dropped_lookup_error:
+        logger.warning("mcp: %s could not check %d document(s) in papra (%s), so they were dropped "
+                       "and the page is partial", what, counts.dropped_lookup_error,
+                       ", ".join(counts.lookup_error_types) or "no type recorded")
 
 
 def _page(swept: Sweep, call: CallScope, *, items: list[SearchItem], page: int, page_size: int,
-          reasons: list[str]) -> SearchPage:
+          reasons: list[str], scope_all: bool, what: str) -> SearchPage:
     """The one place `partial` is decided, so both tools answer it from the same rule.
 
     `partial` is **not** "the page is short": a page that ran out because the archive has nothing
@@ -778,14 +896,18 @@ def _page(swept: Sweep, call: CallScope, *, items: list[SearchItem], page: int, 
     shown, or when the fan-out bound left a bucket in scope unconsulted. Rows the ledger refused, or
     that Papra reports deleted, are not in that list: those were checked, and the archive's answer
     was that they are not this caller's or not there any more.
+
+    It is also the one place the stats leave this module, so the narrowing (`_wire_stats`) and the
+    operator's log line happen for both tools or for neither.
     """
+    _log_what_the_caller_was_not_told(what, swept, call, scope_all=scope_all)
     return SearchPage(
         items=items,
         page=page,
         page_size=page_size,
         partial=bool(reasons),
         scanned=swept.scanned,
-        stats=call.stats,
+        stats=_wire_stats(call.stats, scope_all=scope_all),
         buckets_reached=list(call.reached),
         buckets_skipped=list(call.skipped),
         partial_reason="; ".join(reasons) or None,

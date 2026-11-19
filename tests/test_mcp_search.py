@@ -429,7 +429,7 @@ async def test_a_hit_with_no_ledger_row_is_invisible(store):
     index.hits.append(kz_row(4242))
     after = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung")
     assert len(after.items) == len(page.items)
-    assert after.stats.dropped_unmatched == 1
+    assert after.stats.dropped_unmatched == "1"     # all-buckets caller: exact, as a string
     assert after.partial is False          # nothing was withheld: the row is not ours to show
 
 
@@ -446,7 +446,7 @@ async def test_a_hit_on_the_wrong_generation_is_invisible(store):
     store.bump_generation()
     after = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung")
     assert after.items == []
-    assert after.stats.dropped_unmatched == 4
+    assert after.stats.dropped_unmatched == "4"   # exact for this caller: nothing hides from it
 
 
 async def test_one_hit_two_authorized_references_yields_two_items(store):
@@ -641,8 +641,8 @@ async def test_a_hit_in_a_foreign_bucket_and_a_granted_one_is_kept_for_the_grant
                                                                                org=ORG_B)})
     page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung")
     assert [item.document_id for item in page.items] == ["doc-own"]
-    assert page.stats.dropped_unauthorized == 1
-    assert page.stats.dropped_unmatched == 0
+    assert page.stats.dropped_unauthorized == "1"
+    assert page.stats.dropped_unmatched == "0"
 
 
 async def test_a_deleted_papra_document_is_dropped_and_counted(store):
@@ -1018,7 +1018,7 @@ async def test_the_recent_listing_is_filtered_by_the_ledger_too(store):
                        "doc-org-b": papra_doc("doc-org-b", org=ORG_B)})
     page = await list_recent_documents(ctx(ORG_A), store, papra, kz_index.reader(), limit=10)
     assert [item.org_id for item in page.items] == [ORG_A]
-    assert page.stats.dropped_unauthorized == 1
+    assert page.stats.dropped_unauthorized == "1"
 
 
 async def test_the_recent_listing_pages_by_page_under_the_same_budget(store):
@@ -1076,8 +1076,8 @@ def test_every_since_this_tool_accepts_the_wire_validator_also_accepts(since):
 
 @pytest.mark.parametrize("since", ["2026-11-17T22:28:05Z", "2026-11-17T22:28:05", "1700000000",
                                    "17.11.2026", "yesterday", "",
-                                   # the shapes `str.strip()` cannot rescue: a second line, a suffix,
-                                   # and a time the two-field form cannot mean
+                                   # shapes `str.strip()` cannot rescue: a second line, a
+                                   # suffix, and a time the two-field form cannot mean
                                    "2026-01-01\n2026-01-02", "2026-01-01 22:28:05 UTC",
                                    "2026-01-01 1:02:03"])
 async def test_a_since_the_index_would_ignore_is_refused(store, since):
@@ -1114,7 +1114,7 @@ async def test_a_padded_since_is_stripped_before_it_leaves(store, since):
                                        since=since)
     forwarded = index.list_params[0]["since"]
     assert forwarded == since.strip()
-    assert forwarded == forwarded.strip()          # nothing whitespace-shaped left to confuse anyone
+    assert forwarded == forwarded.strip()       # nothing whitespace-shaped left to confuse anyone
     assert not any(c in forwarded for c in "\n\t")
     assert [item.document_id for item in page.items] == ["doc-1"]
 
@@ -1241,7 +1241,7 @@ async def test_the_wire_search_answers_only_what_the_token_was_granted(store):
                                    kz=index.reader(), papra=papra)
     payload = message["result"]["structuredContent"]
     assert [item["org_id"] for item in payload["items"]] == [ORG_A]
-    assert payload["stats"]["dropped_unauthorized"] == 1
+    assert payload["stats"]["dropped_unauthorized"] == "1"      # a band, not a census
     assert payload["partial"] is False
 
 
@@ -1293,8 +1293,134 @@ async def test_a_grant_with_no_buckets_sees_nothing(store):
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 4)])
     page = await search_documents(ctx(), store, FakePapra(), index.reader(), "rechnung")
     assert page.items == []
-    assert page.stats.dropped_unauthorized == 3
+    assert page.stats.dropped_unauthorized == "2-9"    # banded: see the I-2 tests below
     assert page.stats.kept == 0
+
+
+# --- the counters, and what a scoped token is allowed to learn from them (I-2, M-7) -----------
+
+
+def mixed_corpus(store, *, own=1, foreign=12):
+    """`own` documents in ORG_A and `foreign` in ORG_B, one Kreuzakt row each, all one query.
+
+    The corpus the counting oracle needs: the caller controls the query, so the only thing varying
+    between two calls is how much of the archive the index put in the top `scan_rows`.
+    """
+    for n in range(1, own + 1):
+        bind(store, ORG_A, f"doc-own-{n}", n)
+    for n in range(1, foreign + 1):
+        bind(store, ORG_B, f"doc-foreign-{n}", 100 + n)
+    hits = [kz_row(n) for n in range(1, own + 1)]
+    hits += [kz_row(100 + n) for n in range(1, foreign + 1)]
+    papra = FakePapra()
+    for n in range(1, own + 1):
+        papra.add_for(ORG_A, f"doc-own-{n}")
+    for n in range(1, foreign + 1):
+        papra.add_for(ORG_B, f"doc-foreign-{n}")
+    return ScriptedIndex(hits=hits), papra
+
+
+@pytest.mark.parametrize("count,band", [(0, "0"), (-1, "0"), (1, "1"), (2, "2-9"), (9, "2-9"),
+                                       (10, "10+"), (500, "10+")])
+def test_the_withheld_band_is_one_of_four_stated_values(count, band):
+    """Four bands, named once, and nothing else a client could have to parse.
+
+    A band that could be `"3"` sometimes and `"2-9"` other times would be worse than the number, so
+    the mapping is pinned at the edges rather than sampled in the middle.
+    """
+    from papra_suite.mcp_tools import withheld_band
+
+    assert withheld_band(count) == band
+
+
+async def test_a_scoped_token_is_told_that_other_buckets_matched_not_how_many_rows_they_hold(
+        store, caplog):
+    """`dropped_unauthorized` was a counting oracle; now it is a band, and the number is in the log.
+
+    Measured before the change: a token granted one bucket, asking about `Insulin`, `Kündigung`,
+    `Baubewilligung`, got back `{"dropped_unauthorized": 12}` — the statement that twelve of the top
+    `scan_rows` rows matching *its own* query belong to somebody else's bucket, quotable per query,
+    and always zero for the only tokens that cannot be denied anything. For the caller that number
+    has no use; as a census of another bucket it has one. So the payload says "10+", and the
+    operator's log says 12.
+    """
+    import logging
+
+    index, papra = mixed_corpus(store, own=1, foreign=12)
+    caplog.set_level(logging.INFO, logger="papra_suite.mcp_tools")
+    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung")
+    assert [item.org_id for item in page.items] == [ORG_A]
+    assert page.stats.dropped_unauthorized == "10+"
+    blob = page.model_dump_json()
+    assert '"dropped_unauthorized":"10+"' in blob
+    assert '"dropped_unauthorized":1' not in blob      # the exact integer form is gone
+    assert "dropped_unauthorized=12" in caplog.text    # and kept where it is a diagnostic
+    assert "dropped_unmatched=0" in caplog.text
+
+
+async def test_an_all_buckets_token_is_never_told_anything_was_withheld(store):
+    """The fact that turns the field into a pure disclosure: it is always 0 for `--all-buckets`.
+
+    Nothing can be withheld from a token that covers every bucket, so a non-zero value can only ever
+    mean "denied" — which is why the exact count was information about the denial and not a
+    diagnostic. Asserted over the same corpus the scoped case reads as `10+`.
+    """
+    index, papra = mixed_corpus(store, own=1, foreign=12)
+    page = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung")
+    assert page.stats.dropped_unauthorized == "0"
+    assert len(page.items) == 13
+    # …and an all-buckets caller is the operator, so its numbers stay exact:
+    assert page.stats.kept == 13
+
+
+async def test_dropped_unmatched_is_banded_too_and_the_callers_own_numbers_stay_exact(store):
+    """Unmatched rows can be drift inside a bucket the caller may not be granted, and telling them
+    the count helps nobody: banded. `kept`, `dropped_deleted` and `dropped_lookup_error` are the
+    caller's own business and stay integers.
+
+    One deleted document, two index rows the ledger cannot account for, one row whose Papra state
+    will not answer — for a one-bucket token, which is the shape where "whose drift is this?" is not
+    even answerable.
+    """
+    bind(store, ORG_A, "doc-deleted", 1)
+    bind(store, ORG_A, "doc-unanswered", 4)          # bound, but absent from FakePapra
+    index = ScriptedIndex(hits=[kz_row(n) for n in (1, 2, 3, 4)])
+    papra = FakePapra({"doc-deleted": papra_doc("doc-deleted", isDeleted=True)})
+    scoped = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung")
+    assert scoped.stats.dropped_unmatched == "2-9"
+    assert scoped.stats.dropped_unauthorized == "0"
+    assert scoped.stats.dropped_deleted == 1
+    assert scoped.stats.dropped_lookup_error == 1
+    assert scoped.stats.kept == 0
+    all_buckets = await search_documents(ctx(scope_all=True), store, papra, index.reader(),
+                                        "rechnung")
+    assert all_buckets.stats.dropped_unmatched == "2"
+
+
+async def test_a_papra_outage_is_logged_once_per_call_with_its_size_and_kind(store, caplog):
+    """A failed liveness read used to leave no trace but a field in the caller's own JSON.
+
+    `dropped_lookup_error` is the only witness an operator would never look at: the outage is
+    visible to the person who happened to search during it and to nobody else. One bounded warning
+    per call — count and exception type names, never Papra's prose — is what `_guarded` already does
+    for a ledger failure, and it is what makes "the archive was unreadable between 14:00 and 14:20"
+    a question the log can answer.
+    """
+    import logging
+
+    for n in (1, 2, 3):
+        bind(store, ORG_A, f"doc-{n}", n)
+    index = ScriptedIndex(hits=[kz_row(n) for n in (1, 2, 3)])
+    papra = FakePapra()
+    papra.raise_on_get = True
+    caplog.set_level(logging.WARNING, logger="papra_suite.mcp_tools")
+    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung")
+    assert page.stats.dropped_lookup_error == 3 and page.partial is True
+    lines = [r.getMessage() for r in caplog.records if "could not check" in r.getMessage()]
+    assert len(lines) == 1, f"one line per call, got {lines}"
+    assert "3 document(s)" in lines[0]
+    assert "KreuzaktError" in lines[0]
+    assert "papra refused the read" not in caplog.text     # Papra's own prose stays out of the log
 
 
 # --- what a call that could not find out says, and what it must not say -----------------------
@@ -1609,6 +1735,13 @@ async def test_the_result_shape_is_a_closed_list_of_fields(store):
     assert set(ResolveStats.model_fields) == {"kept", "dropped_unauthorized", "dropped_unmatched",
                                               "dropped_deleted", "dropped_lookup_error",
                                               "dropped_unreached", "expanded"}
+    # …and which of them are bands: the two that can describe another bucket are strings, so a
+    # silent revert to an exact integer is a schema change, not a refactor.
+    assert ResolveStats.model_fields["dropped_unauthorized"].annotation is str
+    assert ResolveStats.model_fields["dropped_unmatched"].annotation is str
+    for exact in ("kept", "dropped_deleted", "dropped_lookup_error", "dropped_unreached",
+                  "expanded"):
+        assert ResolveStats.model_fields[exact].annotation is int, exact
 
 
 async def test_an_index_outage_reaches_the_client_as_one_code_and_no_body(store):

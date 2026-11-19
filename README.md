@@ -582,8 +582,10 @@ Two behaviours worth knowing before you debug one:
   bridge; a Papra-backed result behind an "index" tool would be a second, worse index that does not
   say it fell back, and "no documents match" under a dead index is a claim about your archive that
   the call is not entitled to make. Upstream prose stops at the boundary too: the client sees
-  `index_unavailable` and the HTTP status — not Kreuzakt's body, and not our exception class names,
-  which tell an agent about our source code and nothing about its question.
+  `index_unavailable` and the HTTP status — not Kreuzakt's body, not the free-text `status` its
+  health endpoint returned (a measured one carried `/var/lib/kreuzakt/index` out to the caller), and
+  not our exception class names, which tell an agent about our source code and nothing about its
+  question.
 
 `check` ends with the state of all this in one line — `mcp: disabled (…), tokens: 1 active,
 1 revoked` — with counts only: labels name a device and an agent, and `check` output is what gets
@@ -597,7 +599,14 @@ rows matched" into "these 3 of yours matched", and what it cannot account for is
 row, a row bound under a generation that no longer means what it said, a row in a bucket this token
 was not given. Then Papra is asked about the survivors only — a document in the trash is not a result
 you can open — and a document Papra will not confirm is dropped and counted, because "could not check"
-is not "safe to show". A page of 5 out of 500 scanned rows costs 5 liveness reads, not 500.
+is not "safe to show". A **first** page of 5 costs 5 liveness reads even when the index scanned 500
+rows to find them — the check is owed to the documents that could be returned, not to the rows that
+were looked at. A deep page costs what it asks for: `want` is `page * page_size`, so every candidate
+the scan has to step over is checked before the slice is taken (measured: `page=40, page_size=50` over
+a 500-row corpus cost 500 liveness reads and 5 index pages to return an empty page, correctly reported
+`partial=False` because the corpus really was exhausted). That is the price of the alternative being
+wrong: truncating *before* the liveness check lets a document your token may see, but which sits in
+the Papra trash, eat a slot of your page — and the only way to find out is to ask.
 
 **`partial` is the field that decides whether an empty answer means anything.** It is true when the
 scan budget (`PAPRA_INDEX_SEARCH_SCAN_ROWS`) was spent, when the index answered a short page while its
@@ -608,6 +617,28 @@ unresolvable, or deleted: those were checked, and the archive's answer was no. `
 examined, and `stats` counts each reason separately, because "your token does not cover that" and "we
 never held that in the ledger" are different questions for whoever reads an empty list.
 
+**What those counters say about somebody else's bucket is written down here, because it is a
+disclosure and not only a diagnostic.** `stats` is exact for an `--all-buckets` token and banded for a
+scoped one: `dropped_unauthorized` and `dropped_unmatched` are strings — `"0"`, `"1"`, `"2-9"`,
+`"10+"` — while `kept`, `expanded`, `dropped_deleted`, `dropped_lookup_error` and `dropped_unreached`
+stay integers for everybody, because those describe the caller's own answer. The two that are banded
+are the two that can describe buckets the caller was not given. The exact figure stated, per query,
+"N of the top `scan_rows` rows matching *your* question belong to a bucket you were not granted" — a
+census of another bucket that its recipient can do nothing with, and always zero for the only tokens
+that could ever be told a non-zero value, since an all-buckets token is denied nothing. The exact
+counts are in the listener's log instead: `mcp: search_documents banded its withheld counts for a
+scoped token; exact: dropped_unauthorized=12 dropped_unmatched=0 rows_scanned=13`.
+
+**And what no field takes away, which is the accepted part of that risk.** A scoped token can still
+learn *that* other buckets have matches: a caller who wants to can bound the same fact from `scanned`,
+`kept` and the length of the answer with both counters gone, and a query that only foreign documents
+match answers with an empty list rather than an error. Coarsening the numbers removes the census, not
+the existence signal, and no field-level change will. So this deployment is one trust domain: `--org-id`
+scoping reduces the blast radius of a leaked device token and is a boundary the code enforces, but it is
+not confidentiality between buckets. If that ever became a requirement, the fix is a different scope
+model — a per-token filtered index that cannot see the other buckets at all — and not another field on
+this page.
+
 **The fan-out bound is enforced on the read, not at mint time.** One tool call consults at most
 **8 buckets** with at most **4 lookups in flight**, because `--all-buckets` is exempt from
 `mcp-token --create`'s 8-bucket ceiling by design and is how an operator's own credential is minted:
@@ -617,7 +648,11 @@ of returning a silently-short list.
 
 **Bounds are refusals, never clamps.** `1 <= page_size <= 50`, `page >= 1`, a query of at most
 `PAPRA_INDEX_QUERY_MAX_CHARS` (512), `1 <= limit <= 50` on the recent listing; a violation is
-`invalid-request`, and a clamp would turn "give me 51" into an answer that looks like 51. Paging is by
+`invalid-request`, and a clamp would turn "give me 51" into an answer that looks like 51. The bounds
+are measured on the value that is forwarded — leading and trailing whitespace is stripped once and the
+stripped value is what goes upstream — so a padded query cannot pass a bound it then overshoots, and a
+watermark padded with spaces is the date the caller meant rather than an outage reported back to them
+for their own typo. Paging is by
 `page` — `/api/search` and `/api/documents` honour it and ignore `offset` — with one page size per
 scan, because rows are addressed as `(page - 1) * limit` and shrinking the last request to fit a
 ragged budget would re-read some rows while never reading others. The page size is chosen per scan to
