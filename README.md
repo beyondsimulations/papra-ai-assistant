@@ -439,7 +439,7 @@ papra-suite mcp                                               # reads both rows 
 papra-suite mcp --enable                                      # mcp_server_enabled: unset → 1
 papra-suite mcp --enable --dry-run                            # the same line, no row written
 papra-suite mcp --allow-nonloopback --yes-i-mean-it           # the listener may leave loopback — only if you mean it
-papra-suite mcp --disable                                     # nothing answers the network again
+papra-suite mcp --disable                                     # no listener on the next `serve`
 ```
 
 `--enable` refuses with exit `2` and writes nothing when the state it would produce is one `serve`
@@ -449,7 +449,9 @@ produces a process which cannot start is Task 12's availability defect with a si
 `check` would only report it after the fact. `--allow-nonloopback` is the one flag that needs a second
 flag, because it is the one that moves a bearer token: it prints what that means and asks for
 `--yes-i-mean-it`, the discipline `ledger --reindex-all` uses. Both rows are read when `serve` starts,
-so **restart `serve`** after changing either; `papra-suite check` prints the `mcp:` line, and
+so **restart `serve`** after changing either — a listener that is running right now keeps its port
+and its settings until that process is stopped, which matters most when the change was made to
+stop it being reachable. `papra-suite check` prints the `mcp:` line, and
 `papra-suite mcp` reads the rows back with the store's own reading beside each one — `unset`, `off`
 and `maybe` all mean 0, and only you can say whether one of them was a mistake.
 

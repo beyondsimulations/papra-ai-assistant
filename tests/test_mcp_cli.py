@@ -376,13 +376,29 @@ def test_the_command_prints_no_token_and_no_digest(store, config, capsys, caplog
     with caplog.at_level(logging.DEBUG):
         assert run(["--status"], store=store, config=config) == EXIT_OK
 
-    printed = capsys.readouterr().out + capsys.readouterr().err
+    captured = capsys.readouterr()
+    printed = captured.out + captured.err
     assert token not in printed + caplog.text and digest not in printed + caplog.text
     # The settings key is that digest behind a prefix, so a line that echoed a key would echo a
     # third of a credential's input space. Checked on what the command printed: the logger's own
     # name contains `mcp_token`, and a guard that fired on that trains people to delete it.
     assert TOKEN_SETTING_PREFIX not in printed
     assert "1 active" in printed
+
+
+def test_the_no_credential_assertion_sees_stderr_too(capsys):
+    """One `readouterr()` call, both streams: the first call already drains stderr.
+
+    The control for the test above, because the first version of it was blind: it read
+    `capsys.readouterr().out + capsys.readouterr().err`, and the first call had already emptied
+    stderr, so a credential written there passed a test whose whole job is refusing that.
+    """
+    print("to-stdout")
+    print("to-stderr", file=sys.stderr)
+
+    captured = capsys.readouterr()
+    assert "to-stdout" in captured.out and "to-stderr" in captured.err
+    assert capsys.readouterr().err == "", "the drain is not single-shot; simplify the test above"
 
 
 def test_an_interruption_is_a_sentence_and_a_nonzero_exit(store, config, capsys):
@@ -516,12 +532,13 @@ def test_the_shipped_entry_point_accepts_every_invocation_the_runbook_prints(arg
 
 
 def test_the_runbook_names_the_command_and_hands_over_no_settings_row():
-    """The guard on the runbook lives in `test_shipped_citations.py`; this one lives here.
+    """The runbook invariant is asserted here too, so it is not only this file's business.
 
-    Deliberately a second site: the mutation that makes the citation guard accept any number of raw
-    invocations edits that file, and an invariant restated somewhere it cannot reach still fails. It
-    is the same rule with the same evidence, not a new one — the MCP section must name the command
-    and must not hand over a `settings` row to type by hand.
+    Weaker than it looks and stated honestly: this calls the same `sole_handover()` that
+    `test_shipped_citations.py` does, so a mutation of that function is not caught twice — what
+    catches the "accept any number of handovers" mutation is the injected-README canary in that
+    file. What this site adds is that a README edit which drops the command from the MCP section
+    fails a test outside the file most likely to be edited along with the README.
     """
     from tests.test_shipped_citations import (
         README,
@@ -537,3 +554,35 @@ def test_the_runbook_names_the_command_and_hands_over_no_settings_row():
     assert "papra-suite mcp --enable" in section
     assert "papra-suite mcp --allow-nonloopback" in section
     assert not raw_invocations(section)
+
+
+def test_status_combined_with_a_change_is_refused_rather_than_run_as_a_write(store, config,
+                                                                            capsys):
+    """`--status` promises a read; the two flag groups cannot say "exclusive" to argparse."""
+    for argv in (["--status", "--allow-nonloopback", "--yes-i-mean-it"],
+                 ["--status", "--deny-nonloopback"]):
+        assert run(argv, store=store, config=config) == EXIT_REFUSED, argv
+
+    # `--enable` sits in the group argparse can enforce; the interface flags sit in the one it
+    # cannot, and both refusals have to say the same thing in the same place.
+    with pytest.raises(SystemExit) as caught:
+        parse(["--status", "--enable"])
+    assert caught.value.code == 2
+
+    assert gated_rows(store) == {MCP_ENABLED_SETTING: None, MCP_NONLOOPBACK_SETTING: None}
+    assert "--status" in capsys.readouterr().err
+
+
+def test_a_report_that_cannot_be_read_still_reports_the_commit(store, config, capsys,
+                                                               monkeypatch):
+    """The footnote is advisory: a store that stops answering mid-report must not undo the write."""
+    def refusing(_store):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("papra_suite.mcp_cli.token_counts", refusing)
+
+    assert run(["--enable"], store=store, config=config) == EXIT_OK
+
+    assert store.get_setting(MCP_ENABLED_SETTING) == "1"
+    err = capsys.readouterr().err
+    assert "committed" in err and "Traceback" not in err

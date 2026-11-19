@@ -89,8 +89,10 @@ def add_subparser(subparsers) -> None:
                           help=f"set {MCP_ENABLED_SETTING}, so `serve` starts the listener. "
                                "Refused if the resulting bind or public URL would not start")
     listener.add_argument("--disable", action="store_true",
-                          help=f"clear {MCP_ENABLED_SETTING}, so nothing answers the network. "
-                               "Never refused: switching a listener off is the safe direction")
+                          help=f"clear {MCP_ENABLED_SETTING}, so the next `serve` starts no "
+                               "listener; a listener running right now keeps its port until that "
+                               "process is stopped. Never refused: switching a listener off is "
+                               "the safe direction")
     interface = parser.add_mutually_exclusive_group()
     interface.add_argument("--allow-nonloopback", dest="allow_nonloopback", action="store_true",
                            help=f"set {MCP_NONLOOPBACK_SETTING}, which permits a non-loopback "
@@ -125,6 +127,13 @@ def run_mcp(config, args, *, store: Store | None = None) -> int:
     # `finally` closing something that was never opened.
     opened: Store | None = None
     try:
+        if getattr(args, "status", False) and _plan(args):
+            # The two flag groups cannot say "mutually exclusive" to argparse, so the refusal is
+            # here: `--status` promises a read, and a writer that quietly becomes a writer is the
+            # last thing an operator reaches for when they are checking what a change did.
+            print("--status is a question, not a change: drop it to write, or run it afterwards to "
+                  "read back what the change did", file=sys.stderr)
+            return EXIT_REFUSED
         ops = _plan(args)
         reading = not ops
         if store is None:
@@ -330,9 +339,25 @@ def _apply(store: Store, config, args, ops) -> int:
 
     changed, incomplete = _execute(store, ops)
     if changed:
+        _report_after_change(store, config)
+    return EXIT_INCOMPLETE if incomplete else EXIT_OK
+
+
+def _report_after_change(store: Store, config) -> None:
+    """Print what happens next — advisory only, and never at the price of the verdict.
+
+    The rows are committed and printed by the time this runs, so a store that will not answer *now*
+    is a missing footnote, not a failed command. Letting that raise would send it to the outer
+    handler, which reports "would not start" with exit `2` for a change that did happen: the one
+    reading that makes an operator run the write again, or reach for SQLite.
+    """
+    try:
         _print_footer(store)
         _print_stranded_note(store, config)
-    return EXIT_INCOMPLETE if incomplete else EXIT_OK
+    except (sqlite3.Error, ValueError) as error:
+        print(f"the rows above are committed; the note that follows them could not be read "
+              f"({type(error).__name__}: {error}). `papra-suite mcp --status` reads them back",
+              file=sys.stderr)
 
 
 def _execute(store: Store, ops) -> tuple[bool, bool]:
@@ -341,9 +366,10 @@ def _execute(store: Store, ops) -> tuple[bool, bool]:
     The `set` direction reads the row again rather than trusting the value printed a moment earlier:
     a row that `serve` or another terminal changed in between is not the row this command described,
     and overwriting it silently is how `off` becomes `1` with no witness. There is no fenced write
-    for this: `Store.set_setting` means "make it so" and has no condition — so the worst that can
-    happen is that the printed `from` is one glance stale, and the re-read is what keeps even that
-    rare.
+    for this: `Store.set_setting` means "make it so" and has no condition — so a write that lands
+    here is unconditional, and a row that moved between the pre-flight refusal and this line is a
+    state the refusal never saw. Both commands are single-operator by design; the re-read and the
+    printed `from` are what make a stale glance visible, not what prevent one.
 
     The `clear` direction is the opposite act, and the store already offers the fence for it:
     `clear_setting(key, expected=...)` deletes the row only if it still holds what was read. A False
@@ -392,8 +418,10 @@ def _print_stranded_note(store: Store, config) -> None:
         return
     print("note: the listener is still enabled, and this is now a configuration `serve` refuses to "
           "start: " + " | ".join(refusals))
-    print("that refusal is the guard rather than a fault. Set PAPRA_MCP_HOST back to loopback, or "
-          "run `papra-suite mcp --disable` if the listener should not run at all")
+    print("that refusal is the guard rather than a fault: the next `serve` binds nothing until it "
+          "is resolved. Fix what the refusal names, or run `papra-suite mcp --disable` if the "
+          "listener should not run at all. A listener that is running right now still holds its "
+          "port until that process is stopped")
 
 
 def _print_footer(store: Store) -> None:
@@ -403,9 +431,10 @@ def _print_footer(store: Store) -> None:
     nothing else; and a listener enabled with no token is a port that answers 401 to everything,
     which reads as a broken server rather than as an empty credential table.
     """
-    print("These rows are read when `serve` starts: a running `serve` keeps the listener it "
-          "already has, so restart it to apply this. `papra-suite check` prints the `mcp:` line, "
-          "and `papra-suite mcp --status` reads the rows back.")
+    print("These rows are read when `serve` starts, so restart it to apply this — and a listener "
+          "that is running right now keeps its port and its settings until that process is "
+          "stopped. `papra-suite check` prints the `mcp:` line, and `papra-suite mcp --status` "
+          "reads the rows back.")
     if store.settings_flag(MCP_ENABLED_SETTING):
         active, _revoked = token_counts(store)
         if not active:
