@@ -856,7 +856,7 @@ Five properties make it safe to run against a live corpus:
    also means the command finishing is not the rebuild finishing. The end state is `stale: 0` in
    `papra-suite ledger --status` **and** no `index` rows left in `pending` or `running`:
    ```bash
-   sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs GROUP BY 1, 2;"
+   papra-suite jobs --kind index --drain
    ```
    Do not use `current == refs` as the finish line: `references` counts rows the index will never
    hold — deleted ones, and any that a rebuild reported as left out on purpose — so that condition
@@ -975,10 +975,15 @@ A `pending` row waiting out a backoff is fair game — it is in nobody's hands, 
 
 `--drain` is the handover gate, not a summary. It counts `pending` and `running` in scope from one
 SQL statement — so no listing cap can make a busy queue look quiet, and the two numbers cannot come
-from two different instants — refuses with exit `1` and both counts while either is non-zero, and
-refuses to be narrowed: `--drain --status pending` would answer "no pending rows" above a `running`
-job. Read it twice a minute apart and flip the delivery flag only when both readings are 0; one
-empty reading is what a loop that claims the next row a second later looks like.
+from two different instants — refuses with exit `1` and both counts while either is non-zero, names
+the kinds that hold those rows (also read from the table, never from the capped listing, so a queue
+of a thousand `ocr` rows cannot hide the one `index` row), and refuses to be narrowed: `--drain
+--status pending` would answer "no pending rows" above a `running` job, and `--drain --document-id`
+is a question about one document rather than a gate over the queue. When it is quiet, the sentence
+names the flag that reading covers: `--kind ocr` is the reading `PAPRA_INDEX_CONTENT_DELIVERY` waits
+on, `--kind title` is the one `PAPRA_LEGACY_WORKERS` waits on, and neither speaks for the other. Read
+it twice a minute apart and flip the delivery flag only when both readings are 0; one empty reading
+is what a loop that claims the next row a second later looks like.
 
 
 ### Backfilling a corpus, and enrolling the documents the sweep will never visit
@@ -986,10 +991,17 @@ empty reading is what a loop that claims the next row a second later looks like.
 `papra-suite backfill` queues work the automatic passes will not ask for. Say plainly what that
 population is, because it is the part of a corpus that stays invisible until something is written
 down: **every document `documents` says this suite ingested but `index_ledger` has never held** —
-the PDFs mailed in before the handover, the oversized skips the sweep recorded as seen and never
-indexed, anything a store restore left with a sighting and no reference. The sweep skips documents
-it has already seen, and every eligibility rule, count and cadence reads the ledger, so that corpus
-cannot be reached from anywhere else in the system. This command is how it gets in.
+the PDFs mailed in before the handover, and anything a store restore left with a sighting and no
+reference. The sweep skips documents it has already seen, and every eligibility rule, count and
+cadence reads the ledger, so that corpus cannot be reached from anywhere else in the system. This
+command is how it gets in.
+
+Say what it does **not** admit, because the population is named in the same breath: a document over
+`OCR_MAX_DOCUMENT_BYTES` is **counted and refused**, not enrolled. It gets its own bucket on the
+summary line and it stays outside the index, and running the command again does not change that. The
+size gate is the OCR intake's own rule and `backfill` enqueues through the intake path rather than
+around it; lifting it for the index alone is a decision about what the index should hold, not a flag
+this command can quietly make for you.
 
 ```bash
 papra-suite backfill --dry-run                 # what would be queued, and what it costs
@@ -1018,15 +1030,17 @@ a live row already carries is absorbed and does not spend the cap — and the wa
 the cap so the rest can be counted rather than guessed:
 
 ```
-backfill: enqueued 5 new row(s) across 1 bucket(s); asked for 5 of 12 candidate(s); 7 remaining
+backfill: queued 5 new row(s) across 1 bucket(s); asked for 5 of 12 candidate(s); 7 remaining
 ```
 
 A run that stopped at the cap could not tell "the rest is eligible" from "the rest is already
 indexed", and that difference decides whether you run it again. Two counts are printed because they
 answer two questions: the leading one is what the run *changed* (new queue rows), the `asked for` one
-is the population it vouched for — `enqueued = new rows + already queued`, so a run over a corpus
-whose workers are stalled reads `enqueued 0 new row(s) … asked for 4 of 4 candidate(s) (4 already
-queued, unchanged)`. Documents whose work a live row already carries are counted apart and do not
+is the population it vouched for — `asked_for = new rows + already queued`, so a run over a corpus
+whose workers are stalled reads `queued 0 new row(s) … asked for 4 of 4 candidate(s) (4 already
+queued, unchanged)`. Two words for two populations, because one word for both is how a run that
+changed nothing reads as one that queued four. Documents whose work a live row already carries are
+counted apart and do not
 spend the cap, so a stalled queue cannot make every later run re-report the same head of the corpus.
 Documents deliberately left out get their own buckets (not a PDF, in Papra's trash or queued for
 deletion, over the size limit) and are not remaining work.

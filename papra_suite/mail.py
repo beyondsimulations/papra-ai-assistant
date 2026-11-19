@@ -662,10 +662,9 @@ async def _poll_mailbox_once(store: Store, client: PapraClient, mailbox: Mailbox
                 # Which queue an intake document enters is the writer handover, and
                 # `legacy_workers` selects it so that both remain reachable: the handover
                 # is `PAPRA_LEGACY_WORKERS=false` first, quiescence proven twice a minute
-                # apart against the state database —
-                # `sqlite3 "$DATA_DIR/state.db" "SELECT kind, status, count(*) FROM jobs
-                # GROUP BY 1, 2;"` reading no `ocr` row in `pending` or `running` both
-                # times — and only then the delivery flags.
+                # apart with the command that reads the queue —
+                # `papra-suite jobs --kind ocr --drain`, which exits `1` while any `ocr` row is
+                # `pending` or `running` — and only then the delivery flags.
                 #
                 # With the legacy writers on, nothing changes: the OCR job is enqueued and
                 # Papra keeps writing its own text. Note what that still costs, because it
