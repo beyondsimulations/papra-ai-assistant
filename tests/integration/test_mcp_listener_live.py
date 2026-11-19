@@ -85,24 +85,37 @@ async def listener(tmp_path):
     task = asyncio.create_task(run_mcp_listener(config, store, papra=object(), kreuzakt=kreuzakt,
                                                 stop=stop))
     endpoint = f"http://127.0.0.1:{port}/mcp"
-    deadline = time.monotonic() + 20.0
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), 0.25):
-                break
-        except OSError:
-            await asyncio.sleep(0.05)
-    else:
-        pytest.fail("the mcp listener never took the port")
-
     try:
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            if task.done():
+                # It raised on the way up (a refused bind, a bad URL); waiting for a port that will
+                # never open would burn the whole timeout and report the wrong thing.
+                await task
+            try:
+                with socket.create_connection(("127.0.0.1", port), 0.25):
+                    break
+            except OSError:
+                await asyncio.sleep(0.05)
+        else:
+            pytest.fail("the mcp listener never took the port")
+
         yield SimpleNamespace(endpoint=endpoint, port=port, store=store, kreuzakt=kreuzakt)
     finally:
+        # Cleanup covers the startup path too: a readiness failure must not leave a server task
+        # running or a store open.
         stop.set()
-        # Bounded, and a failure here is the test's own: a listener that outlives its stop event is
-        # the hung-container bug, so it fails the run rather than leaking a task.
-        await asyncio.wait_for(task, timeout=20.0)
-    store.close()
+        try:
+            if task.done():
+                task.result()
+            else:
+                # Bounded, and a failure here is the test's own: a listener that outlives its stop
+                # event is the hung-container bug, so it fails the run rather than leaking a task.
+                await asyncio.wait_for(task, timeout=20.0)
+        finally:
+            if not task.done():
+                task.cancel()
+            store.close()
 
 
 def raw_client(token=None):
