@@ -195,8 +195,15 @@ class _GetOnlyClient:
     This is the second of the two doors on the HTTP views, and the one that closes the argument
     rather than the loophole: the view's own `_request` already refuses a write, but a caller that
     digs for the transport would otherwise find the ordinary client underneath. With this in front
-    of it there is no path — not even `_client.request("PATCH", …)` — that reaches Papra or Kreuzakt
-    with a verb that changes anything.
+    of it, **no verb that changes anything is reachable from the view's own method set** —
+    `_client.request("PATCH", …)` is refused on its way past, and there is nothing else to call.
+
+    What is deliberately not claimed is stronger than that, because it cannot be: this is not a
+    boundary against an already-compromised process, which the spec excludes in as many words.
+    `view._client._client` is the raw `httpx.AsyncClient`, `tests/test_mcp_read_containment.py`
+    asserts that identity rather than pretending otherwise, and reaching a write from there takes
+    deliberate tool code two private levels deep — at which point the tool author was writing a
+    write, and containment was never the thing standing in the way.
     """
 
     def __init__(self, client: object) -> None:
