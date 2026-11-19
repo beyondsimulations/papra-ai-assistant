@@ -373,6 +373,30 @@ async def test_a_reference_in_another_bucket_is_not_in_scope_and_the_index_never
     assert papra.get_calls == 0
 
 
+async def test_the_reason_goes_to_the_log_that_the_answer_may_not_give(store, caplog):
+    """The bucket the caller is not told about is still a fact the operator is owed.
+
+    This is Task 13's rule for the banded counters applied to the one code on this surface that
+    withholds a fact: the client's answer is deliberately uninformative, and an uninformative answer
+    is cheap to give only if somebody can still find out afterwards. So the holding bucket and the
+    token's label are logged, and the assertion pair is the whole point — the same string must be
+    absent from the refusal and present in the log. Whether `not-in-scope` should be answerable at
+    all is the controller's open decision (report §"The `not-in-scope` oracle"); this line is what
+    makes collapsing it on the wire affordable, because the diagnosis survives either way.
+    """
+    bind(store, ORG_B, "doc-b", kreuzakt_id=7)
+    papra = FakePapra({"doc-b": papra_doc("doc-b", org=ORG_B)})
+    index = ScriptedIndex()
+    caplog.set_level(logging.INFO, logger="papra_suite.mcp_tools")
+    with pytest.raises(ToolError, match="not-in-scope") as caught:
+        await get_document(ctx(ORG_A), store, papra, index.reader(), "doc-b")
+
+    assert ORG_B not in str(caught.value)            # the wire stays silent about where it lives
+    assert ORG_B in caplog.text                      # and the operator is not left guessing
+    assert "doc-b" in caplog.text and "not granted" in caplog.text
+    assert "Traceback" not in caplog.text            # a refusal is not an exception worth a stack
+
+
 async def test_an_all_buckets_token_reads_the_other_buckets_document(store):
     """`--all-buckets` is not refused by the same code: the check is the grant, not a surprise.
 

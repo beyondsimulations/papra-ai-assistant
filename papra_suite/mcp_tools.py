@@ -1131,6 +1131,15 @@ def _resolve_reference(ctx, store, document_id: str, *, what: str):
     if mine:
         return mine[0]
     if live:
+        # The client's answer says as little as it can, so the reason has to be recorded where it
+        # cannot read. Task 13's banded counts work the same way: the withheld fact is worth having
+        # when somebody debugs "the assistant cannot see a document I can see in papra", and it is
+        # not worth handing to the token that asked. The holding bucket and the token's label go to
+        # the log, which is the operator's; the answer stays one line that names nothing.
+        holders = ", ".join(sorted(ref.papra_org_id for ref in live))
+        logger.info("mcp: %s refused %s: the id is a live reference in %s, which token %r is not "
+                    "granted (%d row(s) for that id at generation %s)", what, document_id, holders,
+                    ctx.label, len(live), generation)
         raise NotInScope()
     raise DocumentNotFound()
 

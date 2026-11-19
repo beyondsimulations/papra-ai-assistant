@@ -717,11 +717,14 @@ bound to the current generation (a foreign row that is deleted or stale answers 
 everything else), and it never names the bucket, the title, or anything else about the document. What
 it cannot be made not to say is the fact itself: to a leaked single-bucket token that holds a real
 document id, `not-in-scope` and `not-found` are two answers where collapsing them would be one, and
-Papra's ids are the only thing standing between that and an enumeration. The 2026-11-16 spec's own
-error model collapsed the two on exactly that argument; this milestone's plan separated them so that an
-operator debugging an empty result can tell "wrong token" from "no such document". Both are true, the
-code follows the plan, and the argument for collapsing them is in the Task 14 report rather than
-settled here.
+Papra's ids are the only thing standing between that and an enumeration. So the part the caller is not
+told goes where the operator reads it: refusing a document logs the holding bucket and the token's
+label at `info`, and only the code reaches the client — the same rule that puts the exact withheld
+counts in the log and the bands in the JSON. The 2026-11-16 spec's own error model collapsed the two
+codes on exactly that argument; this milestone's plan separated them so that an operator debugging an
+empty result can tell "wrong token" from "no such document", and with that log line the diagnosis no
+longer depends on the wire answer. Both documents are in the tree and they disagree, so the decision is
+recorded as an acceptance item in the Task 14 report rather than settled here.
 
 ### Handing the `content` column over
 
