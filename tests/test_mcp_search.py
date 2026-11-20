@@ -28,6 +28,7 @@ sketch reads `store.ledger_resolve(...)` off a `Store`, and the shipped listener
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -307,6 +308,14 @@ def bind(store, org, document_id, kreuzakt_id, *, generation=None, name=None):
 
 
 def ctx(*orgs, scope_all=False):
+    """The token a call is made with.
+
+    Tests that measure the **sweep** — scan budgets, page divisors, paging arithmetic — pass
+    `scope_all=True`: an exact `scanned` is the operator's own number, withheld from a scoped token
+    because beside `kept` and the other exact counters it reconstitutes the banded
+    `dropped_unauthorized` (see `SearchPage.scanned`). Those corpora are single-bucket, so the
+    answer itself is identical either way; only the arithmetic visibility moves.
+    """
     return TokenContext(label="test", org_ids=frozenset(orgs), scope_all=scope_all)
 
 
@@ -789,8 +798,8 @@ async def test_one_generation_judges_the_whole_call_even_if_a_rebuild_lands_mid_
         def ledger_resolve(self, ids, *, generation):
             return self._inner.ledger_resolve(ids, generation=generation)
 
-    page = await search_documents(ctx(ORG_A), RebuildingStore(store), papra, index.reader(),
-                                  "rechnung", page_size=5)
+    page = await search_documents(ctx(scope_all=True), RebuildingStore(store), papra,
+                                  index.reader(), "rechnung", page_size=5)
     assert reads == [1], f"the generation was read {len(reads)} times for one call"
     assert [item.document_id for item in page.items] == [f"doc-{n}" for n in range(151, 156)]
     assert page.scanned == 200 and page.partial is False     # the corpus was exhausted
@@ -856,7 +865,7 @@ async def test_page_size_of_100_rows_stops_at_exhaustion_not_budget(store):
     """Upstream serves 100 rows a request; one request fills a 50-item page and the scan ends."""
     papra = own_corpus(store, 100)
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 101)])
-    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "miete",
+    page = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "miete",
                                   page_size=50)
     assert page.partial is False
     assert page.scanned == 100
@@ -872,7 +881,7 @@ async def test_a_short_page_whose_total_still_claims_rows_is_partial(store):
     """
     own_corpus(store, 3)
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 11)], total=40)
-    page = await search_documents(ctx(ORG_A), store, FakePapra(), index.reader(), "miete")
+    page = await search_documents(ctx(scope_all=True), store, FakePapra(), index.reader(), "miete")
     assert page.scanned == 10
     assert page.partial is True
     assert "short page" in (page.partial_reason or "")
@@ -881,8 +890,8 @@ async def test_a_short_page_whose_total_still_claims_rows_is_partial(store):
 async def test_budget_exhaustion_reports_partial_and_counts_scanned(store):
     """A scan that spends the row budget says so instead of claiming a small corpus."""
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 901)])
-    page = await search_documents(ctx(ORG_A), store, FakePapra(), index.reader(), "versicherung",
-                                  page=1, page_size=20)
+    page = await search_documents(ctx(scope_all=True), store, FakePapra(), index.reader(),
+                                  "versicherung", page=1, page_size=20)
     assert page.items == [] and page.partial is True
     assert page.scanned == DEFAULT_LIMITS.scan_rows
     assert "budget" in (page.partial_reason or "")
@@ -929,7 +938,7 @@ async def test_a_deep_page_checks_every_candidate_it_has_to_step_over(store):
     """
     papra = own_corpus(store, 100)
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 101)])
-    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung",
+    page = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung",
                                   page=3, page_size=50)
     assert [item.document_id for item in page.items] == [f"doc-{n}" for n in range(101, 101)]
     assert page.scanned == 100 and page.partial is False
@@ -1042,10 +1051,10 @@ async def test_a_papra_document_is_asked_about_once_per_call_and_again_on_the_ne
     """
     papra = own_corpus(store, 3)
     reader = ScriptedIndex(hits=[kz_row(n) for n in range(1, 4)]).reader()
-    first = await search_documents(ctx(ORG_A), store, papra, reader, "rechnung")
+    first = await search_documents(ctx(scope_all=True), store, papra, reader, "rechnung")
     assert papra.get_calls == 3 and first.scanned == 3
     assert len(papra.requested) == len(set(papra.requested))     # no document asked twice
-    second = await search_documents(ctx(ORG_A), store, papra, reader, "rechnung")
+    second = await search_documents(ctx(scope_all=True), store, papra, reader, "rechnung")
     assert second.scanned == 3
     assert papra.get_calls == 6                                  # asked again, deliberately
 
@@ -1152,7 +1161,7 @@ async def test_the_recent_listing_pages_by_page_under_the_same_budget(store):
     """100 rows a request, the scan budget as the ceiling, and `partial` when it runs out."""
     papra = own_corpus(store, 30)
     index = ScriptedIndex(rows=[kz_document_row(n) for n in range(1, 31)])
-    page = await list_recent_documents(ctx(ORG_A), store, papra, index.reader(), limit=5)
+    page = await list_recent_documents(ctx(scope_all=True), store, papra, index.reader(), limit=5)
     assert page.scanned == 30                       # the rows it actually looked at, 5 returned
     assert len(page.items) == 5 and page.partial is False
     assert index.list_calls == [(1, KREUZAKT_PAGE_ROWS, None)]
@@ -1162,7 +1171,8 @@ async def test_the_recent_listing_pages_by_page_under_the_same_budget(store):
 async def test_a_recent_listing_that_spends_the_budget_is_partial(store):
     """A scan that stops mid-corpus never reports "these are the newest" without saying so."""
     index = ScriptedIndex(rows=[kz_document_row(n) for n in range(1, 901)])
-    page = await list_recent_documents(ctx(ORG_A), store, FakePapra(), index.reader(), limit=5)
+    page = await list_recent_documents(ctx(scope_all=True), store, FakePapra(), index.reader(),
+                                       limit=5)
     assert page.items == []
     assert page.scanned == DEFAULT_LIMITS.scan_rows
     assert page.partial is True and "budget" in (page.partial_reason or "")
@@ -1513,6 +1523,38 @@ async def test_a_scoped_token_is_told_that_other_buckets_matched_not_how_many_ro
     assert "dropped_unmatched=0" in caplog.text
 
 
+async def test_scanned_cannot_reconstitute_the_withheld_row_count_for_a_scoped_token(store):
+    """The band was decorative: the payload carried the minuend, the subtrahend and the difference.
+
+    Measured on the wire before this fix — one granted bucket, twelve foreign rows, `partial:false`
+    saying the scan was complete: `"scanned":13, "kept":1`, every other counter `0`, and
+    `"dropped_unauthorized":"10+"`. `13 − 1 − 0 − 0 − 0 = 12`, exactly, and the caller knew the
+    answer was exact, not a lower bound: the scan had not stopped early. The same field handed a
+    one-bucket device the corpus size: `list_recent_documents(limit=1)` over a 60-row
+    index answered `"scanned":60`. So a scoped caller keeps `partial` and `partial_reason`, which
+    are what
+    actually answer "was the archive searched, or did we stop looking", and loses the row count,
+    which it has no use for. The operator's log keeps the exact figure either way.
+    """
+    index, papra = mixed_corpus(store, own=1, foreign=12)
+    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung")
+    assert page.scanned is None
+    blob = page.model_dump_json()
+    assert '"scanned":null' in blob
+    assert '"scanned":13' not in blob
+    # nothing in the payload closes the arithmetic any more
+    assert ',"scanned":' in blob or '"scanned":null' in blob
+    assert not re.search(r'"scanned":\d', blob)
+
+    recent = await list_recent_documents(ctx(ORG_A), store, papra, index.reader(), limit=1)
+    assert recent.scanned is None
+
+    # the operator's own credential keeps the diagnostic, because it is the thing that tells
+    # "no matches" apart from "we stopped looking" for the person who can act on it
+    full = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung")
+    assert full.scanned == 13
+
+
 async def test_an_all_buckets_token_is_never_told_anything_was_withheld(store):
     """The fact that turns the field into a pure disclosure: it is always 0 for `--all-buckets`.
 
@@ -1715,9 +1757,9 @@ async def test_the_bounds_are_the_ones_the_environment_configures(store):
     papra = own_corpus(store, 2)
     index = ScriptedIndex(hits=[kz_row(1), kz_row(2)])
     with pytest.raises(ToolError, match="invalid-request"):
-        await search_documents(ctx(ORG_A), store, papra, index.reader(), "x" * 41,
+        await search_documents(ctx(scope_all=True), store, papra, index.reader(), "x" * 41,
                                limits=configured)
-    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "x" * 40,
+    page = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "x" * 40,
                                   limits=configured)
     assert page.partial is False and page.scanned == 2
 
@@ -1846,7 +1888,7 @@ async def test_a_ragged_budget_is_spent_in_pages_that_divide_it(store):
     bind(store, ORG_A, "doc-far", 105)
     papra = FakePapra({"doc-far": papra_doc("doc-far")})
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 251)])
-    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung",
+    page = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung",
                                   page_size=5, limits=SearchLimits(scan_rows=120))
     assert index.search_calls == [(1, 60), (2, 60)]
     assert [item.document_id for item in page.items] == ["doc-far"]
@@ -1889,7 +1931,7 @@ async def test_an_allowance_with_no_usable_divisor_names_the_rows_it_cannot_spen
     bind(store, ORG_A, "doc-far", 105)
     papra = FakePapra({"doc-far": papra_doc("doc-far")})
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 1201)])
-    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung",
+    page = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung",
                                   page_size=5, limits=SearchLimits(scan_rows=997))
     assert len(index.search_calls) == 9 and {n for n, _ in index.search_calls} == set(range(1, 10))
     assert {limit for _, limit in index.search_calls} == {KREUZAKT_PAGE_ROWS}
@@ -1911,7 +1953,7 @@ async def test_the_page_size_is_asked_for_the_same_way_every_time(store):
     bind(store, ORG_A, "doc-far", 105)
     papra = FakePapra({"doc-far": papra_doc("doc-far")})
     index = ScriptedIndex(hits=[kz_row(n) for n in range(1, 251)])
-    page = await search_documents(ctx(ORG_A), store, papra, index.reader(), "rechnung",
+    page = await search_documents(ctx(scope_all=True), store, papra, index.reader(), "rechnung",
                                   page_size=5, limits=SearchLimits(scan_rows=250))
     assert [item.document_id for item in page.items] == ["doc-far"]
     limits = {limit for (_page, limit) in index.search_calls}

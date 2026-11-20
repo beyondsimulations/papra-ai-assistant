@@ -863,7 +863,8 @@ of the measured behaviours are controller's measurements on the operator's own e
 | `strasse` against a document holding `Straße` | the `ß`/`ss` spelling difference | **no hit** | `ß` is **not** folded to `ss`, even though umlauts fold. A spelling difference is a real search miss |
 
 Phrase queries work (`Versicherungsschein Nr.`, `Nr. VH-2024`). A `page_size` of 5 with
-`scanned` far above it is normal: `scanned` is rows the index looked at, not candidates.
+`scanned` far above it is normal: `scanned` is rows the index looked at, not candidates. It reads
+`null` for a scoped device token — that is the withheld count, not a broken listener (Step 5.5).
 
 **If not**
 
@@ -1232,12 +1233,16 @@ and then the same call with the operator's `--all-buckets` token.
 two-bucket store, scoped token first:
 
 ```json
-{ "items": [], "page": 1, "page_size": 20, "partial": false, "scanned": 1,
+{ "items": [], "page": 1, "page_size": 20, "partial": false, "scanned": null,
   "stats": { "kept": 0, "dropped_unauthorized": "1", "dropped_unmatched": "0",
              "dropped_deleted": 0, "dropped_lookup_error": 0, "dropped_unreached": 0,
              "expanded": 0 },
   "buckets_reached": [], "buckets_skipped": [], "partial_reason": null }
 ```
+
+`scanned` is **`null`** on the scoped call and a number on the all-buckets one. That is deliberate and
+it is the second half of the band: an exact row count, sitting beside the exact `kept` and drop
+counters, is `dropped_unauthorized` written in a different field.
 
 - **zero items**, `partial: false`, and the word `not-in-scope` **nowhere in the response**
 - `dropped_unauthorized` present, as a **band** (`"1"`, `"2-9"`, `"10+"`), never an exact count for a

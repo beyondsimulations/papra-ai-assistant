@@ -240,8 +240,14 @@ class SearchPage(BaseModel):
     tool scanned, or the scan proved upstream had nothing more to give. A full page that also
     exhausted the corpus is `partial=False` — being short is not the same as being incomplete.
 
-    `scanned` is Kreuzakt rows examined, not items returned: it is what the scan budget was
-    spent on, and it is how an operator can tell "no matches" from "we stopped looking".
+    `scanned` is Kreuzakt rows examined, not items returned: it is what the scan budget was spent
+    on, and it is how an operator can tell "no matches" from "we stopped looking". **Exact for an
+    all-buckets credential, `null` for a scoped one.** Beside the exact `kept`, `dropped_deleted`,
+    `dropped_lookup_error` and `dropped_unreached`, an exact `scanned` is the arithmetic residual of
+    the banded `dropped_unauthorized`: subtract them and the number of withheld rows in buckets this
+    caller may not see falls out — exactly, whenever `partial` is false and the scan therefore
+    covered the corpus. A scoped caller keeps `partial` and `partial_reason`, which carry the actual
+    "did we look at everything" signal, and the operator's log keeps the row count.
 
     `buckets_reached` and `buckets_skipped` say which buckets were consulted. Skipped ones are named
     because the only way to skip a bucket is to hold an `--all-buckets` token, which is already
@@ -253,7 +259,7 @@ class SearchPage(BaseModel):
     page: int
     page_size: int
     partial: bool
-    scanned: int
+    scanned: int | None
     stats: ResolveStats
     buckets_reached: list[str] = []
     buckets_skipped: list[str] = []
@@ -901,6 +907,10 @@ def _log_what_the_caller_was_not_told(what: str, swept: Sweep, call: CallScope,
     ledger failure: the type is the actionable part, and the messages are Papra's prose.
     """
     counts = call.stats
+    if not scope_all:
+        # The payload withholds the exact scan count from a scoped token (see `SearchPage.scanned`),
+        # so the operator's line has to carry it, including the calls that withheld nothing.
+        logger.debug("mcp: %s scanned %d index rows for a scoped token", what, swept.scanned)
     if not scope_all and (counts.dropped_unauthorized or counts.dropped_unmatched):
         logger.info("mcp: %s banded its withheld counts for a scoped token; exact: "
                     "dropped_unauthorized=%d dropped_unmatched=%d rows_scanned=%d",
@@ -931,7 +941,7 @@ def _page(swept: Sweep, call: CallScope, *, items: list[SearchItem], page: int, 
         page=page,
         page_size=page_size,
         partial=bool(reasons),
-        scanned=swept.scanned,
+        scanned=swept.scanned if scope_all else None,
         stats=_wire_stats(call.stats, scope_all=scope_all),
         buckets_reached=list(call.reached),
         buckets_skipped=list(call.skipped),

@@ -686,8 +686,9 @@ own `total` claimed more rows, when a Papra read failed, or when a bucket in sco
 (see the fan-out bound below) — and `partial_reason` names which in one line. It is false for a short
 page that exhausted the corpus, and false when rows were dropped for being another bucket's,
 unresolvable, or deleted: those were checked, and the archive's answer was no. `scanned` is index rows
-examined, and `stats` counts each reason separately, because "your token does not cover that" and "we
-never held that in the ledger" are different questions for whoever reads an empty list.
+examined — exact for an `--all-buckets` token, `null` for a scoped one, for the reason in the second
+paragraph below — and `stats` counts each reason separately, because "your token does not cover that"
+and "we never held that in the ledger" are different questions for whoever reads an empty list.
 
 **What those counters say about somebody else's bucket is written down here, because it is a
 disclosure and not only a diagnostic.** `stats` is exact for an `--all-buckets` token and banded for a
@@ -701,11 +702,21 @@ that could ever be told a non-zero value, since an all-buckets token is denied n
 counts are in the listener's log instead: `mcp: search_documents banded its withheld counts for a
 scoped token; exact: dropped_unauthorized=12 dropped_unmatched=0 rows_scanned=13`.
 
+**`scanned` is withheld from a scoped token for the same reason, and it travels as `null`.** It did
+not at first, and the first version of that mitigation did not mitigate: with `dropped_unauthorized`
+banded to `"10+"`, the same payload carried `"scanned":13`, `"kept":1` and every other counter `0`, so
+`13 − 1 − 0 − 0 − 0 = 12` fell out of the answer — exactly rather than as a bound, because `partial`
+was false and the scan had therefore seen the whole corpus. Measured the same way, a one-bucket device
+asking for `list_recent_documents(limit=1)` over a 60-row index was told `"scanned":60`, which is the
+corpus size. A band whose minuend ships is decoration. The row count is the operator's own number: it
+separates "no matches" from "we stopped looking", which only means something to whoever can raise
+`PAPRA_INDEX_SEARCH_SCAN_ROWS` or rebuild, and it is in the log line quoted above. A scoped caller keeps
+`partial` and `partial_reason`, which say the same thing without the arithmetic.
+
 **And what no field takes away, which is the accepted part of that risk.** A scoped token can still
-learn *that* other buckets have matches: a caller who wants to can bound the same fact from `scanned`,
-`kept` and the length of the answer with both counters gone, and a query that only foreign documents
-match answers with an empty list rather than an error. Coarsening the numbers removes the census, not
-the existence signal, and no field-level change will. So this deployment is one trust domain: `--org-id`
+learn *that* other buckets have matches: a query that only foreign documents match answers with an
+empty list rather than an error, and the banded `"1"` says it outright. Coarsening the numbers removes
+the census, not the existence signal, and no field-level change will. So this deployment is one trust domain: `--org-id`
 scoping reduces the blast radius of a leaked device token and is a boundary the code enforces, but it is
 not confidentiality between buckets. If that ever became a requirement, the fix is a different scope
 model — a per-token filtered index that cannot see the other buckets at all — and not another field on
