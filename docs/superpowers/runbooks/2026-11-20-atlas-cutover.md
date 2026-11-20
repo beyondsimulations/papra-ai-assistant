@@ -1098,6 +1098,23 @@ mistake is visible to something other than you. Everything before it moved text 
 this hands a read-only view of the archive to `pi` and `hermes`, each scoped to the buckets its token
 names.
 
+**One correction to "the only part", because it is the easiest way to expose the archive by accident.**
+Kreuzakt also answers HTTP, and it answers it with a human web UI: `GET /` on the container returns a
+35 KB page titled *Kreuzakt Document Search*, a Next.js front end over the same API this suite calls.
+It has **no authentication of any kind** — measured on the pinned image, `GET /api/documents` with no
+credential answers `200` with the corpus. Inside the stack network that is deliberate, and it is why
+`papra-suite` can talk to the index without a second secret. The consequence for this step is narrow
+and firm: the thing that gets a tailnet domain is the MCP listener, never Kreuzakt. Publishing its
+port, or giving it a `tailscale serve` front, would put every document — and the ability to upload,
+edit and delete them — in reach of anything that can route to it, and it would bypass the bearer
+tokens, the bucket scoping and the Papra liveness checks in one move, because all three live in our
+listener and none of them live in Kreuzakt. Our test compose publishes it on `127.0.0.1:12400` for the
+sake of the tests; the production snippet in the README publishes no port at all.
+
+Its legitimate use is as a debug surface, from the box. It is the quickest way to read one document's
+extracted text beside the page it came from, which is the spot-check Step 3.1 asks for — run the read
+from a container that has `curl`, since the Kreuzakt image has none.
+
 The listener is loopback-only unless you say otherwise in the database, and it refuses every request
 whose `Host` or `Origin` is not derived from `PAPRA_MCP_URL` — **before** authentication. That is
 what makes Step 0b a prerequisite rather than a footnote.
