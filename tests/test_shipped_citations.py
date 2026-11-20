@@ -26,6 +26,7 @@ import papra_suite
 
 PACKAGE_DIR = Path(papra_suite.__file__).resolve().parent
 README = PACKAGE_DIR.parent / "README.md"
+RUNBOOK_DIR = PACKAGE_DIR.parent / "docs" / "superpowers" / "runbooks"
 
 #: A read handed to a human to run by hand: the `sqlite3` CLI and a `SELECT` on one line. Written to
 #: catch the shape rather than the three strings it replaced, so any database filename and any query
@@ -143,6 +144,19 @@ def _shipped_sources():
     return sorted(PACKAGE_DIR.rglob("*.py")), README
 
 
+def runbooks():
+    """`{name: text}` for every operator runbook under `docs/superpowers/runbooks/`.
+
+    These are shipped in the same sense the README is: a named human is told to sit down and follow
+    them, on a server, with the archive in reach. The README is where the rules were learned, so the
+    rule belongs here too — and a runbook is the document most likely to be written at speed, under
+    time pressure, which is exactly when a raw query gets typed in because it is the thing that
+    works today.
+    """
+    return {path.name: path.read_text(encoding="utf-8")
+            for path in sorted(RUNBOOK_DIR.glob("*.md"))}
+
+
 def test_no_shipped_file_hands_the_operator_a_raw_sql_query():
     """No `sqlite3 … SELECT` in any shipped source file or in the README.
 
@@ -156,6 +170,8 @@ def test_no_shipped_file_hands_the_operator_a_raw_sql_query():
 
     sources, readme = _shipped_sources()
     assert len(sources) > 10 and readme.is_file(), "the scan found nothing to scan"
+    books = runbooks()
+    assert books, f"the scan found no runbooks under {RUNBOOK_DIR}"
 
     offenders = []
     for path in [*sources, readme]:
@@ -163,6 +179,10 @@ def test_no_shipped_file_hands_the_operator_a_raw_sql_query():
         for number, line in enumerate(text.splitlines(), start=1):
             if RAW_SQL_HANDOVER.search(line):
                 offenders.append(f"{path.name}:{number}: {line.strip()[:90]}")
+    for name, text in books.items():
+        for number, line in enumerate(text.splitlines(), start=1):
+            if RAW_SQL_HANDOVER.search(line):
+                offenders.append(f"{name}:{number}: {line.strip()[:90]}")
 
     assert not offenders, "raw SQL handed to an operator:\n" + "\n".join(offenders)
 
@@ -251,6 +271,51 @@ def test_sql_lives_in_the_store_and_nowhere_else():
                  if path.name != "store.py" and "FROM jobs" in path.read_text(encoding="utf-8")]
 
     assert not offenders, f"modules naming the jobs table directly: {offenders}"
+
+
+def test_the_cutover_runbook_changes_state_through_commands_only():
+    """The long-form runbook gets the no-raw-SQL rule with no exception, and names its commands.
+
+    Two halves, because a negative rule alone can be satisfied by deleting the documentation. The
+    README is allowed exactly one raw statement (the `DELETE` with no command equivalent, pinned
+    above); a runbook written *after* that argument was had is held to the stricter rule, with no
+    exception at all — and then required to name the commands that actually change the state each of
+    its steps is about. That second assertion is what makes this a citation test and not just a
+    regex pointed at a new directory: a runbook that quietly lost `mcp --disable` while keeping its
+    prose about rolling the listener back is the stale document this file exists to catch.
+    """
+    books = runbooks()
+    assert books, f"no runbooks found under {RUNBOOK_DIR}"
+    cutover = {name: text for name, text in books.items() if "atlas-cutover" in name}
+    assert len(cutover) == 1, f"expected exactly one cutover runbook, got {sorted(books)}"
+    name, text = next(iter(cutover.items()))
+
+    # No raw handover of any shape — the exception the README keeps is not inherited here.
+    assert not raw_invocations(text, name=name), f"{name} hands over raw SQL"
+    # And the guard bites on this file rather than passing it by accident.
+    injected = raw_invocations(
+        text + '\n```bash\nsqlite3 "$DATA_DIR/state.db" "SELECT count(*) FROM jobs"\n```\n',
+        name=name)
+    assert len(injected) == 1, f"the guard does not notice a handover added to {name}"
+
+    # The positive half: every state change the runbook performs is a command it names.
+    for command, why in (
+        ("papra-suite mcp --enable", "enabling the listener"),
+        ("papra-suite mcp --disable", "closing the listener again"),
+        ("papra-suite mcp-token --create", "minting a token"),
+        ("papra-suite mcp-token --revoke", "revoking a token"),
+        ("papra-suite jobs --kind ocr --drain", "proving the content queue quiet"),
+        ("papra-suite jobs --kind title --drain", "proving the title queue quiet"),
+        ("papra-suite jobs --kind index --drain", "the index queue's finish line"),
+        ("papra-suite ledger --reindex-all", "rebuilding by generation"),
+        ("papra-suite metadata --restore-auto", "the ownership audit"),
+    ):
+        assert command in text, f"{name} lost the command for {why}: {command}"
+
+    # The settings rows are never handed over as rows to write.
+    for row in ("mcp_server_enabled", "mcp_bind_nonloopback"):
+        assert row not in text or f"{row}: unset" in text or f"`{row}`" in text, \
+            f"{name} appears to hand over the {row} row itself"
 
 
 def test_the_handover_sites_cite_the_drain_command_that_proves_quiescence():
