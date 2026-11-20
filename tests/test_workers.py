@@ -149,6 +149,34 @@ async def test_run_ocr_job_raises_on_zero_page_pdf(store, config):
     assert papra.content_updates == []  # nothing written back
 
 
+async def test_a_negative_ocr_max_pages_refuses_rather_than_emptying_the_document(store, config):
+    """A minus sign in the environment must not become an empty `content` in the archive.
+
+    Reproduced before this fix: with `ocr_max_pages=-3` on a two-page PDF, `min(2, -3)` is `-3`, the
+    `limit == 0` guard missed it, `range(-3)` transcribed nothing, and `update_document(content='')`
+    emptied the document while the job was marked done. `0` raised, which is why nobody expected the
+    neighbouring value to be the destructive one.
+    """
+    from dataclasses import replace
+
+    import fitz
+
+    pdf = fitz.open()
+    pdf.new_page()
+    pdf.new_page()
+    pdf_bytes = pdf.tobytes()
+    pdf.close()
+    papra = StubPapra(pdf_bytes)
+    llm, calls = make_llm(["# Seite eins"])
+
+    with pytest.raises(ValueError, match="no pages to transcribe"):
+        await run_ocr_job(papra, llm, make_job(store),
+                          config=replace(config, ocr_max_pages=-3))
+
+    assert calls["n"] == 0
+    assert papra.content_updates == []      # the assertion that matters: no empty write
+
+
 async def test_run_ocr_job_renders_pages_lazily(store, config, monkeypatch):
     """Pin the lazy path: run_ocr_job must call render_page once per page
     index (off the loop via asyncio.to_thread), not render_pages upfront."""

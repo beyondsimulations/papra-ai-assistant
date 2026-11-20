@@ -664,6 +664,36 @@ async def test_list_documents_refuses_a_since_that_only_accidentally_matches():
     await client.aclose()
 
 
+async def test_list_documents_refuses_a_date_the_calendar_does_not_have():
+    """The shape guard accepted month 13, and Kreuzakt compares `since` lexically.
+
+    Measured against the pinned container with the client itself: `since="2026-13-45"` returned **0
+    rows** — the "an incremental scan concludes nothing ever changed" arm named in the guard's own
+    docstring — while `since="2026-00-00 99:99:99"` and `since="2026-02-30"` returned a **full
+    page**,
+    the "re-reads everything" arm. Both came back 200. So the regex was checking the grammar and not
+    the calendar, and the two failures this guard was written to refuse walked straight through it.
+    """
+    page = load("kreuzakt_documents_page.json")
+    client, calls = make_client([("/api/documents", ok(page))])
+    for impossible in ("2026-13-45", "2026-00-00", "2026-02-30", "2026-11-31 12:00:00",
+                       "2025-02-29 10:00:00", "2026-00-00 99:99:99"):
+        with pytest.raises(KreuzaktError, match="since"):
+            await client.list_documents(since=impossible)
+    assert calls == []                     # nothing sent, so nothing can answer "no matches"
+    await client.aclose()
+
+
+async def test_a_real_leap_day_is_still_a_valid_watermark():
+    """The point is to refuse impossible dates, not to refuse February."""
+    page = load("kreuzakt_documents_page.json")
+    client, calls = make_client([("/api/documents", ok(page))])
+    await client.list_documents(since="2024-02-29")
+    await client.list_documents(since="2024-02-29 23:59:59")
+    assert len(calls) == 2
+    await client.aclose()
+
+
 async def test_list_documents_accepts_both_measured_since_forms():
     page = load("kreuzakt_documents_page.json")
     client, calls = make_client([("/api/documents", ok(page))])

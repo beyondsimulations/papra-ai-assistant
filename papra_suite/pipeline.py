@@ -218,8 +218,13 @@ async def run_ocr_job(papra: PapraClient, ocr_llm: LLMClient, job: Job, *,
             "document has %d pages; skipped %d additional pages beyond max_pages=%d",
             total, total - config.ocr_max_pages, config.ocr_max_pages,
         )
-    if limit == 0:
-        raise ValueError("document has no pages to transcribe")
+    if limit <= 0:
+        # `<= 0`, not `== 0`. With a negative `ocr_max_pages` the `min()` above returns that
+        # negative, `range(negative)` transcribes nothing, and the empty markdown assembled below is
+        # PATCHed onto the document — erasing its text in the system of record, which keeps no
+        # previous version. `load_config` refuses the value now; this is the second door.
+        raise ValueError(f"document has no pages to transcribe (pages={total}, "
+                         f"max_pages={config.ocr_max_pages})")
     page_markdowns = []
     for index in range(limit):
         png = await asyncio.to_thread(

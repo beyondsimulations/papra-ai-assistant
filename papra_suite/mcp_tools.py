@@ -50,7 +50,13 @@ from urllib.parse import quote, urlparse
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel
 
-from papra_suite.kreuzakt_client import KreuzaktError, KzDocument, KzHit, _hit_from_row
+from papra_suite.kreuzakt_client import (
+    KreuzaktError,
+    KzDocument,
+    KzHit,
+    _hit_from_row,
+    is_document_watermark,
+)
 
 # `_hit_from_row` is imported rather than re-written: it is the single check that a Kreuzakt row
 # carries the fields the bridge depends on, and the house precedent for borrowing a private
@@ -100,7 +106,6 @@ CLIENT_MESSAGE_LIMIT = 240
 #: `invalid-request` — their mistake — rather than as an upstream error. Matched with `fullmatch`
 #: below: with `match`, the trailing `$` still permitted a newline, so `2026-01-01\n` passed this
 #: check and a shape nobody chose reached the wire.
-_SINCE_FORM = re.compile(r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?$")
 
 
 class IndexUnavailable(ToolError):
@@ -339,9 +344,10 @@ def check_recent_request(limit: int, since: object, *, limits: SearchLimits) -> 
     _require_page(1, limit, limits=limits)
     if since is None:
         return None
-    if not isinstance(since, str) or _SINCE_FORM.fullmatch(since.strip()) is None:
+    if not is_document_watermark(since):
         raise InvalidRequest(
-            f"since must be 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS', got {since!r}. A value in ISO "
+            f"since must be 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS', and a date the calendar has, "
+            f"got {since!r}. A value in ISO "
             "`…Z` form is refused rather than rewritten: measured against the pinned container it "
             "answers 200 with no rows at all, and the column it would be compared against has no "
             "documented timezone, so converting it would pick a meaning for the instant and hide "

@@ -1179,6 +1179,24 @@ async def test_a_recent_listing_that_spends_the_budget_is_partial(store):
     assert len(index.list_calls) == DEFAULT_LIMITS.scan_rows // KREUZAKT_PAGE_ROWS
 
 
+async def test_a_date_the_calendar_does_not_have_is_refused_not_answered(store):
+    """`since=2026-13-45` used to be a legitimate-looking request that answered "nothing".
+
+    The tool validated the grammar and the client validated the grammar, so the value reached
+    Kreuzakt
+    and the lexical comparison over a `YYYY-MM-DD HH:MM:SS` column matched nothing — an agent is
+    told
+    "no documents since then", which is a wrong answer rather than a refusal. Both validators now
+    share one calendar check, so this is `invalid-request` before anything is read.
+    """
+    papra = own_corpus(store, 2)
+    index = ScriptedIndex(rows=[kz_document_row(1)])
+    for impossible in ("2026-13-45", "2026-02-30", "2026-00-00 99:99:99"):
+        with pytest.raises(ToolError, match="invalid-request"):
+            await list_recent_documents(ctx(ORG_A), store, papra, index.reader(), limit=5,
+                                        since=impossible)
+
+
 async def test_since_goes_upstream_in_kreuzakts_own_form(store):
     """The value that filters is `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`, unchanged.
 

@@ -1,4 +1,5 @@
 import ipaddress
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -222,6 +223,21 @@ def _positive_int_env(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _non_negative_int_env(env: Mapping[str, str], name: str, default: int) -> int:
+    """For the one knob where zero is a *feature*: `SWEEP_INTERVAL_S=0` means "do not sweep".
+
+    `serve` implements it that way and `tests/test_serve.py` pins it (the sweep-disable guard), so
+    refusing zero here would delete a supported mode rather than add a safety. Negative values are
+    still refused: a negative interval is not "off", it is a sleep that returns immediately, i.e.
+    the
+    sweep running as fast as it can while reading as disabled to whoever typed `-1`.
+    """
+    value = _int_env(env, name, default)
+    if value < 0:
+        raise ConfigError(f"{name} must be 0 (which disables the sweep) or greater, got: {value}")
+    return value
+
+
 def _float_env(env: Mapping[str, str], name: str, default: float) -> float:
     raw = env.get(name, "").strip()
     if not raw:
@@ -233,9 +249,17 @@ def _float_env(env: Mapping[str, str], name: str, default: float) -> float:
 
 
 def _positive_float_env(env: Mapping[str, str], name: str, default: float) -> float:
+    """A quantity, not any float that survives a comparison.
+
+    `float("nan") <= 0` is False, so a NaN interval used to load happily and then make every
+    comparison against it false: a poller that never sleeps, a timeout that never fires. `inf` is
+    the
+    mirror image — a wait that never ends is indistinguishable from a hung worker from outside. Both
+    are refused here, naming the variable, because they arrive as a plausible-looking env file.
+    """
     value = _float_env(env, name, default)
-    if value <= 0:
-        raise ConfigError(f"{name} must be greater than 0, got: {value}")
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError(f"{name} must be a finite number greater than 0, got: {value}")
     return value
 
 
@@ -396,11 +420,11 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
         dashboard_host=host,
         dashboard_port=port,
         data_dir=Path(env.get("DATA_DIR", "").strip() or "/app/data"),
-        ocr_max_pages=_int_env(env, "OCR_MAX_PAGES", 50),
-        ocr_page_pixel_budget=_int_env(env, "OCR_PAGE_PIXEL_BUDGET", 2_000_000),
-        ocr_dpi=_int_env(env, "OCR_DPI", 150),
-        ocr_concurrency=min(_int_env(env, "OCR_CONCURRENCY", 3), 3),
-        sweep_interval_s=_int_env(env, "SWEEP_INTERVAL_S", 300),
+        ocr_max_pages=_positive_int_env(env, "OCR_MAX_PAGES", 50),
+        ocr_page_pixel_budget=_positive_int_env(env, "OCR_PAGE_PIXEL_BUDGET", 2_000_000),
+        ocr_dpi=_positive_int_env(env, "OCR_DPI", 150),
+        ocr_concurrency=min(_positive_int_env(env, "OCR_CONCURRENCY", 3), 3),
+        sweep_interval_s=_non_negative_int_env(env, "SWEEP_INTERVAL_S", 300),
         # `_positive_int_env`, the port's and the counters' parser: `10MB`, `1e8` and `-5` refuse
         # with the bad value named rather than falling back to 100 MiB, which is the failure the
         # operator would never see — they raise the ceiling to admit a big scan, the typo is

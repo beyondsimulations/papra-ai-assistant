@@ -640,3 +640,65 @@ def test_whitespace_only_max_document_bytes_falls_back_to_the_default():
     config = load_config({**BASE_ENV, "PAPRA_MAX_DOCUMENT_BYTES": "   "})
 
     assert config.max_document_bytes == 104857600
+
+
+# --- sign discipline on the knobs that gate writes and worker counts ---------------------------
+
+#: Every knob that was parsed without a sign check and where zero is not a mode. Each has a way to
+#: hurt the archive or stall a worker silently: `OCR_MAX_PAGES=-3` emptied document text (see
+#: test_workers) and `OCR_CONCURRENCY=0` starts no worker at all while `check` still credits the
+#: worker. `SWEEP_INTERVAL_S` is deliberately absent from this list — zero is implemented there, and
+#: `test_sweep_interval_zero_still_means_do_not_sweep` keeps it that way.
+UNSIGN_CHECKED_KNOBS = [
+    "OCR_MAX_PAGES",
+    "OCR_PAGE_PIXEL_BUDGET",
+    "OCR_DPI",
+    "OCR_CONCURRENCY",
+]
+
+
+@pytest.mark.parametrize("name", UNSIGN_CHECKED_KNOBS)
+@pytest.mark.parametrize("value", ["0", "-1", "-99999"])
+def test_zero_and_negative_values_are_refused_by_name(tmp_path, name, value):
+    """`0` is not "unlimited" and `-1` is not "unbounded": both are refused at startup.
+
+    The refusal has to name the variable, because this runs during a deploy over ssh and a bare
+    "must be at least 1" tells nobody which line of the environment file to fix.
+    """
+    with pytest.raises(ConfigError, match=name):
+        load_config({**BASE_ENV, "DATA_DIR": str(tmp_path), name: value})
+
+
+@pytest.mark.parametrize("name", UNSIGN_CHECKED_KNOBS)
+def test_one_is_accepted_where_zero_is_not(tmp_path, name):
+    """The boundary is "at least 1", so the smallest legal value has to load."""
+    load_config({**BASE_ENV, "DATA_DIR": str(tmp_path), name: "1"})
+
+
+@pytest.mark.parametrize("name", ["PAPRA_INDEX_POLL_INTERVAL_S", "PAPRA_INDEX_WAIT_TIMEOUT_S"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e999"])
+def test_a_float_knob_refuses_the_values_that_are_not_quantities(tmp_path, name, value):
+    """`float('nan')` passes a `> 0` test by failing it, which is the wrong direction.
+
+    A NaN interval is not a refusal and not a wait: it is a comparison that is always false, i.e. a
+    poller that never sleeps or a timeout that never fires. `inf` is the other half — a wait that
+    never ends looks identical to a hung worker from the outside.
+    """
+    with pytest.raises(ConfigError, match=name):
+        load_config({**BASE_ENV, "DATA_DIR": str(tmp_path), name: value})
+
+
+def test_sweep_interval_zero_still_means_do_not_sweep(tmp_path):
+    """The deliberate exception, kept deliberate.
+
+    `serve` reads 0 as "no sweep task at all" and `tests/test_serve.py` pins that behaviour, so the
+    sign discipline above must not reach this knob — refusing 0 here would silently remove a
+    supported
+    mode. What *is* refused is a negative interval, which reads as "off" to whoever typed it and
+    means
+    "sweep as fast as possible" to the scheduler.
+    """
+    config = load_config({**BASE_ENV, "DATA_DIR": str(tmp_path), "SWEEP_INTERVAL_S": "0"})
+    assert config.sweep_interval_s == 0
+    with pytest.raises(ConfigError, match="SWEEP_INTERVAL_S"):
+        load_config({**BASE_ENV, "DATA_DIR": str(tmp_path), "SWEEP_INTERVAL_S": "-1"})

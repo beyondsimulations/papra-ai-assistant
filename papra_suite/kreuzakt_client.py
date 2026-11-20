@@ -45,6 +45,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -721,6 +722,38 @@ class KreuzaktClient:
 _DOCUMENTS_SINCE = re.compile(r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?$")
 
 
+_WATERMARK_FORMATS = ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S")
+
+
+def is_document_watermark(value: object) -> bool:
+    """Is this a value Kreuzakt's `since` filter can actually mean?
+
+    Grammar was the half that was checked; the calendar is the other half, and without it the shape
+    guard let through exactly the two failures it documents. Measured against the pinned container
+    with this client: `2026-13-45` answers **200 with no rows** ("nothing ever changed"), while
+    `2026-00-00 99:99:99` and `2026-02-30` answer **200 with a full page** ("re-read everything").
+    The comparison upstream is lexical against a `YYYY-MM-DD HH:MM:SS` column, so an impossible date
+    is not an error upstream — it is a silent, confident, wrong row set.
+
+    No timezone is invented and no coercion happens: the value must parse as one of the two forms.
+    Shared with the MCP tool so the two validators cannot drift into disagreeing about what a date
+    is.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if _DOCUMENTS_SINCE.fullmatch(text) is None:
+        return False
+    for fmt in _WATERMARK_FORMATS:
+        try:
+            datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+
 def _hit_from_row(row: Any) -> KzHit:
     """One search hit, with the fields `KzHit` declares actually present.
 
@@ -755,11 +788,13 @@ def _require_documents_since(since: str) -> str:
     comparison against a `YYYY-MM-DD HH:MM:SS` column, so only that shape (or its date
     prefix) is a filter at all.
     """
-    if not _DOCUMENTS_SINCE.match(since):
+    if not is_document_watermark(since):
         raise KreuzaktError(
             f"since={since!r} is not a Kreuzakt document watermark: `since` must be "
-            "'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' (measured: an ISO-8601 value with "
-            "'T'/'Z' returns 200 with no rows, and an epoch integer returns every row, "
-            "so neither can be sent as if it filtered)"
+            "'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS' **and a date the calendar has** "
+            "(measured: an ISO-8601 value with 'T'/'Z' returns 200 with no rows, an epoch integer "
+            "returns every row, and an impossible date such as '2026-13-45' also returns 200 with "
+            "no rows because the comparison upstream is lexical — so all three can be sent as if "
+            "they filtered, and none of them did)"
         )
     return since
