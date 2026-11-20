@@ -535,11 +535,35 @@ faithful at the top of page 1.
   `ghcr.io/anaisbetts/kreuzakt@sha256:4a0109d0…`, with synthetic PDFs.
 
 So the letterhead risk is real and it is **scoped**: **digital PDFs that carry a text layer can lose
-their top 40–60 points — sender, document number, issue date — and scans do not.** Your archive is
-mostly scans, which is the good news; the documents at risk are the ones that arrived as digital
-PDFs (e-invoices, bank and insurer exports, PDFs printed from a browser, mail attachments that were
-never paper). None of the 52 integration tests can see this either way: they assert the bridge, not
-the extractor's fidelity.
+their top 40–60 points — sender, document number, issue date — and scans do not.** The documents at
+risk are the ones that arrived as digital PDFs (e-invoices, bank and insurer exports, PDFs printed
+from a browser, mail attachments that were never paper). None of the 52 integration tests can see this
+either way: they assert the bridge, not the extractor's fidelity.
+
+**How many of yours are at risk is measurable, and it is the number the whole decision turns on.**
+"Mostly scans" is not a fact anybody here has measured, and 5 documents and 400 imply different
+answers to the question in Step 1.6. `scripts/text_layer_census.py` answers it read-only: it pages each
+bucket's listing, downloads a deterministic sample, and classifies every document by what its **own
+embedded text layer** says — `scanned`, `digital-clean` (text, but nothing in the top band), or
+`digital-at-risk` (text in the band, so the band is what would be lost). It never writes to Papra, never
+contacts Kreuzakt, and spends no inference token, so it is safe to run at any point before Step 3.
+
+```bash
+.venv/bin/python scripts/text_layer_census.py                     # every known bucket, 60 documents each
+.venv/bin/python scripts/text_layer_census.py --per-bucket 30 --top-band-pt 45
+```
+
+**Expect** a per-bucket breakdown, the sample size beside every share, a Wilson interval scaled to that
+bucket's PDF count, and the names of the at-risk documents so you can look at two of them. Then:
+
+- **near zero** — the letterhead risk is a rounding error, and the handover can be decided on other
+  grounds;
+- **a handful** — spot-check them in Step 1.3 and accept, or re-index that class later;
+- **hundreds** — do not hand over a column whose text you know to be shorter. Fix the write policy
+  first, then come back.
+
+`--top-band-pt 45` versus the default `60` is the sensitivity dial: the strip was bracketed, not pinned,
+so a count that barely moves between the two is a count you can trust.
 
 **Do** — make sure the twenty in Step 1.3 include **at least one digital PDF with a text layer**
 (`papra-suite jobs --document-id <id>` shows what ran; a text-layer document is one that never spent
