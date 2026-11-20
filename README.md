@@ -434,6 +434,14 @@ block the test compose uses, with the `ports:` key removed and nothing else chan
       METADATA_LLM_MODEL: "${OMLX_TEXT_MODEL:-}"
     volumes:
       - kreuzakt-data:/data
+    # No `ports:` here, on purpose — and not for tidiness. Kreuzakt has no authentication anywhere:
+    # `GET /api/documents` answers 200 with the whole corpus and no credential, and `GET /` serves a
+    # web UI ("Kreuzakt Document Search") over the same API. A published port, or a `tailscale serve`
+    # front, is therefore an open archive with upload, edit and delete rights — and it routes around
+    # the bearer tokens, the bucket scoping and the Papra liveness checks in one move, because all
+    # three live in this suite's MCP listener and none of them live in Kreuzakt. The suite reaches it
+    # by service name over `indexnet`; the MCP listener is the only thing in this stack that ever
+    # faces a client, and Step 0b of the runbook is what has to be measured before even that opens.
     networks: [indexnet]
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/3000'"]

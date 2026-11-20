@@ -124,7 +124,12 @@ services:
     volumes:
       - kreuzakt-data:/data
     ports:
-      - "127.0.0.1:12400:3000"          # TEST ONLY; absent in production
+      # TEST ONLY — absent in production, and that absence is load-bearing, not tidiness. Kreuzakt
+      # has no authentication anywhere: `GET /api/documents` answers 200 with the corpus and no
+      # credential, and `GET /` serves a web UI over the same API. Loopback-only, on a dev box, with
+      # synthetic documents, is the most this may ever be published; the README's production snippet
+      # publishes nothing and the MCP listener is the only thing in the stack that faces a client.
+      - "127.0.0.1:12400:3000"
     networks: [indexnet]
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/3000'"]
