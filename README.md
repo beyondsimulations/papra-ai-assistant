@@ -56,7 +56,7 @@ listener test imports directly because the SDK's client speaks it, not `httpx`).
 | `DASHBOARD_BIND` | defaults to `127.0.0.1:8080`; never publish it to the LAN |
 | `OCR_MAX_PAGES`, `OCR_PAGE_PIXEL_BUDGET`, `OCR_DPI`, `OCR_CONCURRENCY`, `SWEEP_INTERVAL_S` | optional tuning |
 | `PAPRA_MAX_DOCUMENT_BYTES` | default `104857600` (100 MiB). Over it a document is **not enrolled, and so never indexed** — the remedy is to compress it and re-upload to Papra, or raise this and re-run `backfill`. One number for both consumers (the OCR worker's memory guard and the enrollment gate). A typo (`10MB`, `1e8`, `-5`, `0`) is a startup refusal naming the bad value, never a silent fall back to the default — see "Documents that are too big" |
-| `PAPRA_KREUZAKT_URL` | the Kreuzakt index, e.g. `http://kreuzakt:3000`; unset means no index, search falls back to Papra |
+| `PAPRA_KREUZAKT_URL` | the Kreuzakt index, e.g. `http://kreuzakt:3000`. **Unsetting it disables nothing:** the parser falls back to that same address, and there is no no-index mode in the code. With the index unreachable, MCP search answers `index_unavailable` — it never falls back to a Papra search — while the sweep and the enroll path fail and book `index_failed`. To stop the index, stop the Kreuzakt service; and note that `check` will not report the difference, because it reads the ledger rather than the index (runbook A.1b) |
 | `PAPRA_INDEX_CONTENT_DELIVERY` | default `false` — see "Handing the `content` column over" |
 | `PAPRA_INDEX_METADATA_DELIVERY` | default `false` — see "Handing the title, date and note over" |
 | `PAPRA_LEGACY_WORKERS` | default `true` — this suite's OCR and title workers keep writing; flipping it off is the handover |

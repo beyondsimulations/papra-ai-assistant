@@ -1303,8 +1303,28 @@ claim correct for it.
 | the bridge writing `name`/`documentDate`/`notes` | `PAPRA_INDEX_METADATA_DELIVERY=false` (leave `PAPRA_LEGACY_WORKERS=true` if the title worker must run) | yes | `metadata writer: suite title worker (legacy)` |
 | everything back to pre-cutover | all three delivery flags `false`, `PAPRA_LEGACY_WORKERS=true` | yes | both writers named `legacy` |
 | no writer at all (a quarantine, not a state to live in) | delivery flags `false`, `PAPRA_LEGACY_WORKERS=false` | yes | `content writer: none (handover window)` |
-| the index entirely | `PAPRA_KREUZAKT_URL` unset | yes | search falls back to Papra; the ledger stops being consulted |
+| the index entirely | **there is no switch for this.** Unsetting `PAPRA_KREUZAKT_URL` does not disable the index: the parser then uses its default, `http://kreuzakt:3000`. Stopping the index means stopping the Kreuzakt service itself | yes | **nothing different** — `check` never contacts Kreuzakt (A.1b), so it stays green while every index call fails |
 | the network door | `papra-suite mcp --disable` | yes (`serve`) | `mcp: disabled (nothing listens…)` |
+
+### A.1b What `check` cannot see, and what its numbers count
+
+Measured on this build, with `PAPRA_KREUZAKT_URL` pointed at a port where nothing listens: `check`
+exits **0** and prints its usual lines. It never contacts Kreuzakt, and `check --json` has no field for
+the Kreuzakt URL or for index reachability. So three things an operator might reasonably expect from it
+are not there:
+
+- **whether the index is up.** It is not. `papra-suite mcp --status` and the listener's own log are the
+  authority for the door; for the index, `docker compose ps kreuzakt` and a `GET /api/health` on the
+  container. The failure mode this hides is exactly the one the table above sells: a config that points
+  the suite at a dead address reads as a healthy `check`.
+- **what `index: N refs` means.** It counts **ledger rows in the current generation**, not documents in
+  Papra. During the backfill it is far below Papra's count by design — that gap is progress, not loss —
+  and a `check` taken mid-backfill is not evidence of what the archive holds. `papra-suite ledger
+  --status` is the same ledger view with the per-bucket breakdown.
+- **whether the queue has drained.** `extraction-empty` in `check` counts ledger rows flagged empty,
+  which is a *result*, not a queue state. Drain is `papra-suite jobs --kind index --drain` (Step 3.1),
+  and the delivery-side authority is the same command for `--kind index` plus the extraction counts in
+  `check --json`.
 
 Two things this table is claiming, said plainly:
 
