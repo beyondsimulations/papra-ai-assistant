@@ -26,7 +26,7 @@ from papra_suite.untrusted_text import UNSAFE_CATEGORIES as _UNSAFE_CATEGORIES
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 
-def _recent_event_counts(store) -> str:
+def _recent_event_counts(events: dict) -> str:
     """One line for `check`: what the poller decided against in the last day.
 
     This is the line that turns "the mailbox is polling but nothing arrives" into
@@ -38,13 +38,14 @@ def _recent_event_counts(store) -> str:
     configuration error, and a check that exited non-zero for an empty table would
     train people to stop running check; so an unreadable table degrades to a
     stated reason on the same line rather than a new exit code.
+
+    Rendered from the `events` group of `_check_facts`, which is also what `check --json`
+    prints: an empty table is `none` here and `{}` there, and both statements come from one
+    read of one store.
     """
-    try:
-        counts = store.count_ingest_events_by_kind(
-            since=(datetime.now(UTC) - timedelta(days=1)).isoformat()
-        )
-    except sqlite3.Error as error:
-        return f"events (last 24h): unavailable ({type(error).__name__})"
+    if events.get("unavailable"):
+        return f"events (last 24h): unavailable ({events['unavailable']})"
+    counts = events["by_kind"]
     if not counts:
         return "events (last 24h): none"
     summary = ", ".join(f"{kind}={counts[kind]}" for kind in sorted(counts))
@@ -274,7 +275,7 @@ async def run_serve(config, **kwargs) -> None:
                 signal.signal(sig, handler)   # restore exactly what we replaced
 
 
-def _index_line(store) -> str:
+def _index_line(index, index_unavailable) -> str:
     """One line for `check`: what the index holds, what Papra holds, and what hurts.
 
     The fields are ordered the way the question is asked — how many references exist, how
@@ -299,18 +300,13 @@ def _index_line(store) -> str:
 
     It never fails `check`, for the same reason the events line does: an empty store is not
     a configuration error, and a check that exits non-zero on one trains people to stop
-    running check.
+    running check. `index` is None when the store refused to count at all; the reason is
+    `index_unavailable`, chosen by `_check_facts`, and `--json` reports the same pair as
+    `index: null` beside the reason rather than as a table of zeros.
     """
-    try:
-        stats = store.ledger_stats()
-    except ValueError:
-        # A corrupt `index_generation` means no generation is current, so every
-        # generation-scoped count would be a guess and the store refuses to produce one.
-        # Naming the key is the useful part: the repair is `ledger --invalidate`, and a
-        # bare "unavailable" would send the operator to the wrong service.
-        return "index: unavailable (index_generation names no current generation)"
-    except sqlite3.Error as error:
-        return f"index: unavailable ({type(error).__name__})"
+    if index is None:
+        return f"index: unavailable ({index_unavailable})"
+    stats = index
     return (f"index: {stats['references']} refs, {stats['indexed_current']} current, "
             f"{stats['stale']} stale, {stats['unledgered']} unledgered, "
             f"{stats['delivered']} delivered, {stats['extraction_empty']} extraction-empty, "
@@ -322,7 +318,7 @@ def _index_line(store) -> str:
             f"cleanup-pending (failed {stats['cleanup_failed']})")
 
 
-def _deletion_pass_line(store) -> str:
+def _deletion_pass_line(deletion: dict) -> str:
     """`deletions: ...` — what the last delete-propagation pass did, or why it refused.
 
     `check` opens no Papra or Kreuzakt client — its whole purpose is answering "is this
@@ -332,70 +328,69 @@ def _deletion_pass_line(store) -> str:
     They need to: a corpus whose listing stopped being trustworthy propagates no deletions at
     all, and from the ledger that is indistinguishable from a corpus where nobody deleted
     anything.
+
+    The four extras are read once, by `_check_facts`, and `--json` emits the same group as data, so
+    a quarantine cannot be visible on one surface and invisible on the other.
     """
     from papra_suite import indexing
 
-    stamp = store.get_setting(indexing.LAST_DELETION_PASS_SETTING)
+    stamp = deletion["stamp"]
     # Four things a pass can be quietly wrong about, printed beside its own verdict: buckets it set
     # aside, the marks counter that can hold marking for a day, the walk cadence that can skip the
     # pass entirely, and the ids the liveness probe still cannot read. All four are stated in the
     # pass's own log, but `check` is where an operator looks when something is not happening, and a
     # quarantine is exactly that.
     extra = ""
-    quarantine = store.get_setting(indexing.DELETION_QUARANTINE_SETTING)
-    if quarantine:
+    if deletion["set_aside"]:
         # The list is rewritten only by a pass that walked every bucket to its end, so after an
         # abort it is the PREVIOUS pass's verdict. Printed unqualified it reads as current, which
         # is the staleness the row was rewritten from a lock in order to avoid.
-        stale = not (stamp or "").startswith("ok ")
-        extra += f" | set aside: {quarantine}"
-        if stale:
+        extra += f" | set aside: {deletion['set_aside']}"
+        if deletion["set_aside_stale"]:
             extra += " (not re-read by the last pass)"
-    marks = store.get_setting(indexing.MARKS_ROLLING_SETTING)
-    if marks and "|" in marks:
+    if deletion["marks_counted"] is not None:
         # The counter alone is not a fact: 34 means nothing until it is beside the 30 it is being
         # judged against, and the row to clear has to be named or this becomes an sqlite lesson.
-        try:
-            counted, allowance = indexing.marks_window_state(store)
+        if deletion["marks_allowance"] is not None:
             # Both names belong here: the settings row is what holds the state, and the
             # subcommand is what clears it without an sqlite lesson at 23:00.
-            extra += (f" | marks this window: {counted} of {allowance} allowed (clear "
+            extra += (f" | marks this window: {deletion['marks_counted']} of "
+                      f"{deletion['marks_allowance']} allowed (clear "
                       f"{indexing.MARKS_ROLLING_SETTING} with `papra-suite ledger --clear-marks` "
                       "to resume)")
-        except ValueError:
-            counted = marks.split("|", 1)[1]
-            extra += f" | marks this window: {counted}"
-    gate = indexing.listing_walk_gate(store)
-    if gate:
+        else:
+            # The allowance could not be read, but the count is still closer to useful than the
+            # raw settings text.
+            extra += f" | marks this window: {deletion['marks_counted']}"
+    if deletion["gated_until"]:
         # Without this, a pass that is sitting out its cadence prints the last walk's `ok` line and
         # looks like a pass that found nothing, beside a document somebody trashed five minutes ago.
-        extra += f" | gated until {gate}"
-    rereads = indexing.pending_probe_rereads(store)
-    if rereads:
-        extra += f" | probe re-reads: {rereads}"
+        extra += f" | gated until {deletion['gated_until']}"
+    if deletion["probe_rereads"]:
+        extra += f" | probe re-reads: {deletion['probe_rereads']}"
     if not stamp:
         return ("deletions: never ran (the sweep does this once per pass, with kreuzakt up)"
                 + extra)
     return f"deletions: {stamp}" + extra
 
 
-def _mcp_line(store, config) -> str:
+def _mcp_line(mcp: dict) -> str:
     """`mcp: ...` — whether this build would answer the network, and with how many credentials.
 
     The state a reader needs before they look for a token problem: a server that is disabled answers
     "connection refused", which looks identical from a client to a server that is firewalled,
     down, or
     has no tokens. One line distinguishes all four, and prints no label (see `mcp_state_line`).
+    Rendered from `mcp_server.mcp_state`, which is also the group `check --json` emits.
     """
     from papra_suite import mcp_server
 
-    try:
-        return mcp_server.mcp_state_line(store, config)
-    except sqlite3.Error as error:
-        return f"mcp: unavailable ({type(error).__name__})"
+    if mcp.get("state") == "unavailable":
+        return f"mcp: unavailable ({mcp['reason']})"
+    return mcp_server.render_mcp_state(mcp)
 
 
-def _oversized_line(store, config) -> str:
+def _oversized_line(oversized: dict) -> str:
     """`oversized: ...` — the documents the ceiling refused, and which ceiling that was.
 
     One line, three numbers: the count, the largest size seen, the limit in force. It is here
@@ -410,34 +405,49 @@ def _oversized_line(store, config) -> str:
     It never fails `check`, for the reason the lines above it do not: a scan over 100 MB is not a
     configuration error, and a check that exits non-zero on one trains people to stop running check.
 
-    **There is no dashboard yet.** This line and the `oversized` field of the MCP `index_status`
-    tool are the two surfaces that show the reason; when a dashboard exists it reads this
+    **There is no dashboard yet.** This line, `check --json`'s `oversized` group, and the MCP
+    `index_status` tool are the surfaces that show the reason; when a dashboard exists it reads this
     same record.
     """
-    from papra_suite.oversized import OVERSIZED_RECORD_LIMIT, oversized_seen
+    from papra_suite.oversized import OVERSIZED_RECORD_LIMIT
 
-    try:
-        record = oversized_seen(store)
-    except sqlite3.Error as error:
+    if oversized.get("unavailable"):
         # Same degradation as `_index_line`: `check` is run *because* something looks wrong, often
         # while the daemon is mid-write, and a traceback here would cost the operator every line of
         # this output rather than the one they came for.
-        return f"oversized: unavailable ({type(error).__name__})"
-    if record.count == 0:
-        return (f"oversized: none seen (limit in force {config.max_document_bytes} bytes) — over "
+        return f"oversized: unavailable ({oversized['unavailable']})"
+    limit = oversized["limit_in_force"]
+    if oversized["count"] == 0:
+        return (f"oversized: none seen (limit in force {limit} bytes) — over "
                 "it a document is neither enrolled nor indexed: compress it and re-upload to papra")
-    moved = (f" (refused at {record.limit}; they fit the limit now, and each drops out of this "
-             "count when it is enrolled)"
-             if record.limit is not None and record.limit != config.max_document_bytes else "")
-    evicted = (f", {record.evicted} not named (the record lists the newest "
-               f"{OVERSIZED_RECORD_LIMIT})" if record.evicted else "")
-    return (f"oversized: {record.count} seen since {record.since}, largest {record.largest} bytes, "
-            f"limit in force {config.max_document_bytes}{moved}{evicted} — not enrolled, not "
-            "indexed: compress and re-upload to papra, or raise PAPRA_MAX_DOCUMENT_BYTES and run "
-            "`papra-suite backfill` again")
+    moved = (f" (refused at {oversized['limit']}; they fit the limit now, and each drops out of "
+             "this count when it is enrolled)"
+             if oversized["limit"] is not None and oversized["limit"] != limit else "")
+    evicted = (f", {oversized['evicted']} not named (the record lists the newest "
+               f"{OVERSIZED_RECORD_LIMIT})" if oversized["evicted"] else "")
+    return (f"oversized: {oversized['count']} seen since {oversized['since']}, largest "
+            f"{oversized['largest']} bytes, limit in force {limit}{moved}{evicted} — not enrolled, "
+            "not indexed: compress and re-upload to papra, or raise PAPRA_MAX_DOCUMENT_BYTES and "
+            "run `papra-suite backfill` again")
 
 
-def _content_writer_line(config) -> str:
+def _content_writer_facts(config) -> dict:
+    """The content-writer state as data: the state string, plus the two settings behind it.
+
+    The booleans are included because a script watching a handover wants the cause rather than the
+    prose, and because `content_writer_state` maps a pair of flags onto a word — the word alone
+    cannot be inverted back into the configuration that produced it.
+    """
+    from papra_suite import indexing
+    from papra_suite.pipeline import content_writer_state
+
+    delivery = bool(config.index_content_delivery
+                    and indexing.CONTENT_DELIVERY_IMPLEMENTED)
+    return {"state": content_writer_state(delivery, config.legacy_workers),
+            "delivery": delivery, "legacy_workers": bool(config.legacy_workers)}
+
+
+def _content_writer_line(writer: dict) -> str:
     """`content writer: ...` — who writes Papra's text under this configuration.
 
     Computed from the config rather than from the settings rows, because `check` is asking
@@ -446,15 +456,21 @@ def _content_writer_line(config) -> str:
     handover window, where nobody owns the column, is legitimate for an afternoon and wrong
     for a fortnight, and the two look identical from the outside.
     """
+    return f"content writer: {writer['state']}"
+
+
+def _metadata_writer_facts(config) -> dict:
+    """The metadata-writer state as data, shaped exactly like the content writer's group."""
     from papra_suite import indexing
-    from papra_suite.pipeline import content_writer_state
+    from papra_suite.pipeline import metadata_writer_state
 
-    delivery = bool(config.index_content_delivery
-                    and indexing.CONTENT_DELIVERY_IMPLEMENTED)
-    return f"content writer: {content_writer_state(delivery, config.legacy_workers)}"
+    delivery = bool(config.index_metadata_delivery
+                    and indexing.METADATA_DELIVERY_IMPLEMENTED)
+    return {"state": metadata_writer_state(delivery, config.legacy_workers),
+            "delivery": delivery, "legacy_workers": bool(config.legacy_workers)}
 
 
-def _metadata_writer_line(config) -> str:
+def _metadata_writer_line(writer: dict) -> str:
     """`metadata writer: ...` — who writes Papra's name, date and notes under this config.
 
     Its own line rather than a clause on the content writer's, because the two columns
@@ -464,19 +480,105 @@ def _metadata_writer_line(config) -> str:
     `two writers` rather than refusing, and stays true for exactly as long as the `ocr` and
     `title` queues take to starve — see `metadata_writer_state`.
     """
-    from papra_suite import indexing
-    from papra_suite.pipeline import metadata_writer_state
+    return f"metadata writer: {writer['state']}"
 
-    delivery = bool(config.index_metadata_delivery
-                    and indexing.METADATA_DELIVERY_IMPLEMENTED)
-    return f"metadata writer: {metadata_writer_state(delivery, config.legacy_workers)}"
+
+def _check_facts(store, config) -> dict:
+    """Every read `check` performs, taken once, in one place.
+
+    This function exists so the two renderings of the readout cannot disagree: the lines an operator
+    pastes into a bug report, and the JSON a script watches a multi-day backfill with. Every
+    renderer above takes one group this produces, and nothing reads the store on the way to the
+    terminal. A second read would risk more than a different number under concurrent writes — it
+    would risk a different *meaning*, which is the failure a machine surface is supposed to remove
+    rather than add.
+
+    It reads while the store is open and never fails: every group degrades to a stated reason
+    (`unavailable`, or a named `index_unavailable`), because `check` is what an operator runs *when*
+    something is wrong, often with the daemon mid-write. The one case worth naming is a corrupt
+    `index_generation`: the store refuses to count against a generation that does not exist, and
+    naming the key is the useful part, because the repair is `ledger --invalidate` and a bare
+    "unavailable" would send the operator to the wrong service.
+
+    No credential material is read here. That stays a rule because `--json` is the output that gets
+    redirected, collected, and pasted into an agent's context, and it is tested as one.
+    """
+    from papra_suite import indexing, mcp_server
+    from papra_suite.oversized import oversized_seen
+
+    facts: dict = {
+        "data_dir": str(config.data_dir),
+        "max_document_bytes": config.max_document_bytes,
+        "senders": {"describe": config.allowed_senders.describe()},
+        "index": None,
+        "index_unavailable": None,
+    }
+
+    try:
+        counts = store.count_ingest_events_by_kind(
+            since=(datetime.now(UTC) - timedelta(days=1)).isoformat()
+        )
+        facts["events"] = {"window_hours": 24, "by_kind": dict(counts)}
+    except sqlite3.Error as error:
+        facts["events"] = {"window_hours": 24, "by_kind": None,
+                           "unavailable": type(error).__name__}
+
+    try:
+        facts["index"] = dict(store.ledger_stats())
+    except ValueError:
+        facts["index_unavailable"] = "index_generation names no current generation"
+    except sqlite3.Error as error:
+        facts["index_unavailable"] = type(error).__name__
+
+    deletion: dict = {"stamp": store.get_setting(indexing.LAST_DELETION_PASS_SETTING),
+                      "set_aside": None, "set_aside_stale": False,
+                      "marks_counted": None, "marks_allowance": None,
+                      "gated_until": None, "probe_rereads": None}
+    quarantine = store.get_setting(indexing.DELETION_QUARANTINE_SETTING)
+    deletion["set_aside"] = quarantine
+    deletion["set_aside_stale"] = (bool(quarantine)
+                                   and not (deletion["stamp"] or "").startswith("ok "))
+    marks = store.get_setting(indexing.MARKS_ROLLING_SETTING)
+    if marks and "|" in marks:
+        try:
+            counted, allowance = indexing.marks_window_state(store)
+            deletion["marks_counted"], deletion["marks_allowance"] = counted, allowance
+        except ValueError:
+            # The allowance is unreadable; the count is still the number an operator wants, and the
+            # renderer says so without inventing a limit.
+            deletion["marks_counted"] = int(marks.split("|", 1)[1])
+    deletion["gated_until"] = indexing.listing_walk_gate(store)
+    deletion["probe_rereads"] = indexing.pending_probe_rereads(store)
+    facts["deletions"] = deletion
+
+    try:
+        record = oversized_seen(store)
+        facts["oversized"] = {"count": record.count, "since": record.since,
+                              "largest": record.largest, "evicted": record.evicted,
+                              "limit": record.limit,
+                              "limit_in_force": config.max_document_bytes}
+    except sqlite3.Error as error:
+        facts["oversized"] = {"unavailable": type(error).__name__}
+
+    facts["content_writer"] = _content_writer_facts(config)
+    facts["metadata_writer"] = _metadata_writer_facts(config)
+
+    try:
+        facts["mcp"] = mcp_server.mcp_state(store, config)
+    except sqlite3.Error as error:
+        facts["mcp"] = {"state": "unavailable", "reason": type(error).__name__}
+    return facts
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="papra-suite")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("check", help="validate config, open and migrate the store, exit")
+    check = sub.add_parser("check",
+                           help="validate config, open and migrate the store, exit")
+    check.add_argument("--json", action="store_true",
+                       help="print the readout as one JSON document, to watch a long backfill from "
+                            "a script; every number is the one the text lines print")
     sub.add_parser("serve", help="run the pipeline: pollers, OCR/title workers, sweep")
     replay = sub.add_parser(
         "replay",
@@ -568,25 +670,29 @@ def main() -> int:
             # Read while the store is still open: `check` closes it in a finally,
             # and querying a closed store raises — which the helper would report
             # as "unavailable" instead of the counts that are the point of the
-            # line.
-            recent_events = _recent_event_counts(store)
-            index_line = _index_line(store)
-            deletion_line = _deletion_pass_line(store)
-            mcp_line = _mcp_line(store, config)
-            oversized_line = _oversized_line(store, config)
+            # line. One read feeds both output modes, so the text lines and
+            # `--json` cannot disagree about the store they just opened.
+            facts = _check_facts(store, config)
         finally:
             store.close()
-        print(f"config ok; store migrated; data dir: {config.data_dir}")
+        if args.json:
+            # The machine surface exists for the corpus backfill: extraction costs minutes a page,
+            # so "how far along" is a question worth asking on a timer. Everything that could have
+            # made this command print a warning instead of a document already returned non-zero
+            # above, so stdout is one JSON value and nothing else.
+            print(_dump_json(facts))
+            return 0
+        print(f"config ok; store migrated; data dir: {facts['data_dir']}")
         # Printed last because it is the line that answers "why is nothing
         # arriving?": an empty allow-list denies every sender by design.
-        print(f"senders: {config.allowed_senders.describe()}")
-        print(recent_events)
-        print(index_line)
-        print(deletion_line)
-        print(oversized_line)
-        print(_content_writer_line(config))
-        print(_metadata_writer_line(config))
-        print(mcp_line)
+        print(f"senders: {facts['senders']['describe']}")
+        print(_recent_event_counts(facts["events"]))
+        print(_index_line(facts["index"], facts["index_unavailable"]))
+        print(_deletion_pass_line(facts["deletions"]))
+        print(_oversized_line(facts["oversized"]))
+        print(_content_writer_line(facts["content_writer"]))
+        print(_metadata_writer_line(facts["metadata_writer"]))
+        print(_mcp_line(facts["mcp"]))
         return 0
 
     if args.command == "replay":

@@ -964,6 +964,56 @@ def mcp_listener_requested(store: Store) -> bool:
     return store.settings_flag(MCP_ENABLED_SETTING)
 
 
+def mcp_state(store: Store, config) -> dict:
+    """The listener's configuration as data: would it run, on what, with how many credentials.
+
+    One read, two renderings. `mcp_state_line` below is the sentence `check` prints, and
+    `check --json` emits this dict, so the terminal and the script cannot be told different stories
+    about one store — the failure mode that makes a machine surface worse than none at all.
+
+    `state` is one of `disabled`, `refused`, `enabled`: the same three cases the line distinguishes,
+    because "connection refused" from the client's side is indistinguishable from firewalled, down,
+    or tokenless, and these three are what separate them. `bind` appears only when a bind resolved,
+    and `refused` only when the configuration was rejected — a null for either would read as "no
+    problem" in exactly the case that is one. No label appears here: `check` output gets pasted into
+    issues, and a token label names a device (see `mcp_state_line`).
+    """
+    active, revoked = token_counts(store)
+    state: dict = {"state": "disabled", "tokens_active": active, "tokens_revoked": revoked}
+    if not mcp_listener_requested(store):
+        return state
+    state["state"] = "enabled"
+    try:
+        bind = resolve_bind(config, store=store)
+        _public_url(config.mcp_url if getattr(config, "mcp_url", None) else "")
+    except McpConfigError as error:
+        state["state"] = "refused"
+        state["refused"] = str(error)
+        return state
+    state["bind"] = str(bind)
+    state["bind_host"] = bind.host
+    state["bind_port"] = bind.port
+    return state
+
+
+def render_mcp_state(state: dict) -> str:
+    """The `check` sentence for a `mcp_state` dict — the renderer, with no store of its own.
+
+    Split out so `check` and `check --json` are rendered from one read while the wording stays in
+    one place: the sentence is what an operator pastes into a bug report, so it is not something to
+    duplicate.
+    """
+    counts = f"{state['tokens_active']} active, {state['tokens_revoked']} revoked"
+    if state["state"] == "disabled":
+        return (f"mcp: disabled (nothing listens; set {MCP_ENABLED_SETTING}=1 and give "
+                f"PAPRA_MCP_URL to start the listener), tokens: {counts}")
+    if state["state"] == "refused":
+        return f"mcp: enabled but refused: {state['refused']} | tokens: {counts}"
+    return (f"mcp: enabled on {state['bind']} — configuration only: this command opens no socket, "
+            "and a listener that dies exits serve. "
+            f"Tokens: {counts}; names: `papra-suite mcp-token --list`")
+
+
 def mcp_state_line(store: Store, config) -> str:
     """The `check` line: would a listener run, on what, and with how many credentials.
 
@@ -972,6 +1022,8 @@ def mcp_state_line(store: Store, config) -> str:
     terminal. The refused-bind case prints the refusal rather than pretending the bind is fine,
     because `check` is where an operator learns a container will not come up.
 
+    `render_mcp_state(mcp_state(store, config))`, which is also what `check --json` prints.
+
     What this line reports is **configuration, not liveness**, and it says so. It reads settings; it
     opens no socket, and it cannot know whether a running `serve` still has its listener. The
     alternative — probing the port from `check` — would make the diagnostic command depend on the
@@ -979,19 +1031,7 @@ def mcp_state_line(store: Store, config) -> str:
     not this line but the death path in `run_mcp_listener`: a listener that goes away exits `serve`,
     so "enabled" and "not listening" cannot coexist for long.
     """
-    active, revoked = token_counts(store)
-    counts = f"{active} active, {revoked} revoked"
-    if not mcp_listener_requested(store):
-        return (f"mcp: disabled (nothing listens; set {MCP_ENABLED_SETTING}=1 and give "
-                f"PAPRA_MCP_URL to start the listener), tokens: {counts}")
-    try:
-        bind = resolve_bind(config, store=store)
-        _public_url(config.mcp_url if getattr(config, "mcp_url", None) else "")
-    except McpConfigError as error:
-        return f"mcp: enabled but refused: {error} | tokens: {counts}"
-    return (f"mcp: enabled on {bind} — configuration only: this command opens no socket, and a "
-            f"listener that dies exits serve. Tokens: {counts}; names: "
-            "`papra-suite mcp-token --list`")
+    return render_mcp_state(mcp_state(store, config))
 
 
 def uvicorn_config_kwargs(bind: McpBind) -> dict:

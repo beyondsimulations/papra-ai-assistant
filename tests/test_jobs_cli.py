@@ -849,7 +849,24 @@ def test_every_papra_suite_command_the_shipped_code_names_is_one_that_parses():
         named.update(re.findall(r"papra-suite ([a-z][a-z-]*) +--?[a-z]", text))
 
     assert named, "the scan matched nothing, which is not the same as nothing being wrong"
-    unregistered = sorted(named - set(sub.choices))
+
+    # `check`, `serve`, `replay`, `events` and the two mcp commands are built inside `main()` rather
+    # than by an `add_subparser` helper, so the loop above cannot see them and a correct citation of
+    # `papra-suite check --json` reads as an unregistered command. Read the shipped binary's own
+    # usage line, so the set is the commands this branch ships rather than the subset one
+    # construction path happens to expose — a guard with a blind spot like this trains people to
+    # word their citations around the guard instead of around the truth.
+    import subprocess
+    import sys
+
+    registered = set(sub.choices)
+    shipped = subprocess.run([sys.executable, "-m", "papra_suite", "--help"],
+                             capture_output=True, text=True, check=True)
+    listing = re.search(r"\{([a-z][a-z,-]*)\}", shipped.stdout)
+    assert listing, "shipped --help printed no subcommand list, so this guard can see nothing"
+    registered |= {name for name in listing.group(1).split(",") if name}
+
+    unregistered = sorted(named - registered)
     assert not unregistered, f"cited but not registered: {unregistered}"
 
 

@@ -778,7 +778,17 @@ only `OCR_VLM_BASE_URL`, `OCR_VLM_MODEL`, `OCR_VLM_API_KEY`, `OCR_VLM_DEV_*` and
 `OCR_VLM_TIMEOUT_SECS`, with no documented concurrency knob to turn. Two consequences: start the
 full backfill only when a multi-day run is acceptable, and treat Step 3.2's `extraction-empty` count,
 not a quiet-looking queue, as the authority on whether extraction is finished — because a document
-whose extraction timed out is not distinguishable, over the API, from one still in flight.
+whose extraction timed out is not distinguishable, over the API, from one still in flight. To watch
+it without re-reading prose all day, poll the machine surface of the same readout:
+
+```bash
+watch -n 60 "papra-suite check --json | jq -c '{current: .index.indexed_current, empty: .index.extraction_empty, blocked: .index.delivery_blocked}'"
+```
+
+`extraction_empty` creeping up slowly is a throughput story; `extraction_empty` climbing fast while
+`indexed_current` stalls is the extractor being wrong for this corpus, which is the case Step 3.2
+names. Both numbers come from the one read that prints the lines above, so the two surfaces cannot
+disagree about what to alert on.
 
 **Spot-check one extraction against the paper while you are here.** One of the three scans, a
 single-page certificate, came back with 10,191 characters of text. It may well be everything printed

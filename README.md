@@ -94,7 +94,7 @@ trust boundary is verified for a specific provider.
 
 | Command | |
 |---|---|
-| `papra-suite check` | config + migrations, the parsed allow-list, and what was refused in the last 24 h; changes nothing |
+| `papra-suite check [--json]` | config + migrations, the parsed allow-list, and what was refused in the last 24 h; `--json` prints the same readout as one document for a script; changes nothing |
 | `papra-suite serve` | pollers, OCR and title workers, sweep loop |
 | `papra-suite replay --mailbox-id ID [--from-uid N] [--dry-run]` | rewind the poll cursor |
 | `papra-suite events [--limit N] [--mailbox-id ID] [--kind K] [--since YYYY-MM-DD] [--json]` | why messages and attachments were **not** ingested |
@@ -111,6 +111,52 @@ trust boundary is verified for a specific provider.
 — because `check` is the command an operator already runs when something is wrong,
 and "the mailbox polls fine but nothing arrives" should not need a second one. An
 empty or fresh store prints `none`; it never fails the check.
+
+**`check --json` is the same readout, for a script.** One JSON document on stdout and nothing else,
+so it can be polled on a timer — which matters because a corpus backfill on this hardware is a
+multi-day extraction, not a coffee break, and "how far along" should be a question a watch loop asks:
+
+```bash
+papra-suite check --json | jq '{current: .index.indexed_current, empty: .index.extraction_empty, mcp: .mcp.state}'
+```
+
+```json
+{"data_dir": "/data", "max_document_bytes": 104857600,
+ "senders": {"describe": "a@x.com"},
+ "index": {"references": 0, "indexed_current": 0, "stale": 0, "unledgered": 0, "delivered": 0,
+           "extraction_empty": 0, "delivery_blocked": 0, "protected_name": 0,
+           "protected_date": 0, "protected_notes": 0, "repairs_24h": 0, "cleanup_pending": 0,
+           "cleanup_failed": 0},
+ "index_unavailable": null,
+ "events": {"window_hours": 24, "by_kind": {}},
+ "deletions": {"stamp": null, "set_aside": null, "set_aside_stale": false, "marks_counted": null,
+               "marks_allowance": null, "gated_until": null, "probe_rereads": 0},
+ "oversized": {"count": 0, "since": null, "largest": 0, "evicted": 0, "limit": null,
+               "limit_in_force": 104857600},
+ "content_writer": {"state": "suite ocr worker (legacy)", "delivery": false, "legacy_workers": true},
+ "metadata_writer": {"state": "suite title worker (legacy)", "delivery": false,
+                     "legacy_workers": true},
+ "mcp": {"state": "disabled", "tokens_active": 0, "tokens_revoked": 0}}
+```
+
+Every number in it is the number the text lines print, because both are rendered from **one read** of
+the store and a test rebuilds each line out of the payload — a machine surface that could disagree
+with the terminal would be worse than no machine surface, since the script is the one nobody argues
+with. Three properties are worth knowing before you write against it:
+
+- **`index: null` is not "zero documents".** A corrupt `index_generation` makes every
+  generation-scoped count a guess, so the store refuses to produce one and the payload carries the
+  reason in `index_unavailable`, exactly as the line prints `index: unavailable (…)`. Zeros here would
+  tell a watching script the corpus had been emptied.
+- **The writer groups carry their causes, not just their prose.** `content_writer.delivery` and
+  `.legacy_workers` are the two flags that decide the sentence, because during a handover the state
+  word (`none (handover window)`, `two writers (title queue draining)`) is the thing you want to alert
+  on and cannot be inverted back into a configuration.
+- **Nothing secret is in here.** `check` loads the Papra key, the LLM key and the admin password in
+  order to validate the configuration, and prints none of them: `--json` output is the kind that gets
+  redirected into a file, collected by a monitoring loop, or pasted to an agent. `mcp` carries token
+  *counts*, never a label, digest, or plaintext — `mcp-token --list` is the command for names, on the
+  operator's own terminal.
 
 `replay` is the answer to "I set the allow-list wrong for a week." Refused mail
 was retired but never deleted, so rewinding re-reads it, and Papra's content-hash
