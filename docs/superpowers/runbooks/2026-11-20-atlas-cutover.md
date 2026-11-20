@@ -186,6 +186,15 @@ recreate the container, and read the health endpoint again.
   you are willing to send and what the backup's retention is — and then re-read Step 4 before
   Step 5, because the fallback you are deleting is the one that would have kept this inside.
 
+**The literal, because the failure it produces is misleading.** The index's inference base URL has
+to carry the `/v1` path segment: with the same key, `OCR_VLM_BASE_URL=https://<host>` returns **401**
+and `OCR_VLM_BASE_URL=https://<host>/v1` returns **200**, measured against the operator's own host on
+2026-11-20. A missing `/v1` therefore looks exactly like a revoked key, and the obvious response —
+mint a new key — fixes nothing. Note that the two halves of this system want **opposite** shapes, so
+do not copy one value into the other: the index is configured with a path-bearing URL, while this
+suite's own `LLM_BASE_URL` is validated by `_require_base_url` and **refuses a path**, failing at
+startup with `LLM_BASE_URL must not include a path, got: 'https://<host>'`.
+
 ### 0.4 The languages the extractor was told to read
 
 **Why.** The corpus is German. Papra's OCR default is English, and the index's language setting is
@@ -270,6 +279,15 @@ papra-suite check
   you reach what an earlier ceiling kept out. Do not shrink it; the check is against Papra's stored
   size, so a file that was legal last month can become illegal by the same rule, and it will keep
   its index row while its new mail does not.
+
+**Measured on the operator's archive (2026-11-20).** `backfill --dry-run` was run against production
+with a key whose permissions are `documents:read`, `tags:read`, `custom-properties:read`,
+`organizations:read` — capability-enforced read-only, so nothing here could write: **1,183 PDFs**
+across the four buckets (Herde 327, of which 9 are not PDFs; Katharina Illustration 285;
+BeyondSimulations 79; Uni Hamburg 492), and **zero of them over the ceiling**. So the 100 MiB default
+is not a live constraint on this archive: keep it, do not raise it, and revisit only if a scanner
+starts emitting hundred-megabyte scans. The same dry-run listed the largest bucket's 492 documents in
+half a second, which is what makes Step 1.3's twenty-document rehearsal cheap.
 
 ### 0.7 The queue baseline, before anything changes
 
@@ -750,6 +768,23 @@ wrote down in Step 0.7.
 - Rows in `failed` with the same error: fix that error and re-run the slice; the sweep re-enqueues
   anything un-delivered, so nothing is lost by waiting. If the error is Kreuzakt refusing, stop and
   go back to Step 0.3 — a backfill into a dead index is a way to spend VLM minutes for nothing.
+
+**The clock you are actually buying** (measured 2026-11-20, three median-sized single-page scans from
+the Uni Hamburg bucket, extracted on the operator's own inference host at
+`Qwen3-VL-8B-Instruct-4bit`): **133 s** and **147 s** to extract, with a third document finishing only
+after the 181-second window the probe had allowed. So budget **two to three minutes per page**, not
+seconds — at 1,183 documents the corpus is a multi-day extraction, and the image's own README names
+only `OCR_VLM_BASE_URL`, `OCR_VLM_MODEL`, `OCR_VLM_API_KEY`, `OCR_VLM_DEV_*` and
+`OCR_VLM_TIMEOUT_SECS`, with no documented concurrency knob to turn. Two consequences: start the
+full backfill only when a multi-day run is acceptable, and treat Step 3.2's `extraction-empty` count,
+not a quiet-looking queue, as the authority on whether extraction is finished — because a document
+whose extraction timed out is not distinguishable, over the API, from one still in flight.
+
+**Spot-check one extraction against the paper while you are here.** One of the three scans, a
+single-page certificate, came back with 10,191 characters of text. It may well be everything printed
+on the page; it may also be the vision model expanding boilerplate into prose. Read the page and the
+text side by side once. If the model inflates, the fix is a different `OCR_VLM_MODEL`, and you want
+that decision made before 1,183 documents carry it, not after.
 
 ### 3.2 The documents that never arrived
 
