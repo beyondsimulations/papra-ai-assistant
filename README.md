@@ -489,6 +489,24 @@ Two things the listener does behind that proxy, both asserted in
   tries. Once you set `mcp_bind_nonloopback`, a peer that can route to the port could otherwise send
   `Host: localhost` and clear the transport check.
 
+**How the index matches your words** (measured on the operator's own corpus, 2026-11-20). It is a
+stemmed full-text index rather than a substring search, and in German the difference is visible:
+
+- **Stems match.** `Rechnungen` and `Rechnungs` find `Rechnung`, `Versicherungsscheine` finds
+  `Versicherungsschein`, and `Grüßen` — even `grusse` — finds `Grüße`. This is the reason the index
+  exists: Papra's own search could not do it, which is what "the invoice is in there somewhere, I
+  know it" usually means.
+- **Compounds are not split.** `Haftpflicht` does not find `Kfz-Haftpflichtversicherung`, and `Straße`
+  does not find `Straßenbahnschienen`. Ask for a word the document itself would contain, or a short
+  phrase from it.
+- **`ß` is not folded to `ss`.** `strasse` misses `Straße`, even though umlauts do fold. When the
+  spelling is uncertain, try both and read the counts.
+
+An empty result therefore means "no indexed document holds this token in this spelling", which is not
+the same claim as "this document is not in the archive". `search_documents` publishes the same rules in
+its tool description, because that is the text an agent has in front of it at the moment it reads a
+zero; the README is the text it read once, earlier.
+
 **What a token can see.** A token carries a list of buckets, or `--all-buckets`. The scoping is a
 security boundary rather than a filter: no tool takes an `org_id`, a bucket list or a scope argument —
 the schema the server publishes has none — so an agent can

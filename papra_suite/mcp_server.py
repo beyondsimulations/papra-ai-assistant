@@ -873,6 +873,13 @@ def build_mcp_app(store: LedgerReader, papra: PapraReader, kz: KreuzaktReader, *
         Papra's: a document in the trash, or one Papra will not confirm, is not shown either.
         `partial: true` means the answer could be missing results — the scan budget ran out, or a
         bucket in scope was beyond the per-call fan-out bound — and `partial_reason` says which.
+
+        How this index matches words, because a zero is easy to over-read: it stems, so `Rechnungen`
+        finds `Rechnung`; it does not split German compounds, so `Haftpflicht` does not find
+        `Kfz-Haftpflichtversicherung`; and it folds umlauts (`grusse` finds `Grüße`) but not `ß` to
+        `ss`, so `strasse` misses `Straße`. So `total: 0` means "no indexed document holds this
+        token in this spelling", not an absence from the archive: retry with the word the document
+        would itself use, or a short phrase from it, before concluding it is not there.
         """
         return await search_documents_tool(
             require_principal(ctx.request_context.request), store, papra, kz, query,

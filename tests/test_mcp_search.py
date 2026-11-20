@@ -1328,6 +1328,31 @@ async def test_the_surface_is_the_six_registered_read_tools(store):
         "get_document", "get_document_content", "open_document"}
 
 
+async def test_the_search_tool_tells_the_client_how_words_match(store):
+    """The published description states the matching rules, because a bare zero lies to the caller.
+
+    Measured on the operator's own corpus and inference host (2026-11-20): the index stems, so
+    `Rechnungen` finds `Rechnung` and `Versicherungsscheine` finds `Versicherungsschein`; it does
+    not split German compounds, so `Haftpflicht` does not find `Kfz-Haftpflichtversicherung`; and it
+    folds umlauts (`grusse` finds `Grüße`) but not `ß` to `ss` (`strasse` misses `Straße`). The last
+    two are indistinguishable, from the client's side, from an archive that does not hold the
+    document — and an agent that concludes absence from `total: 0` will tell the operator their
+    invoice is missing.
+
+    The rule is published in the tool description rather than only in the README because the
+    description is the text an agent has in hand at the moment it reads a zero, while the README is
+    the text it read once, hours earlier. Substrings are asserted rather than the whole docstring so
+    that rewording around the three rules stays possible.
+    """
+    token = mint_token(store, label="wire", org_ids=[ORG_A])
+    description = registered_tools(store, token)["search_documents"]["description"]
+    assert "compound" in description
+    assert "Haftpflicht" in description
+    assert "ß" in description and "strasse" in description
+    assert "Rechnungen" in description
+    assert "not an absence" in description
+
+
 async def test_the_listener_serves_one_route_and_no_other(store):
     """Condition 3, pinned: there is no second door.
 
